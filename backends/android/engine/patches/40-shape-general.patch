@@ -1,0 +1,110 @@
+diff --git a/tools/qwen35_engine.c b/tools/qwen35_engine.c
+index 31c02f2..c3a57dd 100644
+--- a/tools/qwen35_engine.c
++++ b/tools/qwen35_engine.c
+@@ -495,7 +495,7 @@ static void quant_need(size_t n) {
+ 
+ // ---- pack + index --------------------------------------------------------
+ typedef struct { char name[64]; u64 off; u64 bytes; int rows, cols; int is_f32; int row_bytes; int fmt; } TInfo;
+-static TInfo gT[1024];
++static TInfo gT[4096];
+ static int gNT = 0;
+ static const uint8_t *gPack = NULL;
+ static size_t gMapSz = 0;  // nonzero: gPack is an mmap; drop its pages per layer (RSS <= one layer)
+@@ -595,6 +595,10 @@ static void load_index(const char *dir) {
+       exit(1);
+     }
+     if (t.fmt < 0) { fprintf(stderr, "unknown tensor type %s for %s\n", type, t.name); exit(1); }
++    if (t.fmt == 2 || t.fmt == 8) {  // 22-shape: registered, but no dot/deq here: refuse instead of computing zeros
++      fprintf(stderr, "%s: tensor type %s is not supported by the CPU engine (repack as Q8_0/Q4_K/Q5_K/Q6_K)\n", t.name, type);
++      exit(1);
++    }
+     if (gNT >= (int)(sizeof gT / sizeof gT[0])) { fprintf(stderr, "index: more than %d tensors\n", gNT); exit(1); }
+     gT[gNT++] = t;
+   }
+@@ -732,17 +736,24 @@ static void rope_im(float *x, int slot, int nd, int hd, float base) {
+ // ---- model state ---------------------------------------------------------
+ static float *gS, *gConv, *gK, *gV;
+ static int gCap = 0;
+-static int gFull[64];
++// 22-shape: per-layer arrays sized from n_layers; KV only for full-attention layers and the recurrent
++// state only for linear layers, indexed by the layer's ordinal within its kind (gOrd).
++static int *gFull, *gOrd, gNFull, gNLin;
++static float *gInvQ, *gInvK;
+ static int is_full(int i) { return (i + 1) % INTERVAL == 0; }
+ 
+ static void state_alloc(int cap) {
+   gCap = cap;
+-  gS = (float *)calloc((size_t)L * TR * SZ * SZ, 4);
+-  gConv = (float *)calloc((size_t)L * (KC - 1) * CONVD, 4);
+-  gK = (float *)calloc((size_t)L * cap * KV * HDIM, 4);
+-  gV = (float *)calloc((size_t)L * cap * KV * HDIM, 4);
+-  if (!gS || !gConv || !gK || !gV) { fprintf(stderr, "state alloc failed\n"); exit(1); }
+-  for (int i = 0; i < L; i++) gFull[i] = is_full(i);
++  gFull = (int *)calloc(L, sizeof(int)); gOrd = (int *)calloc(L, sizeof(int));
++  gInvQ = (float *)calloc(GK, 4); gInvK = (float *)calloc(GK, 4);
++  if (!gFull || !gOrd || !gInvQ || !gInvK) { fprintf(stderr, "state alloc failed\n"); exit(1); }
++  gNFull = gNLin = 0;
++  for (int i = 0; i < L; i++) { gFull[i] = is_full(i); gOrd[i] = gFull[i] ? gNFull++ : gNLin++; }
++  gS = (float *)calloc((size_t)gNLin * TR * SZ * SZ + 1, 4);
++  gConv = (float *)calloc((size_t)gNLin * (KC - 1) * CONVD + 1, 4);
++  gK = (float *)calloc((size_t)gNFull * cap * KV * HDIM + 1, 4);
++  gV = (float *)calloc((size_t)gNFull * cap * KV * HDIM + 1, 4);
++  if (!gS || !gConv || !gK || !gV) { fprintf(stderr, "state alloc failed (KV for %d full layers x %d positions)\n", gNFull, cap); exit(1); }
+ }
+ 
+ // named scratch buffers (no aliasing across an op)
+@@ -796,7 +807,7 @@ static void linear_core(int il, const char *p, const float *QKV, const float *Z,
+   for (int i = 0; i < TR; i++) GATE_PRE[i] = hf_softplus(apre[i] + dt[i]) * alog[i];
+ 
+   N("ssm_conv1d.weight"); const float *cw = fvec(id);
+-  float *cs = gConv + (size_t)il * (KC - 1) * CONVD;
++  float *cs = gConv + (size_t)gOrd[il] * (KC - 1) * CONVD;
+   for (int c = 0; c < CONVD; c++) {
+     float acc = 0.0f;
+     for (int k = 0; k < KC - 1; k++) acc += cs[k * CONVD + c] * cw[c * KC + k];
+@@ -813,7 +824,7 @@ static void linear_core(int il, const char *p, const float *QKV, const float *Z,
+   const float *yq = Y, *yk = Y + kd, *yv = Y + 2 * kd;
+   // q/k are per-group l2-normalized, then tiled GK->TR (np.tile: value head hh
+   // reads key group hh % GK, i.e. the whole group axis repeated rep times)
+-  float invq[64], invk[64];
++  float *invq = gInvQ, *invk = gInvK;
+   for (int g = 0; g < GK; g++) {
+     const float *qg = yq + g * SZ, *kg = yk + g * SZ;
+     float sq = 0.0f, sk = 0.0f;
+@@ -830,7 +841,7 @@ static void linear_core(int il, const char *p, const float *QKV, const float *Z,
+ 
+   N("ssm_norm.weight"); const float *sn = fvec(id);
+   if (il == 0) { dl_dump("qt", QT, TR * SZ); dl_dump("kt", KT, TR * SZ); }
+-  float *sbase = gS + (size_t)il * TR * SZ * SZ;
++  float *sbase = gS + (size_t)gOrd[il] * TR * SZ * SZ;
+   // heads are independent recurrences; each head keeps its serial order
+ #ifdef LLB_PAR_CORE
+   #pragma omp parallel for schedule(LLB_SCHED)
+@@ -893,7 +904,7 @@ static void full_qkv(int il, const float *qnw, const float *knw, const float *QG
+     for (int i = 0; i < HDIM; i++) qn[hh * HDIM + i] = q[i] * s * qnw[i];
+     rope_im(qn + hh * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
+   }
+-  size_t base = ((size_t)il * gCap + tpos) * KV * HDIM;
++  size_t base = ((size_t)gOrd[il] * gCap + tpos) * KV * HDIM;
+   float *kc = gK + base;
+   for (int g = 0; g < KV; g++) {
+     const float *k = KB + g * HDIM;
+@@ -912,7 +923,7 @@ static void full_head(int il, const float *qh, int hh, int tpos, float *probs, f
+   float scale = 1.0f / hf_sqrt((float)HDIM);
+   float mx = -INFINITY;
+   const size_t st = (size_t)KV * HDIM;
+-  const float *k0 = gK + ((size_t)il * gCap * KV + kvh) * HDIM, *v0 = gV + ((size_t)il * gCap * KV + kvh) * HDIM;
++  const float *k0 = gK + ((size_t)gOrd[il] * gCap * KV + kvh) * HDIM, *v0 = gV + ((size_t)gOrd[il] * gCap * KV + kvh) * HDIM;
+   // 4 positions at once = 4 independent dot chains, each in the serial i order
+   int tp = 0;
+   for (; tp + 3 <= tpos; tp += 4) {
+@@ -1673,7 +1684,7 @@ static int serve_decide(const char *dir, int ctx) {
+   int eos = getenv("KEV_EOS") != NULL, stop[2] = {-1, -1};
+   if (eos) { q35_tok_encode(&tk, "<|im_end|>", 1, &stop[0], 1); q35_tok_encode(&tk, "<|endoftext|>", 1, &stop[1], 1); }
+   else q35_tok_free(&tk);
+-  size_t ns = (size_t)L * TR * SZ * SZ, nc = (size_t)L * (KC - 1) * CONVD;
++  size_t ns = (size_t)gNLin * TR * SZ * SZ, nc = (size_t)gNLin * (KC - 1) * CONVD;
+   float *sS = malloc(ns * 4), *sC = malloc(nc * 4), *h = malloc((size_t)D * 4);
+   int *ids = malloc((size_t)ctx * 4), *pre = malloc((size_t)ctx * 4), npre = 0, fork = !getenv("KEV_NOFORK");
+   gHid = malloc((size_t)ctx * D * 4);

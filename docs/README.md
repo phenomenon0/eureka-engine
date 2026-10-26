@@ -46,6 +46,7 @@ This directory holds the Eureka Engine documentation. Start with the
 | Page | Description |
 |---|---|
 | [Backends](backends.md) | Status, measurements, and gaps for each of the five backends. |
+| [Model and hardware limits](limits.md) | What each engine accepts, what blocks other sizes and smaller hardware, and the cheapest fixes. |
 | [Branches](branches.md) | Branch naming convention. |
 | [Documentation style](documentation-style.md) | Rules for file names and writing. |
 

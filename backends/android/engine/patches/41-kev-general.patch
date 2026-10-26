@@ -1,0 +1,138 @@
+diff --git a/tools/kevserve/kev.c b/tools/kevserve/kev.c
+index 6cb9a26..e99b915 100755
+--- a/tools/kevserve/kev.c
++++ b/tools/kevserve/kev.c
+@@ -8,7 +8,7 @@
+ // state), queued here: Sys1.next hands out the next question without reading stdin until the request is answered.
+ // Render = tools/k4bfull/assemble.py, readout + ANSWER bytes = tools/k4bfull/kevhead.c (same f32 order).
+ // Timings + kevhead's raw line: one JSON line per request on stderr.
+-// Env: LLB_GGUF (the Kev GGUF), TMPDIR, KEVDUAL_KEEP (dir: keep each question's marker + pointer rows, kevhead format).
++// Env: LLB_GGUF (the Kev GGUF; optional: without it only generate is served), TMPDIR, KEVDUAL_KEEP (dir: keep each question's marker + pointer rows, kevhead format).
+ #define _POSIX_C_SOURCE 200809L
+ #include "../../host/llb_gguf.c"
+ #include "../clef3/json.h"
+@@ -16,7 +16,9 @@
+ #include <math.h>
+ #include <time.h>
+ 
+-enum { D = 2560, N = 512, DP = 256, RB = D / 32 * 34, KMAX = 255, TMAX = 16384, QMAX = 64 };
++enum { N = 512, DP = 256, KMAX = 255, TMAX = 16384, QMAX = 64 };
++static int D, RB;      // 23-kev-general: the head's input width, read from cls.output.weight (0 = no head loaded)
++static int has_head;  // LLB_GGUF given: decide is served; else decide is refused and generate runs alone
+ 
+ static void die(const char *s) { fprintf(stderr, "kevdual: %s\n", s); exit(1); }
+ 
+@@ -168,15 +170,15 @@ static void tok_init(const char *dir, const char *gguf) {
+   if (q35_tok_load(&tok, dir)) die("sidecar requires tokenizer.bin (llb-tok extract)");
+   for (int i = 0; i < 5; i++) {
+     int id[2];
+-    if (q35_tok_encode(&tok, SPECIAL[i], 1, id, 2) != 1) die("special token missing from the vocab");
++    if (q35_tok_encode(&tok, SPECIAL[i], 1, id, 2) != 1) { if (gguf) die("special token missing from the vocab"); sid[i] = -1; continue; }
+     sid[i] = id[0];
+   }
+-  temps(gguf);
++  if (gguf) temps(gguf);
+ }
+ 
+ // ---------------------------------------------------------------- readout (kevhead.c)
+ 
+-static uint8_t wq[N * RB];
++static uint8_t *wq;
+ static float bias[N];
+ 
+ static void head(const float *h, float *y) {  // decide.c's y = W h + b, f32 in index order
+@@ -203,21 +205,23 @@ static void head_init(const char *path) {
+     if (!strcmp(g.t[i].name, "cls.output.weight")) w = &g.t[i];
+     if (!strcmp(g.t[i].name, "cls.output.bias")) b = &g.t[i];
+   }
+-  if (!w || !b || !w->q8 || w->rb != RB || w->bytes != (uint64_t)N * RB || b->bytes != N * 4) die("cls.output: not Q8_0 2560x512 + F32 512");
+-  if (gg_pread(g.fd, wq, sizeof wq, w->src) || gg_pread(g.fd, (uint8_t *)bias, sizeof bias, b->src)) die("tensor read failed");
++  if (!w || !b || !w->q8 || !w->rb || w->rb % 34 || w->bytes != (uint64_t)N * w->rb || b->bytes != N * 4) die("cls.output: not Q8_0 Dx512 + F32 512");
++  RB = (int)w->rb, D = RB / 34 * 32;
++  if (!(wq = malloc((size_t)N * RB))) die("head alloc failed");
++  if (gg_pread(g.fd, wq, (size_t)N * RB, w->src) || gg_pread(g.fd, (uint8_t *)bias, sizeof bias, b->src)) die("tensor read failed");
+   close(g.fd);
+ }
+ 
+ static double r4(double x) { return round(x * 1e4) / 1e4; }  // kev/api.py round_prob (4 decimals)
+ 
+ // rows (pos order, all prompt rows of the question) -> kevhead's raw line and answer object
+-static void answer(const Q *q, float (*h)[D], sb *raw, sb *o) {
++static void answer(const Q *q, float *h, sb *raw, sb *o) {
+   static float yq[N], yk[N];
+   static double s[KMAX], p[KMAX];
+   int K = q->k;
+-  head(h[q->at[K]], yq);
++  head(h + (size_t)q->at[K] * D, yq);
+   for (int i = 0; i < K; i++) {
+-    head(h[q->at[i]], yk);
++    head(h + (size_t)q->at[i] * D, yk);
+     double acc = 0;
+     for (int j = 0; j < DP; j++) acc += (double)yk[DP + j] * yq[j];  // k(h_opt) . q(h_decide)
+     s[i] = acc / sqrt((double)DP);
+@@ -291,13 +295,15 @@ static void drop(void) {
+ static void init(const char *dir) {
+   double t0 = now();
+   const char *gguf = getenv("LLB_GGUF"), *tmp = getenv("TMPDIR");
+-  if (!gguf || !*gguf) die("kevdual needs LLB_GGUF");
+-  if (!tmp || !*tmp) die("set TMPDIR to owned scratch");
+-  if (snprintf(hidden_path, sizeof hidden_path, "%s/kevdual-%d.hidden", tmp, (int)getpid()) >= (int)sizeof hidden_path) die("TMPDIR too long");
++  if (!gguf || !*gguf) gguf = NULL;
++  has_head = gguf != NULL;
++  if (has_head && (!tmp || !*tmp)) die("set TMPDIR to owned scratch");
++  if (has_head && snprintf(hidden_path, sizeof hidden_path, "%s/kevdual-%d.hidden", tmp, (int)getpid()) >= (int)sizeof hidden_path) die("TMPDIR too long");
+   tok_init(dir, gguf);
+-  head_init(gguf);
++  if (has_head) head_init(gguf);
+   out = stdout;
+-  fprintf(stderr, "kevdual: kev head + tokenizer ready %.3f ms (T noul %.9g choice %.9g score %.9g)\n", (now() - t0) * 1000, temp[0], temp[1], temp[2]);
++  if (has_head) fprintf(stderr, "kevdual: kev head (width %d) + tokenizer ready %.3f ms (T noul %.9g choice %.9g score %.9g)\n", D, (now() - t0) * 1000, temp[0], temp[1], temp[2]);
++  else fprintf(stderr, "kevdual: tokenizer ready %.3f ms; no LLB_GGUF, so generate only (decide is refused)\n", (now() - t0) * 1000);
+ }
+ 
+ static char *command(const int *ids, int n, int st) {  // argv words for the request's ids + steps
+@@ -352,6 +358,7 @@ static int parse(char *line, unsigned ctx) {
+     mode = 2, steps = (int)k->num, prompt_n = c;
+     return 1;
+   }
++  if (!has_head) return refuse("decide needs a decide head: start the engine with LLB_GGUF set"), 0;
+   const jv *state = json_get(req, "state"), *qo = json_get(req, "questions");
+   if (!state || !qo || qo->type != J_OBJ || qo->n < 1 || qo->n > QMAX) return refuse("decide needs state and questions (object, 1..64)"), 0;
+   for (nq = 0; nq < (int)qo->n; nq++) {
+@@ -390,8 +397,8 @@ int dual_next(const char *dir, unsigned ctx, char **cmd, const char **hidden, un
+   return 1;
+ }
+ 
+-static float (*rows(const Q *q))[D] {  // the hook's file: every prompt row, [pos, width] + f32 row each
+-  float (*h)[D] = malloc(sizeof *h * q->n);
++static float *rows(const Q *q) {  // the hook's file: every prompt row, [pos, width] + f32 row each
++  float *h = malloc((size_t)D * 4 * q->n);
+   FILE *f = fopen(hidden_path, "rb"), *keep = NULL;
+   const char *kd = getenv("KEVDUAL_KEEP");
+   if (!h || !f) die("cannot read the hidden rows");
+@@ -402,10 +409,13 @@ static float (*rows(const Q *q))[D] {  // the hook's file: every prompt row, [po
+   }
+   for (int i = 0, m = 0; i < q->n; i++) {
+     uint32_t hd[2];
+-    if (fread(hd, 4, 2, f) != 2 || hd[0] != (uint32_t)i || hd[1] != D || fread(h[i], 4, D, f) != D) die("hidden rows: bad dump");
++    float *hi = h + (size_t)i * D;
++    if (fread(hd, 4, 2, f) != 2 || hd[0] != (uint32_t)i) die("hidden rows: bad dump");
++    if (hd[1] != (uint32_t)D) { fprintf(stderr, "kevdual: model width %u != decide head width %d\n", hd[1], D); exit(1); }
++    if (fread(hi, 4, D, f) != (size_t)D) die("hidden rows: bad dump");
+     if (i != q->at[m]) continue;
+-    for (int j = 0; j < D; j++) if (!isfinite(h[i][j])) die("nonfinite hidden row");
+-    if (keep && (fwrite(hd, 4, 2, keep) != 2 || fwrite(h[i], 4, D, keep) != D)) die("KEVDUAL_KEEP: write failed");
++    for (int j = 0; j < D; j++) if (!isfinite(hi[j])) die("nonfinite hidden row");
++    if (keep && (fwrite(hd, 4, 2, keep) != 2 || fwrite(hi, 4, D, keep) != (size_t)D)) die("KEVDUAL_KEEP: write failed");
+     m++;
+   }
+   fclose(f);
+@@ -460,7 +470,7 @@ void dual_done(void) {
+   Q *q = &qs[qi];
+   fwd_ms[qi] = (t_ran - t_fwd) * 1000;
+   double t_h = now();
+-  float (*h)[D] = rows(q);
++  float *h = rows(q);
+   sb r = {0};
+   sb_add(&ans, qi ? "," : "{\"answers\":{");
+   json_quote(&ans, q->id);
