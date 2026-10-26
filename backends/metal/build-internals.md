@@ -50,6 +50,8 @@ The build script performs these steps:
    - Gates (SENSES-MATRIX, this emit linked on the M3 Ultra): 4B image-in is 32/32 exact on small277, invoice, and photo640 compared with llama.cpp mtmd. The default emit stays `c13b9e28`.
 6. Emit C. This step is platform-independent. On Darwin, the script then links exactly as the `mac/build.sh` of engine-vision3 does. `link/dual.c` is the S1D pin, because the `dual.c` of this tree has changed since then, with twoheads S3.
 
+7. Unless `LLB_METAL_BASE=1` is set, apply `cc/metal-anyshape-cc.patch` and `engine/metal-anyshape-engine.patch` (after the vision patches when `VISION=1`), and patch a scratch copy of `link/dual.c` with `link/dual-anyshape.patch` before the link. The emitted C is then `00979448…` (`VISION=1`: `85c8d3c4…`). See [README.md](README.md#any-shape).
+
 ## Why the build uses collapsed patches
 
 The original Mac recipe read a patch directory that no longer exists, so it cannot rebuild from scratch. Only a materialized source tree remains. The two patches in this directory are the diff of that tree against this tree. With them, the Mac product is reproducible again, from git.

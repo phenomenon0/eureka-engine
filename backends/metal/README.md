@@ -41,7 +41,8 @@ On a Mac:
 LLB_BACKEND=metal ./build.sh
 ```
 
-This builds `sys1mac` (emitted C `c13b9e28`, the Mac product build).
+This builds `sys1mac` with the [any-shape](#any-shape) patches (emitted C
+`00979448`). `LLB_METAL_BASE=1` builds the Mac product (`c13b9e28`).
 `LLB_BEND` must point at the pinned Bend compiler: export the
 `pins/bend-240ecef4` branch's `bend2/` (git tree `aada4cbf`) into a
 directory with a `.commit` file. A plain clone does not fetch that branch;
@@ -185,6 +186,70 @@ sources plus the fixes above: `./build.sh` emitted `c13b9e28` and linked
 returned 200 at 84.8 tok/s decode, `decide` 200, `see` 200, `hear` 200
 (whisper-server, `ggml-base.en-q5_1.bin`), and `speak` 200 (24 kHz WAV).
 This check used the `server/` sources before the `b47d73d4` refresh.
+
+## Any shape
+
+The default build applies `cc/metal-anyshape-cc.patch`,
+`engine/metal-anyshape-engine.patch` and `link/dual-anyshape.patch` after the
+product patches (emitted C `00979448…`, `VISION=1` `85c8d3c4…`).
+`LLB_METAL_BASE=1 ./build.sh` leaves them out and still reproduces
+`c13b9e28` / `fbdefec7`. What they change:
+
+- **Shapes.** The quant pack's manifest is checked structurally
+  (`mf.dense`): any layer count up to 1,024, heads with a whole number of q
+  heads per kv head, d_model and d_ff multiples of 256 (at most 8192 and
+  17,408), SSM value heads a multiple of the key heads, vocabulary up to
+  250,048. head_dim 256, SSM state 128, a 4-tap conv, a full-attention layer
+  every fourth, rope 1e7 over 64 dims and eps 1e-6 are compiled into the
+  kernels and are refused by name otherwise. The engine passes the head
+  counts, vocabulary and layer count to the host (pass words 57–59, chunk
+  words 52–54). The 9B, 27B and 4B keep every legacy dispatch; another shape
+  takes the generic arms: attention over any kv-head count
+  (`llb_m_attn6`, six-dispatch split), the slot copy for kv rows other than
+  1024 floats, K-quant GEMV bodies at depth 8–13 in Q4_K / Q5_K / Q6_K, the
+  padded rmsnorm tree at any width but 2048 / 4096, the fused step's head
+  and embedding at its width and vocabulary. The fast prefill chunk runs a
+  generic shape when its GQA is 4 or 6 over 2 or 4 kv heads (the 0.8B and 2B:
+  4 over 2). The plain (non-fused) path stays the 9B's; a generic shape runs
+  the fused step only. The Q8 pack and the 35B MoE keep the whitelist.
+- **Context.** Up to 2^27 slots. The KV (kv rows of n_kv_heads × 256
+  floats), the attention planes and the chunk area live in the engine's own
+  Metal buffer, sized from the context and checked against
+  `maxBufferLength`; its pages are committed as the slots fill. The fused
+  step no longer allocates a Bend state of 2^(dT + 10) floats per layer.
+  `--ctx C` sizes the KV for at least C slots. An argument `@FILE` expands to
+  the file's words, so a prompt of ids can pass the OS argument limit. The
+  `generate` request (`link/dual.c` via `link/dual-anyshape.patch`, and
+  `server/src/dualm.c`) takes prompts up to the KV capacity. The 35B MoE arm
+  stays at 2^17.
+
+Run a new shape exactly as the 9B: make the sidecar with `gguf2pack
+MODEL.gguf --sidecar-only DIR` and set `LLB_GGUF`.
+
+Checked on the M3 Ultra, 2026-10-26 (receipts are not in this repository):
+
+- 4B and 9B Q4_K_M against the base build: the same 64 greedy ids on three
+  prompts, exact and default prefill (12/12), and byte-identical logits lines
+  on a 20,027-token prompt.
+- 0.8B and 2B Q4_K_M against llama.cpp `9d57ce45` (CPU, greedy, no
+  template): exact and default prefill agree with each other on every
+  prompt. Against llama.cpp, three of six 64-token runs match all 64 ids; the
+  others split at near-ties (llama.cpp margins 0.435, 0.067, 0.073 logits).
+  The 4B base build splits from llama.cpp the same way on the same prompts
+  (margins 0.018, 0.055). Mean top-1 logit difference over the matching
+  prefixes: 0.09–0.18 (0.8B, 2B), 0.05–0.09 (4B).
+- Needle in a haystack (`violet-harbor-42` at 40% depth): found by the 0.8B,
+  2B, 4B and 9B at 20,027 tokens, and by the 0.8B and 2B at 153,031 tokens
+  (KV 2^18 slots; 189 s and 208 s with the default fast prefill).
+- `--ctx 300000` on the 4B gives the same ids as the default capacity;
+  `--ctx 2097152` (2^21) runs on the 0.8B; `--ctx 16777216` on the 0.8B is
+  refused (385 GiB > the 58.3 GiB buffer limit).
+- Decode: 0.8B about 5 ms a token, 2B 6, 4B 10, 9B 14 (both builds).
+
+Not done: f16 KV; head_dim 128 or SSM state 64; rope base and eps as kernel
+arguments; the fast chunk at other GQA ratios; the 35B MoE past 2^17. The
+`VISION=1` image rows are placed by the legacy reserve only, so a vision run
+needs a legacy shape at 2^17 slots or fewer.
 
 ## Gaps
 

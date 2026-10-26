@@ -53,7 +53,9 @@ the lane harness scripts, the legacy library recipes (`build-ios.sh`,
   comments is in `engine/llb_engine.h`, so the header hash changes. See
   [Pins](#pins).
 
-No patch, kernel, wrapper or tower source changed. The 23 patches in
+No patch, kernel, wrapper or tower source changed. (Later, METAL-ANYSHAPE changed the wrapper's
+`llb_open` ctx cap and `llb_span` default, and one comment in
+`engine/llb_engine.h`; see [`../README.md`](../README.md#any-shape-and-long-context).) The 23 patches in
 `patches/` and the 2 in `mac/` are byte-identical to `8ff026e`, and
 `patches/SHA256SUMS` still verifies.
 

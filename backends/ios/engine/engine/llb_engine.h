@@ -98,7 +98,7 @@ const char* llb_release_report(void);
 
 // (KEVPHONE) the resident session: the weights stay loaded across requests.
 // llb_open(dir, cache, ctx, flags, st): llb_load + one load of dir's weights into the span, kept: main runs on an engine thread
-//   of its own in the SYS1 srv loop, its KV capacity ctx (rounded up to a power of two, 64 .. 131072). Returns once
+//   of its own in the SYS1 srv loop, its KV capacity ctx (rounded up to a power of two, 64 .. 2^27). Returns once
 //   the weights are resident (st: compile_ms, load_ms, total_ms, span_bytes), 0, or -1 (llb_error, llb_log). Already
 //   open on dir: 0 at once, nothing loaded. Open on another model: that one is closed first (one engine per process).
 // While open, llb_generate / llb_decide on dir run as jobs on it (load_ms 0: nothing loaded, nothing released), the

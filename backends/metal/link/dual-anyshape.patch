@@ -1,0 +1,36 @@
+--- a/dual.c
++++ b/dual.c
+@@ -22,7 +22,16 @@
+ static char *text;
+ static jv *req;
+ static Record *rec;
+-static int mode,steps,seq,prompt_n,prompt_ids[CLEF_MAX_T];
++static int mode,steps,seq,prompt_n,*prompt_ids,prompt_cap;
++// (METAL-ANYSHAPE) a generate prompt of any length up to the KV capacity (not CLEF_MAX_T): prompt_ids grows to fit
++static int prompt_room(size_t n) {
++    if (n>(size_t)prompt_cap) {
++        int *q=realloc(prompt_ids,sizeof *q*n);
++        if (!q) return 0;
++        prompt_ids=q,prompt_cap=(int)n;
++    }
++    return 1;
++}
+ static double t_req;
+ 
+ static double now(void) {
+@@ -153,10 +162,12 @@
+         jv *p=json_get(req,"prompt"),*k=json_get(req,"n");
+         if (!p || p->type!=J_STR || !k || k->type!=J_NUM || k->num<1 || k->num>65536 || k->num!=floor(k->num))
+             return refuse("generate needs prompt (string) and n (integer 1..65536)"),0;
+-        int cap_ids=CLEF_MAX_T,*ids=malloc(sizeof *ids*cap_ids);
+-        int c=q35_tok_encode(&tok,p->str,0,ids,cap_ids);
+-        if (c<1) return free(ids),refuse("prompt must tokenize to 1..16384 tokens"),0;
++        // (METAL-ANYSHAPE) a token is at least one byte of the prompt: strlen + 1 ids always suffice
++        int cap_ids=(int)strlen(p->str)+1,*ids=malloc(sizeof *ids*(size_t)cap_ids);
++        int c=ids?q35_tok_encode(&tok,p->str,0,ids,cap_ids):-1;
++        if (c<1) return free(ids),refuse("prompt must tokenize to 1 or more tokens"),0;
+         if ((unsigned)c+(unsigned)k->num-1>ctx) return free(ids),refuse("prompt + n exceeds the KV capacity fixed at launch"),0;
++        if (!prompt_room((size_t)c)) return free(ids),refuse("out of memory for the prompt"),0;
+         mode=2;
+         steps=(int)k->num;
+         prompt_n=c;

@@ -1,0 +1,1332 @@
+diff --git a/bend2/comp.ts b/bend2/comp.ts
+index fbf48ab..4ecb709 100644
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -10409,6 +10409,11 @@ KQ_BD2(6, 4, 4) KQ_BD2(6, 4, 2) KQ_BD2(6, 16, 8)
+ // rd2 = kq_r<FMT, NP, NPR, 2, 0, 1> over the NPR = cols / 1024 real pairs: Q4_K
+ // down d 13 (5120 x 17408, 17 pairs), the Q6_K head d 11 (248320 x 5120, 5)
+ KQ_BD2(4, 8, 8) KQ_BD2(6, 8, 8)
++// (METAL-ANYSHAPE) the generic arm's bodies (m9_kgemv): every depth 8 .. 13 in every format, NS = min(NP, 8);
++// the ones above are reused (d 10: NP 4 NS 4, d 11 Q4_K / Q6_K: 8 / 8, d 12: 16 / 8)
++KQ_BD2(4, 1, 1) KQ_BD2(4, 2, 2) KQ_BD2(4, 32, 8)
++KQ_BD2(9, 1, 1) KQ_BD2(9, 2, 2) KQ_BD2(9, 8, 8) KQ_BD2(9, 32, 8)
++KQ_BD2(6, 1, 1) KQ_BD2(6, 2, 2) KQ_BD2(6, 32, 8)
+ #define KQ_RD2(FMT, NP, NPR) \
+   template [[host_name("rd2_f" #FMT "_n" #NP "_p" #NPR "_m0")]] kernel void kq_r<FMT, NP, NPR, 2, 0, 1>( \
+     device const u8*, device const float*, constant WarpArgs&, device u8*, uint, uint, uint, uint, uint);
+@@ -11267,7 +11272,9 @@ kernel void llb_m_rmsnorm(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]]
+     const float a0 = xp[0] * xp[0], a1 = xp[1] * xp[1];
+     const float a2 = xp[2] * xp[2], a3 = xp[3] * xp[3];
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 2048) {
++  } else if (n != 2048) {
++    // (METAL-ANYSHAPE) every width but 2048 and 4096 (q 4 above): the padded 8-leaf tree over 8192, so
++    // n 1024 (the 0.8B; the 2-leaf arm below read overlapping pairs there) and any n % 256 == 0 up to 8192
+     // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
+     // 8-wide tree over 8192
+     // (tools/metal-27b.patch) n 5120 (the 27B), CUDA's: the tree over 8192,
+@@ -11328,7 +11335,9 @@ kernel void llb_m_addrms(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
+     const float a0 = v0 * v0, a1 = v1 * v1;
+     const float a2 = v2 * v2, a3 = v3 * v3;
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 2048) {
++  } else if (n != 2048) {
++    // (METAL-ANYSHAPE) every width but 2048 and 4096 (q 4 above): the padded 8-leaf tree over 8192, so
++    // n 1024 (the 0.8B; the 2-leaf arm below read overlapping pairs there) and any n % 256 == 0 up to 8192
+     // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
+     // 8-wide tree over 8192
+     float b[8];
+@@ -11583,7 +11592,9 @@ kernel void llb_m_rmsnormt(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]
+     const float a0 = xp[0] * xp[0], a1 = xp[1] * xp[1];
+     const float a2 = xp[2] * xp[2], a3 = xp[3] * xp[3];
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 2048) {
++  } else if (n != 2048) {
++    // (METAL-ANYSHAPE) every width but 2048 and 4096 (q 4 above): the padded 8-leaf tree over 8192, so
++    // n 1024 (the 0.8B; the 2-leaf arm below read overlapping pairs there) and any n % 256 == 0 up to 8192
+     // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
+     // 8-wide tree over 8192
+     // (tools/metal-27b.patch) n 5120 (the 27B), CUDA's: the tree over 8192,
+@@ -11642,7 +11653,9 @@ kernel void llb_m_addrmst(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]]
+     const float a0 = v0 * v0, a1 = v1 * v1;
+     const float a2 = v2 * v2, a3 = v3 * v3;
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 2048) {
++  } else if (n != 2048) {
++    // (METAL-ANYSHAPE) every width but 2048 and 4096 (q 4 above): the padded 8-leaf tree over 8192, so
++    // n 1024 (the 0.8B; the 2-leaf arm below read overlapping pairs there) and any n % 256 == 0 up to 8192
+     // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
+     // 8-wide tree over 8192
+     float b[8];
+@@ -12125,7 +12138,7 @@ kernel void llb_f27_gdl(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
+ // pos0 + nt <= 2^dT and 2^dT >= 32
+ // (lane m31) the body a template on F27_G, the q heads a kv head: the 27B's 6
+ // (llb_f27_attn, its text unchanged inside), the 9B's 4 (llb_f9_attn)
+-template <short F27_G>
++template <short F27_G, uint KVS = 1024>
+ INLINE void f27_attn_g(device u8* C, device u8* S, constant FAttArgs& A,
+   uint2 tg, ushort sg, ushort l, threadgroup float (*ssh)[8 * 32],
+   threadgroup float (*dsh)[64]) {
+@@ -12154,7 +12167,7 @@ INLINE void f27_attn_g(device u8* C, device u8* S, constant FAttArgs& A,
+       simdgroup_load(mq, qb + 8 * d, A.qs, 0, false);
+       F27_UNROLL (short j = 0; j < 4; j++) {
+         simdgroup_float8x8 mk;
+-        simdgroup_load(mk, kb0 + (u64)(kb + 8 * j) * 1024 + 8 * d, 1024, 0, true);
++        simdgroup_load(mk, kb0 + (u64)(kb + 8 * j) * KVS + 8 * d, KVS, 0, true);
+         simdgroup_multiply_accumulate(sc[j], mq, mk, sc[j]);
+       }
+     }
+@@ -12199,10 +12212,10 @@ INLINE void f27_attn_g(device u8* C, device u8* S, constant FAttArgs& A,
+     F27_UNROLL (short j = 0; j < 4; j++) {
+       simdgroup_float8x8 pj;
+       simdgroup_load(pj, ss + 8 * j, 32, 0, false);
+-      device const float* vr = vb0 + (u64)(kb + 8 * j) * 1024;
++      device const float* vr = vb0 + (u64)(kb + 8 * j) * KVS;
+       F27_UNROLL (short d = 0; d < 32; d++) {
+         simdgroup_float8x8 mv;
+-        simdgroup_load(mv, vr + 8 * d, 1024, 0, false);
++        simdgroup_load(mv, vr + 8 * d, KVS, 0, false);
+         simdgroup_multiply_accumulate(O[d], pj, mv, O[d]);
+       }
+     }
+@@ -12244,6 +12257,25 @@ kernel void llb_f9_attn(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
+   f27_attn_g<4>(C, S, A, tg, sg, l, ssh, dsh);
+ }
+ 
++// (METAL-ANYSHAPE) the same bodies over kv rows of 512 floats (2 kv heads of 256: the 0.8B / 2B)
++kernel void llb_f27_attn_k512(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant FAttArgs& A [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
++  ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort l [[thread_index_in_simdgroup]]) {
++  threadgroup float ssh[6][8 * 32];
++  threadgroup float dsh[6][64];
++  f27_attn_g<6, 512>(C, S, A, tg, sg, l, ssh, dsh);
++}
++
++kernel void llb_f9_attn_k512(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant FAttArgs& A [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
++  ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort l [[thread_index_in_simdgroup]]) {
++  threadgroup float ssh[4][8 * 32];
++  threadgroup float dsh[4][64];
++  f27_attn_g<4, 512>(C, S, A, tg, sg, l, ssh, dsh);
++}
++
+ // llb_f27_conv1dt: lane m21's llb_f_conv1dt (K.conv1d 4-tap + SiLU, A.n
+ // channels) with a per-row input table (row's x / h0 / h1 / h2 = in[row + 3],
+ // in[row], in[row + 1], in[row + 2]); w a[0], y a[1] + row s[1]
+@@ -14275,6 +14307,399 @@ kernel void llb_m_attn5vx(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]]
+   }
+   R[8192 + ch * 256 + tx] = st[0];
+ }
++
++// (METAL-ANYSHAPE) the generic attention: llb_m_attn5x's trees (scores, the max tree, the sum tree, the value
++// tree over the T = 2^dT leaves with the masked tail folded in) for any kv-head count (kv stride A.a[6] floats,
++// A.k q heads a kv head) and any dT. A head's score plane holds A.a[7] floats (m9_attn_ps): the T scores, then
++// the split's partials R = sh + T: block maxes [0, NBX), block sums [NBX, 2 NBX), m and z at 2 NBX, the chunk
++// values from 2 NBX + 8 (NC <= 64 chunks of 256), NBX = max(T / 32, 1). The probability plane has the same
++// stride. llb_m_attn6 is one threadgroup (short windows); a6s / a6m / a6p / a6z / a6v / a6c the split: the
++// max and the sum are joined once a head (a6m, a6z), not once a block, so the cost stays linear in the window.
++INLINE u32 a6_nbx(u32 dT) {
++  return dT >= 5 ? 1u << (dT - 5) : 1u;
++}
++
++kernel void llb_m_attn6(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint h [[threadgroup_position_in_grid]],
++  uint tx [[thread_position_in_threadgroup]]) {
++  device const float* q  = sa_f(C, S, A.a[0]);
++  device const float* kc = sa_f(C, S, A.a[1]);
++  device const float* vc = sa_f(C, S, A.a[2]);
++  device float* att = sa_f(C, S, A.a[3]);
++  device float* sc  = sa_f(C, S, A.a[4]);
++  device float* pr  = sa_f(C, S, A.a[5]);
++  const u32 c = A.c, dT = c & 31, pos = c >> 5;
++  const u64 T = 1ull << dT;
++  const u32 P = (u32)min((u64)pos + 1, T);
++  const u32 lgL = P <= 1 ? 0 : 32 - clz(P - 1), L = 1u << lgL;
++  const u32 NT = min(L, 1024u), B = L / NT;
++  const u32 g = (h / A.k) * 256;
++  const float scale = 1.0f / sqrt(256.0f);
++  const float ninf = as_type<float>(0xFF800000u);
++  const u64 kvs = A.a[6], ps = A.a[7];
++  device float* sh = sc + (u64)h * ps;
++  device float* ph = pr + (u64)h * ps;
++  device const float* qh = q + (u64)h * 256;
++  threadgroup float red[1024];
++  threadgroup float mz[2];
++  {
++    const u32 l = tx & 31, sgi = tx >> 5;
++    const float4 qa = *(device const float4*)(qh + 8 * l);
++    const float4 qb = *(device const float4*)(qh + 8 * l + 4);
++    for (u32 t = sgi; t < P; t += 32) {
++      device const float* k = kc + (u64)t * kvs + g + 8 * l;
++      const float4 ka = *(device const float4*)k;
++      const float4 kb = *(device const float4*)(k + 4);
++      float v = ((ka.x * qa.x + ka.y * qa.y) + (ka.z * qa.z + ka.w * qa.w))
++        + ((kb.x * qb.x + kb.y * qb.y) + (kb.z * qb.z + kb.w * qb.w));
++      for (u32 m = 1; m < 32; m <<= 1) {
++        v = kq_bfly(v, l, m);
++      }
++      if (l == 0) {
++        sh[t] = v * scale;
++      }
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_device);
++  if (tx < NT) {
++    float st[32];
++    u32   sp = 0;
++    for (u32 i = 0; i < B; i++) {
++      const u32 t = tx * B + i;
++      float v = t < P ? sh[t] : ninf;
++      for (u32 u = i; u & 1; u >>= 1) {
++        v = m27_max(st[--sp], v);
++      }
++      st[sp++] = v;
++    }
++    red[tx] = st[0];
++  }
++  for (u32 w = 1; w < NT; w <<= 1) {
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (tx < NT && (tx & (2 * w - 1)) == 0) {
++      red[tx] = m27_max(red[tx], red[tx + w]);
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (tx == 0) {
++    float r = red[0];
++    for (u32 j = lgL; j < dT; j++) {
++      r = m27_max(r, ninf);
++    }
++    mz[0] = r;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  const float m = mz[0];
++  const float e0 = attn_exp(ninf - m);
++  if (tx < NT) {
++    float st[32];
++    u32   sp = 0;
++    for (u32 i = 0; i < B; i++) {
++      const u32 t = tx * B + i;
++      float v = e0;
++      if (t < P) {
++        v = attn_exp(sh[t] - m);
++        ph[t] = v;
++      }
++      for (u32 u = i; u & 1; u >>= 1) {
++        v = st[--sp] + v;
++      }
++      st[sp++] = v;
++    }
++    red[tx] = st[0];
++  }
++  for (u32 w = 1; w < NT; w <<= 1) {
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (tx < NT && (tx & (2 * w - 1)) == 0) {
++      red[tx] = red[tx] + red[tx + w];
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (tx == 0) {
++    float r = red[0], mj = e0;
++    for (u32 j = 0; j < dT; j++) {
++      if (j >= lgL) {
++        r = r + mj;
++      }
++      mj = mj + mj;
++    }
++    mz[1] = r;
++  }
++  threadgroup_barrier(mem_flags::mem_device);
++  const float z = mz[1];
++  for (u32 t = tx; t < P; t += 1024) {
++    ph[t] = ph[t] / z;
++  }
++  threadgroup_barrier(mem_flags::mem_device);
++  const float pm = e0 / z;
++  const u32 NQ = min(L, 4u), CH = L / NQ, qt = tx >> 8, col = tx & 255;
++  if (qt < NQ) {
++    float st[32];
++    u32   sp = 0;
++    for (u32 i = 0; i < CH; i++) {
++      const u32 t = qt * CH + i;
++      float v = vc[(u64)t * kvs + g + col] * (t < P ? ph[t] : pm);
++      for (u32 u = i; u & 1; u >>= 1) {
++        v = st[--sp] + v;
++      }
++      st[sp++] = v;
++    }
++    red[tx] = st[0];
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (qt == 0) {
++    float r = NQ == 4 ? (red[col] + red[256 + col]) + (red[512 + col]
++      + red[768 + col]) : NQ == 2 ? red[col] + red[256 + col] : red[col];
++    float mv = 0.0f * pm;
++    for (u32 j = 0; j < dT; j++) {
++      if (j >= lgL) {
++        r = r + mv;
++      }
++      mv = mv + mv;
++    }
++    att[(u64)h * 256 + col] = r;
++  }
++}
++
++// D1: scores of block b (32 slots) and its max subtree into R[b]; 256 threads a (head, block)
++kernel void llb_m_a6s(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint gid [[threadgroup_position_in_grid]],
++  uint tx [[thread_position_in_threadgroup]]) {
++  device const float* q  = sa_f(C, S, A.a[0]);
++  device const float* kc = sa_f(C, S, A.a[1]);
++  device float* sc  = sa_f(C, S, A.a[4]);
++  const u32 c = A.c, dT = c & 31, pos = c >> 5;
++  const u64 T = 1ull << dT;
++  const u32 P = (u32)min((u64)pos + 1, T), NB = A.n, h = gid / NB, b = gid % NB;
++  const u32 g = (h / A.k) * 256;
++  const float scale = 1.0f / sqrt(256.0f);
++  const float ninf = as_type<float>(0xFF800000u);
++  const u64 kvs = A.a[6], ps = A.a[7];
++  device float* sh = sc + (u64)h * ps;
++  device float* R = sh + T;
++  device const float* qh = q + (u64)h * 256;
++  const u32 l = tx & 31, sgi = tx >> 5;
++  const float4 qa = *(device const float4*)(qh + 8 * l);
++  const float4 qb = *(device const float4*)(qh + 8 * l + 4);
++  for (u32 i = 0; i < 4; i++) {
++    const u32 t = 32 * b + sgi + 8 * i;
++    if (t < P) {
++      device const float* k = kc + (u64)t * kvs + g + 8 * l;
++      const float4 ka = *(device const float4*)k;
++      const float4 kb = *(device const float4*)(k + 4);
++      float v = ((ka.x * qa.x + ka.y * qa.y) + (ka.z * qa.z + ka.w * qa.w))
++        + ((kb.x * qb.x + kb.y * qb.y) + (kb.z * qb.z + kb.w * qb.w));
++      for (u32 m = 1; m < 32; m <<= 1) {
++        v = kq_bfly(v, l, m);
++      }
++      if (l == 0) {
++        sh[t] = v * scale;
++      }
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_device);
++  if (sgi == 0) {
++    const u32 t = 32 * b + l;
++    float v = t < P ? sh[t] : ninf;
++    for (u32 m = 1; m < 32; m <<= 1) {
++      v = m27_bmax(v, l, m);
++    }
++    if (l == 0) {
++      R[b] = v;
++    }
++  }
++}
++
++// a6m / a6z: the tree over the NB block roots (aligned per-thread runs, then the level tree) and the masked
++// tail, once a head; 1024 threads. max (a6m) into R[2 NBX], sum (a6z) into R[2 NBX + 1]
++kernel void llb_m_a6m(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint h [[threadgroup_position_in_grid]],
++  uint tx [[thread_position_in_threadgroup]]) {
++  device float* sc = sa_f(C, S, A.a[4]);
++  const u32 c = A.c, dT = c & 31, pos = c >> 5;
++  const u64 T = 1ull << dT;
++  const u32 P = (u32)min((u64)pos + 1, T), NB = A.n, NBX = a6_nbx(dT);
++  const u32 lgL = P <= 1 ? 0 : 32 - clz(P - 1);
++  const float ninf = as_type<float>(0xFF800000u);
++  device float* R = sc + (u64)h * A.a[7] + T;
++  const u32 NT = min(NB, 1024u), BB = NB / NT;
++  threadgroup float red[1024];
++  if (tx < NT) {
++    float st[32];
++    u32   sp = 0;
++    for (u32 i = 0; i < BB; i++) {
++      float x = R[tx * BB + i];
++      for (u32 u = i; u & 1; u >>= 1) {
++        x = m27_max(st[--sp], x);
++      }
++      st[sp++] = x;
++    }
++    red[tx] = st[0];
++  }
++  for (u32 w = 1; w < NT; w <<= 1) {
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (tx < NT && (tx & (2 * w - 1)) == 0) {
++      red[tx] = m27_max(red[tx], red[tx + w]);
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (tx == 0) {
++    float r = red[0];
++    for (u32 j = lgL; j < dT; j++) {
++      r = m27_max(r, ninf);
++    }
++    R[2 * NBX] = r;
++  }
++}
++
++// D2: one simdgroup a (head, block): the probabilities of its 32 slots and their sum subtree into R[NBX + b]
++kernel void llb_m_a6p(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint gid [[threadgroup_position_in_grid]],
++  uint l [[thread_position_in_threadgroup]]) {
++  device float* sc = sa_f(C, S, A.a[4]);
++  device float* pr = sa_f(C, S, A.a[5]);
++  const u32 c = A.c, dT = c & 31, pos = c >> 5;
++  const u64 T = 1ull << dT;
++  const u32 P = (u32)min((u64)pos + 1, T), NB = A.n, NBX = a6_nbx(dT), h = gid / NB, b = gid % NB;
++  const float ninf = as_type<float>(0xFF800000u);
++  device float* sh = sc + (u64)h * A.a[7];
++  device float* ph = pr + (u64)h * A.a[7];
++  device float* R = sh + T;
++  const float m = R[2 * NBX];
++  const float e0 = attn_exp(ninf - m);
++  const u32 t = 32 * b + l;
++  float w = e0;
++  if (t < P) {
++    w = attn_exp(sh[t] - m);
++    ph[t] = w;
++  }
++  for (u32 k = 1; k < 32; k <<= 1) {
++    w = kq_bfly(w, l, k);
++  }
++  if (l == 0) {
++    R[NBX + b] = w;
++  }
++}
++
++kernel void llb_m_a6z(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint h [[threadgroup_position_in_grid]],
++  uint tx [[thread_position_in_threadgroup]]) {
++  device float* sc = sa_f(C, S, A.a[4]);
++  const u32 c = A.c, dT = c & 31, pos = c >> 5;
++  const u64 T = 1ull << dT;
++  const u32 P = (u32)min((u64)pos + 1, T), NB = A.n, NBX = a6_nbx(dT);
++  const u32 lgL = P <= 1 ? 0 : 32 - clz(P - 1);
++  const float ninf = as_type<float>(0xFF800000u);
++  device float* R = sc + (u64)h * A.a[7] + T;
++  const float e0 = attn_exp(ninf - R[2 * NBX]);
++  const u32 NT = min(NB, 1024u), BB = NB / NT;
++  threadgroup float red[1024];
++  if (tx < NT) {
++    float st[32];
++    u32   sp = 0;
++    for (u32 i = 0; i < BB; i++) {
++      float x = R[NBX + tx * BB + i];
++      for (u32 u = i; u & 1; u >>= 1) {
++        x = st[--sp] + x;
++      }
++      st[sp++] = x;
++    }
++    red[tx] = st[0];
++  }
++  for (u32 w = 1; w < NT; w <<= 1) {
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (tx < NT && (tx & (2 * w - 1)) == 0) {
++      red[tx] = red[tx] + red[tx + w];
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (tx == 0) {
++    float r = red[0], mj = e0;
++    for (u32 j = 0; j < dT; j++) {
++      if (j >= lgL) {
++        r = r + mj;
++      }
++      mj = mj + mj;
++    }
++    R[2 * NBX + 1] = r;
++  }
++}
++
++// D3: 256 threads (a column each) a (head, chunk of CH = L / NC slots); the chunk's probabilities staged 1024 at
++// a time, the one value tree carried across the stages
++kernel void llb_m_a6v(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint gid [[threadgroup_position_in_grid]],
++  uint tx [[thread_position_in_threadgroup]]) {
++  device const float* vc = sa_f(C, S, A.a[2]);
++  device float* sc = sa_f(C, S, A.a[4]);
++  device float* pr = sa_f(C, S, A.a[5]);
++  const u32 c = A.c, dT = c & 31, pos = c >> 5;
++  const u64 T = 1ull << dT;
++  const u32 P = (u32)min((u64)pos + 1, T), NC = A.n, NBX = a6_nbx(dT), h = gid / NC, ch = gid % NC;
++  const u32 lgL = P <= 1 ? 0 : 32 - clz(P - 1), L = 1u << lgL;
++  const u32 CH = L / NC, g = (h / A.k) * 256;
++  const float ninf = as_type<float>(0xFF800000u);
++  const u64 kvs = A.a[6];
++  device float* ph = pr + (u64)h * A.a[7];
++  device float* R = sc + (u64)h * A.a[7] + T;
++  threadgroup float pz[1024];
++  const float z = R[2 * NBX + 1];
++  const float pm = attn_exp(ninf - R[2 * NBX]) / z;
++  const u32 t0 = ch * CH;
++  float st[32];
++  u32   sp = 0;
++  for (u32 s0 = 0; s0 < CH; s0 += 1024) {
++    const u32 sn = min(CH - s0, 1024u);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (u32 i = tx; i < sn; i += 256) {
++      const u32 t = t0 + s0 + i;
++      pz[i] = t < P ? ph[t] / z : pm;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (u32 i = 0; i < sn; i++) {
++      const u32 ii = s0 + i;
++      float v = vc[(u64)(t0 + ii) * kvs + g + tx] * pz[i];
++      for (u32 u = ii; u & 1; u >>= 1) {
++        v = st[--sp] + v;
++      }
++      st[sp++] = v;
++    }
++  }
++  R[2 * NBX + 8 + ch * 256 + tx] = st[0];
++}
++
++// D4: the chunks' tree + the masked tail, 256 threads a head
++kernel void llb_m_a6c(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint h [[threadgroup_position_in_grid]],
++  uint tx [[thread_position_in_threadgroup]]) {
++  device float* att = sa_f(C, S, A.a[3]);
++  device float* sc  = sa_f(C, S, A.a[4]);
++  const u32 c = A.c, dT = c & 31, pos = c >> 5;
++  const u64 T = 1ull << dT;
++  const u32 P = (u32)min((u64)pos + 1, T), NC = A.n, NBX = a6_nbx(dT);
++  const u32 lgL = P <= 1 ? 0 : 32 - clz(P - 1);
++  const float ninf = as_type<float>(0xFF800000u);
++  device float* R = sc + (u64)h * A.a[7] + T;
++  float st[32];
++  u32   sp = 0;
++  for (u32 k = 0; k < NC; k++) {
++    float v = R[2 * NBX + 8 + k * 256 + tx];
++    for (u32 u = k; u & 1; u >>= 1) {
++      v = st[--sp] + v;
++    }
++    st[sp++] = v;
++  }
++  float r = st[0];
++  const float e0 = attn_exp(ninf - R[2 * NBX]);
++  float mv = 0.0f * (e0 / R[2 * NBX + 1]);
++  for (u32 j = 0; j < dT; j++) {
++    if (j >= lgL) {
++      r = r + mv;
++    }
++    mv = mv + mv;
++  }
++  att[(u64)h * 256 + tx] = r;
++}
+ #endif
+ 
+ #if !DEVICE
+@@ -15292,6 +15717,12 @@ static id<MTLComputePipelineState> gpu_m_embq8, gpu_m_embk4, gpu_m_gdl2;
+ static id<MTLComputePipelineState> gpu_m_embk6;
+ static id<MTLComputePipelineState> gpu_m_ropecs, gpu_m_qkr2, gpu_m_l2nr, gpu_m_addrms;
+ static id<MTLBuffer>               gpu_scr;
++// (METAL-ANYSHAPE) the generic attention (any kv-head count, any 2^dT: llb_m_attn6 and its six-dispatch split),
++// the kv-slot copy for kv rows other than 1024 floats, and the K-quant GEMV bodies for any depth 8 .. 13
++// (bd2: NP = 2^(d - 8) pairs, NS = min(NP, 8) simdgroups) by format [Q4_K, Q5_K, Q6_K]
++static id<MTLComputePipelineState> gpu_m_attn6, gpu_m_a6s, gpu_m_a6m, gpu_m_a6p, gpu_m_a6z, gpu_m_a6v;
++static id<MTLComputePipelineState> gpu_m_a6c, gpu_m_copy;
++static id<MTLComputePipelineState> gpu_kg[3][6];
+ 
+ // (tools/metal-27b.patch) M9_BLK 81920 floats: the 27B's fbn (2 * 5120 + 3 *
+ // 17408) and down's d 13 x window (aab + 4 << 13), CUDA's gpu_blk; M9_HEADH
+@@ -15300,7 +15731,12 @@ static id<MTLBuffer>               gpu_scr;
+ #define M9_LOGIT (SA_SCR + 81920ull * 4)
+ #define M9_HEADH (M9_LOGIT + (4ull << 18))
+ #define M9_ATTS  (M9_HEADH + 8192ull * 4)
+-#define M9_SCR   (M9_ATTS + 2ull * 24 * (1u << 17) * 4 - SA_SCR)
++// (METAL-ANYSHAPE) M9_SCR is a variable: its default holds the legacy planes (24 heads of 2^17 floats); the
++// first pass bang grows it to the Shape's planes at its dT (pass_reserve, m9_attn_bytes) before anything
++// past it is taken
++#define M9_SCR0  (M9_ATTS + 2ull * 24 * (1u << 17) * 4 - SA_SCR)
++static u64 m9_scr_n = M9_SCR0;
++#define M9_SCR   m9_scr_n
+ 
+ static void m9_init(void) {
+   gpu_m_rnorm = warp_pipe("llb_m_rmsnorm");
+@@ -15381,6 +15817,36 @@ static void m9_init(void) {
+       err_fail("warp serve: a K-quant GEMV's threadgroup does not fit");
+     }
+   }
++  gpu_m_attn6 = warp_pipe("llb_m_attn6");
++  gpu_m_a6s = warp_pipe("llb_m_a6s");
++  gpu_m_a6m = warp_pipe("llb_m_a6m");
++  gpu_m_a6p = warp_pipe("llb_m_a6p");
++  gpu_m_a6z = warp_pipe("llb_m_a6z");
++  gpu_m_a6v = warp_pipe("llb_m_a6v");
++  gpu_m_a6c = warp_pipe("llb_m_a6c");
++  gpu_m_copy = warp_pipe("llb_f27_copy");
++  if (gpu_m_attn6.maxTotalThreadsPerThreadgroup < 1024
++    || gpu_m_a6s.maxTotalThreadsPerThreadgroup < 256
++    || gpu_m_a6m.maxTotalThreadsPerThreadgroup < 1024
++    || gpu_m_a6p.maxTotalThreadsPerThreadgroup < 32
++    || gpu_m_a6z.maxTotalThreadsPerThreadgroup < 1024
++    || gpu_m_a6v.maxTotalThreadsPerThreadgroup < 256
++    || gpu_m_a6c.maxTotalThreadsPerThreadgroup < 256
++    || gpu_m_copy.maxTotalThreadsPerThreadgroup < 256) {
++    err_fail("warp serve: a generic attention kernel's threadgroup does not fit");
++  }
++  static const char* kgf[3] = { "4", "9", "6" };
++  for (u32 f = 0; f < 3; f += 1) {
++    for (u32 k = 0; k < 6; k += 1) {
++      char nm[64];
++      u32  np = 1u << k, ns = np < 8 ? np : 8;
++      snprintf(nm, sizeof nm, "bd2_f%s_n%u_s%u_m0", kgf[f], np, ns);
++      gpu_kg[f][k] = warp_pipe(nm);
++      if (gpu_kg[f][k].maxTotalThreadsPerThreadgroup < 32 * ns) {
++        err_fail("warp serve: a K-quant GEMV's threadgroup does not fit");
++      }
++    }
++  }
+   gpu_scr = [gpu_dev newBufferWithLength:M9_SCR
+     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+   if (!gpu_scr) {
+@@ -15452,8 +15918,27 @@ static void m9_kgemv(id<MTLComputeCommandEncoder> en, u32 fm, u64 w, u32 rb,
+     || cols / 4 > 1u << d
+     || (d != 10 && d != 12 && !d11 && !d13) || n == 0 || (x & 15) != 0
+     || (q6 ? (w & 1) != 0 : (w & 15) != 0)) {
+-    err_fail("warp GEMV: K-quant operands refused (Metal: d 10 / 12, Q4_K /"
+-      " Q6_K d 11, Q4_K 17408-col d 13, whole superblock quads, aligned rows)");
++    // (METAL-ANYSHAPE) any other K-quant GEMV of whole superblocks (cols % 256 == 0) at depth 8 .. 13: the
++    // bd2 body at NP = 2^(d - 8) pairs (a partial last pair as the 4B's), NS = min(NP, 8) simdgroups, grid
++    // ceil(n / 2); the legacy shapes never reach this arm (their (format, depth, cols) take the choice above)
++    if (sb == 0 || rb % sb != 0 || cols % 256 != 0 || cols / 4 > 1u << d
++      || d < 8 || d > 13 || n == 0 || (x & 15) != 0
++      || (q6 ? (w & 1) != 0 : (w & 15) != 0)) {
++      err_fail("warp GEMV: K-quant operands refused (Metal: whole superblocks,"
++        " depth 8 .. 13, 16-aligned x and rows, 2-aligned Q6_K rows)");
++    }
++    u32 gf = fm == LLB_FM_Q4_K ? 0 : fm == LLB_FM_Q5_K ? 1 : 2;
++    u32 np = 1u << (d - 8), ns = np < 8 ? np : 8;
++    [en setBuffer:((x & SA_SCR) != 0 ? gpu_scr : gpu_buf) offset:(x & ~SA_SCR)
++      atIndex:1];
++    [en setBuffer:((y & SA_SCR) != 0 ? gpu_scr : gpu_buf) offset:0 atIndex:3];
++    WarpArgs ga = { w, y & ~SA_SCR, rb, cols / 4, n, d, 0 };
++    [en setComputePipelineState:gpu_kg[gf][d - 8]];
++    [en setBytes:&ga length:sizeof ga atIndex:2];
++    [en dispatchThreadgroups:MTLSizeMake((n + 1) / 2, 1, 1)
++      threadsPerThreadgroup:MTLSizeMake(32 * ns, 1, 1)];
++    m28_bar(en);
++    return;
+   }
+   u32 f = fm == LLB_FM_Q4_K ? 0 : fm == LLB_FM_Q5_K ? 1 : 2;
+   u32 k = d == 12 ? 2 : n == 1024 && !q6 ? 1 : 0;
+@@ -15625,8 +16110,15 @@ static void m9_bad(u32 aux) {
+ typedef struct {
+   u32 fm[20], rb[20];
+   u32 d, f, nh, lkh, lvh, nl;
++  // (METAL-ANYSHAPE) nkv kv heads (kvd = nkv 256 floats a kv row), vc the vocabulary, gen: a shape outside the
++  // legacy four (every arm below keeps its legacy dispatches when gen is false)
++  u32 nkv, kvd, vc;
++  bool gen;
+ } M9Rows;
+ 
++// (METAL-ANYSHAPE) the layer arrays' bound (was 64, the 27B's layers); the engine refuses more
++#define M9_NL_MAX 1024u
++
+ // the 9B or the 27B (the engine's mf.validate admits exactly these two)
+ // (ENGINE-4B, patches/metal-4b.patch) or the 4B: d 2560, f 9216, the 9B's
+ // heads / SSM / layers. Its attn_output / ssm_out rows are nh 256 = 4096
+@@ -15637,6 +16129,7 @@ static bool m9_shape(M9Rows* R, u32 d, u32 f) {
+   bool b4 = d == 2560 && f == 9216;
+   R->d = d; R->f = f; R->nh = b27 ? 24 : 16; R->lkh = 16;
+   R->lvh = b27 ? 48 : 32; R->nl = b27 ? 64 : 32;
++  R->nkv = 4; R->kvd = 1024; R->vc = 248320; R->gen = false;
+   if (b4) {
+     R->rb[13] = R->rb[19] = LLB_FM_RB(LLB_FM_Q8_0, R->nh * 256);
+   }
+@@ -15651,6 +16144,46 @@ static void m9_rows_q8(M9Rows* R, u32 rg, u32 rd) {
+   m9_shape(R, 4096, 12288);
+ }
+ 
++// (METAL-ANYSHAPE) the Shape from the engine's words: d_model d, d_ff f, sh = n_heads | n_kv_heads << 8 |
++// ssm_group_count << 16 | ssm_time_step_rank << 24, vc the vocabulary, nl the layers the engine runs. A legacy
++// shape (the 9B / 27B / 4B, whose words match m9_shape's literals) keeps m9_shape's record exactly; any other
++// is generic (gen). The layout limits of the scratch below are checked here, each with its reason
++static u32 m9_cd(u32 cols);
++static bool m9_shape_w(M9Rows* R, u32 d, u32 f, u32 sh, u32 vc, u32 nl) {
++  u32  nh = sh & 255, nkv = sh >> 8 & 255, lkh = sh >> 16 & 255, lvh = sh >> 24;
++  bool leg = m9_shape(R, d, f);
++  if (leg && nh == R->nh && nkv == 4 && lkh == R->lkh && lvh == R->lvh
++    && vc == 248320 && nl >= 1 && nl <= R->nl) {
++    return true;
++  }
++  memset(R->rb, 0, sizeof R->rb);
++  R->d = d; R->f = f; R->nh = nh; R->nkv = nkv; R->kvd = nkv * 256;
++  R->lkh = lkh; R->lvh = lvh; R->nl = nl; R->vc = vc; R->gen = true;
++  const char* why = NULL;
++  u32 lk = lkh * 128, lv = lvh * 128, cv = 2 * lk + lv, qa = nh * 256;
++  if (nh == 0 || nkv == 0 || nh % nkv != 0 || lkh == 0 || lvh % lkh != 0) {
++    why = "head counts (n_heads a multiple of n_kv_heads, value heads a multiple of key heads)";
++  } else if (d % 256 != 0 || f % 256 != 0 || d == 0 || f == 0 || d > 8192) {
++    why = "d_model / d_ff (multiples of 256; d_model <= 8192, the rmsnorm tree)";
++  } else if (vc == 0 || vc > 250048) {
++    why = "vocab_size (<= 250048: the logit plane and the rope table share M9_LOGIT)";
++  } else if (nl == 0 || nl > M9_NL_MAX) {
++    why = "n_layers (1 .. 1024)";
++  } else if (2ull * d + 2ull * f + (4ull << m9_cd(f)) > 81920 || 2ull * d + 3ull * f + d > 81920) {
++    why = "d_model / d_ff (the FFN chain's scratch, M9_BLK = 81920 floats)";
++  } else if (6ull * qa + d + 3ull * nkv * 256 > 81920 || qa + (4ull << m9_cd(qa)) > 81920) {
++    why = "n_heads / n_kv_heads (the attention chain's scratch, M9_BLK)";
++  } else if (4 * lv + 4 * lvh + cv > 38912 || lvh > 128) {
++    why = "SSM heads (the linear chain's scratch: 4 lv + 4 nv + conv <= 38912 floats, nv <= 128)";
++  }
++  if (why != NULL) {
++    fprintf(stderr, "warp pass: unsupported Qwen3.5 shape d %u f %u heads %u/%u ssm %u/%u vocab %u: %s\n",
++      d, f, nh, nkv, lkh, lvh, vc, why);
++    return false;
++  }
++  return true;
++}
++
+ // the least d with 2^d >= cols / 4: a GEMV's group depth (the engine's cdepth)
+ static u32 m9_cd(u32 cols) {
+   u32 d = 0;
+@@ -15662,8 +16195,9 @@ static u32 m9_cd(u32 cols) {
+ 
+ // Offs word f's columns (ffn_down d_ff, attn_output / ssm_out nh 256 = lvh
+ // 128, the rest d_model) and rows (an F32 tensor: its floats)
++// (METAL-ANYSHAPE) ssm_out's columns are the value heads' lvh 128 (equal to nh 256 on every legacy shape)
+ static u32 m9_cols(const M9Rows* R, u32 f) {
+-  return f == 4 ? R->f : f == 13 || f == 19 ? R->nh * 256 : R->d;
++  return f == 4 ? R->f : f == 13 ? R->lvh * 128 : f == 19 ? R->nh * 256 : R->d;
+ }
+ 
+ static u64 m9_n(const M9Rows* R, u32 f) {
+@@ -15671,7 +16205,7 @@ static u64 m9_n(const M9Rows* R, u32 f) {
+   static const u8 k[20] = { 0, 0, 1, 1, 0, 2, 3, 4, 4, 4, 4, 5, 6, 0, 7, 8, 8,
+     9, 9, 0 };
+   u32 v[10] = { R->d, R->f, cv, lv, R->lvh, 4 * cv, 128, 2 * R->nh * 256,
+-    1024, 256 };
++    R->kvd, 256 };
+   return v[k[f]];
+ }
+ 
+@@ -15681,6 +16215,65 @@ static u64 m9_tsz(const M9Rows* R, u32 f) {
+   return m9_n(R, f) * (R->fm[f] == LLB_FM_F32 && f != 7 && f != 8 ? 4 : R->rb[f]);
+ }
+ 
++// (METAL-ANYSHAPE) the generic attention's plane: T scores, the split's partials (2 NBX + 8) and 64 chunk
++// rows of 256 (llb_m_attn6's comment); the probability plane has the same stride
++static u64 m9_attn_ps(u32 dT) {
++  u64 T = 1ull << dT, nbx = dT >= 5 ? T / 32 : 1;
++  return T + 2 * nbx + 8 + 64ull * 256;
++}
++
++// the legacy kernels (attn5 and its split, 2^17-float planes) serve a legacy Shape up to 2^17 slots; a generic
++// Shape, or a longer window, takes the generic attention
++static bool m9_attn_leg(const M9Rows* R, u32 dT) {
++  return !R->gen && dT <= 17;
++}
++
++// the bytes of the two attention planes the pass needs at dT (from M9_ATTS)
++static u64 m9_attn_bytes(const M9Rows* R, u32 dT) {
++  return m9_attn_leg(R, dT) ? 2ull * 24 * (1u << 17) * 4 : 2ull * R->nh * m9_attn_ps(dT) * 4;
++}
++
++static void m9_attn6(id<MTLComputeCommandEncoder> en, u64 q, u64 kc, u64 vc,
++  u64 y, u32 c, u32 nh, u32 nkv) {
++  HybArgs A;
++  u32 dT = c & 31, pos = c >> 5;
++  u64 ps = m9_attn_ps(dT), T = 1ull << dT;
++  if (M9_ATTS - SA_SCR + 2 * (u64)nh * ps * 4 > M9_SCR) {
++    err_fail("warp pass: the attention planes do not fit the scratch (pass_reserve)");
++  }
++  m9_args(&A, q, kc, vc, y, M9_ATTS, M9_ATTS + (u64)nh * ps * 4, (u64)nkv * 256, 0, c,
++    nh / nkv, 0.0f);
++  A.a[7] = ps;
++  u64 P = (u64)pos + 1 < T ? (u64)pos + 1 : T;
++  u32 L = 1;
++  while (L < P) {
++    L <<= 1;
++  }
++  if (L < M27_LS) {
++    m9_go(en, gpu_m_attn6, &A, nh, 1024);
++    return;
++  }
++  u32 ch = L / 64 < 32 ? 32 : L / 64, nb = L / 32, nc = L / ch;
++  A.n = nb;
++  m9_go(en, gpu_m_a6s, &A, nh * nb, 256);
++  m9_go(en, gpu_m_a6m, &A, nh, 1024);
++  m9_go(en, gpu_m_a6p, &A, nh * nb, 32);
++  m9_go(en, gpu_m_a6z, &A, nh, 1024);
++  A.n = nc;
++  m9_go(en, gpu_m_a6v, &A, nh * nc, 256);
++  m9_go(en, gpu_m_a6c, &A, nh, 256);
++}
++
++// the pass chain's attention by Shape and window
++static void m9_attn(id<MTLComputeCommandEncoder> en, u64 q, u64 kc, u64 vc,
++  u64 y, u32 c, const M9Rows* R) {
++  if (m9_attn_leg(R, c & 31)) {
++    m9_attn5(en, q, kc, vc, y, c, R->nh);
++    return;
++  }
++  m9_attn6(en, q, kc, vc, y, c, R->nh, R->nkv);
++}
++
+ static void m9_fbn_run(id<MTLComputeCommandEncoder> en, u64 b, u32 post,
+   u32 fg, u32 fu, u32 fd, const M9Rows* R, u64 x, u64 at, u64 y, u32 grid,
+   u64 nw, u64 nh) {
+@@ -15853,10 +16446,11 @@ static void m9_fulb_run(id<MTLComputeCommandEncoder> en, u64 b, u32 an,
+   HybArgs A;
+   u32 pos = c >> 5;
+   // (tools/metal-27b.patch) the layout from the Shape: qa = nh 256
+-  u32 qa = R->nh * 256;
++  // (METAL-ANYSHAPE) kv rows of kvd = nkv 256 floats (1024 on every legacy Shape)
++  u32 qa = R->nh * 256, kvd = R->kvd;
+   u64 attn = M9_BLK, gated = attn + qa * 4, h = M9_BLK + 2 * qa * 4;
+   u64 qgn = h + R->d * 4, qg = qgn + 2 * qa * 4, kb = qg + 2 * qa * 4;
+-  u64 kn = kb + 1024 * 4, vb = kn + 1024 * 4;
++  u64 kn = kb + kvd * 4, vb = kn + kvd * 4;
+   // (tools/metal-m25.patch = M24 lever L5) the (cos, sin) table once a
+   // command buffer; qkr2 reads it
+   m24_ropecs(en, pos);
+@@ -15871,19 +16465,29 @@ static void m9_fulb_run(id<MTLComputeCommandEncoder> en, u64 b, u32 an,
+   m9_args(&A, qgn, b + wqn, qg, M24_CS, 0, 0, 0, 2 * qa, 1, pos, 0.0f);
+   m28_nb = true;
+   m9_go(en, gpu_m_qkr2, &A, R->nh, 256);
+-  m9_gemv(en, R->fm[15], b + wk, R->rb[15], h, kb, 1024, m9_cd(R->d), grid);
+-  m9_args(&A, kb, b + wkn, kn, M24_CS, 0, 0, 0, 1024, 0, pos, 0.0f);
++  m9_gemv(en, R->fm[15], b + wk, R->rb[15], h, kb, kvd, m9_cd(R->d), grid);
++  m9_args(&A, kb, b + wkn, kn, M24_CS, 0, 0, 0, kvd, 0, pos, 0.0f);
+   m28_nb = true;
+-  m9_go(en, gpu_m_qkr2, &A, 1024 / 256, 256);
+-  m9_gemv(en, R->fm[16], b + wv, R->rb[16], h, vb, 1024, m9_cd(R->d), grid);
+-  m9_args(&A, kn, kc + (u64)pos * 1024 * 4, 0, 0, 0, 0, 0, 1024,
++  m9_go(en, gpu_m_qkr2, &A, kvd / 256, 256);
++  m9_gemv(en, R->fm[16], b + wv, R->rb[16], h, vb, kvd, m9_cd(R->d), grid);
++  // (METAL-ANYSHAPE) the slot copies: llb_m_slot's one group of 1024 for the legacy kv row, else the copy
++  // kernel over kvd floats (the same values)
++  m9_args(&A, kn, kc + (u64)pos * kvd * 4, 0, 0, 0, 0, 0, kvd,
+     0, 0, 0.0f);
+   m28_nb = true;
+-  m9_go(en, gpu_m_slot, &A, 1, 1024);
+-  m9_args(&A, vb, vc + (u64)pos * 1024 * 4, 0, 0, 0, 0, 0, 1024,
++  if (kvd == 1024) {
++    m9_go(en, gpu_m_slot, &A, 1, 1024);
++  } else {
++    m9_go(en, gpu_m_copy, &A, (kvd + 255) / 256, 256);
++  }
++  m9_args(&A, vb, vc + (u64)pos * kvd * 4, 0, 0, 0, 0, 0, kvd,
+     0, 0, 0.0f);
+-  m9_go(en, gpu_m_slot, &A, 1, 1024);
+-  m9_attn5(en, qg, kc, vc, attn, c, R->nh);
++  if (kvd == 1024) {
++    m9_go(en, gpu_m_slot, &A, 1, 1024);
++  } else {
++    m9_go(en, gpu_m_copy, &A, (kvd + 255) / 256, 256);
++  }
++  m9_attn(en, qg, kc, vc, attn, c, R);
+   m9_elem(en, 2, attn, qg + qa * 4, gated, qa);
+   m9_gemv(en, R->fm[19], b + wo, R->rb[19], gated, y, R->d, m9_cd(qa), grid);
+ }
+@@ -15904,7 +16508,7 @@ static void m9_fulb_run(id<MTLComputeCommandEncoder> en, u64 b, u32 an,
+ // CUDA allocates per layer between launches, which would orphan the dispatches
+ // already encoded against the old buffer here.
+ // (tools/metal-27b.patch) 64: the 27B's layers
+-static u64  pass_b[64], pass_S[64], pass_kc[64], pass_vc[64], pass_x[3];
++static u64  pass_b[M9_NL_MAX], pass_S[M9_NL_MAX], pass_kc[M9_NL_MAX], pass_vc[M9_NL_MAX], pass_x[3];
+ // lane m26 (tools/metal-f27.patch): the 27B fast chunk's token blocks: F27_CH
+ // blocks of F27_TB floats (x 5120, the mixer's output 5120, then the larger of
+ // the linb / fulb / fbn scratch: fbn's 3 x 5120 + 3 x 17408)
+@@ -15914,8 +16518,8 @@ static u64  pass_b[64], pass_S[64], pass_kc[64], pass_vc[64], pass_x[3];
+ static u64  f27_base;
+ static bool f9_want;
+ static u64  pass_top, pass_end;
+-static u32  pass_r[64], pass_pos[64], pass_dT;
+-static bool pass_on[64];
++static u32  pass_r[M9_NL_MAX], pass_pos[M9_NL_MAX], pass_dT;
++static bool pass_on[M9_NL_MAX];
+ 
+ // (tools/metal-27b.patch) over the Shape's nl layers: an SSM layer's conv
+ // ring 4 cv and S lvh 128 128, the x ping-pong 3 d
+@@ -15946,6 +16550,55 @@ static void pass_reserve(u32 dT, const M9Rows* R) {
+   f27_base = fch != 0 ? pass_end : 0;
+ }
+ 
++// (METAL-ANYSHAPE) pass_reserve for a generic Shape or a window past 2^17 (m9_pass_init picks it; the legacy
++// Shapes up to 2^17 keep pass_reserve, byte for byte): kv rows of kvd floats, the attention planes sized from
++// the Shape and dT (M9_SCR grows first), and the whole buffer checked against the device's largest buffer
++static void pass_reserve_g(u32 dT, const M9Rows* R) {
++  u64 cv = 2 * R->lkh * 128 + R->lvh * 128;
++  // (tools/metal-m25.patch, L2) + the fused step's final slot
++  u64 n = 4ull * R->d * 4;
++  // (METAL-ANYSHAPE) a full layer's kv: 2 x 2^dT rows of kvd floats (1024 on every legacy Shape)
++  for (u32 i = 0; i < R->nl; i += 1) {
++    n += (i + 1) % 4 == 0 ? 2 * (((u64)R->kvd * 4) << dT)
++      : (4 * cv + ((u64)R->lvh << 14)) * 4;
++  }
++  // lane m26 (tools/metal-f27.patch): the 27B fast chunk's area past the
++  // state (its addresses unchanged); only at the 27B Shape
++  // (lane m31) and at d_model 4096 when the first pass bang is a fast chunk
++  // (ENGINE-PREFILL, patches/metal-4bpf.patch) and the 4B's d_model 2560 so
++  // (METAL-ANYSHAPE) and any generic Shape so
++  u64 fch = R->d == 5120 || ((R->d == 4096 || R->d == 2560 || R->gen) && f9_want)
++    ? F27_BYTES : 0;
++  // (METAL-ANYSHAPE) the attention planes at this Shape and dT (M9_SCR grows before the state is taken), and
++  // the whole buffer against the device's limit: a refusal that names the need, not a failed allocation
++  u64 old = M9_SCR, need = M9_ATTS - SA_SCR + m9_attn_bytes(R, dT);
++  if (need > M9_SCR) {
++    M9_SCR = (need + 16383) & ~16383ull;
++  }
++  u64 tot = M9_SCR + n + fch, lim = (u64)[gpu_dev maxBufferLength];
++  if (tot > lim) {
++    fprintf(stderr, "warp pass: the layer state at 2^%u kv slots needs %.2f GiB (kv %.2f GiB, attention planes"
++      " %.2f GiB); this device's largest buffer is %.2f GiB: lower the context (--steps / the prompt)\n", dT,
++      (double)tot / (1ull << 30), (double)(n - 4ull * R->d * 4) / (1ull << 30),
++      (double)m9_attn_bytes(R, dT) / (1ull << 30), (double)lim / (1ull << 30));
++    err_fail("warp pass: the layer state does not fit one Metal buffer");
++  }
++  id<MTLBuffer> g = [gpu_dev newBufferWithLength:tot
++    options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
++  if (!g) {
++    fprintf(stderr, "warp pass: %.2f GiB for the layer state (2^%u kv slots) was not granted\n",
++      (double)tot / (1ull << 30), dT);
++    err_fail("warp pass: cannot allocate the layer state");
++  }
++  // a new Metal buffer is zero-filled: only the old scratch is copied, and the state region's pages are not
++  // touched here, so a long context commits memory as its slots fill, not at the reserve
++  memcpy([g contents], [gpu_scr contents], old);
++  gpu_scr  = g;
++  pass_top = SA_SCR + M9_SCR;
++  pass_end = pass_top + n;
++  f27_base = fch != 0 ? pass_end : 0;
++}
++
+ // n zeroed f32 of the reserved region, as a serve address
+ static u64 pass_zero(u64 n) {
+   u64 p = pass_top;
+@@ -15967,7 +16620,11 @@ static u64 m24_fin;
+ 
+ static void m9_pass_init(u32 dT, const M9Rows* S0) {
+   if (pass_x[0] == 0) {
+-    pass_reserve(dT, S0);
++    if (S0->gen || dT > 17) {
++      pass_reserve_g(dT, S0);
++    } else {
++      pass_reserve(dT, S0);
++    }
+     for (u32 b = 0; b < 3; b += 1) {
+       pass_x[b] = pass_zero(S0->d);
+     }
+@@ -16037,8 +16694,8 @@ static void m9_pass_run(id<MTLComputeCommandEncoder> en, u64 x, u64 y, u32 c,
+         err_fail("warp pass: a layer's state must start at pos 0");
+       }
+       if (full) {
+-        pass_kc[i] = pass_zero(1ull << (dT + 10));
+-        pass_vc[i] = pass_zero(1ull << (dT + 10));
++        pass_kc[i] = pass_zero((u64)S0->kvd << dT);
++        pass_vc[i] = pass_zero((u64)S0->kvd << dT);
+       } else {
+         pass_b[i] = pass_zero(4 * cv);
+         pass_S[i] = pass_zero((u64)S0->lvh << 14);
+@@ -16108,6 +16765,8 @@ static void m9_pass_run(id<MTLComputeCommandEncoder> en, u64 x, u64 y, u32 c,
+ #define F27_G 6
+ #endif
+ static id<MTLComputePipelineState> gpu_f27_mm[4], gpu_f27_gdl, gpu_f27_attn, gpu_f9_attn;
++// (METAL-ANYSHAPE) the chunk attention over kv rows of 512 floats (2 kv heads): GQA 6 / 4
++static id<MTLComputePipelineState> gpu_f27_attn2, gpu_f9_attn2;
+ static id<MTLComputePipelineState> gpu_f27_conv, gpu_f27_copy, gpu_f27_embt;
+ static id<MTLComputePipelineState> gpu_t27_rnorm, gpu_t27_addrms, gpu_t27_elem;
+ static id<MTLComputePipelineState> gpu_t27_grn, gpu_t27_mida, gpu_t27_midb;
+@@ -16124,6 +16783,8 @@ static void f27_pipes(void) {
+   gpu_f9_attn   = warp_pipe("llb_f9_attn");
+   gpu_f27_gdl   = warp_pipe("llb_f27_gdl");
+   gpu_f27_attn  = warp_pipe("llb_f27_attn");
++  gpu_f27_attn2 = warp_pipe("llb_f27_attn_k512");
++  gpu_f9_attn2  = warp_pipe("llb_f9_attn_k512");
+   gpu_f27_conv  = warp_pipe("llb_f27_conv1dt");
+   gpu_f27_copy  = warp_pipe("llb_f27_copy");
+   gpu_f27_embt  = warp_pipe("llb_f27_embt");
+@@ -16143,6 +16804,8 @@ static void f27_pipes(void) {
+     || gpu_f9_attn.maxTotalThreadsPerThreadgroup < 32 * 4
+     || gpu_f27_gdl.maxTotalThreadsPerThreadgroup < 128
+     || gpu_f27_attn.maxTotalThreadsPerThreadgroup < 32 * F27_G
++    || gpu_f27_attn2.maxTotalThreadsPerThreadgroup < 32 * F27_G
++    || gpu_f9_attn2.maxTotalThreadsPerThreadgroup < 32 * 4
+     || gpu_f27_conv.maxTotalThreadsPerThreadgroup < 256
+     || gpu_f27_copy.maxTotalThreadsPerThreadgroup < 256
+     || gpu_f27_embt.maxTotalThreadsPerThreadgroup < 256
+@@ -16324,12 +16987,15 @@ static void f27_linb(id<MTLComputeCommandEncoder> en, u32 i, u64 b,
+ static void f27_fulb(id<MTLComputeCommandEncoder> en, u32 i, u64 b,
+   const u32* p, const M9Rows* R, u32 dT, u32 pos0, u32 nt) {
+   const u64 B = f27_base;
+-  const u32 d = R->d, qa = R->nh * 256;
++  // (METAL-ANYSHAPE) kv rows of kvd floats; the chunk attention bodies: GQA 6 or 4 over kv rows of 1024 or
++  // 512 floats (llb_f27_attn / llb_f9_attn and their 512-stride twins)
++  const u32 d = R->d, qa = R->nh * 256, kvd = R->kvd, G = R->nh / R->nkv;
+   const u64 h = F27_W0, qgn = h + d, qg = qgn + 2 * qa, kb = qg + 2 * qa;
+-  const u64 kn = kb + 1024, vb = kn + 1024, attn = vb + 1024, gated = attn + qa;
++  const u64 kn = kb + kvd, vb = kn + kvd, attn = vb + kvd, gated = attn + qa;
+   HybTArgs T;
+-  if ((R->nh != 24 && R->nh != 16) || gated + qa > F27_TB || dT < 5) {
+-    err_fail("27B fast chunk: the fulb shape / window does not fit");
++  if ((R->gen ? (G != 4 && G != 6) || (kvd != 512 && kvd != 1024)
++      : R->nh != 24 && R->nh != 16) || gated + qa > F27_TB || dT < 5) {
++    err_fail("fast chunk: the fulb shape / window does not fit (GQA 4 or 6 over 2 or 4 kv heads)");
+   }
+   f27_targs(&T, d, 0, 0, 0.0f);
+   T.a[0] = B + F27_X * 4; T.s[0] = F27_TS; T.a[1] = b + p[0];
+@@ -16339,30 +17005,30 @@ static void f27_fulb(id<MTLComputeCommandEncoder> en, u32 i, u64 b,
+     && R->rb[14] == R->rb[16]) {
+     const u64 w3[3] = {b + p[14], b + p[15], b + p[16]};
+     const u64 y3[3] = {B + qgn * 4, B + kb * 4, B + vb * 4};
+-    const u32 m3[3] = {2 * qa, 1024, 1024};
++    const u32 m3[3] = {2 * qa, kvd, kvd};
+     f27_mms(en, R->fm[14], 3, w3, y3, m3, R->rb[14], B + h * 4, d, nt);
+   } else {
+     f27_mm1(en, R->fm[14], b + p[14], R->rb[14], B + h * 4, B + qgn * 4, 2 * qa, d, nt);
+-    f27_mm1(en, R->fm[15], b + p[15], R->rb[15], B + h * 4, B + kb * 4, 1024, d, nt);
+-    f27_mm1(en, R->fm[16], b + p[16], R->rb[16], B + h * 4, B + vb * 4, 1024, d, nt);
++    f27_mm1(en, R->fm[15], b + p[15], R->rb[15], B + h * 4, B + kb * 4, kvd, d, nt);
++    f27_mm1(en, R->fm[16], b + p[16], R->rb[16], B + h * 4, B + vb * 4, kvd, d, nt);
+   }
+   // qk-norm + rope (pos = pos0 + row), the q gate copied after the q heads
+   f27_targs(&T, 2 * qa, 1, pos0, 0.0f);
+   T.a[0] = B + qgn * 4; T.s[0] = F27_TS; T.a[1] = b + p[17];
+   T.a[2] = B + qg * 4; T.s[2] = F27_TS;
+   f27_go(en, gpu_t27_qkr, &T, sizeof T, R->nh, nt, 256);
+-  f27_targs(&T, 1024, 0, pos0, 0.0f);
++  f27_targs(&T, kvd, 0, pos0, 0.0f);
+   T.a[0] = B + kb * 4; T.s[0] = F27_TS; T.a[1] = b + p[18];
+   T.a[2] = B + kn * 4; T.s[2] = F27_TS;
+-  f27_go(en, gpu_t27_qkr, &T, sizeof T, 1024 / 256, nt, 256);
+-  // the cache slots pos0 + row
+-  f27_targs(&T, 1024, 0, 0, 0.0f);
++  f27_go(en, gpu_t27_qkr, &T, sizeof T, kvd / 256, nt, 256);
++  // the cache slots pos0 + row (llb_m_slott: a thread a float, kvd <= 1024)
++  f27_targs(&T, kvd, 0, 0, 0.0f);
+   T.a[0] = B + kn * 4; T.s[0] = F27_TS;
+-  T.a[1] = pass_kc[i] + (u64)pos0 * 1024 * 4; T.s[1] = 4096;
+-  f27_go(en, gpu_t27_slot, &T, sizeof T, 1, nt, 1024);
++  T.a[1] = pass_kc[i] + (u64)pos0 * kvd * 4; T.s[1] = kvd * 4;
++  f27_go(en, gpu_t27_slot, &T, sizeof T, 1, nt, kvd);
+   T.a[0] = B + vb * 4; T.s[0] = F27_TS;
+-  T.a[1] = pass_vc[i] + (u64)pos0 * 1024 * 4; T.s[1] = 4096;
+-  f27_go(en, gpu_t27_slot, &T, sizeof T, 1, nt, 1024);
++  T.a[1] = pass_vc[i] + (u64)pos0 * kvd * 4; T.s[1] = kvd * 4;
++  f27_go(en, gpu_t27_slot, &T, sizeof T, 1, nt, kvd);
+   FAttArgs F;
+   memset(&F, 0, sizeof F);
+   F.q = B + qg * 4;
+@@ -16372,8 +17038,9 @@ static void f27_fulb(id<MTLComputeCommandEncoder> en, u32 i, u64 b,
+   F.qs = (u32)F27_TB;
+   F.pos0 = pos0;
+   F.nt = nt;
+-  f27_go(en, R->nh == 24 ? gpu_f27_attn : gpu_f9_attn, &F, sizeof F, 4,
+-    (nt + 7) / 8, 32 * (R->nh / 4));
++  f27_go(en, kvd == 512 ? (G == 6 ? gpu_f27_attn2 : gpu_f9_attn2)
++    : R->gen ? (G == 6 ? gpu_f27_attn : gpu_f9_attn) : R->nh == 24 ? gpu_f27_attn : gpu_f9_attn,
++    &F, sizeof F, R->nkv, (nt + 7) / 8, 32 * G);
+   // the output gate: attn * sigmoid(gate), the gate at qg + qa
+   f27_targs(&T, qa, 2, 0, 0.0f);
+   T.a[0] = B + attn * 4; T.s[0] = F27_TS; T.a[1] = B + (qg + qa) * 4;
+@@ -16437,9 +17104,9 @@ static void f27_chunk(id<MTLComputeCommandEncoder> en, const u32* ids, u32 nt,
+   if (dT != pass_dT) {
+     err_fail("warp pass: dT changed");
+   }
+-  if (f27_base == 0 || (S0->d != 5120 && S0->d != 4096 && S0->d != 2560)
+-    || nt < 1 || nt > F27_CH || (S0->d == 5120 && (tw == NULL || !ek4))
+-    || (ek6 && (ek4 || S0->d != 2560))) {
++  if (f27_base == 0 || (S0->d != 5120 && S0->d != 4096 && S0->d != 2560 && !S0->gen)
++    || nt < 1 || nt > F27_CH || (S0->d == 5120 && !S0->gen && (tw == NULL || !ek4))
++    || (ek6 && (ek4 || (S0->d != 2560 && !S0->gen))) || (S0->gen && tw == NULL)) {
+     err_fail("fast chunk: no chunk area / not the 27B or 9B / nt out of range");
+   }
+   f27_pipes();
+@@ -16465,8 +17132,8 @@ static void f27_chunk(id<MTLComputeCommandEncoder> en, const u32* ids, u32 nt,
+           err_fail("warp pass: a layer's state must start at pos 0");
+         }
+         if (full) {
+-          pass_kc[i] = pass_zero(1ull << (dT + 10));
+-          pass_vc[i] = pass_zero(1ull << (dT + 10));
++          pass_kc[i] = pass_zero((u64)S0->kvd << dT);
++          pass_vc[i] = pass_zero((u64)S0->kvd << dT);
+         } else {
+           pass_b[i] = pass_zero(4 * cv);
+           pass_S[i] = pass_zero((u64)S0->lvh << 14);
+@@ -16633,14 +17300,58 @@ static void f35_arm(Env e, Corpus H, id<MTLComputeCommandEncoder> en, Loc a, u32
+ // (ENGINE-ONE, patches/metal-kev.patch) and Kev-4B Q4_K_M's Q4_K embedding (dm
+ // 2560, 1440 B rows), by the same length rule; llb_m_embk4 is width-general
+ typedef struct {
+-  bool on, k4, k6;
++  bool on, k4, k6, gen;
+   u64  erow, hb;
+-  u32  noff, ooff, rb, fm, dm;
++  u32  noff, ooff, rb, fm, dm, vc;
+ } M24Fz;
+ 
++// (METAL-ANYSHAPE) a generic Shape's fused step: the embedding told by the region's length at its vocabulary
++// and width (Q4_K 144, Q6_K 210 B a 256-col superblock, Q8_0 34 B a 32-col group: never equal), the head any
++// Q8_0 / K-quant row of d_model columns, vc rows
++static bool m24_fz_gen(Env e, Corpus H, Loc a, const M9Rows* R, M24Fz* F) {
++  Term hd = H[a + 51], ep = H[a + 55];
++  F->on = term_tag(hd) == TAG_STR;
++  if (!F->on) {
++    return true;
++  }
++  StrParts q = str_peek_ro(e, hd), qe = str_peek_ro(e, ep);
++  u32  dm = R->d, vc = R->vc;
++  u64  len = term_tag(ep) == TAG_STR ? (u64)qe.len : 0;
++  bool k4 = len == (u64)vc * (dm / 256 * 144), k6 = len == (u64)vc * (dm / 256 * 210);
++  bool q8 = len == (u64)vc * (dm / 32 * 34);
++  u32  noff = (u32)H[a + 52], ooff = (u32)H[a + 53], hw = (u32)H[a + 54];
++  u32  tok = (u32)H[a + 56], rb, fm;
++  u32  erb = k4 ? dm / 256 * 144 : k6 ? dm / 256 * 210 : dm / 32 * 34;
++  bool rok = m9_rw(hw, &rb, &fm);
++  bool ok = str_nar(q) == 2 && term_tag(ep) == TAG_STR && str_nar(qe) == 2
++    && rok && (k4 || k6 || q8) && tok < vc && noff % 4 == 0 && ooff % 16 == 0
++    && (fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm)) && rb == LLB_FM_RB(fm, dm)
++    && (u64)noff + dm * 4 <= q.len && (u64)ooff + (u64)vc * rb <= q.len;
++  const u8* hb = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
++  const u8* eb = (const u8*)(H + term_peek_ro(e, qe.data)) + qe.off;
++  F->erow = (u64)(eb - (const u8*)H) + (u64)tok * erb;
++  F->hb   = (u64)(hb - (const u8*)H);
++  F->noff = noff;
++  F->ooff = ooff;
++  F->rb   = rb;
++  F->fm   = fm;
++  F->dm   = dm;
++  F->vc   = vc;
++  F->k4   = k4;
++  F->k6   = k6;
++  F->gen  = true;
++  if (!ok) {
++    fprintf(stderr, "warp pass: the fused step's head / embedding refused (d %u, vocab %u, embedding %llu B,"
++      " head format %u row %u B, token %u)\n", dm, vc, (unsigned long long)len, fm, rb, tok);
++  }
++  return ok && (F->erow & 1) == 0;
++}
++
+ static bool m24_fz(Env e, Corpus H, Loc a, u32 dm, M24Fz* F) {
+   Term hd = H[a + 51], ep = H[a + 55];
+   F->on = term_tag(hd) == TAG_STR;
++  F->vc = 248320;
++  F->gen = false;
+   if (!F->on) {
+     return true;
+   }
+@@ -16688,13 +17399,15 @@ static void m24_fz_head(id<MTLComputeCommandEncoder> en, const M24Fz* F, u64 x,
+   if (!nrm) {
+     m9_rnorm(en, x, F->hb + F->noff, M9_HEADH, F->dm);
+   }
+-  if (F->dm == 2048) {
++  // (METAL-ANYSHAPE) vc rows (248320 on every legacy Shape); the 35B's Q8 head by its own arm, not by d 2048
++  // alone (the 2B's d_model is 2048 too)
++  if (F->dm == 2048 && F->vc == 248320 && F->fm == LLB_FM_Q8_0 && !F->gen) {
+     m24_q8(en, F->hb + F->ooff, F->rb, M9_HEADH, M9_LOGIT, 248320, 9);
+   } else {
+-    m9_gemv(en, F->fm, F->hb + F->ooff, F->rb, M9_HEADH, M9_LOGIT, 248320,
++    m9_gemv(en, F->fm, F->hb + F->ooff, F->rb, M9_HEADH, M9_LOGIT, F->vc,
+       m9_cd(F->dm), grid);
+   }
+-  m9_args(&A, M9_LOGIT, y, 0, 0, 0, 0, 0, 248320, 0, 0, 0.0f);
++  m9_args(&A, M9_LOGIT, y, 0, 0, 0, 0, 0, F->vc, 0, 0, 0.0f);
+   m9_go(en, gpu_m_amax, &A, 1, 1024);
+ }
+ 
+@@ -16991,26 +17704,35 @@ static bool m9_serve(Env e, Corpus H, id<MTLComputeCommandEncoder> en, Term t,
+     u32  fgm = rgt ? rgw >> 28 & 3 : (rgw >> 31 ? 2 : rg % 17 == 0);
+     u32  fdm = rdt ? rdw >> 28 & 3 : (rdw >> 31 ? 2 : rd % 17 == 0);
+     u32  po[40], ids[F27_CH];
+-    u64  pw[64];
++    u64  pw[M9_NL_MAX];
+     M9Rows S0;
+     m9_rows_q8(&S0, rg, rd);
+-    bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+-      && m9_shape(&S0, rg / 17 * 16, rd / 17 * 16)
+-      && (S0.d == 5120 || S0.d == 4096 || S0.d == 2560)
+-      && dT >= 5 && dT <= 17 && nt >= 1 && nt <= F27_CH
++    // (METAL-ANYSHAPE) the Shape from the row words and the engine's shape words 52 .. 54, as the pass arm;
++    // a generic Shape takes the chunk with its table; dT up to 27
++    bool moe35 = rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u);
++    bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0 && !moe35
++      && m9_shape_w(&S0, rg / 17 * 16, rd / 17 * 16, (u32)H[a + 52], (u32)H[a + 53],
++        (u32)H[a + 54])
++      && (S0.d == 5120 || S0.d == 4096 || S0.d == 2560 || S0.gen)
++      && dT >= 5 && dT <= 27 && nt >= 1 && nt <= F27_CH
+       && (u64)pos + nt <= (1ull << dT) && !M9_ARR(y)
+-      && a32_load(a32_at(H, H_WARP_N)) == 1 && term_tag(ept) == TAG_STR;
++      && a32_load(a32_at(H, H_WARP_N)) == 1 && term_tag(ept) == TAG_STR
++      && (!S0.gen || term_tag(H[a + 47]) == TAG_STR);
+     k = S0.nl;
+     StrParts eq = str_peek_ro(e, ept);
+     // (lane m31) the embedding: the 27B's Q4_K, the 9B's Q4_K (2304 B rows) or
+     // Q8_0 (4352), told by the region's length (M30 F1's rule)
+     // (ENGINE-PREFILL, patches/metal-4bpf.patch) the 4B (d 2560): Q8_0 (2720
+     // B rows), the Q4_K_M's Q6_K (2100) or Kev-4B's Q4_K (1440), by length
+-    bool ek4 = S0.d == 5120 || (u64)eq.len == 248320ull * 2304
++    // (METAL-ANYSHAPE) a generic Shape: the same length rule at its width and vocabulary
++    u64  vcl = S0.vc;
++    bool ek4 = S0.gen ? (u64)eq.len == vcl * (S0.d / 256 * 144)
++      : S0.d == 5120 || (u64)eq.len == 248320ull * 2304
+       || (S0.d == 2560 && (u64)eq.len == 248320ull * 1440);
+-    bool ek6 = S0.d == 2560 && (u64)eq.len == 248320ull * 2100;
++    bool ek6 = S0.gen ? (u64)eq.len == vcl * (S0.d / 256 * 210)
++      : S0.d == 2560 && (u64)eq.len == 248320ull * 2100;
+     ok = ok && str_nar(eq) == 2
+-      && (u64)eq.len == 248320ull * (ek4 ? S0.d / 256 * 144
++      && (u64)eq.len == vcl * (ek4 ? S0.d / 256 * 144
+         : ek6 ? S0.d / 256 * 210 : S0.d / 32 * 34);
+     // (tools/metal-kquant.patch) the table (task word 49): a 2-part Bytes,
+     // 4-aligned, >= s + k rows; the Q8 pack passes exactly SNil (the old
+@@ -17149,7 +17871,7 @@ static bool m9_serve(Env e, Corpus H, id<MTLComputeCommandEncoder> en, Term t,
+       Loc l = term_peek_ro(e, t3);
+       ids[j] = (u32)H[l];
+       t3 = H[l + 1];
+-      ok = ids[j] < 248320;
++      ok = ids[j] < S0.vc;
+     }
+     if (!ok || (S0.d == 5120 && tw == NULL)) {
+       // (lane m32, f35) the 35B's Shape (rg q8rw(2048), rd q8rw(512)), refused
+@@ -17187,22 +17909,29 @@ static bool m9_serve(Env e, Corpus H, id<MTLComputeCommandEncoder> en, Term t,
+     u32  fgm = rgt ? rgw >> 28 & 3 : (rgw >> 31 ? 2 : rg % 17 == 0);
+     u32  fdm = rdt ? rdw >> 28 & 3 : (rdw >> 31 ? 2 : rd % 17 == 0);
+     u32  po[40];
+-    u64  pw[64];
++    u64  pw[M9_NL_MAX];
+     // (tools/metal-27b.patch) the Shape from the row words: d_model = rg's
+     // columns, d_ff = rd's, exactly the 9B's or the 27B's; x a 2^(cd(d) + 2)
+     // array; s + k within its layers
+     M9Rows S0;
+     m9_rows_q8(&S0, rg, rd);
+-    bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+-      && m9_shape(&S0, rg / 17 * 16, rd / 17 * 16)
+-      && dT >= 1 && dT <= 17 && pos < (1u << dT) && k >= 1 && s + k <= S0.nl
++    // (METAL-ANYSHAPE) the Shape from the row words and the engine's shape words 57 .. 59 (heads, vocabulary,
++    // layers): a legacy Shape as before, any other generic (m9_shape_w); the 35B's words keep its own arm.
++    // dT up to 27 (c = dT | pos << 5): the kv and the attention planes are sized from it (pass_reserve)
++    bool moe35 = rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u);
++    bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0 && !moe35
++      && m9_shape_w(&S0, rg / 17 * 16, rd / 17 * 16, (u32)H[a + 57], (u32)H[a + 58],
++        (u32)H[a + 59])
++      && dT >= 1 && dT <= 27 && pos < (1u << dT) && k >= 1 && s + k <= S0.nl
+       && !M9_ARR(y) && a32_load(a32_at(H, H_WARP_N)) == 1
+       && H[a + 50] == term_pak(CID_SNIL, 0);
+     // (tools/metal-m25.patch = M24 lever L2) the fused step: layers 0 .. k-1,
+     // y the top two (4 words); else x and y Shape arrays, as before. Word 50
+     // (M24's experts.idx) must be SNil here
++    // (METAL-ANYSHAPE) a generic Shape runs the fused step only, with the table
+     M24Fz F;
+-    ok = ok && m24_fz(e, H, a, S0.d, &F)
++    ok = ok && (S0.gen ? m24_fz_gen(e, H, a, &S0, &F) && F.on
++        && term_tag(H[a + 49]) == TAG_STR : m24_fz(e, H, a, S0.d, &F))
+       && (F.on ? s == 0 && blk_cls(y) >= 2
+         : !M9_ARR(x) && blk_cls(x) == m9_cd(S0.d) + 2
+           && blk_cls(y) >= m9_cd(S0.d) + 2);
+@@ -20538,11 +21267,99 @@ static int cli_workers(long n) {
+ // Main
+ // ====
+ 
++// (METAL-ANYSHAPE) an argument @FILE is FILE's whitespace-separated words in its place: a prompt of any length
++// (ids past the OS argument limit) reaches the engine. The expanded vector lives until the next main
++static char** cli_xav;
++static char*  cli_xbuf;
++static char** cli_expand(int* argc, char** argv) {
++  bool any = false;
++  for (int i = 1; i < *argc; i += 1) {
++    any = any || (argv[i][0] == '@' && argv[i][1] != 0);
++  }
++  if (!any) {
++    return argv;
++  }
++  free(cli_xav);
++  free(cli_xbuf);
++  cli_xav = NULL;
++  cli_xbuf = NULL;
++  u64 cap = 0, len = 0;
++  u64* fst = calloc((size_t)*argc, sizeof(u64));
++  u64* fen = calloc((size_t)*argc, sizeof(u64));
++  if (fst == NULL || fen == NULL) {
++    cli_fail("out of memory expanding the argument files", NULL);
++  }
++  for (int i = 1; i < *argc; i += 1) {
++    if (argv[i][0] != '@' || argv[i][1] == 0) {
++      continue;
++    }
++    fst[i] = len;
++    FILE* f = fopen(argv[i] + 1, "rb");
++    if (f == NULL) {
++      cli_fail("cannot read the argument file ", argv[i] + 1);
++    }
++    for (;;) {
++      if (len + 65536 + 1 > cap) {
++        cap = (len + 65536 + 1) * 2;
++        cli_xbuf = realloc(cli_xbuf, cap);
++        if (cli_xbuf == NULL) {
++          cli_fail("out of memory reading ", argv[i] + 1);
++        }
++      }
++      size_t n = fread(cli_xbuf + len, 1, 65536, f);
++      len += n;
++      if (n == 0) {
++        break;
++      }
++    }
++    fclose(f);
++    fen[i] = len;
++    cli_xbuf[len++] = ' ';
++  }
++  if (cli_xbuf == NULL) {
++    return argv;
++  }
++  cli_xbuf[len] = 0;
++  u64 nw = 0;
++  for (u64 j = 0; j < len; j += 1) {
++    char ch = cli_xbuf[j];
++    bool sp = ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r';
++    if (sp) {
++      cli_xbuf[j] = 0;
++    } else if (j == 0 || cli_xbuf[j - 1] == 0) {
++      nw += 1;
++    }
++  }
++  cli_xav = malloc(sizeof(char*) * (*argc + nw + 2));
++  if (cli_xav == NULL) {
++    cli_fail("out of memory expanding the argument files", NULL);
++  }
++  int o = 0;
++  for (int i = 0; i < *argc; i += 1) {
++    if (i == 0 || argv[i][0] != '@' || argv[i][1] == 0) {
++      cli_xav[o++] = argv[i];
++      continue;
++    }
++    // this file's words: its bytes are [fst, fen) of the buffer, each word ended by a 0
++    for (u64 j = fst[i]; j < fen[i]; j += 1) {
++      if (cli_xbuf[j] != 0 && (j == fst[i] || cli_xbuf[j - 1] == 0)) {
++        cli_xav[o++] = cli_xbuf + j;
++      }
++    }
++  }
++  free(fst);
++  free(fen);
++  cli_xav[o] = NULL;
++  *argc = o;
++  return cli_xav;
++}
++
+ int main(int argc, char** argv) {
+   long thr = 0;
+   long wks = 1;
+   int  gpu = -1;
+   u64  mem = 0;
++  argv = cli_expand(&argc, argv);
+   io_argv = argv + 1;
+   for (int i = 1; i < argc; i += 1) {
+     const char* a = argv[i];
+@@ -20688,6 +21505,16 @@ static int bend_close(void) {
+   gpu_t27_rnorm = nil; gpu_t27_addrms = nil; gpu_t27_elem = nil;
+   gpu_t27_grn = nil; gpu_t27_mida = nil; gpu_t27_midb = nil;
+   gpu_t27_slot = nil; gpu_t27_qkr = nil; gpu_t27_l2nr = nil;
++  // (METAL-ANYSHAPE) the generic arms' pipelines and the scratch size
++  gpu_f27_attn2 = nil; gpu_f9_attn2 = nil;
++  gpu_m_attn6 = nil; gpu_m_a6s = nil; gpu_m_a6m = nil; gpu_m_a6p = nil; gpu_m_a6z = nil;
++  gpu_m_a6v = nil; gpu_m_a6c = nil; gpu_m_copy = nil;
++  for (u32 f = 0; f < 3; f += 1) {
++    for (u32 k = 0; k < 6; k += 1) {
++      gpu_kg[f][k] = nil;
++    }
++  }
++  m9_scr_n = M9_SCR0;
+   llb_hidden_path = NULL;
+   memset(llb_hidden_positions, 0, sizeof llb_hidden_positions);
+   llb_hidden_tokens = 0; llb_hidden_pos = 0; llb_hidden_width = 0;

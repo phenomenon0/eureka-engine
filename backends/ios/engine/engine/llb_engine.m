@@ -194,13 +194,19 @@ static int llb_fail(const char* a, const char* b) {
 // the default is GGUF + 3 GiB rounded up to 256 MiB (9B: 8.5 GiB, see engine-ios).
 // LLB_GPU_SPAN_MB overrides; LLB_GPU_EXTRA_MB replaces the 3 GiB.
 // (ENGINE-PHONE: the 4B's measured floor is in REPORT.md "Memory".)
+// (METAL-ANYSHAPE) the default extra is sized from the model: GGUF / 2 + 1 GiB (the head and embedding
+// regions the engine copies, the layer blobs' power-of-two classes, the Bend heap). The fused step keeps its
+// KV, attention planes and fast-chunk area in the engine's own Metal buffer, sized from the requested ctx
+// (llb_open's cap) and refused by the engine past the device's largest buffer, so the span does not grow
+// with ctx. Floors measured on an M3 Ultra at ctx 4096 (docs/limits.md): 0.8B 1.6 GB, 2B 2.6 GB, 4B 4.5 GB,
+// 9B 8.8 GB; this default gives 1.8, 2.9, 5.0, 9.6 GB. Not measured on a phone.
 static u64 llb_span(void) {
   const char* s = getenv("LLB_GPU_SPAN_MB");
   if (s && atoll(s) > 0) {
     return (u64)atoll(s) << 20;
   }
   const char* x = getenv("LLB_GPU_EXTRA_MB");
-  u64 extra = x && atoll(x) > 0 ? (u64)atoll(x) << 20 : 3ull << 30;
+  u64 extra = x && atoll(x) > 0 ? (u64)atoll(x) << 20 : llb_gguf_bytes / 2 + (1ull << 30);
   u64 q = 256ull << 20;
   return (llb_gguf_bytes + extra + q - 1) / q * q;
 }
@@ -759,9 +765,12 @@ int llb_open(const char* model_dir, const char* cache_dir, int ctx, int flags, l
   long ncpu = (long)[[NSProcessInfo processInfo] activeProcessorCount];
   const char* te = getenv("LLB_THREADS");
   long thr = te && atol(te) > 0 ? atol(te) : (ncpu < 8 ? ncpu : 8);
-  // the srv loop's launch argv "0 --steps C": its KV capacity 2^dT = C, a power of two in 64 .. 2^17
+  // the srv loop's launch argv "0 --steps C": its KV capacity 2^dT = C, a power of two in 64 .. 2^27
+  // (METAL-ANYSHAPE: the engine sizes the KV and its attention planes from C in their own Metal buffer and
+  // refuses, naming the bytes, when they exceed the device's largest buffer; the span below no longer holds
+  // a per-layer copy of the KV for the fused step)
   int cap = 64;
-  while (cap < ctx && cap < (1 << 17)) {
+  while (cap < ctx && cap < (1 << 27)) {
     cap *= 2;
   }
   snprintf(rs_spans, sizeof rs_spans, "%lluMB", (unsigned long long)(z.span_bytes >> 20));

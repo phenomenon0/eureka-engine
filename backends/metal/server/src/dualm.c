@@ -39,7 +39,16 @@ static char hidden_path[4096];
 static char *text;
 static jv *req;
 static Record *rec;
-static int mode,steps,seq,prompt_n,prompt_ids[CLEF_MAX_T];
+static int mode,steps,seq,prompt_n,*prompt_ids,prompt_cap;
+// (METAL-ANYSHAPE) a generate prompt of any length up to the KV capacity (not CLEF_MAX_T): prompt_ids grows to fit
+static int prompt_room(size_t n) {
+    if (n>(size_t)prompt_cap) {
+        int *q=realloc(prompt_ids,sizeof *q*n);
+        if (!q) return 0;
+        prompt_ids=q,prompt_cap=(int)n;
+    }
+    return 1;
+}
 static double t_req;
 
 static double now(void) {
@@ -201,7 +210,8 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
     jv *m=json_get(req,"mode");
     if (m && m->type==J_STR && !strcmp(m->str,"generate")) {
         jv *p=json_get(req,"prompt"),*k=json_get(req,"n"),*pi=json_get(req,"prompt_ids");
-        if (pi && pi->type==J_ARR && pi->n>=1 && pi->n<=CLEF_MAX_T && k && k->type==J_NUM && k->num>=1 && k->num<=65536) {
+        if (pi && pi->type==J_ARR && pi->n>=1 && pi->n<=ctx && k && k->type==J_NUM && k->num>=1 && k->num<=65536) {
+            if (!prompt_room(pi->n)) return refuse("out of memory for prompt_ids"),0;
             for (size_t i=0; i<pi->n; i++) {
                 if (pi->items[i]->type!=J_NUM || pi->items[i]->num<0 || pi->items[i]->num>=248320) return refuse("prompt_ids must be integers in [0,248320)"),0;
                 prompt_ids[i]=(int)pi->items[i]->num;
@@ -217,11 +227,13 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         }
         if (!p || p->type!=J_STR || !k || k->type!=J_NUM || k->num<1 || k->num>65536 || k->num!=floor(k->num))
             return refuse("generate needs prompt (string) and n (integer 1..65536)"),0;
-        int cap_ids=CLEF_MAX_T,*ids=malloc(sizeof *ids*cap_ids);
+        // (METAL-ANYSHAPE) a token is at least one byte of the prompt: strlen + 1 ids always suffice
+        int cap_ids=(int)strlen(p->str)+1,*ids=malloc(sizeof *ids*(size_t)cap_ids);
         jv *sp=json_get(req,"special");
-        int c=q35_tok_encode(&tok,p->str,sp&&sp->type==J_BOOL&&sp->b,ids,cap_ids);
-        if (c<1) return free(ids),refuse("prompt must tokenize to 1..16384 tokens"),0;
+        int c=ids?q35_tok_encode(&tok,p->str,sp&&sp->type==J_BOOL&&sp->b,ids,cap_ids):-1;
+        if (c<1) return free(ids),refuse("prompt must tokenize to 1 or more tokens"),0;
         if ((unsigned)c+(unsigned)k->num-1>ctx) return free(ids),refuse("prompt + n exceeds the KV capacity fixed at launch"),0;
+        if (!prompt_room((size_t)c)) return free(ids),refuse("out of memory for the prompt"),0;
         mode=2;
         steps=(int)k->num;
         prompt_n=c;

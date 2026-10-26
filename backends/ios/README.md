@@ -39,6 +39,32 @@ cd engine
 emit, library, and xcframework steps, and the pinned hashes. Copy the
 resulting `LLBEngine.xcframework` into the app's `ios/Vendor/`.
 
+## Any shape and long context
+
+The Metal any-shape patches (`../metal/cc/metal-anyshape-cc.patch`,
+`../metal/engine/metal-anyshape-engine.patch`, see
+[`../metal/README.md`](../metal/README.md#any-shape)) also apply, with
+`patch --fuzz=0`, on top of the full isildur stack (`VISION=1`, the resident
+session and `metal-camera.patch`): append them after `metal-camera.patch` in
+`engine/mac/build.sh`. That emit (`3fe84a23…` on 2026-10-26) compiles on
+macOS as Objective-C. The recipe here does not apply them yet, so
+`patches/CAM_SRC_SHA` is unchanged.
+
+The wrapper (`engine/engine/llb_engine.m`) changed in two places:
+
+- `llb_open` rounds `ctx` up to a power of two in 64 .. 2^27 (was 2^17). The
+  engine keeps the KV, attention planes and fast-chunk area in its own Metal
+  buffer, sized from that capacity, and refuses with the bytes it needs when
+  they exceed the device's `maxBufferLength`.
+- `llb_span` defaults to GGUF + GGUF/2 + 1 GiB (was GGUF + 3 GiB).
+  `LLB_GPU_EXTRA_MB` and `LLB_GPU_SPAN_MB` still override it. The span holds
+  weights and tables only, so it does not grow with `ctx`. Floors measured
+  on the M3 Ultra at ctx 4096: 0.8B 1.6 GB, 2B 2.6 GB, 4B 4.5 GB, 9B 8.8 GB.
+
+None of this ran on an iPhone or in the simulator: the library, the span
+default, the Metal kernels of the iOS stack and the 0.8B / 2B models are
+untested there.
+
 ## Gaps
 
 - The graded app's `Vendor/SHA256SUMS` pins an engine header that does not
@@ -46,3 +72,5 @@ resulting `LLBEngine.xcframework` into the app's `ios/Vendor/`.
   a nearby revision.
 - `engine/isildur.sh verify` compares against the app's Swift bridge,
   `ios/Bend/Engines/LLB/LLBEngine.swift`, which is in the app repository.
+- The any-shape changes are untested on a device (see
+  [Any shape and long context](#any-shape-and-long-context)).

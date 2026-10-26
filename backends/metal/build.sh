@@ -9,7 +9,10 @@
 #   3. a scratch copy of the engine sources + engine/metal-engine.patch (the Mac engine at engine-vision3's
 #      default build); VISION=1 adds the three vendored vision patches, as mac/build.sh does there
 #   4. emit C (platform-independent); on Darwin also link sys1mac exactly as engine-vision3/mac/build.sh
-# Env: LLB_ROOT, LLB_BEND (Bend checkout), LLB_OUT (default $LLB_ROOT/build/metal), VISION, LLB_METAL_EMIT_ONLY.
+#   5. (default) cc/metal-anyshape-cc.patch + engine/metal-anyshape-engine.patch: any Qwen3.5 dense shape and any
+#      context (docs/limits.md); LLB_METAL_BASE=1 leaves them out and reproduces the product hashes above
+# Env: LLB_ROOT, LLB_BEND (Bend checkout), LLB_OUT (default $LLB_ROOT/build/metal), VISION, LLB_METAL_EMIT_ONLY,
+#      LLB_METAL_BASE.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LLB_ROOT=${LLB_ROOT:-$(cd -- "$here/../.." && pwd)}
@@ -20,6 +23,9 @@ FORK=tools/gemv-q8-rw.patch
 # the product hashes this recipe must reproduce (engine-vision3 REPORT.md: default / VISION=1)
 EXPECT_C=c13b9e28d36ca618f2e041e0648e53ad744482db8537c1586666599fa58b61ee
 EXPECT_C_VISION=fbdefec75fe9f02a1f85e5bc8b7a3f1f461a8501c47db51dd8e0f454cd25f10a
+# the same with the any-shape patches (the default build)
+EXPECT_C_ANY=009794484c3860bd111eb131a9fc1d73f995a031ee81114847ecfc221b93fb55
+EXPECT_C_ANY_VISION=85c8d3c489dda683d5bbd12b8928e2645a6268efdec6871d3e755fd1d6c56447
 die() { echo "backends/metal/build.sh: $*" >&2; exit 1; }
 BUN=$(command -v bun || echo "$HOME/.bun/bin/bun"); [ -x "$BUN" ] || die "missing tool: bun"
 (cd "$here" && sha256sum -c --quiet SHA256SUMS 2>/dev/null || shasum -a 256 -c --quiet SHA256SUMS) \
@@ -56,20 +62,33 @@ if [ -n "${VISION:-}" ]; then
   patch --batch --silent --fuzz=0 -d "$LLB_OUT/cc" -p1 < "$here/vision/metal-vision.patch" || die "metal-vision"
   expect=$EXPECT_C_VISION
 fi
+if [ -z "${LLB_METAL_BASE:-}" ]; then
+  patch --batch --silent --fuzz=0 -d "$LLB_OUT/cc" -p1 < "$here/cc/metal-anyshape-cc.patch" || die "metal-anyshape-cc"
+  patch --batch --silent --fuzz=0 -d "$LLB_OUT/tree" -p1 < "$here/engine/metal-anyshape-engine.patch" \
+    || die "metal-anyshape-engine"
+  expect=$([ -n "${VISION:-}" ] && echo "$EXPECT_C_ANY_VISION" || echo "$EXPECT_C_ANY")
+fi
 find "$LLB_OUT/cc" "$LLB_OUT/tree" -name '*.orig' -delete
 (cd "$LLB_OUT/tree" && BEND_NO_TELEMETRY=1 "$BUN" ../cc/bend2/main.ts engine_qwen35_gpu.bend -o "$LLB_OUT/sys1mac.c" \
   2>&1 | grep -v '^- \|bend update' | tail -3)
 got=$( (sha256sum "$LLB_OUT/sys1mac.c" 2>/dev/null || shasum -a 256 "$LLB_OUT/sys1mac.c") | cut -d' ' -f1)
 echo "sys1mac.c $got"
-[ "$got" = "$expect" ] || die "emitted C $got != product $expect"
-echo "emitted C == the Mac product build (${VISION:+VISION=1 }${expect:0:8})"
+[ "$got" = "$expect" ] || [ -n "${LLB_METAL_NOHASH:-}" ] || die "emitted C $got != product $expect"
+lab=$([ -n "${LLB_METAL_BASE:-}" ] || echo "any-shape ")
+echo "emitted C == the Mac product build (${VISION:+VISION=1 }$lab${expect:0:8})"
 
 [ "$(uname -s)" = Darwin ] && [ -z "${LLB_METAL_EMIT_ONLY:-}" ] || exit 0
 # Darwin: the engine-vision3 mac/build.sh link (default build; VISION=1's tower objects live in that tree)
 [ -z "${VISION:-}" ] || die "VISION=1 native link is not carried yet (tower sources are in ~/engine-vision3/vision)"
 O=$LLB_OUT; mkdir -p "$O/obj" "$O/inc"; ln -sfn /opt/homebrew/opt/openblas/include "$O/inc/openblas"
 # dual.c: the S1D pin (llama-bend-sys1dual @ 7e61bda, link/dual.c); the tree's own moved on (twoheads S3)
-for f in "$here/link/dual.c" "$LLB_ROOT"/tools/clef3/{head,weights,spans,json}.c "$LLB_ROOT/tools/qwen35_tokenizer.c"; do
+# (METAL-ANYSHAPE) + link/dual-anyshape.patch (a generate prompt up to the KV capacity) unless LLB_METAL_BASE
+dual=$here/link/dual.c
+if [ -z "${LLB_METAL_BASE:-}" ]; then
+  mkdir -p "$O/link"; cp "$here/link/dual.c" "$O/link/dual.c"; dual=$O/link/dual.c
+  patch --batch --silent --fuzz=0 -d "$O/link" -p1 < "$here/link/dual-anyshape.patch" || die "dual-anyshape"
+fi
+for f in "$dual" "$LLB_ROOT"/tools/clef3/{head,weights,spans,json}.c "$LLB_ROOT/tools/qwen35_tokenizer.c"; do
   clang -D_POSIX_C_SOURCE=200809L -std=c11 -O2 -ffp-contract=off -Wall -Wextra -Wno-unused-function -I"$O/inc" \
     -I"$LLB_ROOT/tools/sys1dual" -c "$f" -o "$O/obj/$(basename "$f" .c).o"
 done
