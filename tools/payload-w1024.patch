@@ -1,0 +1,191 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4983,7 +4983,7 @@
+ static CUfunction gpu_slot;
+ static CUfunction gpu_amax;
+ static CUfunction gpu_amaxp;
+-static CUfunction gpu_embed, gpu_embedk;
++static CUfunction gpu_embed, gpu_embedk, gpu_embed6;
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
+ static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc, gpu_warpqc11;
+@@ -8450,12 +8450,14 @@
+     if (l < R && r0 + l < n) y[r0 + l] = __float_as_uint(EP::st(e, r0 + l, kp_top(slot, occ)));
+   }
+ }
+-// d 9..13 (the envelope admits a K-quant pair body only there)
++// d 8..13 (the envelope admits a K-quant pair body only there; d 8 the 0.8B's
++// 1024 cols, one quad and no pad: tools/payload-w1024.patch)
+ template <u32 FMT, u32 LP, class EP = KpPlain>
+ __device__ __forceinline__ void kp_warp(const u8* __restrict__ W, u32 rb, u32 cg,
+   const u32* __restrict__ x, u32* __restrict__ y, u32 n, u32 d, u32 bx, u32 gx,
+   const float* __restrict__ e) {
+-  if (d == 9) kp_pair<FMT, 2, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
++  if (d == 8) kp_pair<FMT, 1, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
++  else if (d == 9) kp_pair<FMT, 2, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
+   else if (d == 10) kp_pair<FMT, 4, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
+   else if (d == 11) kp_pair<FMT, 8, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
+   else if (d == 12) kp_pair<FMT, 16, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
+@@ -8529,7 +8531,7 @@
+   u32* __restrict__ y, u32 n, u32 d) {
+   // the pair body where it applies (K0b m4r2: no_allocate loads); the tile
+   // body (d <= 11) for rows not a whole number of superblock quads
+-  if (cg % 256 == 0 && d >= 9 && d <= 13) {
++  if (cg % 256 == 0 && d >= 8 && d <= 13) {
+     kp_warp<4, 1>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
+   } else {
+     warp_dq4k(W, rb, cg, x, y, n, d);
+@@ -8638,7 +8640,7 @@
+   u32* __restrict__ y, u32 n, u32 d) {
+   // the pair body where it applies (K0b p6r2: default loads, the second
+   // aligned uint4 is the next lane's first); else the tile body (d <= 11)
+-  if (cg % 256 == 0 && d >= 9 && d <= 13) {
++  if (cg % 256 == 0 && d >= 8 && d <= 13) {
+     kp_warp<6, 0>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
+   } else {
+     warp_dq6k(W, rb, cg, x, y, n, d);
+@@ -9019,8 +9021,10 @@
+   const float* __restrict__ vc, float* __restrict__ att,
+   float* __restrict__ sc, float* __restrict__ pr, u32 c, u32 grp) {
+   const u32 h = blockIdx.x, dT = c & 31, pos = c >> 5, T = 1u << dT;
+-  // grp q heads share a kv head: 4 the 9B, 6 the 27B (tools/payload-27b.patch)
+-  const u32 g = (h / grp) * 256;
++  // grp q heads share a kv head: 4 the 9B, 6 the 27B (tools/payload-27b.patch);
++  // a cache slot holds the gridDim.x / grp kv heads: 1024 there, 512 the 0.8B's
++  // two (tools/payload-w1024.patch)
++  const u32 g = (h / grp) * 256, ks = (gridDim.x / grp) * 256;
+   const float scale = __fdiv_rn(1.0f, __fsqrt_rn(256.0f));
+   const float ninf = __uint_as_float(0xFF800000u);
+   float* sh = sc + (u64)h * (1u << 17);
+@@ -9049,7 +9053,7 @@
+     const u32 t = tb + (threadIdx.x >> 3);
+     float v = 0.0f;
+     if (t < n) {
+-      const float* k = kc + (u64)t * 1024 + g + sub * 32;
++      const float* k = kc + (u64)t * ks + g + sub * 32;
+       const float* qq = qs + sub * 32;
+       float st[6];
+       u32   sp = 0;
+@@ -9112,7 +9116,7 @@
+       float vv[16], pp[16];
+ #pragma unroll
+       for (u32 u = 0; u < 16; u++) {
+-        vv[u] = vc[(u64)(t0 + t + u) * 1024 + g + j];
++        vv[u] = vc[(u64)(t0 + t + u) * ks + g + j];
+         pp[u] = ph[t0 + t + u];
+       }
+ #pragma unroll
+@@ -9121,7 +9125,7 @@
+       }
+     }
+     for (; t < L; t++) {
+-      attn_push(st, &sp, t, __fmul_rn(vc[(u64)(t0 + t) * 1024 + g + j], ph[t0 + t]));
++      attn_push(st, &sp, t, __fmul_rn(vc[(u64)(t0 + t) * ks + g + j], ph[t0 + t]));
+     }
+     vq[pq][j] = st[0];
+   }
+@@ -9612,10 +9616,17 @@
+   // copied 2 or 3 times (lvh = 2 or 3 lkh); warp_q8_res depth 12 (8192 < f)
+   // and gpu_blk (f <= 17408); the o / ssm_out GEMVs read nh * hd = lvh * sd
+   // columns (the 9B, tools/payload-27b.patch the 27B)
+-  bool env = (dm == 4096 || dm == 5120) && df > 8192 && df <= 17408 && df % 32 == 0
++  // or the 0.8B (tools/payload-w1024.patch): d 1024, f 3584, GQA 4 on a 512 kv
++  // stride (2 kv heads; llb_attn4 takes the stride from its grid), lvh = lkh
++  // (l2norm_qk rep 1), the 8192 rms tree at n 1024, K-quant GEMVs at d 8 on
++  // kp_pair's one-quad body, the 3584-col down on the tile body (d 10) + vadd
++  bool env08 = dm == 1024 && df == 3584 && sh.hd == 256 && sh.sd == 128 && sh.nh == 4 * sh.nkv
++    && kv == 512 && lk == 2048 && sh.lvh == sh.lkh && qa == lv
++    && rg == dm / 32 * 34 && rd == df / 32 * 34;
++  bool env = ((dm == 4096 || dm == 5120) && df > 8192 && df <= 17408 && df % 32 == 0
+     && sh.hd == 256 && sh.sd == 128 && (sh.nh == 4 * sh.nkv || sh.nh == 6 * sh.nkv)
+     && kv == 1024 && lk == 2048 && (sh.lvh == 2 * sh.lkh || sh.lvh == 3 * sh.lkh) && qa == lv
+-    && rg == dm / 32 * 34 && rd == df / 32 * 34;
++    && rg == dm / 32 * 34 && rd == df / 32 * 34) || env08;
+   bool ok = env && fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+     && dT >= 1 && dT <= 17 && pos < (1u << dT) && k >= 1 && s + k <= 64
+     && term_tag(x) != TAG_ARR && term_tag(y) != TAG_ARR
+@@ -9632,7 +9643,7 @@
+       : (rwh >> 31 ? 2 : (rbh % 17 == 0));
+     u32      fme = (ewh >> 28 & 3) + ((ewh >> 31 & 1) << 2) + ((ewh >> 27 & 1) << 3);
+     ok = s == 0 && term_tag(eb) == TAG_STR && str_nar(qe) == 2
+-      && te && (fme == LLB_FM_Q8_0 || fme == LLB_FM_Q4_K) && rbe == LLB_FM_RB(fme, dm)
++      && te && (fme == LLB_FM_Q8_0 || fme == LLB_FM_Q4_K || (env08 && fme == LLB_FM_Q6_K)) && rbe == LLB_FM_RB(fme, dm)
+       && (u64)eat + rbe <= qe.len
+       && term_tag(hb) == TAG_STR && str_nar(qh) == 2
+       && (fmh == LLB_FM_Q8_0 || fmh == LLB_FM_Q4_K || fmh == LLB_FM_Q6_K || fmh == LLB_FM_Q5_K)
+@@ -9699,7 +9710,8 @@
+       ok = ok && (!(has >> f & 1) || (q8 >> f & 1 ? fm == LLB_FM_Q8_0 || kq || (!full && (f == 7 || f == 8) && fm == LLB_FM_F32) : fm == LLB_FM_F32));
+     }
+ #define PRB(f, c) ((u64)LLB_FM_RB(tw[i * 32 + 1 + (f)] >> 28, (u32)(c)))
+-    ok = ok && (tw[i * 32 + 5] >> 28 == LLB_FM_Q8_0 || df % 1024 == 0);
++    // the 0.8B's 3584-col down: 14 superblocks on the K-quant tile body (tools/payload-w1024.patch)
++    ok = ok && (tw[i * 32 + 5] >> 28 == LLB_FM_Q8_0 || df % 1024 == 0 || (env08 && df % 256 == 0));
+     // fbn: post, fg, fu, fd at Offs words 1..4
+     ok = ok && p[1] % 4 == 0 && ((u64)(base + p[2]) & 15) == 0
+       && ((u64)(base + p[3]) & 15) == 0 && ((u64)(base + p[4]) & 15) == 0
+@@ -10983,7 +10995,7 @@
+   __shared__ float a[33];
+   const u32 t = threadIdx.x;
+   float acc;
+-  if (n <= 4096) {
++  if (n <= 4096 && n != 1024) {
+     const u64 o = (u64)t * 4;
+     float v[4];
+     #pragma unroll
+@@ -10994,7 +11006,8 @@
+     acc = __fadd_rn(__fadd_rn(__fmul_rn(v[0], v[0]), __fmul_rn(v[1], v[1])),
+       __fadd_rn(__fmul_rn(v[2], v[2]), __fmul_rn(v[3], v[3])));
+   } else {
+-    // n 5120 (the 27B, tools/payload-27b.patch): the tree over 8192, +0 pad leaves
++    // n 5120 (the 27B, tools/payload-27b.patch) or 1024 (the 0.8B, tools/payload-w1024.patch):
++    // the tree over 8192, +0 pad leaves
+     float b[8];
+     #pragma unroll
+     for (u32 k = 0; k < 8; k++) {
+@@ -11084,8 +11097,9 @@
+     const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
+     const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
+     acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+-  } else if (n > 4096) {
+-    // n 5120 (the 27B, tools/payload-27b.patch): the tree over 8192, +0 pad leaves
++  } else if (n > 4096 || n == 1024) {
++    // n 5120 (the 27B, tools/payload-27b.patch) or 1024 (the 0.8B, tools/payload-w1024.patch):
++    // the tree over 8192, +0 pad leaves
+     float b[8];
+     #pragma unroll
+     for (u32 k = 0; k < 8; k++) {
+@@ -11274,6 +11288,26 @@
+   }
+ }
+ 
++// The folded step's Q6_K embedding row (the 0.8B's tied table; G33's
++// tools/payload-q6k2560.patch, tools/payload-w1024.patch here): ggml's
++// dequantize_row_q6_K (ggml-quants.c), one element a thread: w = (d * sc) * q,
++// q = (ql nibble | 2 qh bits << 4) - 32, the same f32 ops as q6k_w. Column
++// 128 n + 32 quad + l: ql[64 n + 32 (quad & 1) + l] >> (quad >= 2 ? 4 : 0),
++// qh[128 + 32 n + l] >> 2 quad, sc[192 + 8 n + 2 quad + l / 16], d at 208
++extern "C" __global__ void llb_embed6(const u8* __restrict__ row, u32 c,
++  float* __restrict__ y) {
++  u32 i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < c) {
++    const u8* B = row + (u64)(i >> 8) * 210;
++    u32 r = i & 255, n = r >> 7, rr = r & 127, quad = rr >> 5, l = rr & 31;
++    u32 ql = B[n * 64 + (quad & 1) * 32 + l], qh = B[128 + n * 32 + l];
++    u32 nsh = quad >= 2 ? 4u : 0u, qsh = 2 * quad;
++    int scv = (int)(signed char)B[192 + n * 8 + quad * 2 + (l >> 4)];
++    float ds = __fmul_rn(llb_f16(B[208] | B[209] << 8), (float)scv);
++    y[i] = __fmul_rn(ds, (float)(int)(((ql >> nsh) & 15) | (((qh >> qsh) & 3) << 4)) - 32.0f);
++  }
++}
++
+ // flat.bend's argmax twice over z[0 .. n), y := [v, i, w, j] (ids as exact
+ // F32), the head bang's tail (tools/payload-head.patch). K.amax.pick (the
+ // first NaN, else the first max) is the least by (not NaN, value, index), so
+@@ -12426,6 +12460,7 @@
+     || cuModuleGetFunction(&gpu_amaxp, gpu_lib, "llb_amax_part") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_embed, gpu_lib, "llb_embed") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_embedk, gpu_lib, "llb_embedk") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_embed6, gpu_lib, "llb_embed6") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mid, gpu_lib, "llb_mid32") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rnadd, gpu_lib, "llb_rmsnorm_add") != CUDA_SUCCESS

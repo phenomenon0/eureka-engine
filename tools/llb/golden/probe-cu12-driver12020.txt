@@ -1,0 +1,5 @@
+PASS GPU 0 of 1: FAKE (LLB_PROBE_FAKE, test only), compute 8.6, 24576 MiB, L2 6144 KiB (engine bag CUBE_LOG 6)
+PASS driver supports CUDA 12.2; this engine needs 12.2 or newer
+PASS compute capability 8.0 or newer (sm_80+)
+PASS concurrent managed memory access
+exit 0

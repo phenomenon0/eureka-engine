@@ -1,0 +1,294 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4923,6 +4923,7 @@
+ static CUfunction gpu_embed;
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
++static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpq2;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_blk;
+ static CUdeviceptr gpu_logit;
+@@ -7767,11 +7768,11 @@
+ template <u32 NV>
+ __device__ __forceinline__ void warp_dq_q8_split(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+-  u32* __restrict__ y, u32 n) {
++  u32* __restrict__ y, u32 n, u32 bx, u32 gx, const float* __restrict__ res) {
+   __shared__ float qs[2][4];
+   const u32 l = threadIdx.x & 31, w = threadIdx.x >> 5;
+   u32 par = 0;
+-  for (u32 r = blockIdx.x; r < n; r += gridDim.x, par ^= 1) {
++  for (u32 r = bx; r < n; r += gx, par ^= 1) {
+     const u8* row = W + (u64)r * rb;
+     float slot[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+     u32 occ = 0;
+@@ -7828,8 +7829,10 @@
+     }
+     __syncthreads();
+     if (threadIdx.x == 0) {
+-      y[r] = __float_as_uint(__fadd_rn(__fadd_rn(qs[par][0], qs[par][1]),
+-        __fadd_rn(qs[par][2], qs[par][3])));
++      float o = __fadd_rn(__fadd_rn(qs[par][0], qs[par][1]),
++        __fadd_rn(qs[par][2], qs[par][3]));
++      // fbn's residual (K.vadd x1 + dd) in the down GEMV's store
++      y[r] = __float_as_uint(res != nullptr ? __fadd_rn(res[r], o) : o);
+     }
+   }
+ }
+@@ -7838,16 +7841,32 @@
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+   if (d == 10 && n < 4 * gridDim.x) {
+-    warp_dq_q8_split<8>(W, rb, cg, x, y, n);
++    warp_dq_q8_split<8>(W, rb, cg, x, y, n, blockIdx.x, gridDim.x, nullptr);
+   } else if (d == 10) {
+     warp_dq_q8_rw<8>(W, rb, cg, x, y, n, d);
+   } else if (d == 12) {
+-    warp_dq_q8_split<32>(W, rb, cg, x, y, n);
++    warp_dq_q8_split<32>(W, rb, cg, x, y, n, blockIdx.x, gridDim.x, nullptr);
+   } else {
+     warp_dq_q8_rw<0>(W, rb, cg, x, y, n, d);
+   }
+ }
+ 
++// fbn's down GEMV with the residual add (tools/payload-fuse.patch): d = 12
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q8_res(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, const float* __restrict__ res) {
++  warp_dq_q8_split<32>(W, rb, cg, x, y, n, blockIdx.x, gridDim.x, res);
++}
++
++// two short d = 10 GEMVs over one x (linb's beta / alpha): half the grid each
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q8_two(
++  const u8* __restrict__ W0, const u8* __restrict__ W1, u32 rb, u32 cg,
++  const u32* __restrict__ x, u32* __restrict__ y0, u32* __restrict__ y1, u32 n) {
++  const u32 h = gridDim.x / 2, k = blockIdx.x >= h;
++  warp_dq_q8_split<8>(k ? W1 : W0, rb, cg, x, k ? y1 : y0, n, blockIdx.x - (k ? h : 0), h,
++    nullptr);
++}
++
+ extern "C" __global__ void __launch_bounds__(128) llb_warp_f16(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+@@ -9447,6 +9466,107 @@
+   }
+ }
+ 
++// Launch fusion (tools/payload-fuse.patch): each value keeps its ops and
++// their order; only the launches and the shared-memory levels change.
++// rms_tree: the halving strides st = 1 .. 16 as __shfl_down (lane t + st's
++// partial lands on t: the same low + high pairs), then the warp sums in a[]
++// through the same strides; the block total is returned to every thread.
++// One block of 32 nw threads, nw a power of 2 up to 32.
++__device__ __forceinline__ float rms_tree(float v, float* a, u32 t, u32 nw) {
++  #pragma unroll
++  for (u32 st = 1; st < 32; st <<= 1) {
++    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, st));
++  }
++  if ((t & 31) == 0) {
++    a[t >> 5] = v;
++  }
++  __syncthreads();
++  if (t < 32) {
++    v = t < nw ? a[t] : 0.0f;
++    for (u32 st = 1; st < nw; st <<= 1) {
++      v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, st));
++    }
++    if (t == 0) {
++      a[32] = v;
++    }
++  }
++  __syncthreads();
++  return a[32];
++}
++
++// fbn's head: x1 := x + z (K.vadd), then llb_rmsnorm over x1 (n = 4096)
++extern "C" __global__ void __launch_bounds__(1024) llb_rmsnorm_add(
++  const float* __restrict__ x, const float* __restrict__ z,
++  const float* __restrict__ w, float* __restrict__ x1, float* __restrict__ y,
++  u32 n) {
++  __shared__ float a[33];
++  const u32 t = threadIdx.x;
++  const u64 o = (u64)t * 4;
++  float v[4];
++  #pragma unroll
++  for (u32 k = 0; k < 4; k++) {
++    v[k] = __fadd_rn(x[o + k], z[o + k]);
++    x1[o + k] = v[k];
++  }
++  const float acc = __fadd_rn(__fadd_rn(__fmul_rn(v[0], v[0]), __fmul_rn(v[1], v[1])),
++    __fadd_rn(__fmul_rn(v[2], v[2]), __fmul_rn(v[3], v[3])));
++  const float sum = rms_tree(acc, a, t, 32);
++  const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
++    __uint_as_float(0x358637BDu))));
++  for (u32 i = t; i < n; i += 1024) {
++    y[i] = __fmul_rn(__fmul_rn(__fadd_rn(x[i], z[i]), s), w[i]);
++  }
++}
++
++// linb's four l2norms as one launch: q (scale sq) and k (scale 1) heads of
++// 128 from cnv / cnvk, each written to dst and its copy dst + 2048
++extern "C" __global__ void __launch_bounds__(64) llb_l2norm_qk(
++  const float* __restrict__ vq, const float* __restrict__ vk,
++  float* __restrict__ yq, float* __restrict__ yk, float sq, u32 heads) {
++  __shared__ float a[33];
++  const u32 kq = blockIdx.x >= heads, h = blockIdx.x - (kq ? heads : 0);
++  const u32 t = threadIdx.x;
++  const float sc = kq ? 1.0f : sq;
++  const float2 x = ((const float2*)((kq ? vk : vq) + ((u64)h << 7)))[t];
++  const float sum = rms_tree(__fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y)),
++    a, t, 2);
++  const float rt = __fsqrt_rn(sum);
++  const float ep = __uint_as_float(0x358637BDu);
++  const float s = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
++  const float2 r = make_float2(__fmul_rn(x.x, s), __fmul_rn(x.y, s));
++  float* y = (kq ? yk : yq) + ((u64)h << 7);
++  ((float2*)y)[t] = r;
++  ((float2*)(y + 2048))[t] = r;
++}
++
++// linb's mid32 (block 0) beside conv1d (blocks 1 ..): independent inputs
++extern "C" __global__ void __launch_bounds__(256) llb_midconv(
++  const float* __restrict__ bpre, const float* __restrict__ apre,
++  const float* __restrict__ dtp, const float* __restrict__ sap,
++  float* __restrict__ beta, float* __restrict__ dec, u32 nm,
++  const float* __restrict__ w, const float* __restrict__ x,
++  const float* __restrict__ h0, const float* __restrict__ h1,
++  const float* __restrict__ h2, float* __restrict__ y, u32 nch) {
++  if (blockIdx.x == 0) {
++    const u32 i = threadIdx.x;
++    if (i < nm) {
++      const float b = bpre[i];
++      beta[i] = __fdiv_rn(1.0f, __fadd_rn(1.0f, attn_exp(-b)));
++      const float gp = __fmul_rn(mid_sp(__fadd_rn(apre[i], dtp[i])), sap[i]);
++      dec[i] = attn_exp(gp);
++    }
++    return;
++  }
++  const u32 c = (blockIdx.x - 1) * 256 + threadIdx.x;
++  if (c >= nch) {
++    return;
++  }
++  const float a = __fadd_rn(__fmul_rn(h0[c], w[4 * c]), __fmul_rn(h1[c], w[4 * c + 1]));
++  const float b = __fadd_rn(__fmul_rn(h2[c], w[4 * c + 2]), __fmul_rn(x[c], w[4 * c + 3]));
++  const float u = __fadd_rn(a, b);
++  y[c] = __fdiv_rn(u, __fadd_rn(1.0f, attn_exp(-u)));
++}
++
+ // K.rms_norm over n = 2^d (d = 11 or 12): s = 1 / sqrt(sumsq / n + eps),
+ // h = (x * s) * w. sumsq is the balanced tree of x*x: a balanced local tree
+ // over the n / 1024 elements a thread owns, then the shared halving strides --
+@@ -9467,20 +9587,10 @@
+   } else {
+     acc = __fadd_rn(__fmul_rn(xp[0], xp[0]), __fmul_rn(xp[1], xp[1]));
+   }
+-  a[t] = acc;
+-  __syncthreads();
+-  for (u32 st = 1; st < 1024; st <<= 1) {
+-    if ((t & (2 * st - 1)) == 0) {
+-      a[t] = __fadd_rn(a[t], a[t + st]);
+-    }
+-    __syncthreads();
+-  }
+-  if (t == 0) {
+-    sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], (float)n),
+-      __uint_as_float(0x358637BDu))));
+-  }
+-  __syncthreads();
+-  const float s = sv;
++  // the strides as rms_tree's shuffles (tools/payload-fuse.patch)
++  const float sum = rms_tree(acc, a, t, 32);
++  const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
++    __uint_as_float(0x358637BDu))));
+   for (u32 i = t; i < n; i += 1024) {
+     y[i] = __fmul_rn(__fmul_rn(x[i], s), w[i]);
+   }
+@@ -10172,6 +10282,11 @@
+     || cuModuleGetFunction(&gpu_embed, gpu_lib, "llb_embed") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mid, gpu_lib, "llb_mid32") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_rnadd, gpu_lib, "llb_rmsnorm_add") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_l2qk, gpu_lib, "llb_l2norm_qk") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_midconv, gpu_lib, "llb_midconv") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpqr, gpu_lib, "llb_warp_q8_res") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_q8_two") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_blk, 49152 * 4) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+@@ -10259,16 +10374,13 @@
+   CUdeviceptr aab = uub + 12288 * 4, ddb = aab + 12288 * 4;
+   u32 n4 = 4096, ngu = 12288, dgu = 10, dfd = 12;
+   u32 siluG = (12288 + 255) / 256, vaddG = (4096 + 1023) / 1024;
+-  void* x1_[] = { &xp17, &ap17, &x1b, &n4 };
+-  void* rb17[] = { &x1b, &postp17, &h2b, &n4 };
++  void* rb17[] = { &xp17, &ap17, &postp17, &x1b, &h2b, &n4 };
+   void* gg17[] = { &fgp17, &rg17, &cgu, &h2b, &ggb, &ngu, &dgu };
+   void* uu17[] = { &fup17, &rg17, &cgu, &h2b, &uub, &ngu, &dgu };
+   void* ss17[] = { &ggb, &uub, &aab, &ngu };
+-  void* dd17[] = { &fdp17, &rd17, &cgd, &aab, &ddb, &n4, &dfd };
+-  void* vv17[] = { &x1b, &ddb, &yp, &n4 };
+-  if (cuLaunchKernel(gpu_vadd, vaddG, 1, 1, 1024, 1, 1, 0, NULL, x1_, NULL)
+-    != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, rb17, NULL)
++  void* dd17[] = { &fdp17, &rd17, &cgd, &aab, &yp, &n4, &x1b };
++  (void)dfd; (void)ddb; (void)vaddG;
++  if (cuLaunchKernel(gpu_rnadd, 1, 1, 1, 1024, 1, 1, 0, NULL, rb17, NULL)
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, gg17, NULL)
+       != CUDA_SUCCESS
+@@ -10276,9 +10388,7 @@
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_silu, siluG, 1, 1, 256, 1, 1, 0, NULL, ss17, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, dd17, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_vadd, vaddG, 1, 1, 1024, 1, 1, 0, NULL, vv17, NULL)
++    || cuLaunchKernel(gpu_warpqr, grid, 1, 1, 128, 1, 1, 0, NULL, dd17, NULL)
+       != CUDA_SUCCESS) {
+     err_fail("device launch failed");
+   }
+@@ -10308,14 +10418,11 @@
+   void* r18[] = { &xp18, &anp18, &hb18, &n4 };
+   void* q18[] = { &wqkvp18, &rg18, &cg18, &hb18, &qkvp18, &n8192, &d10 };
+   void* z18[] = { &gtp, &rg18, &cg18, &hb18, &zz, &n4, &d10 };
+-  void* b18[] = { &bop, &rg18, &cg18, &hb18, &bpre, &n32, &d10 };
+-  void* a18[] = { &aop, &rg18, &cg18, &hb18, &apre, &n32, &d10 };
+-  void* m18[] = { &bpre, &apre, &dtp, &sap, &beta, &dec, &n32 };
+-  void* c18[] = { &cvp, &qkvp18, &h0p, &h1p, &h2p, &cnv, &n8192 };
+-  void* l18q[] = { &cnv, &qt, &sq.f, &hs16 };
+-  void* l18q2[] = { &cnv, &qt2, &sq.f, &hs16 };
+-  void* l18k[] = { &cnvk, &kt, &one.f, &hs16 };
+-  void* l18k2[] = { &cnvk, &kt2, &one.f, &hs16 };
++  void* ba18[] = { &bop, &aop, &rg18, &cg18, &hb18, &bpre, &apre, &n32 };
++  void* mc18[] = { &bpre, &apre, &dtp, &sap, &beta, &dec, &n32,
++    &cvp, &qkvp18, &h0p, &h1p, &h2p, &cnv, &n8192 };
++  void* l18[] = { &cnv, &cnvk, &qt, &kt, &sq.f, &hs16 };
++  (void)qt2; (void)kt2; (void)one;
+   void* g18[] = { &Sp, &qt, &kt, &vn, &dec, &beta, &gout, &hs32 };
+   void* n18[] = { &gout, &snp, &zz, &normed, &hs32 };
+   void* o18[] = { &sop, &rg18, &cg18, &normed, &yp, &n4, &d10 };
+@@ -10325,21 +10432,11 @@
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, z18, NULL)
+     != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, b18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, a18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_mid, 1, 1, 1, 32, 1, 1, 0, NULL, m18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_conv, gconv, 1, 1, 256, 1, 1, 0, NULL, c18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18q, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18q2, NULL)
++    || cuLaunchKernel(gpu_warpq2, 2 * n32, 1, 1, 128, 1, 1, 0, NULL, ba18, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18k, NULL)
++    || cuLaunchKernel(gpu_midconv, 1 + gconv, 1, 1, 256, 1, 1, 0, NULL, mc18, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18k2, NULL)
++    || cuLaunchKernel(gpu_l2qk, 2 * hs16, 1, 1, 64, 1, 1, 0, NULL, l18, NULL)
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_gdl, hs32, 32, 1, 128, 1, 1, 0, NULL, g18, NULL)
+       != CUDA_SUCCESS

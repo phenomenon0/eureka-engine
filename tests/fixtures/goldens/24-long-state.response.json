@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"outage":{"type":"noul","noul":0.9719528991957445},"route":{"type":"choice","choice":"technical","probabilities":{"billing":0.00860660274608364,"sales":0.009824231945911541,"technical":0.9815691653080048},"confidence":0.9723537479620071}},"usage":{"input_tokens":3020,"output_tokens":0}}

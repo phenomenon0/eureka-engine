@@ -1,0 +1,5 @@
+usage: llb tok enc MODEL [TEXT]
+       llb tok dec MODEL [IDS]
+
+Text to token ids and back (stdin if TEXT or IDS is absent).
+exit 0

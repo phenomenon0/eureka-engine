@@ -1,0 +1,132 @@
+{
+ "_": "G41: every input of the Linux Kokoro pack, pinned by sha256 (the same pins as the app's scripts/fetch-voice.sh, VOICESHOP). kokoro_tts.py fetch reads this. models: fp32 = the Linux default (G41: int8 is ~9x slower on x86 CPU), int8 = the phone's.",
+ "files": [
+  {
+   "file": "us_gold.json",
+   "url": "https://raw.githubusercontent.com/hexgrad/misaki/fba1236595f2d2bf21d414ba6e57d25256afada3/misaki/data/us_gold.json",
+   "sha256": "dc414872a49a28ae6c141463d502fd945f3b2fde040484fdc47d00cc4612686f"
+  },
+  {
+   "file": "us_silver.json",
+   "url": "https://raw.githubusercontent.com/hexgrad/misaki/fba1236595f2d2bf21d414ba6e57d25256afada3/misaki/data/us_silver.json",
+   "sha256": "de8f67be911bb6c659187b4a65fd966b6a30e56350e0f790d763210b053ac475"
+  },
+  {
+   "file": "gb_gold.json",
+   "url": "https://raw.githubusercontent.com/hexgrad/misaki/fba1236595f2d2bf21d414ba6e57d25256afada3/misaki/data/gb_gold.json",
+   "sha256": "29e62f4b60261c88f7f3c2c7811ca3825978948090b72d2b27d565b729282f71"
+  },
+  {
+   "file": "gb_silver.json",
+   "url": "https://raw.githubusercontent.com/hexgrad/misaki/fba1236595f2d2bf21d414ba6e57d25256afada3/misaki/data/gb_silver.json",
+   "sha256": "48131e2d92ccc41655f4543e87e0f938e71463eb5a54be7f0693bb712ebb6bce"
+  },
+  {
+   "file": "LICENSE-misaki",
+   "url": "https://raw.githubusercontent.com/hexgrad/misaki/fba1236595f2d2bf21d414ba6e57d25256afada3/LICENSE",
+   "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  }
+ ],
+ "config": {
+  "url": "https://huggingface.co/hexgrad/Kokoro-82M/resolve/f3ff3571791e39611d31c381e3a41a3af07b4987/config.json",
+  "sha256": "5abb01e2403b072bf03d04fde160443e209d7a0dad49a423be15196b9b43c17f"
+ },
+ "bundled": {
+  "revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+  "base": "https://huggingface.co/hexgrad/Kokoro-82M/resolve/f3ff3571791e39611d31c381e3a41a3af07b4987",
+  "house_voice": "af_bella",
+  "voices": [
+   {
+    "id": "af_bella",
+    "name": "Bella",
+    "lang": "en-us",
+    "gender": "female",
+    "grade": "A-",
+    "pt_sha256": "8cb64e02fcc8de0327a8e13817e49c76c945ecf0052ceac97d3081480e8e48d6",
+    "detail": "The house voice (owner's pick) · target quality A · 10+ hours"
+   },
+   {
+    "id": "af_heart",
+    "name": "Heart",
+    "lang": "en-us",
+    "gender": "female",
+    "grade": "A",
+    "pt_sha256": "0ab5709b8ffab19bfd849cd11d98f75b60af7733253ad0d67b12382a102cb4ff",
+    "detail": "Kokoro's flagship voice (grade A)"
+   },
+   {
+    "id": "am_michael",
+    "name": "Michael",
+    "lang": "en-us",
+    "gender": "male",
+    "grade": "C+",
+    "pt_sha256": "9a443b79a4b22489a5b0ab7c651a0bcd1a30bef675c28333f06971abbd47bd37",
+    "detail": "Top-graded American male · hours of audio"
+   },
+   {
+    "id": "af_nicole",
+    "name": "Nicole",
+    "lang": "en-us",
+    "gender": "female",
+    "grade": "B-",
+    "pt_sha256": "c5561808bcf5250fe8c5f5de32caf2d94f27e57e95befdb098c5c85991d4c5da",
+    "detail": "Soft, close-mic · 10+ hours"
+   },
+   {
+    "id": "bf_emma",
+    "name": "Emma",
+    "lang": "en-gb",
+    "gender": "female",
+    "grade": "B-",
+    "pt_sha256": "d0a423deabf4a52b4f49318c51742c54e21bb89bbbe9a12141e7758ddb5da701",
+    "detail": "The best British voice · 10+ hours"
+   },
+   {
+    "id": "am_fenrir",
+    "name": "Fenrir",
+    "lang": "en-us",
+    "gender": "male",
+    "grade": "C+",
+    "pt_sha256": "98e507eca1db08230ae3b6232d59c10aec9630022d19accac4f5d12fcec3c37a",
+    "detail": "Deeper American male · hours of audio"
+   },
+   {
+    "id": "am_puck",
+    "name": "Puck",
+    "lang": "en-us",
+    "gender": "male",
+    "grade": "C+",
+    "pt_sha256": "dd1d8973f4ce4b7d8ae407c77a435f485dabc052081b80ea75c4f30b84f36223",
+    "detail": "Brighter American male · hours of audio"
+   },
+   {
+    "id": "bm_george",
+    "name": "George",
+    "lang": "en-gb",
+    "gender": "male",
+    "grade": "C",
+    "pt_sha256": "f1bc812213dc59774769e5c80004b13eeb79bd78130b11b2d7f934542dab811b",
+    "detail": "British male · target quality B"
+   }
+  ]
+ },
+ "catalog": {
+  "revision": "b7c9d17c8a1eee90e38d49acfb093b390a98bcf1",
+  "url": "https://huggingface.co/jethrovic/bend-models/resolve/b7c9d17c8a1eee90e38d49acfb093b390a98bcf1/voices/catalog.json",
+  "sha256": "16ab7c678c6966ad1d0e86e1d7f53df17f4984d136316bded69c352f0b7b0f84"
+ },
+ "models": {
+  "fp32": {
+   "file": "kokoro-v1.0.onnx",
+   "url": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx",
+   "sha256": "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
+   "note": "Linux default: ~9x faster than int8 on x86 onnxruntime CPU (G41 bench)"
+  },
+  "int8": {
+   "file": "kokoro-v1.0.int8.onnx",
+   "url": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx",
+   "sha256": "6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb",
+   "note": "the phone's model (92 MB); slow on x86 onnxruntime CPU"
+  }
+ }
+}

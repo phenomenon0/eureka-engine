@@ -1,0 +1,6 @@
+PASS GPU 0 of 1: FAKE (LLB_PROBE_FAKE, test only), compute 8.6, 24576 MiB, L2 6144 KiB (engine bag CUBE_LOG 6)
+FAIL driver supports CUDA 12.2; this engine needs 13.0 (NVIDIA driver R580 or newer)
+     fix: update the NVIDIA driver to R580+, or use the cuda12 bundle (driver R535+)
+PASS compute capability 8.0 or newer (sm_80+)
+PASS concurrent managed memory access
+exit 1

@@ -1,0 +1,389 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4918,6 +4918,8 @@
+ static CUfunction gpu_q8x;
+ static CUfunction gpu_q4dpgu;
+ static CUfunction gpu_q4dpre;
++static CUfunction gpu_siluq, gpu_rnaddq, gpu_rnormq;
++static CUfunction gpu_q8x2, gpu_q4dp2gu, gpu_q4dp2re, gpu_q8dp2, gpu_q8dp2c, gpu_q6dp2;
+ static CUfunction gpu_warp3;
+ static CUfunction gpu_warp2;
+ static CUfunction gpu_warpq2;
+@@ -4949,6 +4951,7 @@
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_blk;
+ static CUdeviceptr gpu_q8b;
++static CUdeviceptr gpu_q8c;
+ static CUdeviceptr gpu_logit;
+ static CUdeviceptr gpu_headh;
+ static CUdeviceptr gpu_atts;
+@@ -10092,6 +10095,229 @@
+   q4dp_row<DpRes>(W, rb, rb / 144, qx, dx, y, blockIdx.x, x1);
+ }
+ 
++// ---- tools/payload-dp4b.patch: tools/q27c/q4dp2.cuh verbatim (K1 there) ----
++// The Q4_K dp4a tier, two int8 planes (tools/payload-dp4b.patch, LLB_Q4_DP4A=4):
++// llb_q8x / q4dp_sb's numerics with x's rounding error cut ~127x. Per block of
++// 32: d = amax / 127, q = round(x / d) clamped +-127, e = d / 127, q2 =
++// round(fma(-d, q, x) / e) clamped +-127 (|q2| <= 64 but for e's rounding), so
++// x = e (127 q + q2) to e / 2. qx[0, n) holds q, qx[n, 2n) q2, dx[n / 32] e (0
++// where d is; NaN for a block with an inf / NaN, q = q2 = 0). The dots merge
++// the planes as integers before the float combine (127 t + t2: |.| < 2^21, x sc
++// < 2^27), so the float ops are q4dp_sb's. CPU twin: tools/q27c/q4dp2_ref.h.
++extern "C" __global__ void __launch_bounds__(256) llb_q8x2(const float* __restrict__ x,
++  signed char* __restrict__ qx, float* __restrict__ dx, u32 n) {
++  const u32 i = blockIdx.x * 256 + threadIdx.x;
++  if (i >= n) return;
++  const float v = x[i];
++  float a = fabsf(v);
++  int nf = (__float_as_uint(v) & 0x7f800000u) == 0x7f800000u;
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
++  nf = __any_sync(0xffffffffu, nf);
++  const float d = __fdiv_rn(a, 127.0f), e = __fdiv_rn(d, 127.0f);
++  int q = 0, q2 = 0;
++  if (!nf && d != 0.0f) q = max(-127, min(127, (int)roundf(__fdiv_rn(v, d))));
++  if (!nf && e != 0.0f) q2 = max(-127, min(127, (int)roundf(__fdiv_rn(__fmaf_rn(-d, (float)q, v), e))));
++  qx[i] = (signed char)q;
++  qx[n + i] = (signed char)q2;
++  if ((threadIdx.x & 31) == 0) dx[i >> 5] = nf ? __uint_as_float(0x7fffffffu) : e;
++}
++
++// q4dp_sb on the two planes (n = x's length: plane 2 at qx + n)
++__device__ __forceinline__ float q4dp2_sb(const u8* __restrict__ B, const signed char* __restrict__ qx,
++  const float* __restrict__ dx, u32 n, u32 sb, u32 g, u32 k) {
++  const u32 dm = *(const u32*)B;
++  const unsigned short* s16 = (const unsigned short*)(B + 4);
++  u32 a0, a1;
++  if (g < 2) {
++    a0 = s16[g] & 0x3f3fu;
++    a1 = s16[g + 2] & 0x3f3fu;
++  } else {
++    a0 = ((s16[g + 2] >> 0) & 0x0f0fu) | ((s16[g - 2] & 0xc0c0u) >> 2);
++    a1 = ((s16[g + 2] >> 4) & 0x0f0fu) | ((s16[g] & 0xc0c0u) >> 2);
++  }
++  const int* q4 = (const int*)(B + 16 + 32 * g + 4 * k);
++  const int v0 = q4[0], v1 = q4[4];
++  const int l0 = v0 & 0x0F0F0F0F, l1 = v1 & 0x0F0F0F0F, h0 = (v0 >> 4) & 0x0F0F0F0F, h1 = (v1 >> 4) & 0x0F0F0F0F;
++  const u32 j0 = 8 * sb + 2 * g;
++  const int* u = (const int*)(qx + 32 * j0 + 4 * k);
++  const int* w = (const int*)(qx + n + 32 * j0 + 4 * k);
++  const int u00 = u[0], u01 = u[4], u10 = u[8], u11 = u[12];
++  const int w00 = w[0], w01 = w[4], w10 = w[8], w11 = w[12];
++  const float e0 = dx[j0], e1 = dx[j0 + 1];
++  const int t0 = 127 * __dp4a(l1, u01, __dp4a(l0, u00, 0)) + __dp4a(l1, w01, __dp4a(l0, w00, 0));
++  const int t1 = 127 * __dp4a(h1, u11, __dp4a(h0, u10, 0)) + __dp4a(h1, w11, __dp4a(h0, w10, 0));
++  const int s0 = 127 * __dp4a(0x01010101, u01, __dp4a(0x01010101, u00, 0)) + __dp4a(0x01010101, w01, __dp4a(0x01010101, w00, 0));
++  const int s1 = 127 * __dp4a(0x01010101, u11, __dp4a(0x01010101, u10, 0)) + __dp4a(0x01010101, w11, __dp4a(0x01010101, w10, 0));
++  float A = __fmul_rn(e0, (float)(t0 * (int)(a0 & 0xff)));
++  A = __fmaf_rn(e1, (float)(t1 * (int)(a0 >> 8)), A);
++  float M = __fmul_rn(e0, (float)(s0 * (int)(a1 & 0xff)));
++  M = __fmaf_rn(e1, (float)(s1 * (int)(a1 >> 8)), M);
++  return __fmaf_rn(q4dp_f16(dm), A, -__fmul_rn(q4dp_f16(dm >> 16), M));
++}
++
++// q4dp_row / llb_q4dp_gu / llb_q4dp_res on q4dp2_sb, the same thread map and order
++template <class EP>
++__device__ __forceinline__ void q4dp2_row(const u8* __restrict__ W, u32 rb, u32 nsb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, float* __restrict__ y, u32 r,
++  const float* __restrict__ e) {
++  __shared__ float part[3][32];
++  const u32 t = threadIdx.x, l = t & 31, w = t >> 5, g = (t >> 2) & 3, k = t & 3, n = 256 * nsb;
++  const u8* row = W + (u64)r * rb;
++  float acc = 0.0f;
++  for (u32 sb = t >> 4; sb < nsb; sb += 8) acc = __fadd_rn(acc, q4dp2_sb(row + 144 * sb, qx, dx, n, sb, g, k));
++  if (w > 0) part[w - 1][l] = acc;
++  __syncthreads();
++  if (w > 0) return;
++  acc = __fadd_rn(acc, part[0][l]);
++  acc = __fadd_rn(acc, part[1][l]);
++  acc = __fadd_rn(acc, part[2][l]);
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, m));
++  if (l == 0) y[r] = EP::st(e, r, acc);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_q4dp2(const u8* __restrict__ W, u32 rb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, float* __restrict__ y, u32 n) {
++  q4dp2_row<DpPlain>(W, rb, rb / 144, qx, dx, y, blockIdx.x, nullptr);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_q4dp2_gu(const u8* __restrict__ Wg,
++  const u8* __restrict__ Wu, u32 rb, const signed char* __restrict__ qx, const float* __restrict__ dx,
++  float* __restrict__ yg, float* __restrict__ yu, u32 n) {
++  __shared__ float part[2][3][32];
++  const u32 t = threadIdx.x, l = t & 31, w = t >> 5, g = (t >> 2) & 3, k = t & 3, nsb = rb / 144, r = blockIdx.x;
++  const u32 nx = 256 * nsb;
++  const u8* rg = Wg + (u64)r * rb;
++  const u8* ru = Wu + (u64)r * rb;
++  float ag = 0.0f, au = 0.0f;
++  for (u32 sb = t >> 4; sb < nsb; sb += 8) {
++    ag = __fadd_rn(ag, q4dp2_sb(rg + 144 * sb, qx, dx, nx, sb, g, k));
++    au = __fadd_rn(au, q4dp2_sb(ru + 144 * sb, qx, dx, nx, sb, g, k));
++  }
++  if (w > 0) {
++    part[0][w - 1][l] = ag;
++    part[1][w - 1][l] = au;
++  }
++  __syncthreads();
++  if (w > 0) return;
++  #pragma unroll
++  for (u32 i = 0; i < 3; i++) {
++    ag = __fadd_rn(ag, part[0][i][l]);
++    au = __fadd_rn(au, part[1][i][l]);
++  }
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) {
++    ag = __fadd_rn(ag, __shfl_xor_sync(0xffffffffu, ag, m));
++    au = __fadd_rn(au, __shfl_xor_sync(0xffffffffu, au, m));
++  }
++  if (l == 0) {
++    yg[r] = ag;
++    yu[r] = au;
++  }
++}
++extern "C" __global__ void __launch_bounds__(128) llb_q4dp2_res(const u8* __restrict__ W, u32 rb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, float* __restrict__ y, u32 n,
++  const float* __restrict__ x1) {
++  q4dp2_row<DpRes>(W, rb, rb / 144, qx, dx, y, blockIdx.x, x1);
++}
++// The Q8_0 dp4a tier on q4dp2.cuh's two planes (tools/payload-dp4b.patch, LLB_Q4_DP4A
++// bit 16): llama.cpp's vec_dot_q8_0_q8_1 on x = e (127 q + q2). A repacked Q8_0 row
++// (rb bytes) is c int8 weights, then c / 32 f16 scales; one row a block of 128:
++// thread t takes the 16 weights at 2048 i + 16 t (i = 0, 1, ..) against both
++// planes' 16, s = w's f16, e = dx's of that block:
++//   acc = fma(s * e, (float)(127 dot(w, q) + dot(w, q2)), acc)    (|.| < 2^26)
++// then q4dp2_row's order: warps 1..3 into warp 0, the xor butterfly 16 .. 1.
++// Needs c % 256 == 0 (rb % 16 == 0). CPU twin: tools/q27c/q4dp2_ref.h ref_q8row2.
++__device__ __forceinline__ float q8dp2_rowsum(const u8* __restrict__ row, u32 c,
++  const signed char* __restrict__ qx, const float* __restrict__ dx) {
++  __shared__ float part[3][32];
++  const u32 t = threadIdx.x, l = t & 31, w = t >> 5;
++  float acc = 0.0f;
++  for (u32 o = 16 * t; o < c; o += 2048) {
++    const int4 wv = *(const int4*)(row + o);
++    const int4 u = *(const int4*)(qx + o);
++    const int4 v = *(const int4*)(qx + c + o);
++    const int a = __dp4a(wv.w, u.w, __dp4a(wv.z, u.z, __dp4a(wv.y, u.y, __dp4a(wv.x, u.x, 0))));
++    const int b = __dp4a(wv.w, v.w, __dp4a(wv.z, v.z, __dp4a(wv.y, v.y, __dp4a(wv.x, v.x, 0))));
++    const float s = llb_f16(*(const unsigned short*)(row + c + 2 * (o >> 5)));
++    acc = __fmaf_rn(__fmul_rn(s, dx[o >> 5]), (float)(127 * a + b), acc);
++  }
++  if (w > 0) part[w - 1][l] = acc;
++  __syncthreads();
++  if (w > 0) return 0.0f;
++  acc = __fadd_rn(acc, part[0][l]);
++  acc = __fadd_rn(acc, part[1][l]);
++  acc = __fadd_rn(acc, part[2][l]);
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, m));
++  return acc;
++}
++// y = W x (n rows of c = (rb / 17) * 16 cols), grid n
++extern "C" __global__ void __launch_bounds__(128) llb_q8dp2(const u8* __restrict__ W, u32 rb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, float* __restrict__ y, u32 n) {
++  const u32 r = blockIdx.x;
++  const float a = q8dp2_rowsum(W + (u64)r * rb, rb / 17 * 16, qx, dx);
++  if (threadIdx.x == 0) y[r] = a;
++}
++// llb_warp_q8_cat's members over one x, grid c.end[3]: block r is member k's row r - end[k - 1]
++extern "C" __global__ void __launch_bounds__(128) llb_q8dp2_cat(u32 rb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, Q8Cat cc) {
++  const u32 r = blockIdx.x, k = (r >= cc.end[0]) + (r >= cc.end[1]) + (r >= cc.end[2]);
++  // selects, not cc.W[k]: a dynamic index into the by-value param spills it to local memory
++  const u32 i = r - (k == 0 ? 0 : k == 1 ? cc.end[0] : k == 2 ? cc.end[1] : cc.end[2]);
++  const u8* W = k == 0 ? cc.W[0] : k == 1 ? cc.W[1] : k == 2 ? cc.W[2] : cc.W[3];
++  const float a = q8dp2_rowsum(W + (u64)i * rb, rb / 17 * 16, qx, dx);
++  u32* y = k == 0 ? cc.y[0] : k == 1 ? cc.y[1] : k == 2 ? cc.y[2] : cc.y[3];
++  if (threadIdx.x == 0) y[i] = __float_as_uint(a);
++}
++// The Q6_K dp4a tier on q4dp2.cuh's two planes (tools/payload-dp4b.patch,
++// LLB_Q4_DP4A bit 32): llama.cpp's vec_dot_q6_K_q8_1 on x = e (127 q + q2).
++// A row is c / 256 ggml block_q6_K's (210 bytes: ql 128, qh 64, sc 16, d f16;
++// 2-byte aligned, so 16-bit loads). Unit u = (superblock u / 8, half n, cols l..l+7,
++// l = 8 (u & 3)) is 24 bytes: ql[64 n + l] (quads 0 / 2), ql[64 n + 32 + l]
++// (1 / 3), qh[32 n + l]; quad q's 8 weights (q6 - 32) sit at col 256 b + 128 n +
++// 32 q + l against x block 8 b + 4 n + q (e) and its scale sc[8 n + 2 q + l / 16]:
++//   acc = fma((d * sc) * e, (float)(127 dot(w, q) + dot(w, q2)), acc)   (|.| < 2^24)
++// quads 0..3 in order; lane j takes units j, j + 32, ..; one warp a row (4 a
++// block of 128), the xor butterfly 16 .. 1. Needs c % 256 == 0. Twin: q4dp2_ref.h ref_q6row2.
++__device__ __forceinline__ u32 q6dp2_w4(const u8* __restrict__ p) {
++  return (u32)*(const unsigned short*)p | (u32)*(const unsigned short*)(p + 2) << 16;
++}
++extern "C" __global__ void __launch_bounds__(128) llb_q6dp2(const u8* __restrict__ W, u32 rb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, float* __restrict__ y, u32 n) {
++  const u32 r = blockIdx.x * 4 + (threadIdx.x >> 5), l32 = threadIdx.x & 31;
++  if (r >= n) return;
++  const u32 c = rb / 210 * 256, nu = c / 32;
++  const u8* row = W + (u64)r * rb;
++  float acc = 0.0f;
++  for (u32 u = l32; u < nu; u += 32) {
++    const u32 b = u >> 3, hn = (u >> 2) & 1, l = 8 * (u & 3);
++    const u8* B = row + 210 * b;
++    const u32 La[2] = { q6dp2_w4(B + 64 * hn + l), q6dp2_w4(B + 64 * hn + l + 4) };
++    const u32 Lb[2] = { q6dp2_w4(B + 64 * hn + 32 + l), q6dp2_w4(B + 64 * hn + 32 + l + 4) };
++    const u32 H[2] = { q6dp2_w4(B + 128 + 32 * hn + l), q6dp2_w4(B + 128 + 32 * hn + l + 4) };
++    const float d = llb_f16(*(const unsigned short*)(B + 208));
++    #pragma unroll
++    for (u32 q = 0; q < 4; q++) {
++      const u32 xb = 8 * b + 4 * hn + q;
++      const int2 xa = *(const int2*)(qx + 32 * xb + l), xc = *(const int2*)(qx + c + 32 * xb + l);
++      int a = 0, s2 = 0;
++      #pragma unroll
++      for (u32 k = 0; k < 2; k++) {
++        const u32 L = q & 1 ? Lb[k] : La[k];
++        const u32 v = ((q >= 2 ? L >> 4 : L) & 0x0f0f0f0fu) | ((H[k] >> (2 * q)) & 0x03030303u) << 4;
++        const int w = (int)__vsub4(v, 0x20202020u);
++        a = __dp4a(w, k ? xa.y : xa.x, a);
++        s2 = __dp4a(w, k ? xc.y : xc.x, s2);
++      }
++      const float sc = (float)(signed char)B[192 + 8 * hn + 2 * q + (l >> 4)];
++      acc = __fmaf_rn(__fmul_rn(__fmul_rn(d, sc), dx[xb]), (float)(127 * a + s2), acc);
++    }
++  }
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, m));
++  if (l32 == 0) y[r] = acc;
++}
++
+ // Qwen2.5 qk-norm (tools/qknorm.patch): per-head RMSNorm on v[rows][128] with
+ // gain g[128]. For each row r: s = 1 / sqrt(sumsq / 128 + eps), sumsq the
+ // balanced tree of v * v over 128 elements (64 pairs, then halves up in shared
+@@ -10465,6 +10691,114 @@
+   }
+ }
+ 
++// Lever 3 (LLB_Q4_DP4A=9, bit 64): llb_q8x2 fused into its producer's store.
++// Each warp stores 32 consecutive elements (all lanes active: n % 256 == 0, a
++// strided loop warp-uniform), so a block of 32's amax is the warp's; q / q2 /
++// e are llb_q8x2's ops on the same float (byte-identical planes).
++__device__ __forceinline__ void q8x2_st(float v, signed char* __restrict__ qx,
++  float* __restrict__ dx, u32 n, u32 i) {
++  float a = fabsf(v);
++  int nf = (__float_as_uint(v) & 0x7f800000u) == 0x7f800000u;
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
++  nf = __any_sync(0xffffffffu, nf);
++  const float d = __fdiv_rn(a, 127.0f), e = __fdiv_rn(d, 127.0f);
++  int q = 0, q2 = 0;
++  if (!nf && d != 0.0f) q = max(-127, min(127, (int)roundf(__fdiv_rn(v, d))));
++  if (!nf && e != 0.0f) q2 = max(-127, min(127, (int)roundf(__fdiv_rn(__fmaf_rn(-d, (float)q, v), e))));
++  qx[i] = (signed char)q;
++  qx[n + i] = (signed char)q2;
++  if ((i & 31) == 0) dx[i >> 5] = nf ? __uint_as_float(0x7fffffffu) : e;
++}
++
++// llb_silu + q8x2 (n % 256 == 0)
++extern "C" __global__ void __launch_bounds__(256) llb_silu_q8x2(
++  const float* __restrict__ g, const float* __restrict__ u,
++  float* __restrict__ a, u32 n, signed char* __restrict__ qx, float* __restrict__ dx) {
++  const u32 i = blockIdx.x * 256 + threadIdx.x;
++  const float v = g[i];
++  const float r = __fmul_rn(__fdiv_rn(v, __fadd_rn(1.0f, attn_exp(-v))), u[i]);
++  a[i] = r;
++  q8x2_st(r, qx, dx, n, i);
++}
++
++// llb_rmsnorm_add + q8x2 (n % 256 == 0): llb_rmsnorm_add's ops, the store quantized
++extern "C" __global__ void __launch_bounds__(1024) llb_rmsnorm_add_q8x2(
++  const float* __restrict__ x, const float* __restrict__ z,
++  const float* __restrict__ w, float* __restrict__ x1, float* __restrict__ y,
++  u32 n, signed char* __restrict__ qx, float* __restrict__ dx) {
++  __shared__ float a[33];
++  const u32 t = threadIdx.x;
++  float acc;
++  if (n <= 4096) {
++    const u64 o = (u64)t * 4;
++    float v[4];
++    #pragma unroll
++    for (u32 k = 0; k < 4; k++) {
++      v[k] = __fadd_rn(x[o + k], z[o + k]);
++      x1[o + k] = v[k];
++    }
++    acc = __fadd_rn(__fadd_rn(__fmul_rn(v[0], v[0]), __fmul_rn(v[1], v[1])),
++      __fadd_rn(__fmul_rn(v[2], v[2]), __fmul_rn(v[3], v[3])));
++  } else {
++    float b[8];
++    #pragma unroll
++    for (u32 k = 0; k < 8; k++) {
++      const u64 i = (u64)t * 8 + k;
++      const float v = i < n ? __fadd_rn(x[i], z[i]) : 0.0f;
++      if (i < n) {
++        x1[i] = v;
++      }
++      b[k] = i < n ? __fmul_rn(v, v) : 0.0f;
++    }
++    acc = __fadd_rn(__fadd_rn(__fadd_rn(b[0], b[1]), __fadd_rn(b[2], b[3])),
++      __fadd_rn(__fadd_rn(b[4], b[5]), __fadd_rn(b[6], b[7])));
++  }
++  const float sum = rms_tree(acc, a, t, 32);
++  const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
++    __uint_as_float(0x358637BDu))));
++  for (u32 i = t; i < n; i += 1024) {
++    const float r = __fmul_rn(__fmul_rn(__fadd_rn(x[i], z[i]), s), w[i]);
++    y[i] = r;
++    q8x2_st(r, qx, dx, n, i);
++  }
++}
++
++// llb_rmsnorm + q8x2 (n % 256 == 0): llb_rmsnorm's ops, the store quantized
++extern "C" __global__ void __launch_bounds__(1024) llb_rmsnorm_q8x2(
++  const float* __restrict__ x, const float* __restrict__ w,
++  float* __restrict__ y, u32 n, signed char* __restrict__ qx, float* __restrict__ dx) {
++  __shared__ float a[1024];
++  const u32 t = threadIdx.x;
++  const u32 q = n >> 10;
++  const float* xp = x + (u64)t * q;
++  float acc;
++  if (q == 4) {
++    const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
++    const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
++    acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
++  } else if (n > 4096) {
++    float b[8];
++    #pragma unroll
++    for (u32 k = 0; k < 8; k++) {
++      const u64 i = (u64)t * 8 + k;
++      b[k] = i < n ? __fmul_rn(x[i], x[i]) : 0.0f;
++    }
++    acc = __fadd_rn(__fadd_rn(__fadd_rn(b[0], b[1]), __fadd_rn(b[2], b[3])),
++      __fadd_rn(__fadd_rn(b[4], b[5]), __fadd_rn(b[6], b[7])));
++  } else {
++    acc = __fadd_rn(__fmul_rn(xp[0], xp[0]), __fmul_rn(xp[1], xp[1]));
++  }
++  const float sum = rms_tree(acc, a, t, 32);
++  const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
++    __uint_as_float(0x358637BDu))));
++  for (u32 i = t; i < n; i += 1024) {
++    const float r = __fmul_rn(__fmul_rn(x[i], s), w[i]);
++    y[i] = r;
++    q8x2_st(r, qx, dx, n, i);
++  }
++}
++
+ // K.vadd / K.vmul (tools/payload-vadd.patch): pure elementwise maps, so the
+ // flat index kernel reproduces their tree leaf for leaf.
+ extern "C" __global__ void llb_vadd(const float* __restrict__ x,
+@@ -11150,6 +11484,15 @@
+     || cuModuleGetFunction(&gpu_q8x, gpu_lib, "llb_q8x") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_q4dpgu, gpu_lib, "llb_q4dp_gu") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_q4dpre, gpu_lib, "llb_q4dp_res") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_q8x2, gpu_lib, "llb_q8x2") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_siluq, gpu_lib, "llb_silu_q8x2") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_rnaddq, gpu_lib, "llb_rmsnorm_add_q8x2") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_rnormq, gpu_lib, "llb_rmsnorm_q8x2") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_q4dp2gu, gpu_lib, "llb_q4dp2_gu") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_q4dp2re, gpu_lib, "llb_q4dp2_res") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_q8dp2, gpu_lib, "llb_q8dp2") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_q8dp2c, gpu_lib, "llb_q8dp2_cat") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_q6dp2, gpu_lib, "llb_q6dp2") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp3, gpu_lib, "llb_warp_q3k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp2, gpu_lib, "llb_warp_q2_0") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_pq2_0") != CUDA_SUCCESS
+@@ -11192,6 +11535,8 @@
+     || cuMemsetD32(gpu_blk, 0, 81920) != CUDA_SUCCESS
+     // tools/payload-dp4a.patch: the int8 x and its d's (17408 + 544 * 4 bytes the 27B's)
+     || cuMemAlloc(&gpu_q8b, 32768) != CUDA_SUCCESS
++    // tools/payload-dp4b.patch: the two int8 planes and their e's (2 * 17408 + 544 * 4 the 27B's)
++    || cuMemAlloc(&gpu_q8c, 40960) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+     // 8192: the 27B's 5120 and a d 11 pad tail (zeroed); atts 24 heads
+     || cuMemAlloc(&gpu_headh, 8192 * 4) != CUDA_SUCCESS

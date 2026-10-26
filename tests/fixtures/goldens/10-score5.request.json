@@ -1,0 +1,1 @@
+{"model":"clef","state":"The single-user visual typo has no effect on function.","questions":{"severity":{"type":"score","instructions":"How severe is this issue?","criteria":["Cosmetic","Minor","Moderate","Major","Critical"]}}}

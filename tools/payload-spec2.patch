@@ -1,0 +1,495 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4942,6 +4942,23 @@
+   return cuModuleGetFunction(&gpu_sq4s, m, "llb_spec_q4s") == CUDA_SUCCESS
+     && cuModuleGetFunction(&gpu_sgdl, m, "llb_spec_gdl") == CUDA_SUCCESS;
+ }
++// tools/payload-spec2.patch: the T-row twins of the small kernels (MTP28 lever 1)
++static CUfunction gpu_trnaddq, gpu_trnormq, gpu_tsiluq, gpu_tq8x2, gpu_togq, gpu_tqkr, gpu_tattn4;
++static CUfunction gpu_tmidconv, gpu_tl2qk, gpu_tgdl, gpu_tgrn, gpu_tamaxp, gpu_tamax;
++static bool spec2_load(CUmodule m) {
++  const char* nm[13] = { "rnaddq", "rnormq", "siluq", "q8x2", "ogq", "qkr", "attn4", "midconv",
++    "l2qk", "gdl", "grn", "amaxp", "amax" };
++  CUfunction* f[13] = { &gpu_trnaddq, &gpu_trnormq, &gpu_tsiluq, &gpu_tq8x2, &gpu_togq, &gpu_tqkr,
++    &gpu_tattn4, &gpu_tmidconv, &gpu_tl2qk, &gpu_tgdl, &gpu_tgrn, &gpu_tamaxp, &gpu_tamax };
++  char        b[32];
++  for (u32 j = 0; j < 13; j += 1) {
++    snprintf(b, sizeof b, "llb_t_%s", nm[j]);
++    if (cuModuleGetFunction(f[j], m, b) != CUDA_SUCCESS) {
++      return false;
++    }
++  }
++  return true;
++}
+ static CUfunction gpu_warp3;
+ static CUfunction gpu_warp2;
+ static CUfunction gpu_warpq2;
+@@ -11257,6 +11274,460 @@
+ 
+ ${llb_pf()}
+ 
++// MTP28 lever 1 (tools/payload-spec2.patch): T-row twins of the spec cycle's small
++// kernels, row r = blockIdx.y (gridDim.y = T). Each body is its kernel's, the same
++// ops in the same order; only the pointers move by the row (row r of a T launch ==
++// the kernel on row r's buffers), so the per-row loops of llb_host.c are one launch
++extern "C" __global__ void __launch_bounds__(1024) llb_t_rnaddq(
++  const float* __restrict__ x, const float* __restrict__ z,
++  const float* __restrict__ w, float* __restrict__ x1, float* __restrict__ y,
++  u32 n, signed char* __restrict__ qx, float* __restrict__ dx) {
++  __shared__ float a[33];
++  const u64 rw = blockIdx.y;
++  x += rw * n; z += rw * n; x1 += rw * n; y += rw * n; qx += rw * 2 * n; dx += rw * (n / 32);
++  const u32 t = threadIdx.x;
++  float acc;
++  if (n <= 4096) {
++    const u64 o = (u64)t * 4;
++    float v[4];
++    #pragma unroll
++    for (u32 k = 0; k < 4; k++) {
++      v[k] = __fadd_rn(x[o + k], z[o + k]);
++      x1[o + k] = v[k];
++    }
++    acc = __fadd_rn(__fadd_rn(__fmul_rn(v[0], v[0]), __fmul_rn(v[1], v[1])),
++      __fadd_rn(__fmul_rn(v[2], v[2]), __fmul_rn(v[3], v[3])));
++  } else {
++    float b[8];
++    #pragma unroll
++    for (u32 k = 0; k < 8; k++) {
++      const u64 i = (u64)t * 8 + k;
++      const float v = i < n ? __fadd_rn(x[i], z[i]) : 0.0f;
++      if (i < n) {
++        x1[i] = v;
++      }
++      b[k] = i < n ? __fmul_rn(v, v) : 0.0f;
++    }
++    acc = __fadd_rn(__fadd_rn(__fadd_rn(b[0], b[1]), __fadd_rn(b[2], b[3])),
++      __fadd_rn(__fadd_rn(b[4], b[5]), __fadd_rn(b[6], b[7])));
++  }
++  const float sum = rms_tree(acc, a, t, 32);
++  const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
++    __uint_as_float(0x358637BDu))));
++  for (u32 i = t; i < n; i += 1024) {
++    const float r = __fmul_rn(__fmul_rn(__fadd_rn(x[i], z[i]), s), w[i]);
++    y[i] = r;
++    q8x2_st(r, qx, dx, n, i);
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(1024) llb_t_rnormq(
++  const float* __restrict__ x, const float* __restrict__ w,
++  float* __restrict__ y, u32 n, signed char* __restrict__ qx, float* __restrict__ dx) {
++  __shared__ float a[1024];
++  const u64 rw = blockIdx.y;
++  x += rw * n; y += rw * n; qx += rw * 2 * n; dx += rw * (n / 32);
++  const u32 t = threadIdx.x;
++  const u32 q = n >> 10;
++  const float* xp = x + (u64)t * q;
++  float acc;
++  if (q == 4) {
++    const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
++    const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
++    acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
++  } else if (n > 4096) {
++    float b[8];
++    #pragma unroll
++    for (u32 k = 0; k < 8; k++) {
++      const u64 i = (u64)t * 8 + k;
++      b[k] = i < n ? __fmul_rn(x[i], x[i]) : 0.0f;
++    }
++    acc = __fadd_rn(__fadd_rn(__fadd_rn(b[0], b[1]), __fadd_rn(b[2], b[3])),
++      __fadd_rn(__fadd_rn(b[4], b[5]), __fadd_rn(b[6], b[7])));
++  } else {
++    acc = __fadd_rn(__fmul_rn(xp[0], xp[0]), __fmul_rn(xp[1], xp[1]));
++  }
++  const float sum = rms_tree(acc, a, t, 32);
++  const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
++    __uint_as_float(0x358637BDu))));
++  for (u32 i = t; i < n; i += 1024) {
++    const float r = __fmul_rn(__fmul_rn(x[i], s), w[i]);
++    y[i] = r;
++    q8x2_st(r, qx, dx, n, i);
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(256) llb_t_siluq(
++  const float* __restrict__ g, const float* __restrict__ u,
++  float* __restrict__ a, u32 n, signed char* __restrict__ qx, float* __restrict__ dx) {
++  const u64 rw = blockIdx.y;
++  g += rw * n; u += rw * n; a += rw * n; qx += rw * 2 * n; dx += rw * (n / 32);
++  const u32 i = blockIdx.x * 256 + threadIdx.x;
++  const float v = g[i];
++  const float r = __fmul_rn(__fdiv_rn(v, __fadd_rn(1.0f, attn_exp(-v))), u[i]);
++  a[i] = r;
++  q8x2_st(r, qx, dx, n, i);
++}
++
++extern "C" __global__ void __launch_bounds__(256) llb_t_q8x2(const float* __restrict__ x,
++  signed char* __restrict__ qx, float* __restrict__ dx, u32 n) {
++  const u64 rw = blockIdx.y;
++  x += rw * n; qx += rw * 2 * n; dx += rw * (n / 32);
++  const u32 i = blockIdx.x * 256 + threadIdx.x;
++  if (i >= n) return;
++  const float v = x[i];
++  float a = fabsf(v);
++  int nf = (__float_as_uint(v) & 0x7f800000u) == 0x7f800000u;
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
++  nf = __any_sync(0xffffffffu, nf);
++  const float d = __fdiv_rn(a, 127.0f), e = __fdiv_rn(d, 127.0f);
++  int q = 0, q2 = 0;
++  if (!nf && d != 0.0f) q = max(-127, min(127, (int)roundf(__fdiv_rn(v, d))));
++  if (!nf && e != 0.0f) q2 = max(-127, min(127, (int)roundf(__fdiv_rn(__fmaf_rn(-d, (float)q, v), e))));
++  qx[i] = (signed char)q;
++  qx[n + i] = (signed char)q2;
++  if ((threadIdx.x & 31) == 0) dx[i >> 5] = nf ? __uint_as_float(0x7fffffffu) : e;
++}
++
++// llb_outputgate then llb_q8x2 (n % 256 == 0): the gated value goes straight to
++// q8x2_st (its planes are llb_q8x2's); x [T][n], g row r at g + 2 n r, qx / dx row r's
++extern "C" __global__ void __launch_bounds__(256) llb_t_ogq(const float* __restrict__ x,
++  const float* __restrict__ g, u32 n, signed char* __restrict__ qx, float* __restrict__ dx) {
++  const u64 rw = blockIdx.y;
++  x += rw * n; g += rw * 2 * n; qx += rw * 2 * n; dx += rw * (n / 32);
++  const u32 i = blockIdx.x * 256 + threadIdx.x;
++  const float r = __fmul_rn(x[i], __fdiv_rn(1.0f, __fadd_rn(1.0f, attn_exp(-g[i]))));
++  q8x2_st(r, qx, dx, n, i);
++}
++
++// llb_qkr: x / y rows of n (the q rows 2 * 2^d * 256, the k rows 2^d * 256), row r at pos0 + r
++extern "C" __global__ void __launch_bounds__(256) llb_t_qkr(
++  const float* __restrict__ x, const float* __restrict__ w,
++  float* __restrict__ y, u32 n, u32 qk, u32 pos0) {
++  __shared__ float a[256];
++  __shared__ float sv;
++  const u32 pos = pos0 + blockIdx.y;
++  x += (u64)blockIdx.y * n; y += (u64)blockIdx.y * n;
++  const u32 t = threadIdx.x;
++  const u64 off = (u64)blockIdx.x * (qk != 0 ? 512 : 256);
++  const float* xr = x + off;
++  float* yr = y + (u64)blockIdx.x * 256;
++  const float xv = xr[t];
++  const float xb = xr[t + 32];
++  const float xg = qk != 0 ? xr[256 + t] : 0.0f;
++  a[t] = __fmul_rn(xv, xv);
++  __syncthreads();
++  #pragma unroll
++  for (u32 st = 1; st < 256; st <<= 1) {
++    if ((t & (2 * st - 1)) == 0) {
++      a[t] = __fadd_rn(a[t], a[t + st]);
++    }
++    __syncthreads();
++  }
++  if (t == 0) {
++    sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 256.0f),
++      __uint_as_float(0x358637BDu))));
++  }
++  __syncthreads();
++  const float s = sv;
++  const float v = __fmul_rn(__fmul_rn(xv, s), w[t]);
++  if (t < 32) {
++    const float th = __fmul_rn((float)pos, (float)pow((double)10000000.0f,
++      (double)__fdiv_rn(-(float)(2 * t), 64.0f)));
++    const float co = (float)cos((double)th), si = (float)sin((double)th);
++    const float b = __fmul_rn(__fmul_rn(xb, s), w[t + 32]);
++    const float r0 = __fsub_rn(__fmul_rn(v, co), __fmul_rn(b, si));
++    const float r1 = __fadd_rn(__fmul_rn(v, si), __fmul_rn(b, co));
++    yr[2 * t]     = r0;
++    yr[2 * t + 1] = r1;
++  } else if (t >= 64) {
++    yr[t] = v;
++  }
++  if (qk != 0) {
++    yr[(u64)gridDim.x * 256 + t] = xg;
++  }
++}
++
++// llb_attn4: q rows of 2 nh 256 (sp_qg), att rows of nh 256, row r at pos + r; sc / pr
++// planes of 2^dT floats per (row, head) (the trees touch t < T2 <= 2^dT only)
++extern "C" __global__ void __launch_bounds__(1024) llb_t_attn4(
++  const float* __restrict__ q, const float* __restrict__ kc,
++  const float* __restrict__ vc, float* __restrict__ att,
++  float* __restrict__ sc, float* __restrict__ pr, u32 c, u32 grp) {
++  const u32 h = blockIdx.x, dT = c & 31, pos = (c >> 5) + blockIdx.y, T = 1u << dT;
++  q += (u64)blockIdx.y * gridDim.x * 512; att += (u64)blockIdx.y * gridDim.x * 256;
++  const u32 g = (h / grp) * 256;
++  const float scale = __fdiv_rn(1.0f, __fsqrt_rn(256.0f));
++  const float ninf = __uint_as_float(0xFF800000u);
++  float* sh = sc + ((u64)(blockIdx.y * gridDim.x + h) << dT);
++  float* ph = pr + ((u64)(blockIdx.y * gridDim.x + h) << dT);
++  const float* qh = q + (u64)h * 256;
++  __shared__ float qs[256];
++  if (threadIdx.x < 256) {
++    qs[threadIdx.x] = qh[threadIdx.x];
++  }
++  __syncthreads();
++  const u32 n = pos < T ? pos + 1 : T;
++  u32 T2 = 1;
++  while (T2 < n) {
++    T2 <<= 1;
++  }
++  const u32 sub = threadIdx.x & 7;
++  for (u32 tb = 0; tb < T2; tb += blockDim.x >> 3) {
++    const u32 t = tb + (threadIdx.x >> 3);
++    float v = 0.0f;
++    if (t < n) {
++      const float* k = kc + (u64)t * 1024 + g + sub * 32;
++      const float* qq = qs + sub * 32;
++      float st[6];
++      u32   sp = 0;
++      for (u32 i0 = 0; i0 < 32; i0 += 16) {
++        float kk[16];
++#pragma unroll
++        for (u32 u = 0; u < 16; u++) {
++          kk[u] = k[i0 + u];
++        }
++#pragma unroll
++        for (u32 u = 0; u < 16; u++) {
++          attn_push(st, &sp, i0 + u, __fmul_rn(kk[u], qq[i0 + u]));
++        }
++      }
++      v = st[0];
++    }
++#pragma unroll
++    for (u32 m = 1; m < 8; m <<= 1) {
++      v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, m));
++    }
++    if (sub == 0 && t < T2) {
++      ph[t] = sh[t] = t < n ? __fmul_rn(v, scale) : ninf;
++    }
++  }
++  __syncthreads();
++  for (u32 s = 1; s < T2; s <<= 1) {
++    for (u32 t = threadIdx.x * 2 * s; t < T2; t += blockDim.x * 2 * s) {
++      const float a = ph[t], v = ph[t + s];
++      ph[t] = a < v ? v : a;
++    }
++    __syncthreads();
++  }
++  const float m = ph[0];
++  __syncthreads();
++  for (u32 t = threadIdx.x; t < T2; t += blockDim.x) {
++    ph[t] = sh[t] = attn_exp(__fsub_rn(sh[t], m));
++  }
++  __syncthreads();
++  for (u32 s = 1; s < T2; s <<= 1) {
++    for (u32 t = threadIdx.x * 2 * s; t < T2; t += blockDim.x * 2 * s) {
++      sh[t] = __fadd_rn(sh[t], sh[t + s]);
++    }
++    __syncthreads();
++  }
++  const float z = T2 < T ? __fadd_rn(sh[0], 0.0f) : sh[0];
++  for (u32 t = threadIdx.x; t < T2; t += blockDim.x) {
++    ph[t] = __fdiv_rn(ph[t], z);
++  }
++  __syncthreads();
++  __shared__ float vq[4][256];
++  const u32 j = threadIdx.x & 255, pq = threadIdx.x >> 8;
++  const u32 PQ = T2 >= 4 ? 4 : 1, L = T2 / PQ, t0 = pq * L;
++  if (pq < PQ) {
++    float st[18];
++    u32   sp = 0;
++    u32   t = 0;
++    for (; t + 16 <= L; t += 16) {
++      float vv[16], pp[16];
++#pragma unroll
++      for (u32 u = 0; u < 16; u++) {
++        vv[u] = vc[(u64)(t0 + t + u) * 1024 + g + j];
++        pp[u] = ph[t0 + t + u];
++      }
++#pragma unroll
++      for (u32 u = 0; u < 16; u++) {
++        attn_push(st, &sp, t + u, __fmul_rn(vv[u], pp[u]));
++      }
++    }
++    for (; t < L; t++) {
++      attn_push(st, &sp, t, __fmul_rn(vc[(u64)(t0 + t) * 1024 + g + j], ph[t0 + t]));
++    }
++    vq[pq][j] = st[0];
++  }
++  __syncthreads();
++  if (threadIdx.x < 256) {
++    const float o = PQ == 4 ? __fadd_rn(__fadd_rn(vq[0][j], vq[1][j]),
++      __fadd_rn(vq[2][j], vq[3][j])) : vq[0][j];
++    att[(u64)h * 256 + j] = T2 < T ? __fadd_rn(o, 0.0f) : o;
++  }
++}
++
++// llb_midconv: bpre / apre / beta / dec rows of nm, y rows of nch; row r's conv
++// reads the 16-slot ring at p0 + r and the three before it
++extern "C" __global__ void __launch_bounds__(256) llb_t_midconv(
++  const float* __restrict__ bpre, const float* __restrict__ apre,
++  const float* __restrict__ dtp, const float* __restrict__ sap,
++  float* __restrict__ beta, float* __restrict__ dec, u32 nm,
++  const float* __restrict__ w, const float* __restrict__ ring, u32 p0,
++  float* __restrict__ y, u32 nch) {
++  const u32 pr = p0 + blockIdx.y;
++  if (blockIdx.x == 0) {
++    const u64 o = (u64)blockIdx.y * nm;
++    const u32 i = threadIdx.x;
++    if (i < nm) {
++      const float b = bpre[o + i];
++      beta[o + i] = __fdiv_rn(1.0f, __fadd_rn(1.0f, attn_exp(-b)));
++      const float gp = __fmul_rn(mid_sp(__fadd_rn(apre[o + i], dtp[i])), sap[i]);
++      dec[o + i] = attn_exp(gp);
++    }
++    return;
++  }
++  const u32 c = (blockIdx.x - 1) * 256 + threadIdx.x;
++  if (c >= nch) {
++    return;
++  }
++  const float* x = ring + (u64)(pr & 15) * nch;
++  const float* h0 = ring + (u64)((pr - 3) & 15) * nch;
++  const float* h1 = ring + (u64)((pr - 2) & 15) * nch;
++  const float* h2 = ring + (u64)((pr - 1) & 15) * nch;
++  y += (u64)blockIdx.y * nch;
++  const float a = __fadd_rn(__fmul_rn(h0[c], w[4 * c]), __fmul_rn(h1[c], w[4 * c + 1]));
++  const float b = __fadd_rn(__fmul_rn(h2[c], w[4 * c + 2]), __fmul_rn(x[c], w[4 * c + 3]));
++  const float u = __fadd_rn(a, b);
++  y[c] = __fdiv_rn(u, __fadd_rn(1.0f, attn_exp(-u)));
++}
++
++// llb_l2norm_qk: vq / vk rows of xs, yq / yk rows of ys
++extern "C" __global__ void __launch_bounds__(64) llb_t_l2qk(
++  const float* __restrict__ vq, const float* __restrict__ vk,
++  float* __restrict__ yq, float* __restrict__ yk, float sq, u32 heads, u32 rep, u32 xs, u32 ys) {
++  __shared__ float a[33];
++  const u64 rw = blockIdx.y;
++  vq += rw * xs; vk += rw * xs; yq += rw * ys; yk += rw * ys;
++  const u32 kq = blockIdx.x >= heads, h = blockIdx.x - (kq ? heads : 0);
++  const u32 t = threadIdx.x;
++  const float sc = kq ? 1.0f : sq;
++  const float2 x = ((const float2*)((kq ? vk : vq) + ((u64)h << 7)))[t];
++  const float sum = rms_tree(__fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y)),
++    a, t, 2);
++  const float rt = __fsqrt_rn(sum);
++  const float ep = __uint_as_float(0x358637BDu);
++  const float s = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
++  const float2 r = make_float2(__fmul_rn(x.x, s), __fmul_rn(x.y, s));
++  float* y = (kq ? yk : yq) + ((u64)h << 7);
++  for (u32 c = 0; c < rep; c++) {
++    ((float2*)(y + (u64)c * heads * 128))[t] = r;
++  }
++}
++
++// llb_spec_gdl over the T rows in order, the state in registers: row r reads ring slot
++// (sc + r) % R (row r - 1's store, the same bits) and stores slot (sc + r + 1) % R.
++// S the ring (slots of ssz floats); q / kk rows of 2 heads 128, v rows of vs,
++// dec / bet rows of heads, y rows of heads 128
++extern "C" __global__ void __launch_bounds__(128) llb_t_gdl(
++  float* __restrict__ S, u64 ssz, u32 sc, u32 R, u32 T, const float* __restrict__ q,
++  const float* __restrict__ kk, const float* __restrict__ v, u32 vs, const float* __restrict__ dec,
++  const float* __restrict__ bet, float* __restrict__ y, u32 heads) {
++  const u32 h = blockIdx.x, l = threadIdx.x & 31;
++  const u32 j = blockIdx.y * 4 + (threadIdx.x >> 5);
++  if (h >= heads) {
++    return;
++  }
++  const u64 so = ((u64)h * 128 + j) << 7, hs = (u64)heads << 7;
++  float4 s4 = ((const float4*)(S + sc * ssz + so))[l];
++  for (u32 r = 0; r < T; r++) {
++    const float4 k4 = ((const float4*)(kk + r * 2 * hs + ((u64)h << 7)))[l];
++    const float4 q4 = ((const float4*)(q + r * 2 * hs + ((u64)h << 7)))[l];
++    const float  decay = dec[(u64)r * heads + h], beta = bet[(u64)r * heads + h];
++    s4.x = __fmul_rn(s4.x, decay);
++    s4.y = __fmul_rn(s4.y, decay);
++    s4.z = __fmul_rn(s4.z, decay);
++    s4.w = __fmul_rn(s4.w, decay);
++    const float kv = gd_dot(s4, k4);
++    const float delta = __fmul_rn(__fsub_rn(v[(u64)r * vs + ((u64)h << 7) + j], kv), beta);
++    s4.x = __fadd_rn(s4.x, __fmul_rn(k4.x, delta));
++    s4.y = __fadd_rn(s4.y, __fmul_rn(k4.y, delta));
++    s4.z = __fadd_rn(s4.z, __fmul_rn(k4.z, delta));
++    s4.w = __fadd_rn(s4.w, __fmul_rn(k4.w, delta));
++    ((float4*)(S + (sc + r + 1) % R * ssz + so))[l] = s4;
++    const float yv = gd_dot(s4, q4);
++    if (l == 0) {
++      y[r * hs + ((u64)h << 7) + j] = yv;
++    }
++  }
++}
++
++// llb_gated_rmsnorm: o / z / y rows of heads 128
++extern "C" __global__ void __launch_bounds__(64) llb_t_grn(
++  const float* __restrict__ o, const float* __restrict__ w,
++  const float* __restrict__ z, float* __restrict__ y, u32 heads) {
++  __shared__ float a[64];
++  __shared__ float sv;
++  const u64 rw = (u64)blockIdx.y * heads * 128;
++  o += rw; z += rw; y += rw;
++  const u32 h = blockIdx.x, t = threadIdx.x;
++  if (h >= heads || t >= 64) {
++    return;
++  }
++  const float2 x = ((const float2*)(o + ((u64)h << 7)))[t];
++  a[t] = __fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y));
++  __syncthreads();
++  #pragma unroll
++  for (u32 st = 1; st < 64; st <<= 1) {
++    if ((t & (2 * st - 1)) == 0) {
++      a[t] = __fadd_rn(a[t], a[t + st]);
++    }
++    __syncthreads();
++  }
++  if (t == 0) {
++    sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 128.0f),
++      __uint_as_float(0x358637BDu))));
++  }
++  __syncthreads();
++  const float s = sv;
++  const float2 wv = ((const float2*)w)[t];
++  const float2 zz = ((const float2*)(z + ((u64)h << 7)))[t];
++  const float zx = __fdiv_rn(zz.x, __fadd_rn(1.0f, attn_exp(-zz.x)));
++  const float zy = __fdiv_rn(zz.y, __fadd_rn(1.0f, attn_exp(-zz.y)));
++  ((float2*)(y + ((u64)h << 7)))[t] = make_float2(
++    __fmul_rn(__fmul_rn(__fmul_rn(x.x, s), wv.x), zx),
++    __fmul_rn(__fmul_rn(__fmul_rn(x.y, s), wv.y), zy));
++}
++
++// llb_amax_part / llb_amax on row r's logits z + r 2^18 (each row's tail its own), y rows of 4
++extern "C" __global__ void __launch_bounds__(AMAX_T) llb_t_amaxp(
++  float* __restrict__ z, u32 n) {
++  __shared__ float s1[AMAX_T], s2[AMAX_T];
++  __shared__ u32   x1[AMAX_T], x2[AMAX_T];
++  z += (u64)blockIdx.y << 18;
++  const u32 t = threadIdx.x;
++  float b1 = __uint_as_float(0xFF800000u), b2 = b1;
++  u32   j1 = 0xFFFFFFFFu, j2 = 0xFFFFFFFFu;
++  for (u32 i = blockIdx.x * AMAX_T + t; i < n; i += AMAX_G * AMAX_T) {
++    amax_put(z[i], i, &b1, &j1, &b2, &j2);
++  }
++  s1[t] = b1; x1[t] = j1; s2[t] = b2; x2[t] = j2;
++  amax_tree(s1, x1, s2, x2, t, AMAX_T);
++  if (t == 0) {
++    float* p = z + (1u << 18) - 4 * AMAX_G + 4 * blockIdx.x;
++    p[0] = s1[0]; p[1] = __uint_as_float(x1[0]);
++    p[2] = s2[0]; p[3] = __uint_as_float(x2[0]);
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(AMAX_G) llb_t_amax(
++  const float* __restrict__ z, u32 n, float* __restrict__ y) {
++  __shared__ float s1[AMAX_G], s2[AMAX_G];
++  __shared__ u32   x1[AMAX_G], x2[AMAX_G];
++  z += (u64)blockIdx.y << 18; y += (u64)blockIdx.y * 4;
++  const u32 t = threadIdx.x;
++  const float* p = z + (1u << 18) - 4 * AMAX_G + 4 * t;
++  s1[t] = p[0]; x1[t] = __float_as_uint(p[1]);
++  s2[t] = p[2]; x2[t] = __float_as_uint(p[3]);
++  amax_tree(s1, x1, s2, x2, t, AMAX_G);
++  if (t == 0) {
++    y[0] = s1[0]; y[1] = (float)x1[0]; y[2] = s2[0]; y[3] = (float)x2[0];
++  }
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -11758,6 +12229,7 @@
+     || cuModuleGetFunction(&gpu_q8dp2c, gpu_lib, "llb_q8dp2_cat") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_q6dp2, gpu_lib, "llb_q6dp2") != CUDA_SUCCESS
+     || !spec_load(gpu_lib)
++    || !spec2_load(gpu_lib)
+     || cuModuleGetFunction(&gpu_warp3, gpu_lib, "llb_warp_q3k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp2, gpu_lib, "llb_warp_q2_0") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_pq2_0") != CUDA_SUCCESS

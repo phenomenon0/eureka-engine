@@ -1,0 +1,529 @@
+#!/bin/sh
+# llb: one front end for the Eureka Engine. POSIX sh + two C helpers (llb-tok, gguf2pack). `llb help` for usage.
+set -u
+set -f
+LLB_VERSION=0.1.1
+
+p=$0
+while [ -L "$p" ]; do l=$(readlink "$p"); case $l in /*) p=$l ;; *) p=$(dirname "$p")/$l ;; esac; done
+here=$(cd "$(dirname "$p")" && pwd)
+conf=${LLB_CONF:-$here}
+. "$conf/defaults.conf"
+H=${LLB_HOME:-$HOME/.cache/llb}
+OS=${LLB_OS:-$(uname -s)}
+
+say() { printf 'llb: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+gb() { awk -v b="$1" 'BEGIN { printf "%.1f GB", b / 1073741824 }'; }
+q() { for a; do r=; while :; do case $a in *\'*) r="$r${a%%\'*}'\\''"; a=${a#*\'} ;; *) break ;; esac; done; printf "'%s' " "$r$a"; done; }  # no fork per arg
+num() { case $1 in '' | *[!0-9]*) return 1 ;; esac; }
+nthreads() { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+
+# ---- helpers (llb-tok, gguf2pack, engine) ----
+# llb-tok is looked up ONLY next to this script or built from llb-tok.c (the ids-workflow tool is llb-toktest).
+tok() {
+  [ -x "$here/llb-tok" ] && { TOK=$here/llb-tok; return; }
+  TOK=$H/bin/llb-tok
+  [ -x "$TOK" ] && ! [ "$here/llb-tok.c" -nt "$TOK" ] && return
+  [ -f "$here/llb-tok.c" ] || die "llb-tok not found next to llb ($here); run ./build.sh (release bundle) or tools/llb/install.sh"
+  mkdir -p "$H/bin" 2>/dev/null || die "cannot write the cache dir $H; set LLB_HOME to a writable directory"
+  ${CC:-cc} -O2 -o "$TOK.$$" "$here/llb-tok.c" -lm && mv "$TOK.$$" "$TOK" || die "cannot build llb-tok (needs a C compiler: cc)"
+}
+g2p() {
+  for d in "$here" "${LLB_OUT-}" "$here/../../build"; do [ -n "$d" ] && [ -x "$d/gguf2pack" ] && { G2P=$d/gguf2pack; return; }; done
+  G2P=$H/bin/gguf2pack
+  [ -x "$G2P" ] && return
+  [ -f "$here/../gguf2pack.c" ] || die "gguf2pack not found; build it (./build.sh) or reinstall with tools/llb/install.sh"
+  mkdir -p "$H/bin" 2>/dev/null || die "cannot write the cache dir $H; set LLB_HOME to a writable directory"
+  ${CC:-cc} -std=c11 -O2 -o "$G2P.$$" "$here/../gguf2pack.c" && mv "$G2P.$$" "$G2P" || die "cannot build gguf2pack (needs a C compiler: cc)"
+}
+engine() {
+  for e in "${LLB_ENGINE-}" "$here/llb-engine" "${LLB_OUT:+$LLB_OUT/llb-engine}" "$here/../../build/llb-engine"; do
+    [ -n "$e" ] && [ -x "$e" ] && { ENG=$e; return 0; }
+  done
+  return 1
+}
+# probe ARGS: run llb-probe (next to llb, else a build dir): its output in PR, its exit code; 3 = no llb-probe
+probe() {
+  for d in "$here" "${LLB_OUT-}" "$here/../../build"; do
+    [ -n "$d" ] && [ -x "$d/llb-probe" ] && { PR=$("$d/llb-probe" "$@"); return; }
+  done
+  return 3
+}
+
+# ---- models ----
+# row ALIAS | rowmatch ARCH LAYERS FTYPE SIZE: load a models.conf line into m_*
+row() {
+  while read -r a ar l f s sp e fa sc fi so; do
+    case $a in '' | \#*) continue ;; esac
+    if [ "$#" = 1 ]; then k=$a; else k="$ar $l $f $s"; fi
+    if [ "$k" = "$*" ]; then
+      m_alias=$a m_arch=$ar m_layers=$l m_ftype=$f m_size=$s m_span=$sp m_env=$e m_fast=$fa m_spec=$sc m_file=$fi m_src=$so
+      return 0
+    fi
+  done < "$conf/models.conf"
+  return 1
+}
+aliases() { awk '!/^#/ && NF { printf "%s%s", s, $1; s = " " }' "$conf/models.conf"; }
+# samename FILE: every alias whose download lands on FILE, as "ALIAS=SIZE" (the clash set for a pull)
+samename() {
+  awk -v f="$1" '!/^#/ && NF >= 10 && $10 == f { printf "%s%s=%s", sep, $1, $5; sep = ", " }' "$conf/models.conf"
+}
+# info GGUF [CACHED]: header facts into g_* (from CACHED, an earlier llb-tok info line, when given); 1 if not a GGUF
+info() {
+  i=${2-}; [ -n "$i" ] || i=$("$TOK" info "$1" 2>/dev/null) || return 1
+  g_name=
+  for kv in $i; do
+    case $kv in
+      arch=*) g_arch=${kv#arch=} ;; layers=*) g_layers=${kv#layers=} ;; ftype=*) g_ftype=${kv#ftype=} ;;
+      size=*) g_size=${kv#size=} ;; key=*) g_key=${kv#key=} ;;
+    esac
+  done
+}
+searchdirs() { printf '%s:%s' "${LLB_MODELS-}" "$LLB_SEARCH" | tr ':' '\n' | awk 'NF && !seen[$0]++'; }
+# find_alias: the GGUF for m_* (cached in $H/where.ALIAS: path, then its llb-tok info line); FOUND (+ WI), or empty + NFOUND
+# ponytail: the cache trusts size + "not modified since"; a same-size file swapped in with an older mtime is not seen
+find_alias() {
+  FOUND= NFOUND=0 WI= FI=
+  w=$H/where.$m_alias
+  if [ -f "$w" ]; then
+    { IFS= read -r FOUND; IFS= read -r WI; } < "$w"
+    [ -n "$WI" ] && [ -f "$FOUND" ] && [ -n "$(find -L "$FOUND" -prune -size "${m_size}c" ! -newer "$w" 2>/dev/null)" ] && { NFOUND=1; return; }
+    FOUND= WI=
+  fi
+  keys=
+  for d in $(searchdirs | tr '\n' ' '); do
+    [ -d "$d" ] || continue
+    for f in $(find -L "$d" -maxdepth 4 -type f -name '*.gguf' -size "${m_size}c" 2>/dev/null | tr '\n' ' '); do
+      info "$f" && [ "$g_arch $g_layers $g_ftype" = "$m_arch $m_layers $m_ftype" ] || continue
+      case " $keys " in *" $g_key "*) continue ;; esac
+      keys="$keys $g_key" NFOUND=$((NFOUND + 1))
+      [ -z "$FOUND" ] && FOUND=$f FI=$i || FOUND="$FOUND $f"
+    done
+  done
+  [ "$NFOUND" = 1 ] && mkdir -p "$H" 2>/dev/null && printf '%s\n%s\n' "$FOUND" "$FI" > "$w" 2>/dev/null
+  :
+}
+# resolve MODEL: alias or .gguf path -> GGUF NAME m_* g_*
+resolve() {
+  tok
+  case $1 in
+    */* | *.gguf)
+      [ -e "$1" ] || die "no such file: $1"
+      info "$1" || die "not a GGUF file: $1"
+      GGUF=$1 NAME=$(basename "$1" .gguf)
+      case $g_arch in
+        qwen35) ;;
+        clef) say "Clef backbone only; the decision head is not evaluated" ;;
+        *) die "$1: architecture $g_arch is not supported (this engine runs qwen35 and clef backbones)" ;;
+      esac
+      if row "$g_arch" "$g_layers" "$g_ftype" "$g_size"; then NAME=$m_alias; else
+        m_alias=$NAME m_size=$g_size m_span=- m_env=- m_fast=0 m_spec=-
+        say "$1 is not in models.conf; running with plain settings (no fast tiers)"
+      fi ;;
+    *)
+      row "$1" || die "unknown model '$1' (known: $(aliases); or a path to a .gguf)"
+      NAME=$1
+      find_alias
+      if [ "$NFOUND" = 0 ]; then
+        src="from $m_src"; [ "$m_src" = - ] && src="source not recorded"
+        get="llb pull $1"; [ "$m_src" = - ] && get="put it in ~/models"
+        die "$1 not found: $m_file ($(gb "$m_size"), $src); looked in $(searchdirs | tr '\n' ' '); $get or set LLB_MODELS"
+      fi
+      [ "$NFOUND" = 1 ] || die "$1 matches $NFOUND different files: $FOUND; pass the path instead"
+      GGUF=$FOUND
+      info "$GGUF" "$WI" || die "not a GGUF file: $GGUF" ;;
+  esac
+}
+# prep: tokenizer + chat flags + sidecar into $H/KEY (C)
+prep() {
+  C=$H/$g_key
+  [ -f "$C/ok" ] && return 0
+  mkdir -p "$H" 2>/dev/null && [ -w "$H" ] || die "cannot write the cache dir $H; set LLB_HOME to a writable directory"
+  [ "${DRY-}" ] && return 0
+  g2p
+  say "preparing $NAME (tokenizer and sidecar, one time)"
+  t=$C.tmp.$$
+  rm -rf "$t" && mkdir "$t" || die "cannot write $t"
+  if ! "$TOK" extract "$GGUF" "$t" > "$t/prep.log" 2>&1 || ! "$G2P" "$GGUF" --sidecar-only "$t" >> "$t/prep.log" 2>&1; then
+    cat "$t/prep.log" >&2; rm -rf "$t"; die "prep failed for $GGUF"
+  fi
+  printf '%s\n' "$GGUF" > "$t/source" && : > "$t/ok"
+  rm -rf "$C" && mv "$t" "$C"
+}
+# gpucheck: one-line refusal if the card cannot hold the model now
+gpucheck() {
+  [ ! -f "$conf/capacity.tsv" ] || { capacity_check; return; }
+  probe -q --need-mib $((m_size / 1048576 + 1536)) || { [ $? = 3 ] || { printf '%s\n' "$PR" | sed 's/^/llb: /' >&2; exit 1; }; }
+  command -v nvidia-smi > /dev/null || die "no NVIDIA driver found (nvidia-smi is missing); run llb doctor"
+  dev=${CUDA_VISIBLE_DEVICES:-0}; dev=${dev%%,*}
+  set -- $(nvidia-smi -i "$dev" --query-gpu=memory.total,memory.used --format=csv,noheader,nounits 2> /dev/null | tr -d ,)
+  [ $# = 2 ] || die "nvidia-smi cannot read GPU $dev; run llb doctor"
+  need=$((m_size / 1048576 + 1536))
+  [ "$1" -ge "$need" ] || die "$NAME needs about $((need / 1024)) GB of GPU memory; this GPU has $(($1 / 1024)) GB (try a smaller model: llb models)"
+  [ $(($1 - $2)) -ge "$need" ] || die "the GPU has $((($1 - $2) / 1024)) GB free, $NAME needs about $((need / 1024)) GB; in use by pid $(nvidia-smi -i "$dev" --query-compute-apps=pid --format=csv,noheader | tr '\n' ' ')(see nvidia-smi)"
+}
+
+# ---- run / chat / bench ----
+# parse ARGS: flags shared by run, chat and bench
+parse() {
+  N=$LLB_DEFAULT_N PF=$LLB_DEFAULT_PREFILL PFX= SPEC= IDS= DRY= V= F= THINK=2 PASS= POS=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) [ $# -ge 2 ] && num "$2" && [ "$2" -gt 0 ] || die "-n needs a positive number"; N=$2; shift ;;
+      -f) [ $# -ge 2 ] || die "-f needs a file"; F=$2; shift ;;
+      --fast) PF=fast PFX=1 ;; --exact) PF=exact PFX=1 ;; --spec) SPEC=1 ;; --ids) IDS=1 ;; --dry-run) DRY=1 ;; -v) V=1 ;;
+      --think) THINK=1 ;; --no-think) THINK=2 ;;
+      -h | --help) help "$CMD"; exit 0 ;;
+      --) shift; PASS=$(q "$@"); break ;;
+      -?*) die "unknown option $1 (see: llb help $CMD)" ;;
+      *) POS="$POS$(q "$1")" ;;
+    esac
+    shift
+  done
+}
+# mac_cmd IDS...: ENGINE_CMD for macOS = M36's Metal runner (run.sh). NOT RUN: written against its documented
+# flags; see docs/guides/macos-cli-adapter.md for the mapping and its UNKNOWNs.
+mac_cmd() {
+  run=${LLB_MAC_RUN:-$here/run.sh}
+  [ -x "$run" ] || die "Mac runner not found; set LLB_MAC_RUN to M36's run.sh"
+  [ "$SPEC" ] && die "--spec is not available on the Mac"
+  case $m_alias in 9b) mm=9b-q4km ;; *) mm=$m_alias ;; esac
+  pack=$C/pack
+  if ! [ -f "$pack/manifest.json" ] && ! [ "$DRY" ]; then   # Metal has no GGUF loader: dense models need a pack
+    k=$(df -Pk "$H" | awk 'NR == 2 { print $4 }')
+    need=$((4 * m_size / 1048576 + 6144))   # pack ~ 2 x GGUF; refuse below 2 x pack + 6 GB free
+    [ $((k / 1024)) -ge "$need" ] || die "building the $NAME pack needs $((need / 1024)) GB free in $H, $((k / 1048576)) GB free; free space or set LLB_HOME"
+    g2p; say "building the $NAME pack for Metal (one time)"
+    "$G2P" "$GGUF" "$pack.tmp" > "$C/pack.log" 2>&1 && mv "$pack.tmp" "$pack" || die "pack build failed; see $C/pack.log"
+  fi
+  [ "$DRY" ] || printf '%s\n' "$*" > "$C/ids"
+  set -- "$run" --model "$mm" --pack "$pack" --gguf "$GGUF" --ids "$C/ids" --steps "$N"
+  [ "$PFX" ] && case $PF in exact) set -- "$@" --exactpf ;; fast) set -- "$@" --fastpf 512 ;; esac
+  eval "set -- $(q "$@") $PASS"
+  ENGINE_CMD=$(q "$@")
+}
+# engine_cmd IDS...: ENGINE_CMD = the full engine command, quoted (env + stdbuf + engine) for the resolved model
+engine_cmd() {
+  [ "$OS" = Darwin ] && { mac_cmd "$@"; return; }
+  engine
+  span=$m_span; [ "$span" = - ] && span=
+  pf=$PF; [ "$m_fast" = 1 ] || pf=exact
+  ids=$*
+  eval "set -- $PASS"
+  set -- "$ENG" ${span:+--gpu} ${span:+$span} --threads "$(nthreads)" "$@" -- "$C" $ids --steps "$N"
+  command -v stdbuf > /dev/null && set -- stdbuf -oL "$@"   # the engine's stdout is fully buffered in a pipe
+  [ "$pf" = fast ] && set -- LLB_PREFILL=fast "$@"
+  if [ "$SPEC" ]; then
+    [ -n "${LLB_MTP+x}" ] || set -- LLB_MTP="$MTP" "$@"
+    set -- LLB_SPEC=2 "$@"
+  fi
+  [ "$m_env" = - ] || for kv in $(echo "$m_env" | tr , ' '); do
+    eval "[ -n \"\${${kv%%=*}+x}\" ]" || set -- "$kv" "$@"   # an explicit LLB_* in the environment wins
+  done
+  set -- env LLB_GGUF="$GGUF" "$@"
+  ENGINE_CMD=$(q "$@")
+}
+# launch NPROMPT SAVE [llb-tok run opts]: run ENGINE_CMD under llb-tok run (text stream, EOS stop, summary)
+launch() {
+  np=$1 save=$2; shift 2
+  set -- "$TOK" run "$C" -m "$NAME" -P "$np" --log "$H/last.log" "$@"
+  [ "$IDS" ] && set -- "$@" --ids
+  [ "$V" ] && set -- "$@" -v
+  [ -n "$save" ] && set -- "$@" --save "$save"
+  eval "set -- $(q "$@") -- $ENGINE_CMD"
+  if [ "$DRY" ]; then q "$@"; echo; return 0; fi
+  if [ -z "$IDS" ] && [ -z "$V" ] && [ -t 2 ]; then printf 'llb: loading %s (%s) ... ' "$NAME" "$(gb "$m_size")" >&2
+  elif [ -z "$V" ]; then say "loading $NAME ($(gb "$m_size"))"; fi
+  "$@"
+}
+model_ready() {
+  resolve "$1"
+  [ "$SPEC" ] && [ "$m_spec" = - ] && die "--spec is not gated for $NAME (27b only)"
+  if [ "$SPEC" ]; then
+    MTP=${LLB_MTP:-$m_spec}; case $MTP in /*) ;; *) MTP=$(dirname "$GGUF")/$MTP ;; esac
+    [ -f "$MTP" ] || die "--spec needs the NextN drafter $MTP (set LLB_MTP to its path)"
+  fi
+  [ "$PF" = fast ] && [ "$m_fast" != 1 ] && [ "$PFX" ] && die "--fast is not gated for $NAME (27b only)"
+  [ "$OS" = Darwin ] || engine || die "engine not found; build it (./build.sh) or set LLB_ENGINE to the llb-engine binary"
+  [ "$DRY" ] || [ "$OS" = Darwin ] || gpucheck
+  prep
+}
+dryprep() { [ "$DRY" ] && ! [ -f "$C/ok" ] && echo "# prep (one time): $(q "$TOK" extract "$GGUF" "$C"); $(q gguf2pack "$GGUF" --sidecar-only "$C")"; :; }
+
+cmd_run() {
+  parse "$@"
+  eval "set -- $POS"
+  if [ $# = 0 ] && [ -f "$conf/capacity.tsv" ]; then capacity_pick; set -- "$CAPACITY_PICK"; fi
+  [ $# -ge 1 ] || die "usage: llb run [MODEL] [PROMPT] (see: llb help run)"
+  [ $# -le 2 ] || die "too many arguments; quote the prompt (see: llb help run)"
+  [ $# = 2 ] && [ -z "$2" ] && die "empty prompt"
+  if [ $# = 1 ] && [ -z "$IDS" ]; then   # read the prompt before loading anything: errors come first
+    if [ "$F" ]; then [ -r "$F" ] || die "cannot read $F"; [ -s "$F" ] || die "empty prompt"
+    else
+      [ -t 0 ] && say "reading the prompt from stdin (end with Ctrl-D)"
+      P=$(cat; echo x); P=${P%x}; [ -n "$P" ] || die "empty prompt"
+    fi
+  fi
+  model_ready "$1"
+  dryprep
+  if [ "$IDS" ]; then
+    if [ $# = 2 ]; then ids=$2; elif [ "$F" ]; then ids=$(cat "$F") || exit 1; else ids=$(cat); fi
+    ids=$(printf '%s' "$ids" | tr '\n\t' '  ')
+    case $ids in *[!0-9\ ,]*) die "--ids takes token ids (numbers, ',' between prompts)" ;; esac
+  elif [ "$DRY" ] && ! [ -f "$C/ok" ]; then ids=IDS
+  elif [ $# = 2 ]; then ids=$("$TOK" enc "$C" "$2") || exit 1
+  elif [ "$F" ]; then [ -r "$F" ] || die "cannot read $F"; ids=$("$TOK" enc "$C" < "$F") || exit 1
+  else ids=$(printf "%s" "$P" | "$TOK" enc "$C") || exit 1
+  fi
+  [ -n "$(echo $ids)" ] || die "empty prompt"
+  engine_cmd $ids
+  set -- $ids
+  launch $# ""
+}
+
+cmd_chat() {
+  parse "$@"
+  eval "set -- $POS"
+  [ $# = 1 ] || die "usage: llb chat MODEL (see: llb help chat)"
+  [ "$IDS" ] && die "--ids does not apply to chat"
+  model_ready "$1"
+  hist=$H/chat.$$
+  : > "$hist" || die "cannot write $hist"
+  trap 'rm -f "$hist"' EXIT
+  trap 'exit 130' INT TERM
+  say "chat with $NAME (the model reloads every turn, about 17 s for 27b; Ctrl-D ends)"
+  while :; do
+    [ -t 0 ] && printf '> ' >&2
+    IFS= read -r line || break
+    [ -n "$line" ] || continue
+    printf 'user\000%s\000' "$line" >> "$hist"
+    ids=$("$TOK" chat "$C" "$hist" --think "$THINK") || exit 1
+    engine_cmd $ids
+    set -- $ids
+    launch $# "$hist" || exit $?
+    [ -t 1 ] || echo
+  done
+}
+
+cmd_bench() {
+  parse "$@"
+  eval "set -- $POS"
+  [ $# = 1 ] || die "usage: llb bench MODEL (see: llb help bench)"
+  [ "$N" = "$LLB_DEFAULT_N" ] && N=128
+  printf 'user\000Write a detailed technical explanation of how a lighthouse lens focuses light, covering Fresnel lenses, the history of their design, and why they replaced earlier mirror systems.\000' > "${TMPDIR:-/tmp}/llb-bench.$$"
+  model_ready "$1"
+  ids=IDS
+  [ -f "$C/ok" ] && ids=$("$TOK" chat "$C" "${TMPDIR:-/tmp}/llb-bench.$$" --think 2)
+  rm -f "${TMPDIR:-/tmp}/llb-bench.$$"
+  engine_cmd $ids
+  set -- $ids
+  if [ "$DRY" ]; then launch $# ""; else launch $# "" > /dev/null; fi
+}
+
+# ---- other commands ----
+cmd_models() {
+  tok
+  printf '%-7s %-26s %-9s %s\n' MODEL FILE SIZE WHERE
+  awk '!/^#/ && NF { print $1 }' "$conf/models.conf" | while read -r a; do
+    row "$a"; find_alias
+    case $NFOUND in 0) w="not found ($( [ "$m_src" = - ] && echo "source not recorded" || echo "llb pull $a"))" ;; 1) w=$FOUND ;; *) w="ambiguous: $FOUND" ;; esac
+    printf '%-7s %-26s %-9s %s\n' "$a" "$m_file" "$(gb "$m_size")" "$w"
+  done
+}
+cmd_prep() {
+  [ $# = 1 ] || die "usage: llb prep MODEL"
+  resolve "$1"; prep; say "$NAME ready: $C"
+}
+cmd_tok() {
+  [ $# -ge 2 ] || die "usage: llb tok enc|dec MODEL [TEXT|IDS] (stdin if absent)"
+  op=$1; shift
+  resolve "$1"; prep; shift
+  case $op in
+    enc) "$TOK" enc "$C" "$@" ;;
+    dec) if [ $# = 0 ]; then "$TOK" dec "$C" $(cat); else "$TOK" dec "$C" $*; fi ;;
+    *) die "usage: llb tok enc|dec MODEL [TEXT|IDS]" ;;
+  esac
+}
+cmd_pull() {
+  yes=; m=
+  for a; do case $a in -y) yes=1 ;; -*) die "unknown option $a (see: llb help pull)" ;; *) m=$a ;; esac; done
+  [ -n "$m" ] || die "usage: llb pull MODEL [-y]"
+  row "$m" || die "unknown model '$m' (known: $(aliases))"
+  [ "$m_src" = - ] && die "the source of $m is not recorded; download $m_file yourself and put it in ~/models"
+  case $m_src in *://*) url=$m_src/$m_file ;; *) url=https://huggingface.co/$m_src/resolve/main/$m_file ;; esac
+  dir=${LLB_MODELS:-$HOME/models}; dir=${dir%%:*}
+  dest=$dir/$m_file
+  if [ -f "$dest" ]; then
+    have=$(wc -c < "$dest" | tr -d ' ')
+    [ "$have" = "$m_size" ] && { say "already here: $dest"; return 0; }
+    die "$dest is $have bytes but $m expects $m_size bytes; aliases sharing $m_file: $(samename "$m_file"). Refusing to overwrite a different fixture; set LLB_MODELS to a separate dir to keep both."
+  fi
+  command -v curl > /dev/null || die "curl is missing; install curl"
+  size=$(curl -sIL "$url" | tr -d '\r' | awk 'tolower($1) == "content-length:" { n = $2 } END { print n }')
+  [ "$size" = "$m_size" ] || die "the server reports ${size:-no} size for $url, expected $m_size bytes; not downloading"
+  mkdir -p "$dir" || die "cannot create $dir"
+  have=0; [ -f "$dest.part" ] && have=$(wc -c < "$dest.part" | tr -d ' ')
+  avail=$(df -Pk "$dir" | awk 'NR == 2 { print $4 }')
+  [ $(((m_size - have) / 1024)) -lt "$avail" ] || die "not enough disk in $dir: need $(gb $((m_size - have))), have $(gb $((avail * 1024)))"
+  say "$m: $m_file, $(gb "$m_size") from $url$( [ "$have" -gt 0 ] && echo " (resuming at $have bytes)")"
+  if [ "$m_size" -gt 5368709120 ] && [ -z "$yes" ]; then
+    [ -t 0 ] || die "$m is $(gb "$m_size"); pass -y to download without asking"
+    printf 'llb: download %s to %s? [y/N] ' "$(gb "$m_size")" "$dir" >&2
+    read -r ans; case $ans in y | Y | yes) ;; *) die "not downloaded" ;; esac
+  fi
+  curl -fL -C - --progress-bar -o "$dest.part" "$url" || die "download failed; run llb pull $m again to resume"
+  [ "$(wc -c < "$dest.part" | tr -d ' ')" = "$m_size" ] || die "downloaded size is wrong; delete $dest.part and retry"
+  mv "$dest.part" "$dest" && say "saved $dest"
+}
+
+cmd_doctor() {
+  fails=0
+  if [ -t 1 ] && [ -z "${NO_COLOR-}" ]; then cp=$(printf '\033[32m') cw=$(printf '\033[33m') cf=$(printf '\033[31m') c0=$(printf '\033[0m'); else cp= cw= cf= c0=; fi
+  pass() { printf '%sPASS%s %s\n' "$cp" "$c0" "$1"; }
+  warn() { printf '%sWARN%s %s\n     fix: %s\n' "$cw" "$c0" "$1" "$2"; }
+  fail() { printf '%sFAIL%s %s\n     fix: %s\n' "$cf" "$c0" "$1" "$2"; fails=$((fails + 1)); }
+  os=$(uname -s)
+  if [ "$os" = Darwin ]; then warn "macOS: llb runs through the Mac adapter (docs/guides/macos-cli-adapter.md), not checked here" "see docs/guides/macos-cli-adapter.md"; fi
+  probe
+  probe_rc=$?
+  if [ "$probe_rc" = 3 ]; then fail "llb-probe not found next to llb" "rebuild (./build.sh) or re-extract the release bundle"
+  else
+    printf '%s\n' "$PR" | sed -e "s/^PASS/${cp}PASS${c0}/" -e "s/^FAIL/${cf}FAIL${c0}/"
+    fails=$((fails + $(printf '%s\n' "$PR" | grep -c '^FAIL')))
+  fi
+  if command -v nvidia-smi > /dev/null && g=$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits 2> /dev/null | head -1); then
+    IFS=, read -r mt mu <<EOF
+$g
+EOF
+    mt=$(echo $mt) mu=$(echo $mu)
+    if [ -f "$conf/capacity.tsv" ]; then
+      if [ "$probe_rc" = 0 ]; then capacity_doctor; else warn "model capacity unavailable: GPU capability probe failed" "resolve the FAIL lines above"; fi
+    else
+    [ "$mt" -ge 20480 ] && pass "GPU memory: $((mt / 1024)) GB (27b needs about 19 GB)" || warn "GPU memory $((mt / 1024)) GB: too small for 27b" "use 9b or 9b-q8"
+    fi
+    busy=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits | tr '\n' ';')
+    [ -z "$busy" ] && pass "GPU idle" || warn "GPU in use ($((mu / 1024)) GB used; pid, MiB: $busy)" "llb needs the card mostly free; wait or stop those processes"
+  else
+    warn "nvidia-smi missing or failing: GPU memory use not checked" "install the NVIDIA driver utilities (nvidia-smi)"
+  fi
+  if engine; then
+    pass "engine: $ENG"
+    if command -v ldd > /dev/null; then
+      miss=$(ldd "$ENG" 2>&1 | awk '/not found/ { print $1 }' | tr '\n' ' ')
+      [ -z "$miss" ] && pass "engine libraries found (libcuda, libnvrtc)" || fail "engine libraries missing: $miss" "libcuda.so.1 comes with the NVIDIA driver; libnvrtc ships next to llb-engine: re-extract the bundle (a source build needs CUDA NVRTC on the library path)"
+    fi
+    [ -f "$ENG.gpu" ] && pass "GPU kernel cache: $ENG.gpu" || warn "no GPU kernel cache yet: the first run builds it" "none needed (one time, about 70 s)"
+    [ -w "$(dirname "$ENG")" ] || [ -f "$ENG.gpu" ] || fail "cannot write the kernel cache next to $ENG" "make $(dirname "$ENG") writable or reinstall llb to a writable directory"
+  else
+    fail "engine not found" "build it (./build.sh) or set LLB_ENGINE to the llb-engine binary"
+  fi
+  if [ -x "$here/llb-tok" ] || [ -x "$H/bin/llb-tok" ]; then pass "llb-tok found"
+  elif command -v "${CC:-cc}" > /dev/null; then pass "llb-tok: will be built with ${CC:-cc} on first use"
+  else fail "llb-tok missing and no C compiler" "install a C compiler (cc), then ./build.sh (release bundle) or tools/llb/install.sh"; fi
+  command -v stdbuf > /dev/null && pass "stdbuf found (text streams as it is generated)" || warn "stdbuf missing: text arrives only at the end" "install GNU coreutils"
+  if mkdir -p "$H" 2> /dev/null && [ -w "$H" ]; then
+    k=$(df -Pk "$H" | awk 'NR == 2 { print $4 }')
+    [ "$k" -ge 1048576 ] && pass "cache $H writable, $((k / 1048576)) GB free" || warn "cache $H: only $((k / 1024)) MB free" "free space or set LLB_HOME"
+  else fail "cannot write the cache dir $H" "set LLB_HOME to a writable directory"; fi
+  if [ -r /proc/meminfo ]; then
+    ma=$(awk '/MemAvailable/ { print int($2 / 1048576) }' /proc/meminfo)
+    [ "$ma" -ge 8 ] && pass "RAM available: $ma GB" || warn "RAM available: $ma GB (loading uses up to about 8 GB)" "close other programs"
+  fi
+  t=${TMPDIR:-/tmp}  # a 1 MB write catches a per-user quota that df does not show
+  if dd if=/dev/zero of="$t/llb-doctor.$$" bs=1024 count=1024 2> /dev/null; then pass "temp dir $t writable (llb writes only small files there)"
+  else warn "cannot write 1 MB to $t (full or over quota)" "free space in $t or set TMPDIR"; fi
+  rm -f "$t/llb-doctor.$$"
+  if [ -d /dev/shm ]; then
+    s=$(df -Pk /dev/shm | awk 'NR == 2 { print int($3 / 1024) " " int($4 / 1024) }'); su=${s% *} sf=${s#* }
+    [ "$sf" -ge 300 ] && pass "/dev/shm: $su MB used, $sf MB free (llb does not use it)" || warn "/dev/shm: only $sf MB free" "free /dev/shm (the CUDA driver may need a little)"
+  fi
+  tok 2> /dev/null && for a in $(aliases); do
+    row "$a"; find_alias
+    case $NFOUND in 1) pass "model $a: $FOUND" ;; 0) warn "model $a not found ($m_file)" "$([ "$m_src" = - ] && echo "put $m_file in ~/models or set LLB_MODELS" || echo "llb pull $a, or set LLB_MODELS")" ;; *) warn "model $a: several files match" "pass the .gguf path instead" ;; esac
+  done
+  return $fails
+}
+
+help() {
+  case ${1-} in
+    run) cat << 'EOF'
+usage: llb run [MODEL] [PROMPT] [options] [-- engine options]
+
+Generate text after PROMPT (no chat template; use llb chat for that).
+PROMPT comes from the argument, from -f FILE, or from stdin.
+Decoding is greedy only (always the most likely token); there is no --temp.
+Stops at the end-of-text token or after -n tokens.
+
+  -n N        tokens to generate (default 256)
+  -f FILE     read the prompt from FILE
+  --exact     exact prefill, token by token (always used for models other than 27b)
+  --fast      fast prefill, int8 tensor cores (27b only; the 27b default is set in defaults.conf)
+  --spec      speculative decoding, same tokens (27b only; opt-in)
+  --ids       PROMPT is token ids; print ids, not text (no EOS stop)
+  --dry-run   print the commands, run nothing
+  -v          show the engine's own output
+  --          pass the rest to the engine
+
+MODEL is an alias (llb models) or a path to a .gguf file.
+With a measured capacity table, omit MODEL and supply the prompt through stdin
+or -f FILE to select the largest installed model that fits the free GPU memory.
+Examples: printf 'Hello' | llb run -n 8; llb run -f prompt.txt -n 8.
+A lone positional argument is always MODEL, never an inferred prompt.
+EOF
+      ;;
+    chat) cat << 'EOF'
+usage: llb chat MODEL [options]
+
+Chat on the terminal, one line per message; Ctrl-D ends.
+The model is reloaded for every turn (27b: about 17 s before each answer starts).
+Thinking is off by default; --think turns it on (the reply then starts
+with the model's reasoning). Options as for llb run: -n, --exact, --fast, --spec, -v.
+EOF
+      ;;
+    models) echo "usage: llb models"; echo; echo "List the known models and where each one was found." ;;
+    prep) echo "usage: llb prep MODEL"; echo; echo "Write the tokenizer and sidecar for MODEL into the cache (llb run does this on first use)." ;;
+    doctor) echo "usage: llb doctor"; echo; echo "Check the GPU, driver, engine, cache and models. Exit code = number of FAILs." ;;
+    bench) echo "usage: llb bench MODEL [-n N] [--exact|--fast] [--spec]"; echo; echo "Time one fixed chat prompt (default -n 128); prints the summary line only." ;;
+    tok) echo "usage: llb tok enc MODEL [TEXT]"; echo "       llb tok dec MODEL [IDS]"; echo; echo "Text to token ids and back (stdin if TEXT or IDS is absent)." ;;
+    pull) echo "usage: llb pull MODEL [-y]"; echo; echo "Download MODEL into \$LLB_MODELS (or ~/models). Shows the size first,"; echo "resumes a partial download, and asks before anything over 5 GB (-y skips)." ;;
+    version) echo "usage: llb version" ;;
+    *) cat << 'EOF'
+usage: llb COMMAND [args]
+
+  run [MODEL] [PROMPT] generate text (omit MODEL with stdin/-f for automatic selection)
+  chat MODEL           chat on the terminal
+  models               list known models and where they are
+  prep MODEL           prepare a model's cache (run does it on first use)
+  doctor               check this machine
+  bench MODEL          time a fixed prompt
+  tok enc|dec MODEL    tokenize / detokenize
+  pull MODEL           download a model
+  version              print the version
+  help [COMMAND]       help for a command
+
+Models: 27b, 9b, 9b-q8, or a path to a .gguf file.
+Environment: LLB_MODELS (model dirs), LLB_HOME (cache), LLB_ENGINE, NO_COLOR.
+EOF
+      ;;
+  esac
+}
+
+[ ! -r "$conf/capacity.sh" ] || . "$conf/capacity.sh"
+
+CMD=${1-}
+[ $# -gt 0 ] && shift
+case $CMD in
+  run) cmd_run "$@" ;;
+  chat) cmd_chat "$@" ;;
+  models) cmd_models ;;
+  prep) cmd_prep "$@" ;;
+  doctor) cmd_doctor ;;
+  bench) cmd_bench "$@" ;;
+  tok) cmd_tok "$@" ;;
+  pull) cmd_pull "$@" ;;
+  version | --version) echo "llb $LLB_VERSION"; if engine; then echo "engine $ENG"; fi ;;
+  help | -h | --help) help "${1-}" ;;
+  '') help >&2; exit 2 ;;
+  *) say "unknown command '$CMD' (see: llb help)"; exit 2 ;;
+esac

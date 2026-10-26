@@ -1,0 +1,16 @@
+{
+  "source": "https://huggingface.co/Qwen/Qwen3.5-9B (README.md raw, fetched 2026-10-02; Tip block at README line 831 and 'Best Practices' at line 1130)",
+  "note": "Card values are vLLM-style: presence_penalty applies over the whole output there; llama.cpp-style penalties use a window (repeat_last_n, default 64). The card's 'Instruct mode for reasoning tasks' preset is given twice with DIFFERENT numbers (line 836: T1.0 top_p0.95 top_k20 pres1.5; line 1142: T1.0 top_p1.0 top_k40 pres2.0); both recorded, neither is a default.",
+  "defaults": {
+    "greedy":       {"mode": 0, "temperature": 0.0, "top_p": 1.0,  "top_k": 0,  "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0, "source": "ours (oracle-compatible argmax)"},
+    "qwen_thinking":     {"mode": 1, "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0, "source": "card: Thinking mode for general tasks"},
+    "qwen_non_thinking": {"mode": 2, "temperature": 0.7, "top_p": 0.8,  "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0, "source": "card: Instruct (non-thinking) mode for general tasks"}
+  },
+  "card_presets": {
+    "thinking_general":        {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+    "thinking_coding":         {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0},
+    "non_thinking_general":    {"temperature": 0.7, "top_p": 0.8,  "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+    "non_thinking_reasoning_tip_line836":   {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0},
+    "non_thinking_reasoning_best_line1142": {"temperature": 1.0, "top_p": 1.0,  "top_k": 40, "min_p": 0.0, "presence_penalty": 2.0, "repetition_penalty": 1.0}
+  }
+}

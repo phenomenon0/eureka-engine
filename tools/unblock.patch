@@ -1,0 +1,82 @@
+diff -ru a/bend2/comp.ts b/bend2/comp.ts
+--- a/bend2/comp.ts	2026-09-28 09:05:17.189927812 -0500
++++ b/bend2/comp.ts	2026-09-28 22:00:17.416125262 -0500
+@@ -38,6 +38,7 @@
+   host?: boolean;
+   spin?: boolean;
+   fork?: boolean;
++  warp?: boolean;
+ };
+ 
+ type Spine = {
+@@ -2920,6 +2921,7 @@
+   const fid = seg_fid(k);
+   fl.seg.fork ||= bang;
+   if (bang && is_warp(k)) {
++    fl.seg.warp = true;
+     file_push(fl, "if (DEVICE && seq) { err_post(e.mem, ERR_FIDS); return 0; }");
+   }
+   if (bang || fl.seg.def !== k) {
+@@ -3946,19 +3948,26 @@
+ function compile_tables(fl: File, entries: Seg[]): string[] {
+   // A segment may fork (or bang) if it or one it reaches does; a closure
+   // apply reaches every closure.
+-  const forky = new Set(fl.segs.filter((s) => s.fork).map((s) => s.fid));
+-  for (let n = -1; n !== forky.size;) {
+-    n = forky.size;
+-    for (const s of [...fl.segs, { fid: "FID_CLO_APPLY", refs: fl.clos }]) {
+-      if (!forky.has(s.fid) && [...s.refs].some((r) => forky.has(r))) {
+-        forky.add(s.fid);
++  // So may a warp bang (tools/unblock.patch): the device runs such a segment
++  // off the sequential pass (fid_warp), where a bang cannot park.
++  const reach = (seed: (s: Seg) => boolean | undefined): Set<string> => {
++    const got = new Set(fl.segs.filter(seed).map((s) => s.fid));
++    for (let n = -1; n !== got.size;) {
++      n = got.size;
++      for (const s of [...fl.segs, { fid: "FID_CLO_APPLY", refs: fl.clos }]) {
++        if (!got.has(s.fid) && [...s.refs].some((r) => got.has(r))) {
++          got.add(s.fid);
++        }
+       }
+     }
+-  }
++    return got;
++  };
++  const forky = reach((s) => s.fork);
++  const warpy = reach((s) => s.warp);
+   const tabs: [string, number[]][] = [
+     ["FID_ARITY_T", entries.map((s) => s.params.length)],
+     ["FID_FLAG_T", entries.map((s) => Number(fl.bangs.has(s.def))
+-      | Number(!forky.has(s.fid)) << 1)],
++      | Number(!forky.has(s.fid)) << 1 | Number(warpy.has(s.fid)) << 2)],
+     ["FID_RESW_T", entries.map((s) =>
+       s.frame === null ? 0 : s.params.length - s.frame.at.length)],
+     ["CID_ARITY_T", [...fl.cids.values()]],
+@@ -4755,6 +4764,8 @@
+ 
+ #define fid_nofk(x) ((bool)(FID_FLAG_T[x] & 2))
+ 
++#define fid_warp(x) ((bool)(FID_FLAG_T[x] & 4))
++
+ #define fid_seqk(x) (fid_resw(x) != 0)
+ 
+ #define fid_resw(x) ((u32)FID_RESW_T[x])
+@@ -6752,6 +6763,9 @@
+     u32 war = fid_arity(f);
+     WL_FRAME(t)
+     seq |= fid_nofk(f) << 1;
++    if (DEVICE && fid_warp(f)) {
++      seq &= ~1u;
++    }
+     if (fid_seqk(f)) {
+       u32 rw = fid_resw(f);
+       WL_LOAD(a + war - rw, rw)
+@@ -6804,7 +6818,7 @@
+       Loc wa = term_loc(cont);
+       u32 wn = fid_arity(wf);
+       WL_FRAME(cont)
+-      seq = (seq & 1) | fid_nofk(wf) << 1;
++      seq = (seq & (u32)!(DEVICE && fid_warp(wf))) | fid_nofk(wf) << 1;
+       WL_ARGS(wa, wn - n + 1)
+       heap_free(e, cls_fit(wn + 2), wa);
+       WL_TAKE(rv)

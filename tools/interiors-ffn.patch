@@ -1,0 +1,179 @@
+diff -ru c/bend2/comp.ts d/bend2/comp.ts
+--- c/bend2/comp.ts	2026-09-28 11:29:31.811509645 -0500
++++ d/bend2/comp.ts	2026-09-28 11:32:39.149113901 -0500
+@@ -2898,7 +2898,13 @@
+ // runs as one kernel; a sequential lane cannot park it, so there it faults.
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+-    || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k);
++    || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k);
++}
++
++// The FFN bang (tools/interiors-ffn.patch): the host runs llb_rms, the gate
++// and up GEMVs, llb_silu, the down GEMV (llb_warp) and llb_add.
++function is_ffn(k: Name): boolean {
++  return k === "llb.ffn_warp" || k.endsWith(".llb.ffn_warp");
+ }
+ 
+ // The rms-GEMV-rope and rms-GEMV-put bangs (tools/interiors-rope.patch): the
+@@ -4014,6 +4020,7 @@
+     .map((k) => `#define ${is_attn(k) ? "LLB_ATTN_FID"
+       : is_rms(k) ? "LLB_RMS_FID" : is_dadd(k) ? "LLB_DADD_FID"
+       : is_rope(k) ? "LLB_ROPE_FID" : is_put(k) ? "LLB_PUT_FID"
++      : is_ffn(k) ? "LLB_FFN_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4739,6 +4746,8 @@
+ static CUfunction gpu_dlv;
+ static CUfunction gpu_add;
+ static CUfunction gpu_rope;
++static CUfunction gpu_silu;
++static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+ static CUdeviceptr gpu_maild;
+@@ -6858,7 +6867,7 @@
+ // host touch migrates the page, and the next grow launch faults it back
+ // (~0.5 ms a serve, payload stage 1). kind: 0 GEMV, 1 attention, 2 rms,
+ // 3 GEMV-add (tools/interiors-add.patch), 4 rms-GEMV-rope
+-// (tools/interiors-rope.patch).
++// (tools/interiors-rope.patch), 5 FFN (tools/interiors-ffn.patch).
+ typedef struct {
+   u64 w, x, y, k, v, wn, r;
+   u32 kind, n, d, rb, c, q8;
+@@ -6893,11 +6902,14 @@
+ #ifndef LLB_PUT_FID
+ #define LLB_PUT_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_FFN_FID
++#define LLB_FFN_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+   || (u32)term_aux(t) == LLB_DADD_FID || (u32)term_aux(t) == LLB_ROPE_FID \
+-  || (u32)term_aux(t) == LLB_PUT_FID)
++  || (u32)term_aux(t) == LLB_PUT_FID || (u32)term_aux(t) == LLB_FFN_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7392,6 +7404,7 @@
+     // put: rms + GEMV into y from slot at (tools/interiors-rope.patch)
+     bool     pt = (u32)term_aux(t) == LLB_PUT_FID;
+     rm = rm || ro || pt;
++    bool     ff = (u32)term_aux(t) == LLB_FFN_FID;
+     Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
+     u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
+     u32      d  = at ? 9 : (u32)H[a + 6], rb = (u32)H[a + (at ? 9 : 7)];
+@@ -7404,12 +7417,12 @@
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
+       || (q8 ? rb / 17 % 4 != 0 : rb % 16 != 0) || ((u64)w & 15) != 0
+       || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
+-      || term_tag(y) == TAG_ARR || blk_cls(x) < d + 2
++      || term_tag(y) == TAG_ARR || blk_cls(x) < (ff ? 11 : d + 2)
+       || n > 1ull << blk_cls(y)) {
+       bad = bad != 0 ? bad : 1;
+     }
+     WarpOp* o = &M->op[j];
+-    o->kind = at ? 1 : ro ? 4 : rm ? 2 : dd ? 3 : 0;
++    o->kind = at ? 1 : ro ? 4 : rm ? 2 : dd ? 3 : ff ? 5 : 0;
+     o->w = (u64)w;
+     o->x = (u64)(H + blk_loc(H, x));
+     o->y = (u64)(H + blk_loc(H, y));
+@@ -7451,6 +7464,26 @@
+       o->y = (u64)(H + blk_loc(H, y)) + (u64)as * 4;
+       o->c = ro ? (u32)H[a + 10] : 0;
+     }
++    // the FFN bang (tools/interiors-ffn.patch): x = the residual and the
++    // rms input (norm at byte an), the gate and up rows at bytes g, u (rg
++    // bytes a row, the down rows' format), 6144 rows, d = 9 each
++    if (ff) {
++      u32 gb = (u32)H[a + 8], ub = (u32)H[a + 9], an = (u32)H[a + 10];
++      u32 rg = (u32)H[a + 11];
++      const u8* wb = (const u8*)(H + term_peek_ro(e, p.data)) + p.off;
++      if (n != 2048 || blk_cls(x) != 11 || (rg % 17 == 0) != q8
++        || (q8 ? rg / 17 % 4 != 0 : rg % 16 != 0) || ((u64)(wb + gb) & 15) != 0
++        || ((u64)(wb + ub) & 15) != 0 || (u64)gb + 6144ull * rg > p.len
++        || (u64)ub + 6144ull * rg > p.len || an % 4 != 0
++        || (u64)an + 2048 * 4 > p.len) {
++        bad = bad != 0 ? bad : 1;
++      }
++      o->k  = (u64)(wb + gb);
++      o->v  = (u64)(wb + ub);
++      o->wn = (u64)(wb + an);
++      o->c  = rg;
++      o->r  = o->x;
++    }
+     // the GEMV-add bang (tools/interiors-add.patch): y := r + y, n = 2048
+     if (dd) {
+       Term r = H[a + 8];
+@@ -7487,6 +7520,19 @@
+   y[2 * p + 1] = __fadd_rn(__fmul_rn(x0, si), __fmul_rn(x1, co));
+ }
+ 
++// flat.bend's k.silu: a[i] = K.silu1(g[i]) * u[i], silu1(v) = v / (1 +
++// K.exp32(-v)), the exp through F64 (attn_exp); a thread an element of n
++// (tools/payload-silu.patch's kernel, tools/interiors-ffn.patch)
++extern "C" __global__ void __launch_bounds__(256) llb_silu(
++  const float* __restrict__ g, const float* __restrict__ u,
++  float* __restrict__ a, u32 n) {
++  const u32 i = blockIdx.x * 256 + threadIdx.x;
++  if (i < n) {
++    const float v = g[i];
++    a[i] = __fmul_rn(__fdiv_rn(v, __fadd_rn(1.0f, attn_exp(-v))), u[i]);
++  }
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -7950,6 +7996,8 @@
+     || cuModuleGetFunction(&gpu_dlv, gpu_lib, "llb_deliver") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_add, gpu_lib, "llb_add") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rope, gpu_lib, "llb_rope") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_silu, gpu_lib, "llb_silu") != CUDA_SUCCESS
++    || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+     || cuMemHostGetDevicePointer(&gpu_maild, (void*)gpu_mail, 0)
+@@ -8053,14 +8101,37 @@
+       }
+       xp = op;
+     }
++    // FFN (kind 5): llb_rms(x) -> the gate and up GEMVs -> llb_silu, three
++    // 6144 slots of gpu_act; the down GEMV below reads the silu slot
++    if (o->kind == 5) {
++      u64 wn = o->wn, wg = o->k, wu = o->v;
++      u32 rg = o->c, nf = 6144, df = 9;
++      u32 gq = q8 ? rg : rg / 16, gc = q8 ? rg / 17 * 4 : rg / 16;
++      CUdeviceptr ga = gpu_act + (CUdeviceptr)j * 3 * 6144 * 4;
++      CUdeviceptr ua = ga + 6144 * 4, sa = ua + 6144 * 4;
++      void* ra[] = { &xp, &wn, &op };
++      void* ga_[] = { &wg, &gq, &gc, &op, &ga, &nf, &df };
++      void* ua_[] = { &wu, &gq, &gc, &op, &ua, &nf, &df };
++      void* sa_[] = { &ga, &ua, &sa, &nf };
++      if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL) != CUDA_SUCCESS
++        || cuLaunchKernel(q8 ? gpu_warpq : gpu_warp, grid, 1, 1, 128, 1, 1, 0, NULL, ga_,
++          NULL) != CUDA_SUCCESS
++        || cuLaunchKernel(q8 ? gpu_warpq : gpu_warp, grid, 1, 1, 128, 1, 1, 0, NULL, ua_,
++          NULL) != CUDA_SUCCESS
++        || cuLaunchKernel(gpu_silu, 24, 1, 1, 256, 1, 1, 0, NULL, sa_, NULL)
++          != CUDA_SUCCESS) {
++        err_fail("device launch failed");
++      }
++      xp = sa;
++    }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+     if (cuLaunchKernel(q8 ? gpu_warpq : gpu_warp, grid, 1, 1, 128, 1, 1, 0,
+       NULL, args, NULL)
+       != CUDA_SUCCESS) {
+       err_fail("device launch failed");
+     }
+-    // the residual add: attention's (kind 1) and the GEMV-add bang's (3)
+-    if (o->kind == 1 || o->kind == 3) {
++    // the residual add: attention's (kind 1), the GEMV-add bang's (3), FFN's (5)
++    if (o->kind == 1 || o->kind == 3 || o->kind == 5) {
+       u64 rp = o->r;
+       void* ad[] = { &rp, &yp };
+       if (cuLaunchKernel(gpu_add, 8, 1, 1, 256, 1, 1, 0, NULL, ad, NULL)

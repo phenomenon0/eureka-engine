@@ -1,0 +1,102 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2901,7 +2901,7 @@
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+-    || is_og(k) || is_head(k) || is_attn4(k);
++    || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k);
+ }
+ 
+ // The Qwen3.5 attention block bang (tools/payload-attn4.patch): the host runs
+@@ -2911,6 +2911,12 @@
+   return k === "llb.attn4_warp" || k.endsWith(".llb.attn4_warp");
+ }
+ 
++// The SwiGLU silu-mul bang (tools/payload-silumul.patch): the host runs the
++// existing llb_silu (K.vmul(K.silu(g), u)) into the bang's output y (field 3).
++function is_silumul(k: Name): boolean {
++  return k === "llb.silu_mul_warp" || k.endsWith(".llb.silu_mul_warp");
++}
++
+ // The attention output gate bang (tools/payload-og.patch): the host runs
+ // llb_outputgate into the bang's output y (field index 3).
+ function is_og(k: Name): boolean {
+@@ -4101,6 +4107,7 @@
+       : is_rnorm(k) ? "LLB_RNORM_FID" : is_vadd(k) ? "LLB_VADD_FID"
+       : is_vmul(k) ? "LLB_VMUL_FID" : is_og(k) ? "LLB_OG_FID"
+       : is_head(k) ? "LLB_HEAD_FID" : is_attn4(k) ? "LLB_ATTN4_FID"
++      : is_silumul(k) ? "LLB_SILUMUL_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -7044,6 +7051,9 @@
+ #ifndef LLB_ATTN4_FID
+ #define LLB_ATTN4_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_SILUMUL_FID
++#define LLB_SILUMUL_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7055,7 +7065,7 @@
+   || (u32)term_aux(t) == LLB_RNORM_FID \
+   || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID \
+   || (u32)term_aux(t) == LLB_OG_FID || (u32)term_aux(t) == LLB_HEAD_FID \
+-  || (u32)term_aux(t) == LLB_ATTN4_FID)
++  || (u32)term_aux(t) == LLB_ATTN4_FID || (u32)term_aux(t) == LLB_SILUMUL_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7773,6 +7783,23 @@
+     o->c = c;
+     return true;
+   }
++  // The SwiGLU silu-mul bang (tools/payload-silumul.patch): y := silu(g) * u
++  // over 2^d, y at field index 3.
++  if (aux == LLB_SILUMUL_FID) {
++    Term gt = H[a + 1], ut = H[a + 2], y = H[a + 3];
++    u32  d = (u32)H[a + 4];
++    if (term_tag(gt) == TAG_ARR || term_tag(ut) == TAG_ARR || term_tag(y) == TAG_ARR
++      || d < 5 || d > 14) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 16;
++    o->x = (u64)(H + blk_loc(H, gt));
++    o->k = (u64)(H + blk_loc(H, ut));
++    o->y = (u64)(H + blk_loc(H, y));
++    o->n = 1u << d;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7814,7 +7841,7 @@
+       if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
+         || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
+         || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
+-        || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID) {
++        || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID || hx == LLB_SILUMUL_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -8957,6 +8984,17 @@
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 16) {
++        // the SwiGLU silu-mul bang (tools/payload-silumul.patch): y :=
++        // silu(g) * u, the existing llb_silu (256 threads, one an element)
++        u64 gp16 = o->x, up16 = o->k;
++        u32 n16 = o->n;
++        u32 g16 = (n16 + 255) / 256;
++        void* hy[] = { &gp16, &up16, &yp, &n16 };
++        if (cuLaunchKernel(gpu_silu, g16, 1, 1, 256, 1, 1, 0, NULL, hy, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else {
+         // the output gate bang (tools/payload-og.patch)
+         u64 xp13 = o->x, gp13 = o->k;

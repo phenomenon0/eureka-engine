@@ -1,0 +1,1 @@
+{"model":"clef","state":"The ticket can wait until next month.","questions":{"urgency":{"type":"score","instructions":"How urgent is this?","criteria":["Can wait","Immediate action"]}}}

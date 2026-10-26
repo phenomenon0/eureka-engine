@@ -1,0 +1,335 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4942,7 +4942,7 @@
+ static CUfunction gpu_embed, gpu_embedk;
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
+-static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc;
++static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc, gpu_warpqc11;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_blk;
+ static CUdeviceptr gpu_logit;
+@@ -7102,9 +7102,9 @@
+   // format table (tools/payload-table.patch): table.bin's words 1..20 per
+   // absolute layer (offset | fm << 28); tbk/wlk/skk key the last validated
+   // pass (table address, layer list, s | k << 16)
+-  u64    pw[32];
++  u64    pw[64];
+   u64    tbk, wlk, skk;
+-  u32    pt[32][20];
++  u32    pt[64][20];
+   LlbShape sh;
+   WarpOp op[WARP_MAX];
+ } Mail;
+@@ -7808,6 +7808,81 @@
+   }
+ }
+ 
++// d = 11 rows with NR of the 16 vblocks real (cg = 128 NR: 5120 / 6144 cols,
++// tools/payload-27b.patch): rw's leaves, butterfly and carry over the NR real
++// vblocks only, so slot[3] = T8 (vblocks 0..7) and slot[NR == 10 ? 1 : 2] the
++// rest; the pad subtree (groups cg .. 2047, 0 * x) is one block-wide vote P
++// as llb_warp_q8_res's (NaN if any x there is inf / NaN, -0 if all signed,
++// else +0; merged pad subtrees give the same bits, receipts/fable-q27b/c1),
++// so y = T8 + (rest + P), the tree's own top. Every thread must enter (vote).
++template <u32 NR, bool CAT = false>
++__device__ __forceinline__ void warp_dq_q8_rwp(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, Q8Cat cat = Q8Cat{}) {
++  static_assert(NR == 10 || NR == 12, "rwp: 5120 / 6144 cols only");
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  int nf = 0, ng = 1;
++  #pragma unroll 2
++  for (u32 g = cg + threadIdx.x; g < 128 * 16; g += blockDim.x) {
++    const uint4 v = *(const uint4*)(x + 4 * g);
++    nf |= (v.x & 0x7f800000u) == 0x7f800000u | (v.y & 0x7f800000u) == 0x7f800000u
++      | (v.z & 0x7f800000u) == 0x7f800000u | (v.w & 0x7f800000u) == 0x7f800000u;
++    ng &= (v.x & v.y & v.z & v.w) >> 31;
++  }
++  nf = __syncthreads_or(nf);
++  ng = __syncthreads_and(ng);
++  const float p = nf ? __uint_as_float(0x7fffffffu) : ng ? -0.f : 0.f;
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const u8* row = W + (u64)r * rb;
++    u32*      yr  = y + r;
++    if (CAT) {
++      const u32 e0 = cat.end[0], e1 = cat.end[1], e2 = cat.end[2];
++      const u32 r0 = r < e0 ? r : r < e1 ? r - e0 : r < e2 ? r - e1 : r - e2;
++      row = (r < e0 ? cat.W[0] : r < e1 ? cat.W[1] : r < e2 ? cat.W[2] : cat.W[3])
++        + (u64)r0 * rb;
++      yr  = (r < e0 ? cat.y[0] : r < e1 ? cat.y[1] : r < e2 ? cat.y[2] : cat.y[3]) + r0;
++    }
++    float slot[4] = {0.f, 0.f, 0.f, 0.f};
++    u32 occ = 0;
++    #pragma unroll 1
++    for (u32 j = 0; j < NR; j++) {
++      u32 g0 = 128 * j + 4 * l;
++      uint4 q = q8_wld(row + 4 * g0);
++      float s = llb_f16(*(const unsigned short*)
++        (row + 4 * cg + 2 * (g0 >> 3)));
++      float v = __fadd_rn(__fadd_rn(q8_dot(q.x, s, xg(x, g0)),
++        q8_dot(q.y, s, xg(x, g0 + 1))),
++        __fadd_rn(q8_dot(q.z, s, xg(x, g0 + 2)),
++          q8_dot(q.w, s, xg(x, g0 + 3))));
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        float o = __shfl_xor_sync(0xffffffffu, v, m);
++        v = (l & m) ? __fadd_rn(o, v) : __fadd_rn(v, o);
++      }
++      u32 b = 0;
++      #pragma unroll
++      for (u32 t = 0; t < 4; t++) {
++        if (b == t && (occ & (1u << t))) {
++          v = __fadd_rn(slot[t], v);
++          occ &= ~(1u << t);
++          b = t + 1;
++        }
++      }
++      #pragma unroll
++      for (u32 t = 0; t < 4; t++) {
++        if (b == t) {
++          slot[t] = v;
++        }
++      }
++      occ |= 1u << b;
++    }
++    if (l == 0) {
++      *yr = __float_as_uint(__fadd_rn(slot[3], __fadd_rn(slot[NR == 10 ? 1 : 2], p)));
++    }
++  }
++}
++
+ // A block a row, warp w its quarter: vblocks w NV/4 .. (w + 1) NV/4 - 1. With NV
+ // a power of 2 the carry tree is perfect, each quarter is one of its subtrees,
+ // and the row is (Q0 + Q1) + (Q2 + Q3): the same bits as a warp a row. For
+@@ -7894,6 +7969,14 @@
+     warp_dq_q8_rw<8>(W, rb, cg, x, y, n, d);
+   } else if (d == 12) {
+     warp_dq_q8_split<32>(W, rb, cg, x, y, n, blockIdx.x, gridDim.x, nullptr);
++  } else if (d == 11 && n < 4 * gridDim.x) {
++    warp_dq_q8_split<16>(W, rb, cg, x, y, n, blockIdx.x, gridDim.x, nullptr);
++  } else if (d == 11 && cg == 1280) {
++    warp_dq_q8_rwp<10>(W, rb, cg, x, y, n);
++  } else if (d == 11 && cg == 1536) {
++    warp_dq_q8_rwp<12>(W, rb, cg, x, y, n);
++  } else if (d == 11) {
++    warp_dq_q8_rw<16>(W, rb, cg, x, y, n, d);
+   } else {
+     warp_dq_q8_rw<0>(W, rb, cg, x, y, n, d);
+   }
+@@ -8004,6 +8087,18 @@
+   warp_dq_q8_rw<8, true>(c.W[0], rb, cg, x, c.y[0], c.end[3], 10, c);
+ }
+ 
++// the d = 11 cat (the 27B's 5120 / 6144 cols, tools/payload-27b.patch)
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q8_cat11(
++  u32 rb, u32 cg, const u32* __restrict__ x, Q8Cat c) {
++  if (cg == 1280) {
++    warp_dq_q8_rwp<10, true>(c.W[0], rb, cg, x, c.y[0], c.end[3], c);
++  } else if (cg == 1536) {
++    warp_dq_q8_rwp<12, true>(c.W[0], rb, cg, x, c.y[0], c.end[3], c);
++  } else {
++    warp_dq_q8_rw<16, true>(c.W[0], rb, cg, x, c.y[0], c.end[3], 11, c);
++  }
++}
++
+ // two short d = 10 GEMVs over one x (linb's beta / alpha): half the grid each
+ extern "C" __global__ void __launch_bounds__(128) llb_warp_q8_two(
+   const u8* __restrict__ W0, const u8* __restrict__ W1, u32 rb, u32 cg,
+@@ -8871,9 +8966,10 @@
+ extern "C" __global__ void __launch_bounds__(1024) llb_attn4(
+   const float* __restrict__ q, const float* __restrict__ kc,
+   const float* __restrict__ vc, float* __restrict__ att,
+-  float* __restrict__ sc, float* __restrict__ pr, u32 c) {
++  float* __restrict__ sc, float* __restrict__ pr, u32 c, u32 grp) {
+   const u32 h = blockIdx.x, dT = c & 31, pos = c >> 5, T = 1u << dT;
+-  const u32 g = (h >> 2) * 256;
++  // grp q heads share a kv head: 4 the 9B, 6 the 27B (tools/payload-27b.patch)
++  const u32 g = (h / grp) * 256;
+   const float scale = __fdiv_rn(1.0f, __fsqrt_rn(256.0f));
+   const float ninf = __uint_as_float(0xFF800000u);
+   float* sh = sc + (u64)h * (1u << 17);
+@@ -9458,16 +9554,17 @@
+   u64  dm = sh.d, df = sh.f, qa = sh.nh * sh.hd, kv = sh.nkv * sh.hd;
+   u64  lk = sh.lkh * sh.sd, lv = sh.lvh * sh.sd, cv = 2 * lk + lv;
+   u32  ro = (u32)(qa / 32 * 34);
+-  // the envelope: llb_rmsnorm / rmsnorm_add n 4096; llb_attn4 hd 256, GQA 4,
+-  // a 1024 kv stride, 16 heads; l2norm_qk / gdl / grn sd 128 and the 2048 copy
+-  // (lvh = 2 lkh); warp_q8_res depth 12 (8192 < f) and gpu_blk (f <= 12288);
+-  // the o / ssm_out GEMVs read nh * hd = lvh * sd columns
+-  bool env = dm == 4096 && df > 8192 && df <= 12288 && df % 32 == 0
+-    && sh.hd == 256 && sh.sd == 128 && sh.nh == 4 * sh.nkv && kv == 1024
+-    && lk == 2048 && sh.lvh == 2 * sh.lkh && qa == lv
++  // the envelope: llb_rmsnorm / rmsnorm_add n 4096 or 5120; llb_attn4 hd 256,
++  // GQA 4 or 6, a 1024 kv stride; l2norm_qk / gdl / grn sd 128 and 2048 k
++  // copied 2 or 3 times (lvh = 2 or 3 lkh); warp_q8_res depth 12 (8192 < f)
++  // and gpu_blk (f <= 17408); the o / ssm_out GEMVs read nh * hd = lvh * sd
++  // columns (the 9B, tools/payload-27b.patch the 27B)
++  bool env = (dm == 4096 || dm == 5120) && df > 8192 && df <= 17408 && df % 32 == 0
++    && sh.hd == 256 && sh.sd == 128 && (sh.nh == 4 * sh.nkv || sh.nh == 6 * sh.nkv)
++    && kv == 1024 && lk == 2048 && (sh.lvh == 2 * sh.lkh || sh.lvh == 3 * sh.lkh) && qa == lv
+     && rg == dm / 32 * 34 && rd == df / 32 * 34;
+   bool ok = env && fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+-    && dT >= 1 && dT <= 17 && pos < (1u << dT) && k >= 1 && s + k <= 32
++    && dT >= 1 && dT <= 17 && pos < (1u << dT) && k >= 1 && s + k <= 64
+     && term_tag(x) != TAG_ARR && term_tag(y) != TAG_ARR
+     && (fold || blk_cls(x) == 12) && blk_cls(y) >= (fold ? 2 : 12);
+   o->w = 0;
+@@ -9587,7 +9684,7 @@
+     return;
+   }
+   if (!hit) {
+-    u32 nr = qt.len / 128 < 32 ? (u32)(qt.len / 128) : 32;
++    u32 nr = qt.len / 128 < 64 ? (u32)(qt.len / 128) : 64;
+     for (u32 i = 0; i < nr; i += 1) {
+       for (u32 f = 0; f < 20; f += 1) {
+         M->pt[i][f] = tw[i * 32 + 1 + f];
+@@ -10101,15 +10198,32 @@
+   u32 n) {
+   __shared__ float a[33];
+   const u32 t = threadIdx.x;
+-  const u64 o = (u64)t * 4;
+-  float v[4];
+-  #pragma unroll
+-  for (u32 k = 0; k < 4; k++) {
+-    v[k] = __fadd_rn(x[o + k], z[o + k]);
+-    x1[o + k] = v[k];
++  float acc;
++  if (n <= 4096) {
++    const u64 o = (u64)t * 4;
++    float v[4];
++    #pragma unroll
++    for (u32 k = 0; k < 4; k++) {
++      v[k] = __fadd_rn(x[o + k], z[o + k]);
++      x1[o + k] = v[k];
++    }
++    acc = __fadd_rn(__fadd_rn(__fmul_rn(v[0], v[0]), __fmul_rn(v[1], v[1])),
++      __fadd_rn(__fmul_rn(v[2], v[2]), __fmul_rn(v[3], v[3])));
++  } else {
++    // n 5120 (the 27B, tools/payload-27b.patch): the tree over 8192, +0 pad leaves
++    float b[8];
++    #pragma unroll
++    for (u32 k = 0; k < 8; k++) {
++      const u64 i = (u64)t * 8 + k;
++      const float v = i < n ? __fadd_rn(x[i], z[i]) : 0.0f;
++      if (i < n) {
++        x1[i] = v;
++      }
++      b[k] = i < n ? __fmul_rn(v, v) : 0.0f;
++    }
++    acc = __fadd_rn(__fadd_rn(__fadd_rn(b[0], b[1]), __fadd_rn(b[2], b[3])),
++      __fadd_rn(__fadd_rn(b[4], b[5]), __fadd_rn(b[6], b[7])));
+   }
+-  const float acc = __fadd_rn(__fadd_rn(__fmul_rn(v[0], v[0]), __fmul_rn(v[1], v[1])),
+-    __fadd_rn(__fmul_rn(v[2], v[2]), __fmul_rn(v[3], v[3])));
+   const float sum = rms_tree(acc, a, t, 32);
+   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
+     __uint_as_float(0x358637BDu))));
+@@ -10119,10 +10233,11 @@
+ }
+ 
+ // linb's four l2norms as one launch: q (scale sq) and k (scale 1) heads of
+-// 128 from cnv / cnvk, each written to dst and its copy dst + 2048
++// 128 from cnv / cnvk, each written to dst and its rep - 1 copies (the value
++// heads tile the key heads: dst + r * heads * 128, r < rep; 2 the 9B, 3 the 27B)
+ extern "C" __global__ void __launch_bounds__(64) llb_l2norm_qk(
+   const float* __restrict__ vq, const float* __restrict__ vk,
+-  float* __restrict__ yq, float* __restrict__ yk, float sq, u32 heads) {
++  float* __restrict__ yq, float* __restrict__ yk, float sq, u32 heads, u32 rep) {
+   __shared__ float a[33];
+   const u32 kq = blockIdx.x >= heads, h = blockIdx.x - (kq ? heads : 0);
+   const u32 t = threadIdx.x;
+@@ -10135,8 +10250,9 @@
+   const float s = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
+   const float2 r = make_float2(__fmul_rn(x.x, s), __fmul_rn(x.y, s));
+   float* y = (kq ? yk : yq) + ((u64)h << 7);
+-  ((float2*)y)[t] = r;
+-  ((float2*)(y + 2048))[t] = r;
++  for (u32 c = 0; c < rep; c++) {
++    ((float2*)(y + (u64)c * heads * 128))[t] = r;
++  }
+ }
+ 
+ // linb's mid32 (block 0) beside conv1d (blocks 1 ..): independent inputs
+@@ -10184,6 +10300,16 @@
+     const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
+     const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
+     acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
++  } else if (n > 4096) {
++    // n 5120 (the 27B, tools/payload-27b.patch): the tree over 8192, +0 pad leaves
++    float b[8];
++    #pragma unroll
++    for (u32 k = 0; k < 8; k++) {
++      const u64 i = (u64)t * 8 + k;
++      b[k] = i < n ? __fmul_rn(x[i], x[i]) : 0.0f;
++    }
++    acc = __fadd_rn(__fadd_rn(__fadd_rn(b[0], b[1]), __fadd_rn(b[2], b[3])),
++      __fadd_rn(__fadd_rn(b[4], b[5]), __fadd_rn(b[6], b[7])));
+   } else {
+     acc = __fadd_rn(__fmul_rn(xp[0], xp[0]), __fmul_rn(xp[1], xp[1]));
+   }
+@@ -10912,13 +11038,17 @@
+     || cuModuleGetFunction(&gpu_warpqr, gpu_lib, "llb_warp_q8_res") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpqt, gpu_lib, "llb_warp_q8_two") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpqc, gpu_lib, "llb_warp_q8_cat") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpqc11, gpu_lib, "llb_warp_q8_cat11") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+-    || cuMemAlloc(&gpu_blk, 49152 * 4) != CUDA_SUCCESS
++    // 81920: the 27B's fbn (2 * 5120 + 3 * 17408) and a d 13 pad tail
++    || cuMemAlloc(&gpu_blk, 81920 * 4) != CUDA_SUCCESS
+     // zeroed: the down GEMV's x pad tail (aab + f, d 12) is read, never written
+-    || cuMemsetD32(gpu_blk, 0, 49152) != CUDA_SUCCESS
++    || cuMemsetD32(gpu_blk, 0, 81920) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+-    || cuMemAlloc(&gpu_headh, 4096 * 4) != CUDA_SUCCESS
+-    || cuMemAlloc(&gpu_atts, (size_t)2 * 16 * (1u << 17) * 4) != CUDA_SUCCESS
++    // 8192: the 27B's 5120 and a d 11 pad tail (zeroed); atts 24 heads
++    || cuMemAlloc(&gpu_headh, 8192 * 4) != CUDA_SUCCESS
++    || cuMemsetD32(gpu_headh, 0, 8192) != CUDA_SUCCESS
++    || cuMemAlloc(&gpu_atts, (size_t)2 * 24 * (1u << 17) * 4) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+     || cuMemHostGetDevicePointer(&gpu_maild, (void*)gpu_mail, 0)
+@@ -11150,6 +11280,21 @@
+ #define seam_pf(H)
+ #endif
+ 
++// A big file read on the managed heap goes through a host buffer and the
++// copy engine (cuMemcpyHtoD), so the CPU never touches the block: a CPU
++// write populates host pages the driver keeps charged (18 GB for the 27B).
++#if BEND_CUDA && CUDA_VERSION >= 13000
++#define io_big(n) (io_gpu && (n) >= 1ull << 24)
++static void io_put(void* d, const void* p, u64 n) {
++  if (!io_big(n) || cuMemcpyHtoD((CUdeviceptr)(uintptr_t)d, p, n) != CUDA_SUCCESS) {
++    memcpy(d, p, n);
++  }
++}
++#else
++#define io_big(n) 0
++#define io_put(d, p, n) memcpy(d, p, n)
++#endif
++
+ OUTLINE Term corpus_eval(Corpus H, Term t) {
+   Env  e = { H, ALC[0] };
+   Term rv[WL_RESW];
+@@ -11680,7 +11825,7 @@
+ static inline Term io_buf(Env e, const char* p, u64 n) {
+   StrParts out = str_alloc(e, n, 2);
+   if (out.data && !err_seen(e.mem)) {
+-    memcpy((u8*)(e.mem + term_peek(e, out.data)), p, n);
++    io_put((u8*)(e.mem + term_peek(e, out.data)), p, n);
+   }
+   return str_view_owned(e, out);
+ }
+--- a/bend2/effs/file_read_buf.c
++++ b/bend2/effs/file_read_buf.c
+@@ -22,7 +22,7 @@
+ // disk goes to a helper as before. A short count is what read may give.
+ static bool file_read_buf_now(Env e, IoWork* w, Term* out) {
+ #if defined(__linux__) && defined(RWF_NOWAIT)
+-  if (w->word == 0) { return false; }
++  if (w->word == 0 || io_big(w->word)) { return false; }
+   StrParts p = str_alloc(e, w->word, 2);
+   if (!p.data || err_seen(e.mem)) { term_sink(e, p.data); return false; }
+   struct iovec v = { (u8*)(e.mem + term_peek(e, p.data)), w->word };

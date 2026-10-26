@@ -1,0 +1,138 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2900,7 +2900,14 @@
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+-    || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k);
++    || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
++    || is_og(k);
++}
++
++// The attention output gate bang (tools/payload-og.patch): the host runs
++// llb_outputgate into the bang's output y (field index 3).
++function is_og(k: Name): boolean {
++  return k === "llb.outputgate_warp" || k.endsWith(".llb.outputgate_warp");
+ }
+ 
+ // The standalone rms_norm bang (tools/payload-rmsnorm.patch): the host runs
+@@ -4078,7 +4085,7 @@
+       : is_l2n(k) ? "LLB_L2N_FID" : is_conv(k) ? "LLB_CONV_FID"
+       : is_grn(k) ? "LLB_GRN_FID" : is_gdl(k) ? "LLB_GDL_FID"
+       : is_rnorm(k) ? "LLB_RNORM_FID" : is_vadd(k) ? "LLB_VADD_FID"
+-      : is_vmul(k) ? "LLB_VMUL_FID"
++      : is_vmul(k) ? "LLB_VMUL_FID" : is_og(k) ? "LLB_OG_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4814,6 +4821,7 @@
+ static CUfunction gpu_rnorm;
+ static CUfunction gpu_vadd;
+ static CUfunction gpu_vmul;
++static CUfunction gpu_og;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+@@ -7007,6 +7015,9 @@
+ #ifndef LLB_VMUL_FID
+ #define LLB_VMUL_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_OG_FID
++#define LLB_OG_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7016,7 +7027,8 @@
+   || (u32)term_aux(t) == LLB_L2N_FID || (u32)term_aux(t) == LLB_CONV_FID \
+   || (u32)term_aux(t) == LLB_GRN_FID || (u32)term_aux(t) == LLB_GDL_FID \
+   || (u32)term_aux(t) == LLB_RNORM_FID \
+-  || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID)
++  || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID \
++  || (u32)term_aux(t) == LLB_OG_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7608,6 +7620,21 @@
+     o->n = 1u << d;
+     return true;
+   }
++  if (aux == LLB_OG_FID) {
++    Term xt = H[a + 1], gt = H[a + 2], y = H[a + 3];
++    u32  d = (u32)H[a + 4];
++    if (term_tag(xt) == TAG_ARR || term_tag(gt) == TAG_ARR || term_tag(y) == TAG_ARR
++      || d < 5 || d > 14) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 13;
++    o->x = (u64)(H + blk_loc(H, xt));
++    o->k = (u64)(H + blk_loc(H, gt));
++    o->y = (u64)(H + blk_loc(H, y));
++    o->n = 1u << d;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7648,7 +7675,7 @@
+       u32 hx = (u32)term_aux(t);
+       if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
+         || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
+-        || hx == LLB_VADD_FID || hx == LLB_VMUL_FID) {
++        || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -8037,6 +8064,17 @@
+   }
+ }
+ 
++// K.output_gate (tools/payload-og.patch): y := x * sigmoid(g), the exp
++// through F64 (attn_exp), as silu / llb_silu.
++extern "C" __global__ void llb_outputgate(const float* __restrict__ x,
++  const float* __restrict__ g, float* __restrict__ y, u32 n) {
++  const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < n) {
++    y[i] = __fmul_rn(x[i], __fdiv_rn(1.0f,
++      __fadd_rn(1.0f, attn_exp(-g[i]))));
++  }
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -8510,6 +8548,7 @@
+     || cuModuleGetFunction(&gpu_rnorm, gpu_lib, "llb_rmsnorm") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_vadd, gpu_lib, "llb_vadd") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_vmul, gpu_lib, "llb_vmul") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_og, gpu_lib, "llb_outputgate") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+@@ -8685,7 +8724,7 @@
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
+-      } else {
++      } else if (o->kind == 11 || o->kind == 12) {
+         // the elementwise vadd / vmul bangs (tools/payload-vadd.patch)
+         u64 xp11 = o->x, zp11 = o->k;
+         u32 n11 = o->n;
+@@ -8695,6 +8734,16 @@
+           NULL, hy, NULL) != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else {
++        // the output gate bang (tools/payload-og.patch)
++        u64 xp13 = o->x, gp13 = o->k;
++        u32 n13 = o->n;
++        u32 g13 = (n13 + 1023) / 1024;
++        void* hy[] = { &xp13, &gp13, &yp, &n13 };
++        if (cuLaunchKernel(gpu_og, g13, 1, 1, 1024, 1, 1, 0, NULL, hy, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       }
+       continue;
+     }

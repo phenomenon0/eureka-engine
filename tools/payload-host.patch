@@ -1,0 +1,581 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -5,6 +5,17 @@
+ import * as fs from "node:fs";
+ 
+ import * as Bend from "./bend.ts";
++// The llb host chains live in host/llb_host.c (LLB_HOST_DIR, set by tools/build_gpu.sh),
++// neutral C over host/llb_backend.h; the CUDA build puts llb_backend_cuda.h first. Each
++// #include "llb_*.h" is inlined so the emitted C stays one file.
++const llb_host = (): string => {
++  const d = process.env.LLB_HOST_DIR;
++  if (!d) throw new Error("LLB_HOST_DIR unset: build with tools/build_gpu.sh");
++  const read = (f: string): string =>
++    fs.readFileSync(`${d}/${f}`, "utf8").replace(/\n$/, "")
++      .replace(/^#include "(llb_\w+\.h)"$/gm, (_, h: string) => read(h));
++  return `#if BEND_CUDA\n${read("llb_backend_cuda.h")}\n#endif\n${read("llb_host.c")}`;
++};
+ 
+ // Comp
+ // ====
+@@ -10499,559 +10510,7 @@
+ 
+ #endif
+ 
+-#if BEND_CUDA && defined(LLB_WARP_FID)
+-// The fbn / linb / fulb chains (tools/payload-fbn, -linb, -fulb.patch) as
+-// functions of the op, its output y and the GEMV grid: their warp_serve
+-// branches and the pass bang (tools/payload-pass.patch) run the same launches
+-// the device's Q8Cat as launch bytes: 4 + 4 device pointers, 4 row ends
+-typedef struct {
+-  u64 W[4];
+-  u64 y[4];
+-  u32 end[4];
+-} Q8Cat;
+-
+-static void llb_fbn_run(volatile WarpOp* o, u64 yp, u32 grid) {
+-  // the FFN block bang (tools/payload-fbn.patch): rms(post, x + a), the
+-  // gate and up GEMVs, silu, the down GEMV, the residual add -- one task
+-  u64 postp17 = o->w, fgp17 = o->k, fup17 = o->v, fdp17 = o->wn;
+-  u64 xp17 = o->x, ap17 = o->r;
+-  u32 rg17 = o->rb, rd17 = o->d;
+-  u32 cgu = rg17 / 17 * 4, cgd = rd17 / 17 * 4;
+-  CUdeviceptr x1b = gpu_blk, h2b = x1b + 4096 * 4;
+-  CUdeviceptr ggb = h2b + 4096 * 4, uub = ggb + 12288 * 4;
+-  CUdeviceptr aab = uub + 12288 * 4, ddb = aab + 12288 * 4;
+-  u32 n4 = 4096, ngu = 12288, dgu = 10, dfd = 12;
+-  u32 siluG = (12288 + 255) / 256, vaddG = (4096 + 1023) / 1024;
+-  void* rb17[] = { &xp17, &ap17, &postp17, &x1b, &h2b, &n4 };
+-  void* gg17[] = { &fgp17, &rg17, &cgu, &h2b, &ggb, &ngu, &dgu };
+-  void* uu17[] = { &fup17, &rg17, &cgu, &h2b, &uub, &ngu, &dgu };
+-  Q8Cat c17 = { { fgp17, fup17, 0, 0 }, { ggb, uub, 0, 0 }, { ngu, 2 * ngu, 2 * ngu, 2 * ngu } };
+-  void* gu17[] = { &rg17, &cgu, &h2b, &c17 };
+-  (void)gg17; (void)uu17;
+-  void* ss17[] = { &ggb, &uub, &aab, &ngu };
+-  void* dd17[] = { &fdp17, &rd17, &cgd, &aab, &yp, &n4, &x1b };
+-  (void)dfd; (void)ddb; (void)vaddG;
+-  if (cuLaunchKernel(gpu_rnadd, 1, 1, 1, 1024, 1, 1, 0, NULL, rb17, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpqc, grid, 1, 1, 128, 1, 1, 0, NULL, gu17, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_silu, siluG, 1, 1, 256, 1, 1, 0, NULL, ss17, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpqr, 82 * 8, 1, 1, 192, 1, 1, 0, NULL, dd17, NULL)
+-      != CUDA_SUCCESS) {
+-    err_fail("device launch failed");
+-  }
+-}
+-
+-static void llb_linb_run(volatile WarpOp* o, u64 yp, u32 grid) {
+-  // the linear attention block bang (tools/payload-linb.patch): the
+-  // z/beta/alpha GEMVs, the 32-element middleware, conv1d, the two
+-  // l2norms, gated_delta (S in place), gated_rmsnorm, the ssm_out GEMV
+-  u64 base18 = o->w;
+-  u64 xp18 = o->x, qkvp18 = o->qk, h0p = o->k, h1p = o->v, h2p = o->wn, Sp = o->r;
+-  u64 anp18 = base18 + o->ban, wqkvp18 = base18 + o->c;
+-  u64 gtp = base18 + o->bq, bop = base18 + o->bg, aop = base18 + o->bb;
+-  u64 sap = base18 + o->ba, dtp = base18 + o->bsa, cvp = base18 + o->bdt;
+-  u64 snp = base18 + o->bcv, sop = base18 + o->bsn;
+-  u32 rg18 = o->brg, cg18 = rg18 / 17 * 4;
+-  CUdeviceptr zz = gpu_blk, bpre = zz + 4096 * 4, apre = bpre + 32 * 4;
+-  CUdeviceptr hb18 = gpu_blk + 39040 * 4;
+-  CUdeviceptr beta = apre + 32 * 4, dec = beta + 32 * 4;
+-  CUdeviceptr cnv = dec + 32 * 4, cnvk = cnv + 2048 * 4, vn = cnv + 4096 * 4;
+-  CUdeviceptr gout = cnv + 8192 * 4, qt = gout + 4096 * 4;
+-  CUdeviceptr qt2 = qt + 2048 * 4, kt = qt + 4096 * 4;
+-  CUdeviceptr kt2 = kt + 2048 * 4, normed = kt + 4096 * 4;
+-  union { u32 u; float f; } sq = { 0x413504f3u }, one = { 0x3f800000u };
+-  u32 n4 = 4096, n8192 = 8192, n32 = 32, d10 = 10, hs16 = 16, hs32 = 32;
+-  u32 gconv = (8192 + 255) / 256;
+-  void* r18[] = { &xp18, &anp18, &hb18, &n4 };
+-  void* q18[] = { &wqkvp18, &rg18, &cg18, &hb18, &qkvp18, &n8192, &d10 };
+-  void* z18[] = { &gtp, &rg18, &cg18, &hb18, &zz, &n4, &d10 };
+-  void* ba18[] = { &bop, &aop, &rg18, &cg18, &hb18, &bpre, &apre, &n32 };
+-  Q8Cat qc18 = { { wqkvp18, gtp, bop, aop }, { qkvp18, zz, bpre, apre },
+-    { n8192, n8192 + n4, n8192 + n4 + n32, n8192 + n4 + 2 * n32 } };
+-  void* c18[] = { &rg18, &cg18, &hb18, &qc18 };
+-  (void)q18; (void)z18; (void)ba18;
+-  void* mc18[] = { &bpre, &apre, &dtp, &sap, &beta, &dec, &n32,
+-    &cvp, &qkvp18, &h0p, &h1p, &h2p, &cnv, &n8192 };
+-  void* l18[] = { &cnv, &cnvk, &qt, &kt, &sq.f, &hs16 };
+-  (void)qt2; (void)kt2; (void)one;
+-  void* g18[] = { &Sp, &qt, &kt, &vn, &dec, &beta, &gout, &hs32 };
+-  void* n18[] = { &gout, &snp, &zz, &normed, &hs32 };
+-  void* o18[] = { &sop, &rg18, &cg18, &normed, &yp, &n4, &d10 };
+-  if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, r18, NULL)
+-    != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpqc, grid, 1, 1, 128, 1, 1, 0, NULL, c18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_midconv, 1 + gconv, 1, 1, 256, 1, 1, 0, NULL, mc18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_l2qk, 2 * hs16, 1, 1, 64, 1, 1, 0, NULL, l18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_gdl, hs32, 32, 1, 128, 1, 1, 0, NULL, g18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_grn, hs32, 1, 1, 64, 1, 1, 0, NULL, n18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, o18, NULL)
+-      != CUDA_SUCCESS) {
+-    err_fail("device launch failed");
+-  }
+-}
+-
+-static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid) {
+-  u64 base22 = o->w, xp22 = o->x, kcp22 = o->k, vcp22 = o->v;
+-  u64 anp22 = base22 + o->ban, wqp22 = base22 + o->bq, wkp22 = base22 + o->bg;
+-  u64 wvp22 = base22 + o->bb, wqnp22 = base22 + o->ba, wknp22 = base22 + o->bsa;
+-  u64 wop22 = base22 + o->bdt;
+-  u32 c22 = o->c, pos22 = c22 >> 5, rg22 = o->brg, cg22 = rg22 / 17 * 4;
+-  u64 kslot22 = kcp22 + (u64)pos22 * 1024 * 4, vslot22 = vcp22 + (u64)pos22 * 1024 * 4;
+-  u64 s22 = gpu_atts, p22 = gpu_atts + ((u64)16 << 17) * 4;
+-  CUdeviceptr attn22 = gpu_blk, gated22 = attn22 + 4096 * 4;
+-  CUdeviceptr h22 = gpu_blk + 8192 * 4, qgn22 = h22 + 4096 * 4;
+-  CUdeviceptr qg22 = qgn22 + 8192 * 4, gate22 = qg22 + 4096 * 4;
+-  CUdeviceptr kb22 = qg22 + 8192 * 4, kn22 = kb22 + 1024 * 4, vb22 = kn22 + 1024 * 4;
+-  u32 n4 = 4096, n8192 = 8192, n1024 = 1024, d10 = 10, one = 1, zero = 0;
+-  u32 rq22 = 8192 / 512, rk22 = 1024 / 256, gog22 = (4096 + 1023) / 1024;
+-  void* r22[] = { &xp22, &anp22, &h22, &n4 };
+-  void* q22[] = { &wqp22, &rg22, &cg22, &h22, &qgn22, &n8192, &d10 };
+-  void* qr22[] = { &qgn22, &wqnp22, &qg22, &n8192, &one, &pos22 };
+-  void* k22[] = { &wkp22, &rg22, &cg22, &h22, &kb22, &n1024, &d10 };
+-  void* kr22[] = { &kb22, &wknp22, &kn22, &n1024, &zero, &pos22 };
+-  void* v22[] = { &wvp22, &rg22, &cg22, &h22, &vb22, &n1024, &d10 };
+-  Q8Cat qc22 = { { wqp22, wkp22, wvp22, 0 }, { qgn22, kb22, vb22, 0 },
+-    { n8192, n8192 + n1024, n8192 + 2 * n1024, n8192 + 2 * n1024 } };
+-  void* qv22[] = { &rg22, &cg22, &h22, &qc22 };
+-  (void)q22; (void)k22; (void)v22;
+-  void* sk22[] = { &kn22, &kslot22 };
+-  void* sv22[] = { &vb22, &vslot22 };
+-  void* a22[] = { &qg22, &kcp22, &vcp22, &attn22, &s22, &p22, &c22 };
+-  void* g22[] = { &attn22, &gate22, &gated22, &n4 };
+-  void* o22[] = { &wop22, &rg22, &cg22, &gated22, &yp, &n4, &d10 };
+-  if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, r22, NULL)
+-    != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpqc, grid, 1, 1, 128, 1, 1, 0, NULL, qv22, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_qkr, rq22, 1, 1, 256, 1, 1, 0, NULL, qr22, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_qkr, rk22, 1, 1, 256, 1, 1, 0, NULL, kr22, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, sk22, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, sv22, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_attn4, 16, 1, 1, 1024, 1, 1, 0, NULL, a22, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_og, gog22, 1, 1, 1024, 1, 1, 0, NULL, g22, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, o22, NULL)
+-      != CUDA_SUCCESS) {
+-    err_fail("device launch failed");
+-  }
+-}
+-
+-// The whole-pass bang (tools/payload-pass.patch): layers s..s+k-1 of one
+-// step, each the linb (SSM) or fulb (full, (i + 1) % 4 == 0) chain into a,
+-// then the fbn chain (x, a) into the next x; the last into y. The layer state
+-// lives here, not in the interpreter: per SSM layer a ring of four 8192 conv
+-// buffers (h0, h1, h2, qkva = b[r .. r + 3 mod 4], r += 1 a step: lin.go's
+-// (h1, h2, qkva) rotation; qkva's GEMV writes all 8192 rows before conv reads
+-// it) and S (2^19); per full layer kc, vc (2^(dT + 10)). Zeroed at first use
+-// as Array.new(F32, _, 0.0) was; each layer must then see pos, pos + 1, ...
+-// a and the x ping-pong are fully written (4096 rows) before each read.
+-// ponytail: commits 16 x 2^(dT + 10) f32 of caches up front (8 GB at dT 17);
+-// allocate by pos if long contexts matter.
+-static CUdeviceptr pass_b[32], pass_S[32], pass_kc[32], pass_vc[32], pass_x[3];
+-static u32  pass_r[32], pass_pos[32], pass_dT;
+-static bool pass_on[32];
+-
+-static CUdeviceptr pass_zero(size_t n) {
+-  CUdeviceptr p = 0;
+-  if (cuMemAlloc(&p, n * 4) != CUDA_SUCCESS || cuMemsetD32(p, 0, n) != CUDA_SUCCESS) {
+-    err_fail("warp pass: cannot allocate the layer state");
+-  }
+-  return p;
+-}
+-
+-static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
+-  u32 c = o->c, dT = c & 31, pos = c >> 5, s = o->n, k = o->d;
+-  if (pass_x[0] == 0) {
+-    for (u32 b = 0; b < 3; b += 1) {
+-      pass_x[b] = pass_zero(4096);
+-    }
+-    pass_dT = dT;
+-  }
+-  if (dT != pass_dT) {
+-    err_fail("warp pass: dT changed");
+-  }
+-  u64 cur = o->x;
+-  bool fold = o->w != 0;
+-  if (fold) {
+-    // the folded step: the token's embedding row into pass_x[0]
+-    u64 er = o->w, x0 = pass_x[0];
+-    u32 c4 = 4096;
+-    void* ea[] = { &er, &c4, &x0 };
+-    if (cuLaunchKernel(gpu_embed, 16, 1, 1, 256, 1, 1, 0, NULL, ea, NULL)
+-      != CUDA_SUCCESS) {
+-      err_fail("device launch failed");
+-    }
+-    cur = x0;
+-  }
+-  for (u32 j = 0; j < k; j += 1) {
+-    u32  i = s + j;
+-    bool full = (i + 1) % 4 == 0;
+-    if (!pass_on[i]) {
+-      if (pos != 0) {
+-        err_fail("warp pass: a layer's state must start at pos 0");
+-      }
+-      if (full) {
+-        pass_kc[i] = pass_zero((size_t)1 << (dT + 10));
+-        pass_vc[i] = pass_zero((size_t)1 << (dT + 10));
+-      } else {
+-        pass_b[i] = pass_zero(4 * 8192);
+-        pass_S[i] = pass_zero((size_t)1 << 19);
+-      }
+-      pass_on[i] = true;
+-    } else if (pass_pos[i] + 1 != pos) {
+-      err_fail("warp pass: a layer served out of order");
+-    }
+-    pass_pos[i] = pos;
+-    u64 base = gpu_mail->pw[j];
+-    volatile u32* p = gpu_mail->po + (full ? 20 : 0);
+-    WarpOp at = {0};
+-    at.w = base; at.x = cur; at.brg = o->brg; at.ban = p[0];
+-    if (full) {
+-      at.k = pass_kc[i]; at.v = pass_vc[i];
+-      at.bq = p[14]; at.bg = p[15]; at.bb = p[16];
+-      at.ba = p[17]; at.bsa = p[18]; at.bdt = p[19];
+-      at.c = c; at.fm = 1;
+-      llb_fulb_run(&at, pass_x[2], grid);
+-    } else {
+-      u32 r = pass_r[i];
+-      pass_r[i] = r + 1;
+-      at.k  = pass_b[i] + (u64)(r % 4) * 8192 * 4;
+-      at.v  = pass_b[i] + (u64)((r + 1) % 4) * 8192 * 4;
+-      at.wn = pass_b[i] + (u64)((r + 2) % 4) * 8192 * 4;
+-      at.qk = pass_b[i] + (u64)((r + 3) % 4) * 8192 * 4;
+-      at.r  = pass_S[i];
+-      at.c = p[5]; at.bq = p[6]; at.bg = p[7]; at.bb = p[8]; at.ba = p[9];
+-      at.bsa = p[10]; at.bdt = p[11]; at.bcv = p[12]; at.bsn = p[13];
+-      llb_linb_run(&at, pass_x[2], grid);
+-    }
+-    WarpOp ff = {0};
+-    ff.w = base + p[1]; ff.k = base + p[2]; ff.v = base + p[3]; ff.wn = base + p[4];
+-    ff.x = cur; ff.r = pass_x[2]; ff.n = 4096; ff.rb = o->brg; ff.d = o->rb; ff.fm = 1;
+-    u64 nxt = j + 1 == k && !fold ? yp : pass_x[cur == pass_x[0] ? 1 : 0];
+-    llb_fbn_run(&ff, nxt, grid);
+-    cur = nxt;
+-  }
+-  if (fold) {
+-    // the head bang's chain (kind 14): rms_final -> gpu_headh, the head GEMV
+-    // into gpu_logit, llb_amax's four words into y
+-    u64 wn = o->k, wo = o->v, op2 = gpu_headh, lg = gpu_logit;
+-    u32 n4 = 4096, nh = o->gm, rq = o->bq, cg = o->bq / 17 * 4, dh = 10;
+-    void* ra[] = { &cur, &wn, &op2, &n4 };
+-    void* ga[] = { &wo, &rq, &cg, &op2, &lg, &nh, &dh };
+-    void* am[] = { &lg, &nh, &yp };
+-    if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
+-      != CUDA_SUCCESS
+-      || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, ga, NULL)
+-        != CUDA_SUCCESS
+-      || cuLaunchKernel(gpu_amaxp, AMAX_G, 1, 1, AMAX_T, 1, 1, 0, NULL, am, NULL)
+-        != CUDA_SUCCESS
+-      || cuLaunchKernel(gpu_amax, 1, 1, 1, AMAX_G, 1, 1, 0, NULL, am, NULL)
+-        != CUDA_SUCCESS) {
+-      err_fail("device launch failed");
+-    }
+-  }
+-}
+-#endif
+-
+-#if BEND_CUDA && defined(LLB_WARP_FID)
+-// The parked warp GEMVs (warp_park), args (f, +wb, +x, y, +base, +n, +d, +rb)
+-// as flat.bend's gemv: each runs as one llb_warp launch (LLB_WARP_GRID
+-// blocks of 128, default 164), then llb_deliver hands y to its continuation.
+-// The operands come from the mailbox (llb_mail): the host reads no corpus
+-// word, and the next batch queues behind these launches without a sync.
+-static bool warp_serve(Corpus H) {
+-  u32 m = gpu_mail->m;
+-  if (m == 0) {
+-    return false;
+-  }
+-  if (gpu_mail->bad != 0) {
+-    err_fail(gpu_mail->bad == 2 ? "warp attention: unsupported operands"
+-      : gpu_mail->bad == 3 ? "warp rms: unsupported operands"
+-      : gpu_mail->bad == 4 ? "warp GEMV: row format refused (untagged"
+-        " 17 | rb reads as F32 or Q8_0, or a bad tag)"
+-      : "warp GEMV: unsupported operands");
+-  }
+-  const char* gs   = getenv("LLB_WARP_GRID");
+-  u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 768;
+-  for (u32 j = 0; j < m; j += 1) {
+-    volatile WarpOp* o = &gpu_mail->op[j];
+-    u64 w = o->w, xp = o->x, yp = o->y;
+-    // Q8_0 / F16 / Q4_K / Q6_K (llb_warp_q8 / llb_warp_f16 / llb_warp_q4k /
+-    // llb_warp_q6k): rq is the row's bytes; cg = c / 4 = rb / 17 * 4 (Q8_0),
+-    // rb / 8 (F16), rb / 144 * 64 (Q4_K), rb / 210 * 64 (Q6_K)
+-    u32 n = o->n, d = o->d, fm = o->fm, rq = fm ? o->rb : o->rb / 16;
+-    u32 cg = fm == 1 ? o->rb / 17 * 4 : fm == 3 ? o->rb / 144 * 64
+-      : fm == 4 ? o->rb / 210 * 64 : fm == 5 ? o->rb / 110 * 64
+-      : fm == 6 ? o->rb / 18 * 16 : fm == 7 ? o->rb / 34 * 32
+-      : fm == 8 ? o->rb / 136 * 64
+-      : o->rb / (fm ? 8 : 16);
+-    CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
+-    // attention (f, +wt, +q, +kc, +vc, +c, y, +wo, +r): its o GEMV reads
+-    // llb_attn's output, a slot of gpu_att (2048 x 2048 rows of wo, d = 9);
+-    // then llb_add adds the residual r into y
+-    if (o->kind == 1) {
+-      u64 kp = o->k, vp = o->v;
+-      u32 c  = o->c;
+-      void* aa[] = { &xp, &kp, &vp, &op, &c };
+-      if (cuLaunchKernel(gpu_attn, 16, 1, 1, 128, 1, 1, 0, NULL, aa, NULL)
+-        != CUDA_SUCCESS) {
+-        err_fail("device launch failed");
+-      }
+-      xp = op;
+-    }
+-    // rms (f, +wb, +x, y, +base, +n, +d, +rb, +an): the GEMV reads
+-    // llb_rms(x, the 2048 f32 at byte an of wb), a slot of gpu_att
+-    if (o->kind == 2 || o->kind == 4) {
+-      u64 wn = o->wn;
+-      void* ra[] = { &xp, &wn, &op };
+-      if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
+-        != CUDA_SUCCESS) {
+-        err_fail("device launch failed");
+-      }
+-      xp = op;
+-    }
+-    // FFN (kind 5): llb_rms(x) -> the gate and up GEMVs -> llb_silu, three
+-    // 6144 slots of gpu_act; the down GEMV below reads the silu slot
+-    if (o->kind == 5) {
+-      u64 wn = o->wn, wg = o->k, wu = o->v;
+-      u32 rg = o->c, gm = o->gm, nf = 6144, df = 9;
+-      // gate/up carry their own format (gm), which may differ from the down
+-      // rows' (fm) in a Q4_K_M mixture
+-      u32 gq = gm ? rg : rg / 16, gc = gm == 1 ? rg / 17 * 4
+-        : gm == 3 ? rg / 144 * 64 : gm == 4 ? rg / 210 * 64
+-        : gm == 5 ? rg / 110 * 64 : gm == 6 ? rg / 18 * 16
+-        : gm == 7 ? rg / 34 * 32 : gm == 8 ? rg / 136 * 64 : rg / (gm ? 8 : 16);
+-      CUdeviceptr ga = gpu_act + (CUdeviceptr)j * 3 * 6144 * 4;
+-      CUdeviceptr ua = ga + 6144 * 4, sa = ua + 6144 * 4;
+-      void* ra[] = { &xp, &wn, &op };
+-      void* ga_[] = { &wg, &gq, &gc, &op, &ga, &nf, &df };
+-      void* ua_[] = { &wu, &gq, &gc, &op, &ua, &nf, &df };
+-      void* sa_[] = { &ga, &ua, &sa, &nf };
+-      if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(gm == 8 ? gpu_warp4 : gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+-          1, 1, 0, NULL, ga_, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(gm == 8 ? gpu_warp4 : gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+-          1, 1, 0, NULL, ua_,
+-          NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(gpu_silu, 24, 1, 1, 256, 1, 1, 0, NULL, sa_, NULL)
+-          != CUDA_SUCCESS) {
+-        err_fail("device launch failed");
+-      }
+-      xp = sa;
+-    }
+-    // the Qwen3.5 hybrid bangs (tools/payload-hybrid.patch): one kernel a task
+-    // into y; no generic GEMV follows
+-    if (o->kind >= 6) {
+-      if (o->kind == 6) {
+-        union { u32 u; float f; } sc = { o->c };
+-        u32 hs = o->n;
+-        void* hy[] = { &xp, &yp, &sc.f, &hs };
+-        if (cuLaunchKernel(gpu_l2n, hs, 1, 1, 64, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 7) {
+-        u64 wp = o->w, xp2 = o->x, h0p = o->k, h1p = o->v, h2p = o->wn;
+-        u32 nch = o->n;
+-        void* hy[] = { &wp, &xp2, &h0p, &h1p, &h2p, &yp, &nch };
+-        if (cuLaunchKernel(gpu_conv, (nch + 255) / 256, 1, 1, 256, 1, 1, 0, NULL,
+-          hy, NULL) != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 8) {
+-        u64 op8 = o->x, wp8 = o->w, zp = o->k;
+-        u32 hs = o->n;
+-        void* hy[] = { &op8, &wp8, &zp, &yp, &hs };
+-        if (cuLaunchKernel(gpu_grn, hs, 1, 1, 64, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 9) {
+-        u64 Sp = o->w, qp = o->x, kkp = o->k, vp = o->v, decp = o->wn, betp = o->r;
+-        u32 hs = o->n;
+-        void* hy[] = { &Sp, &qp, &kkp, &vp, &decp, &betp, &yp, &hs };
+-        if (cuLaunchKernel(gpu_gdl, hs, 32, 1, 128, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 10) {
+-        // the standalone rms_norm bang (tools/payload-rmsnorm.patch)
+-        u64 xp10 = o->x, wp10 = o->w;
+-        u32 n10 = o->n;
+-        void* hy[] = { &xp10, &wp10, &yp, &n10 };
+-        if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 11 || o->kind == 12) {
+-        // the elementwise vadd / vmul bangs (tools/payload-vadd.patch)
+-        u64 xp11 = o->x, zp11 = o->k;
+-        u32 n11 = o->n;
+-        u32 g11 = (n11 + 1023) / 1024;
+-        void* hy[] = { &xp11, &zp11, &yp, &n11 };
+-        if (cuLaunchKernel(o->kind == 11 ? gpu_vadd : gpu_vmul, g11, 1, 1, 1024, 1, 1, 0,
+-          NULL, hy, NULL) != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 21) {
+-        // the KV-cache slot write (tools/payload-slot.patch)
+-        u64 xp21 = o->x;
+-        void* hy[] = { &xp21, &yp };
+-        if (cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 20) {
+-        // the qk-norm + neox rope bangs (tools/payload-qkr.patch)
+-        u64 xp20 = o->x, wp20 = o->w;
+-        u32 n20 = o->n, qk20 = o->c, pos20 = (u32)o->r;
+-        u32 rows20 = qk20 != 0 ? n20 / 512 : n20 / 256;
+-        void* hy[] = { &xp20, &wp20, &yp, &n20, &qk20, &pos20 };
+-        if (cuLaunchKernel(gpu_qkr, rows20, 1, 1, 256, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 14) {
+-        // the head bang (tools/payload-head.patch): rms_final -> h (gpu_headh),
+-        // the head GEMV into gpu_logit, then llb_amax into y
+-        u64 wn = o->k, op2 = gpu_headh;
+-        u32 n4 = 4096;
+-        u32 rq = o->rb, cg = o->rb / 17 * 4, dh = o->d;
+-        void* ra[] = { &xp, &wn, &op2, &n4 };
+-        void* ga[] = { &w, &rq, &cg, &op2, &gpu_logit, &n, &dh };
+-        void* am[] = { &gpu_logit, &n, &yp };
+-        if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
+-          != CUDA_SUCCESS
+-          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, ga, NULL)
+-            != CUDA_SUCCESS
+-          || cuLaunchKernel(gpu_amaxp, AMAX_G, 1, 1, AMAX_T, 1, 1, 0, NULL, am, NULL)
+-            != CUDA_SUCCESS
+-          || cuLaunchKernel(gpu_amax, 1, 1, 1, AMAX_G, 1, 1, 0, NULL, am, NULL)
+-            != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 15) {
+-        // the Qwen3.5 attention block bang (tools/payload-attn4.patch): one
+-        // block a query head, 256 threads (a dim each)
+-        u64 qp15 = o->x, kp15 = o->k, vp15 = o->v;
+-        u32 c15 = o->c;
+-        u64 s15 = gpu_atts, p15 = gpu_atts + ((u64)16 << 17) * 4;
+-        void* aa15[] = { &qp15, &kp15, &vp15, &yp, &s15, &p15, &c15 };
+-        if (cuLaunchKernel(gpu_attn4, 16, 1, 1, 1024, 1, 1, 0, NULL, aa15, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 16) {
+-        // the SwiGLU silu-mul bang (tools/payload-silumul.patch): y :=
+-        // silu(g) * u, the existing llb_silu (256 threads, one an element)
+-        u64 gp16 = o->x, up16 = o->k;
+-        u32 n16 = o->n;
+-        u32 g16 = (n16 + 255) / 256;
+-        void* hy[] = { &gp16, &up16, &yp, &n16 };
+-        if (cuLaunchKernel(gpu_silu, g16, 1, 1, 256, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else if (o->kind == 17) {
+-        llb_fbn_run(o, yp, grid);
+-      } else if (o->kind == 18) {
+-        llb_linb_run(o, yp, grid);
+-      } else if (o->kind == 22) {
+-        // the full-attention block bang (tools/payload-fulb.patch): the
+-        // kernels, grids and arguments of the rmsnorm, q GEMV, qkr(q), k
+-        // GEMV, qkr(k), v GEMV, slot, slot and aob bangs, in that order, on
+-        // gpu_blk scratch instead of the interpreter's arrays
+-        if (m != 1) {
+-          err_fail("warp fulb: gpu_blk scratch needs a one-task batch");
+-        }
+-        llb_fulb_run(o, yp, grid);
+-      } else if (o->kind == 23) {
+-        if (m != 1) {
+-          err_fail("warp pass: gpu_blk scratch needs a one-task batch");
+-        }
+-        llb_pass_run(o, yp, grid);
+-      } else if (o->kind == 19) {
+-        // the full-attention output tail bang (tools/payload-aob.patch):
+-        // attn4(q, kc, vc) -> outputgate(attn, gate) -> the o GEMV into y
+-        u64 qp19 = o->x, gp19 = o->k, kcp19 = o->v, vcp19 = o->wn;
+-        u64 wao19 = o->w;
+-        u32 c19 = o->c, rg19 = o->rb, cg19 = rg19 / 17 * 4;
+-        u64 s19 = gpu_atts, p19 = gpu_atts + ((u64)16 << 17) * 4;
+-        CUdeviceptr attn19 = gpu_blk, gated19 = attn19 + 4096 * 4;
+-        u32 n4_19 = 4096, d10_19 = 10, gog19 = (4096 + 1023) / 1024;
+-        void* a19[] = { &qp19, &kcp19, &vcp19, &attn19, &s19, &p19, &c19 };
+-        void* g19[] = { &attn19, &gp19, &gated19, &n4_19 };
+-        void* o19[] = { &wao19, &rg19, &cg19, &gated19, &yp, &n4_19, &d10_19 };
+-        if (cuLaunchKernel(gpu_attn4, 16, 1, 1, 1024, 1, 1, 0, NULL, a19, NULL)
+-          != CUDA_SUCCESS
+-          || cuLaunchKernel(gpu_og, gog19, 1, 1, 1024, 1, 1, 0, NULL, g19, NULL)
+-            != CUDA_SUCCESS
+-          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, o19, NULL)
+-            != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      } else {
+-        // the output gate bang (tools/payload-og.patch)
+-        u64 xp13 = o->x, gp13 = o->k;
+-        u32 n13 = o->n;
+-        u32 g13 = (n13 + 1023) / 1024;
+-        void* hy[] = { &xp13, &gp13, &yp, &n13 };
+-        if (cuLaunchKernel(gpu_og, g13, 1, 1, 1024, 1, 1, 0, NULL, hy, NULL)
+-          != CUDA_SUCCESS) {
+-          err_fail("device launch failed");
+-        }
+-      }
+-      continue;
+-    }
+-    void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+-    if (cuLaunchKernel(fm == 8 ? gpu_warp4 : fm == 7 ? gpu_warpq2 : fm == 6 ? gpu_warp2 : fm == 5 ? gpu_warp3 : fm == 4 ? gpu_warp6 : fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
+-      1, 1, 128, 1, 1, 0,
+-      NULL, args, NULL)
+-      != CUDA_SUCCESS) {
+-      err_fail("device launch failed");
+-    }
+-    // the residual add: attention's (kind 1), the GEMV-add bang's (3), FFN's (5)
+-    if (o->kind == 1 || o->kind == 3 || o->kind == 5) {
+-      u64 rp = o->r;
+-      void* ad[] = { &rp, &yp };
+-      if (cuLaunchKernel(gpu_add, 8, 1, 1, 256, 1, 1, 0, NULL, ad, NULL)
+-        != CUDA_SUCCESS) {
+-        err_fail("device launch failed");
+-      }
+-    }
+-    // rope (kind 4): K.rope over the GEMV's n outputs in place, at o->c
+-    if (o->kind == 4) {
+-      float pf = (float)o->c;
+-      void* ro[] = { &yp, &n, &pf };
+-      if (cuLaunchKernel(gpu_rope, (n / 2 + 127) / 128, 1, 1, 128, 1, 1, 0, NULL, ro,
+-        NULL) != CUDA_SUCCESS) {
+-        err_fail("device launch failed");
+-      }
+-    }
+-  }
+-  void* da[] = { &H, &m };
+-  if (cuLaunchKernel(gpu_dlv, 1, 1, 1, 1, 1, 1, 0, NULL, da, NULL)
+-    != CUDA_SUCCESS) {
+-    err_fail("device launch failed");
+-  }
+-  gpu_mail->m = 0;
+-  return true;
+-}
+-#else
+-#define warp_serve(H) false
+-#endif
++${llb_host()}
+ 
+ // Cube
+ // ====

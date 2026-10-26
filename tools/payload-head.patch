@@ -1,0 +1,202 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2901,7 +2901,7 @@
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+-    || is_og(k);
++    || is_og(k) || is_head(k);
+ }
+ 
+ // The attention output gate bang (tools/payload-og.patch): the host runs
+@@ -2910,6 +2910,13 @@
+   return k === "llb.outputgate_warp" || k.endsWith(".llb.outputgate_warp");
+ }
+ 
++// The head bang (tools/payload-head.patch): the host runs llb_rmsnorm, the
++// output GEMV (llb_warp_q8) into gpu_logit and llb_amax; only the top two
++// logits reach y.
++function is_head(k: Name): boolean {
++  return k === "llb.head_warp" || k.endsWith(".llb.head_warp");
++}
++
+ // The standalone rms_norm bang (tools/payload-rmsnorm.patch): the host runs
+ // llb_rmsnorm into the bang's output y (field index 3).
+ function is_rnorm(k: Name): boolean {
+@@ -4086,6 +4093,7 @@
+       : is_grn(k) ? "LLB_GRN_FID" : is_gdl(k) ? "LLB_GDL_FID"
+       : is_rnorm(k) ? "LLB_RNORM_FID" : is_vadd(k) ? "LLB_VADD_FID"
+       : is_vmul(k) ? "LLB_VMUL_FID" : is_og(k) ? "LLB_OG_FID"
++      : is_head(k) ? "LLB_HEAD_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4822,7 +4830,10 @@
+ static CUfunction gpu_vadd;
+ static CUfunction gpu_vmul;
+ static CUfunction gpu_og;
++static CUfunction gpu_amax;
+ static CUdeviceptr gpu_act;
++static CUdeviceptr gpu_logit;
++static CUdeviceptr gpu_headh;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+ static CUdeviceptr gpu_maild;
+@@ -7018,6 +7029,9 @@
+ #ifndef LLB_OG_FID
+ #define LLB_OG_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_HEAD_FID
++#define LLB_HEAD_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7028,7 +7042,7 @@
+   || (u32)term_aux(t) == LLB_GRN_FID || (u32)term_aux(t) == LLB_GDL_FID \
+   || (u32)term_aux(t) == LLB_RNORM_FID \
+   || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID \
+-  || (u32)term_aux(t) == LLB_OG_FID)
++  || (u32)term_aux(t) == LLB_OG_FID || (u32)term_aux(t) == LLB_HEAD_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7635,6 +7649,38 @@
+     o->n = 1u << d;
+     return true;
+   }
++  // The head bang (tools/payload-head.patch): wt = the head Bytes (output.weight
++  // then output_norm), noff the norm weight's byte offset, ooff the output
++  // weight's; n rows of Q8_0 (tagged rw). x is the final hidden, y the four
++  // F32 words [v, i, w, j].
++  if (aux == LLB_HEAD_FID) {
++    Term    wbt = H[a + 1], x = H[a + 2], y = H[a + 3];
++    u32     noff = (u32)H[a + 4], ooff = (u32)H[a + 5], n = (u32)H[a + 6];
++    u32     rw = (u32)H[a + 7];
++    StrParts q = str_peek_ro(e, wbt);
++    bool    tg = rw >> 30 & 1;
++    u32     rb = rw & (tg ? 0x0fffffffu : 0x7fffffffu);
++    u32     fm = tg ? rw >> 28 & 3 : (rw >> 31 ? 2 : (rb % 17 == 0));
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fm != 1
++      || noff % 4 != 0 || ooff % 16 != 0
++      || term_tag(x) == TAG_ARR || term_tag(y) == TAG_ARR || blk_cls(y) < 2
++      || n < 1 || n > 1u << 18
++      || (u64)noff + 4096 * 4 > q.len
++      || (u64)ooff + (u64)n * (u64)rb > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 14;
++    o->w  = (u64)((const u8*)(H + term_peek_ro(e, q.data)) + q.off + ooff);
++    o->k  = (u64)((const u8*)(H + term_peek_ro(e, q.data)) + q.off + noff);
++    o->x  = (u64)(H + blk_loc(H, x));
++    o->y  = (u64)(H + blk_loc(H, y));
++    o->n  = n;
++    o->d  = 10;
++    o->rb = rb;
++    o->fm = fm;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7675,7 +7721,8 @@
+       u32 hx = (u32)term_aux(t);
+       if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
+         || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
+-        || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID) {
++        || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
++        || hx == LLB_HEAD_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -8075,6 +8122,54 @@
+   }
+ }
+ 
++// flat.bend's argmax twice over z[0 .. n), y := [v, i, w, j] (ids as exact
++// F32), the head bang's tail (tools/payload-head.patch). K.amax.pick (the
++// first NaN, else the first max) is the least by (not NaN, value, index), so
++// any tree yields its pick; the second pick reads slot i as -inf. flat.bend's
++// pad slots n .. 2^17 are -inf and never change a pick. One block of 1024.
++INLINE bool amax_lt(float a, u32 ia, float b, u32 ib) {
++  const bool na = a != a, nb = b != b;
++  if (na || nb) {
++    return na && (!nb || ia < ib);
++  }
++  return a > b || (a == b && ia < ib);
++}
++
++extern "C" __global__ void __launch_bounds__(1024) llb_amax(
++  const float* __restrict__ z, u32 n, float* __restrict__ y) {
++  __shared__ float sv[1024];
++  __shared__ u32   si[1024];
++  const u32 t    = threadIdx.x;
++  u32       skip = 0xFFFFFFFFu;
++  for (u32 k = 0; k < 2; k += 1) {
++    float bv = __uint_as_float(0xFF800000u);
++    u32   bi = 0xFFFFFFFFu;
++    for (u32 i = t; i < n; i += 1024) {
++      const float v = i == skip ? __uint_as_float(0xFF800000u) : z[i];
++      if (amax_lt(v, i, bv, bi)) {
++        bv = v;
++        bi = i;
++      }
++    }
++    sv[t] = bv;
++    si[t] = bi;
++    __syncthreads();
++    for (u32 st = 512; st > 0; st >>= 1) {
++      if (t < st && amax_lt(sv[t + st], si[t + st], sv[t], si[t])) {
++        sv[t] = sv[t + st];
++        si[t] = si[t + st];
++      }
++      __syncthreads();
++    }
++    if (t == 0) {
++      y[2 * k]     = sv[0];
++      y[2 * k + 1] = (float)si[0];
++    }
++    skip = si[0];
++    __syncthreads();
++  }
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -8549,7 +8644,10 @@
+     || cuModuleGetFunction(&gpu_vadd, gpu_lib, "llb_vadd") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_vmul, gpu_lib, "llb_vmul") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_og, gpu_lib, "llb_outputgate") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_amax, gpu_lib, "llb_amax") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
++    || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
++    || cuMemAlloc(&gpu_headh, 4096 * 4) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+     || cuMemHostGetDevicePointer(&gpu_maild, (void*)gpu_mail, 0)
+@@ -8734,6 +8832,23 @@
+           NULL, hy, NULL) != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 14) {
++        // the head bang (tools/payload-head.patch): rms_final -> h (gpu_headh),
++        // the head GEMV into gpu_logit, then llb_amax into y
++        u64 wn = o->k, op2 = gpu_headh;
++        u32 n4 = 4096;
++        u32 rq = o->rb, cg = o->rb / 17 * 4, dh = o->d;
++        void* ra[] = { &xp, &wn, &op2, &n4 };
++        void* ga[] = { &w, &rq, &cg, &op2, &gpu_logit, &n, &dh };
++        void* am[] = { &gpu_logit, &n, &yp };
++        if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
++          != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, ga, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_amax, 1, 1, 1, 1024, 1, 1, 0, NULL, am, NULL)
++            != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else {
+         // the output gate bang (tools/payload-og.patch)
+         u64 xp13 = o->x, gp13 = o->k;

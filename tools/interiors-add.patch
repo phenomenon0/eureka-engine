@@ -1,0 +1,95 @@
+diff -ru a/bend2/comp.ts b/bend2/comp.ts
+--- a/bend2/comp.ts	2026-09-28 11:20:40.906165749 -0500
++++ b/bend2/comp.ts	2026-09-28 11:24:33.741134101 -0500
+@@ -2898,7 +2898,13 @@
+ // runs as one kernel; a sequential lane cannot park it, so there it faults.
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+-    || is_rms(k);
++    || is_rms(k) || is_dadd(k);
++}
++
++// The GEMV-add bang (tools/interiors-add.patch): the host runs the GEMV
++// (llb_warp), then llb_add adds the residual into its y.
++function is_dadd(k: Name): boolean {
++  return k === "llb.add_warp" || k.endsWith(".llb.add_warp");
+ }
+ 
+ // The rms-GEMV bang (tools/payload-rms.patch): the host runs llb_rms, then
+@@ -3996,7 +4002,8 @@
+     `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
+   defs.push(...[...fl.bangs].filter(is_warp)
+     .map((k) => `#define ${is_attn(k) ? "LLB_ATTN_FID"
+-      : is_rms(k) ? "LLB_RMS_FID" : "LLB_WARP_FID"} ${
++      : is_rms(k) ? "LLB_RMS_FID" : is_dadd(k) ? "LLB_DADD_FID"
++      : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+   `#define WL_BANK Term ${ws.join(", ")};`, "",
+@@ -6837,7 +6844,8 @@
+ // each parked task's launch operands; llb_deliver hands the results back on
+ // the device. The host never touches the managed corpus between batches: a
+ // host touch migrates the page, and the next grow launch faults it back
+-// (~0.5 ms a serve, payload stage 1). kind: 0 GEMV, 1 attention, 2 rms.
++// (~0.5 ms a serve, payload stage 1). kind: 0 GEMV, 1 attention, 2 rms,
++// 3 GEMV-add (tools/interiors-add.patch).
+ typedef struct {
+   u64 w, x, y, k, v, wn, r;
+   u32 kind, n, d, rb, c, q8;
+@@ -6863,9 +6871,13 @@
+ #ifndef LLB_RMS_FID
+ #define LLB_RMS_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_DADD_FID
++#define LLB_DADD_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+-  || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID)
++  || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
++  || (u32)term_aux(t) == LLB_DADD_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7355,6 +7367,7 @@
+     Loc      a  = term_loc(t);
+     bool     at = (u32)term_aux(t) == LLB_ATTN_FID;
+     bool     rm = (u32)term_aux(t) == LLB_RMS_FID;
++    bool     dd = (u32)term_aux(t) == LLB_DADD_FID;
+     Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
+     u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
+     u32      d  = at ? 9 : (u32)H[a + 6], rb = (u32)H[a + (at ? 9 : 7)];
+@@ -7372,7 +7385,7 @@
+       bad = bad != 0 ? bad : 1;
+     }
+     WarpOp* o = &M->op[j];
+-    o->kind = at ? 1 : rm ? 2 : 0;
++    o->kind = at ? 1 : rm ? 2 : dd ? 3 : 0;
+     o->w = (u64)w;
+     o->x = (u64)(H + blk_loc(H, x));
+     o->y = (u64)(H + blk_loc(H, y));
+@@ -7404,6 +7417,14 @@
+       }
+       o->wn = (u64)((const u8*)(H + term_peek_ro(e, p.data)) + p.off + an);
+     }
++    // the GEMV-add bang (tools/interiors-add.patch): y := r + y, n = 2048
++    if (dd) {
++      Term r = H[a + 8];
++      if (n != 2048 || term_tag(r) == TAG_ARR || blk_cls(r) != 11) {
++        bad = bad != 0 ? bad : 1;
++      }
++      o->r = (u64)(H + blk_loc(H, r));
++    }
+   }
+   M->bad = bad;
+   M->m   = m;
+@@ -7987,7 +8008,8 @@
+       != CUDA_SUCCESS) {
+       err_fail("device launch failed");
+     }
+-    if (o->kind == 1) {
++    // the residual add: attention's (kind 1) and the GEMV-add bang's (3)
++    if (o->kind == 1 || o->kind == 3) {
+       u64 rp = o->r;
+       void* ad[] = { &rp, &yp };
+       if (cuLaunchKernel(gpu_add, 8, 1, 1, 256, 1, 1, 0, NULL, ad, NULL)

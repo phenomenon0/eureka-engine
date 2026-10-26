@@ -1,0 +1,53 @@
+--- a/bend2/comp.ts	2026-09-30 22:20:58.422177440 -0500
++++ b/bend2/comp.ts	2026-09-30 23:02:24.155175045 -0500
+@@ -8548,9 +8548,10 @@
+     return true;
+   }
+   if (aux == LLB_AOB_FID) {
+-    Term wbt = H[a + 1], qt = H[a + 2], gt = H[a + 3], kct = H[a + 4];
+-    Term vct = H[a + 5], y = H[a + 6];
+-    u32  wo = (u32)H[a + 7], c = (u32)H[a + 8], rgw = (u32)H[a + 9];
++    // q|gate as one 8192 buffer, q heads then gates (tools/payload-aqg.patch)
++    Term wbt = H[a + 1], qt = H[a + 2], kct = H[a + 3];
++    Term vct = H[a + 4], y = H[a + 5];
++    u32  wo = (u32)H[a + 6], c = (u32)H[a + 7], rgw = (u32)H[a + 8];
+     u32  dT = c & 31;
+     StrParts q = str_peek_ro(e, wbt);
+     bool rgt = rgw >> 30 & 1;
+@@ -8559,7 +8560,7 @@
+     const u8* base = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
+     if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fm != 1
+       || dT < 1 || dT > 17
+-      || term_tag(qt) == TAG_ARR || term_tag(gt) == TAG_ARR
++      || term_tag(qt) == TAG_ARR || blk_cls(qt) != 13
+       || term_tag(kct) == TAG_ARR || term_tag(vct) == TAG_ARR
+       || term_tag(y) == TAG_ARR
+       || (u64)wo + (u64)4096 * rg > q.len) {
+@@ -8569,7 +8570,7 @@
+     o->kind = 19;
+     o->w  = (u64)(base + wo);
+     o->x  = (u64)(H + blk_loc(H, qt));
+-    o->k  = (u64)(H + blk_loc(H, gt));
++    o->k  = o->x + 4096 * 4;
+     o->v  = (u64)(H + blk_loc(H, kct));
+     o->wn = (u64)(H + blk_loc(H, vct));
+     o->y  = (u64)(H + blk_loc(H, y));
+@@ -9178,15 +9179,15 @@
+     Loc  tl = task_tail(t);
+     Term rv[WL_RESW];
+     // attn4's y is its 4th term (tools/payload-attn4.patch); the aob block's
+-    // is its 6th (tools/payload-aob.patch); the others' is their 3rd, and the
++    // is its 5th (tools/payload-aqg.patch); the others' is their 3rd, and the
+     // llama attention's is its 6th
+     rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6
+       : (u32)term_aux(t) == LLB_ATTN4_FID ? 4
+-      : (u32)term_aux(t) == LLB_AOB_FID ? 6 : 3)];
++      : (u32)term_aux(t) == LLB_AOB_FID ? 5 : 3)];
+     // the aob block's caches come lent (the caller kept them; the body it
+     // skips would drop them): return the lend, so llb.slot_warp finds the
+     // cache unique next step (tools/payload-slot.patch)
+-    for (u32 f = 4; (u32)term_aux(t) == LLB_AOB_FID && f < 6; f += 1) {
++    for (u32 f = 3; (u32)term_aux(t) == LLB_AOB_FID && f < 5; f += 1) {
+       Term kv = H[term_loc(t) + f];
+       if (!term_triv(kv) && term_rfc(kv)
+         && (H[term_loc(kv)] & RFC_CNT) > 1) {

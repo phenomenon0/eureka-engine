@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"urgency":{"type":"score","score":0.011030916064919252,"legend":{"0":"Can wait","1":"Immediate action"},"probabilities":{"0":0.9889690839350809,"1":0.011030916064919252},"confidence":0.9779381678701615}},"usage":{"input_tokens":134,"output_tokens":0}}

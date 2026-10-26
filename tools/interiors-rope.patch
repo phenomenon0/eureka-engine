@@ -1,0 +1,160 @@
+diff -ru b/bend2/comp.ts c/bend2/comp.ts
+--- b/bend2/comp.ts	2026-09-28 11:24:33.741134101 -0500
++++ c/bend2/comp.ts	2026-09-28 11:29:31.811509645 -0500
+@@ -2898,7 +2898,17 @@
+ // runs as one kernel; a sequential lane cannot park it, so there it faults.
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+-    || is_rms(k) || is_dadd(k);
++    || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k);
++}
++
++// The rms-GEMV-rope and rms-GEMV-put bangs (tools/interiors-rope.patch): the
++// host runs llb_rms, the GEMV into y from slot at, then (rope) llb_rope on it.
++function is_rope(k: Name): boolean {
++  return k === "llb.rope_warp" || k.endsWith(".llb.rope_warp");
++}
++
++function is_put(k: Name): boolean {
++  return k === "llb.put_warp" || k.endsWith(".llb.put_warp");
+ }
+ 
+ // The GEMV-add bang (tools/interiors-add.patch): the host runs the GEMV
+@@ -4003,6 +4013,7 @@
+   defs.push(...[...fl.bangs].filter(is_warp)
+     .map((k) => `#define ${is_attn(k) ? "LLB_ATTN_FID"
+       : is_rms(k) ? "LLB_RMS_FID" : is_dadd(k) ? "LLB_DADD_FID"
++      : is_rope(k) ? "LLB_ROPE_FID" : is_put(k) ? "LLB_PUT_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4727,6 +4738,7 @@
+ static CUfunction gpu_mailk;
+ static CUfunction gpu_dlv;
+ static CUfunction gpu_add;
++static CUfunction gpu_rope;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+ static CUdeviceptr gpu_maild;
+@@ -6845,7 +6857,8 @@
+ // the device. The host never touches the managed corpus between batches: a
+ // host touch migrates the page, and the next grow launch faults it back
+ // (~0.5 ms a serve, payload stage 1). kind: 0 GEMV, 1 attention, 2 rms,
+-// 3 GEMV-add (tools/interiors-add.patch).
++// 3 GEMV-add (tools/interiors-add.patch), 4 rms-GEMV-rope
++// (tools/interiors-rope.patch).
+ typedef struct {
+   u64 w, x, y, k, v, wn, r;
+   u32 kind, n, d, rb, c, q8;
+@@ -6874,10 +6887,17 @@
+ #ifndef LLB_DADD_FID
+ #define LLB_DADD_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_ROPE_FID
++#define LLB_ROPE_FID 0xFFFFFFFFu
++#endif
++#ifndef LLB_PUT_FID
++#define LLB_PUT_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+-  || (u32)term_aux(t) == LLB_DADD_FID)
++  || (u32)term_aux(t) == LLB_DADD_FID || (u32)term_aux(t) == LLB_ROPE_FID \
++  || (u32)term_aux(t) == LLB_PUT_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7368,6 +7388,10 @@
+     bool     at = (u32)term_aux(t) == LLB_ATTN_FID;
+     bool     rm = (u32)term_aux(t) == LLB_RMS_FID;
+     bool     dd = (u32)term_aux(t) == LLB_DADD_FID;
++    bool     ro = (u32)term_aux(t) == LLB_ROPE_FID;
++    // put: rms + GEMV into y from slot at (tools/interiors-rope.patch)
++    bool     pt = (u32)term_aux(t) == LLB_PUT_FID;
++    rm = rm || ro || pt;
+     Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
+     u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
+     u32      d  = at ? 9 : (u32)H[a + 6], rb = (u32)H[a + (at ? 9 : 7)];
+@@ -7385,7 +7409,7 @@
+       bad = bad != 0 ? bad : 1;
+     }
+     WarpOp* o = &M->op[j];
+-    o->kind = at ? 1 : rm ? 2 : dd ? 3 : 0;
++    o->kind = at ? 1 : ro ? 4 : rm ? 2 : dd ? 3 : 0;
+     o->w = (u64)w;
+     o->x = (u64)(H + blk_loc(H, x));
+     o->y = (u64)(H + blk_loc(H, y));
+@@ -7417,6 +7441,16 @@
+       }
+       o->wn = (u64)((const u8*)(H + term_peek_ro(e, p.data)) + p.off + an);
+     }
++    // rope/put (tools/interiors-rope.patch): y's slots at .. at + n, then
++    // rope in place at position c
++    if (ro || pt) {
++      u32 as = (u32)H[a + 9];
++      if (term_tag(y) == TAG_ARR || n % 256 != 0 || (u64)as + n > 1ull << blk_cls(y)) {
++        bad = bad != 0 ? bad : 3;
++      }
++      o->y = (u64)(H + blk_loc(H, y)) + (u64)as * 4;
++      o->c = ro ? (u32)H[a + 10] : 0;
++    }
+     // the GEMV-add bang (tools/interiors-add.patch): y := r + y, n = 2048
+     if (dd) {
+       Term r = H[a + 8];
+@@ -7437,6 +7471,22 @@
+   y[i] = __fadd_rn(r[i], y[i]);
+ }
+ 
++// K.rope in place over y[0 .. n) at position pos (flat.bend's k.rope with
++// j = i - c: pair (2p, 2p + 1), theta index p & 63; K.pow32/cos32/sin32
++// through F64 as the interpreter's device lane); a thread a pair, blocks of 128
++extern "C" __global__ void llb_rope(float* y, u32 n, float pos) {
++  const u32 p = blockIdx.x * 128 + threadIdx.x;
++  if (2 * p >= n) {
++    return;
++  }
++  const float t  = __fmul_rn(pos, (float)pow((double)5000000.0f,
++    (double)__fdiv_rn(-(float)(2 * (p & 63)), 128.0f)));
++  const float co = (float)cos((double)t), si = (float)sin((double)t);
++  const float x0 = y[2 * p], x1 = y[2 * p + 1];
++  y[2 * p]     = __fsub_rn(__fmul_rn(x0, co), __fmul_rn(x1, si));
++  y[2 * p + 1] = __fadd_rn(__fmul_rn(x0, si), __fmul_rn(x1, co));
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -7899,6 +7949,7 @@
+     || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_dlv, gpu_lib, "llb_deliver") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_add, gpu_lib, "llb_add") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_rope, gpu_lib, "llb_rope") != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+     || cuMemHostGetDevicePointer(&gpu_maild, (void*)gpu_mail, 0)
+@@ -7993,7 +8044,7 @@
+     }
+     // rms (f, +wb, +x, y, +base, +n, +d, +rb, +an): the GEMV reads
+     // llb_rms(x, the 2048 f32 at byte an of wb), a slot of gpu_att
+-    if (o->kind == 2) {
++    if (o->kind == 2 || o->kind == 4) {
+       u64 wn = o->wn;
+       void* ra[] = { &xp, &wn, &op };
+       if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
+@@ -8017,6 +8068,15 @@
+         err_fail("device launch failed");
+       }
+     }
++    // rope (kind 4): K.rope over the GEMV's n outputs in place, at o->c
++    if (o->kind == 4) {
++      float pf = (float)o->c;
++      void* ro[] = { &yp, &n, &pf };
++      if (cuLaunchKernel(gpu_rope, (n / 2 + 127) / 128, 1, 1, 128, 1, 1, 0, NULL, ro,
++        NULL) != CUDA_SUCCESS) {
++        err_fail("device launch failed");
++      }
++    }
+   }
+   void* da[] = { &H, &m };
+   if (cuLaunchKernel(gpu_dlv, 1, 1, 1, 1, 1, 1, 0, NULL, da, NULL)

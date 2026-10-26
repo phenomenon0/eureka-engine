@@ -1,0 +1,1 @@
+{"model":"clef","state":"The build passed all required tests and is ready for staging.","questions":{"ready":{"type":"noul","instructions":"Is the build ready for staging?","criteria":{"true":"All required tests passed.","false":"At least one required test failed."}}}}

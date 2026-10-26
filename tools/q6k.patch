@@ -1,0 +1,253 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4748,6 +4748,7 @@
+ static CUfunction gpu_warpq;
+ static CUfunction gpu_warph;
+ static CUfunction gpu_warpk;
++static CUfunction gpu_warp6;
+ static CUfunction gpu_attn;
+ static CUfunction gpu_rms;
+ static CUfunction gpu_mailk;
+@@ -6879,7 +6880,7 @@
+ // (tools/interiors-rope.patch), 5 FFN (tools/interiors-ffn.patch).
+ typedef struct {
+   u64 w, x, y, k, v, wn, r;
+-  u32 kind, n, d, rb, c, fm;
++  u32 kind, n, d, rb, c, fm, gm;
+ } WarpOp;
+ 
+ typedef struct Mail {
+@@ -7270,6 +7271,32 @@
+     __fsub_rn(__fmul_rn(d1, (float)((v >> 24) & 15)), m1));
+ }
+ 
++// group g of a Q6_K row (tools/q6k.py: GGUF block layout, 210 bytes a
++// super-block): w = (d * sc) * q, ggml's dequantize_row_q6_K. d*sc is exact
++// (f16 significand * 8-bit int) and (d*sc)*q with |q| <= 32 is exact too; both
++// f32 multiplies are in ggml's order. A group of four columns lies inside one
++// 32-wide quadrant (c = 4g, l a multiple of 4), so the four ql bytes are
++// ql[l..l+3] and the four qh bytes qh[l..l+3]. 210 is not 4-aligned, so the
++// bytes are loaded one at a time (a u32 load would be misaligned for every
++// block past the first; q4k_w could use u32 loads because 144 is 16-aligned).
++// tools/q6k.patch
++INLINE float4 q6k_w(const u8* __restrict__ row, u32 g) {
++  u32  c4 = 4 * g, blk = c4 >> 8, r = c4 & 255;
++  u32  n = r >> 7, rr = r & 127, quad = rr >> 5, l = rr & 31;
++  const u8* B = row + (u64)blk * 210;
++  const u8* ql = B + n * 64 + (quad & 1) * 32 + l;
++  const u8* qh = B + 128 + n * 32 + l;
++  float d = llb_f16(*(const unsigned short*)(B + 208));
++  u32  nsh = (quad >= 2) ? 4u : 0u, qsh = 2 * quad;
++  int  scv = (int)(signed char)B[192 + n * 8 + quad * 2 + (l >> 4)];
++  float ds = __fmul_rn(d, (float)scv);
++  return make_float4(
++    __fmul_rn(ds, (float)(int)(((ql[0] >> nsh) & 15) | (((qh[0] >> qsh) & 3) << 4)) - 32.0f),
++    __fmul_rn(ds, (float)(int)(((ql[1] >> nsh) & 15) | (((qh[1] >> qsh) & 3) << 4)) - 32.0f),
++    __fmul_rn(ds, (float)(int)(((ql[2] >> nsh) & 15) | (((qh[2] >> qsh) & 3) << 4)) - 32.0f),
++    __fmul_rn(ds, (float)(int)(((ql[3] >> nsh) & 15) | (((qh[3] >> qsh) & 3) << 4)) - 32.0f));
++}
++
+ // llb_warp over Q8_0 (H false) or F16 (H true) rows of rb bytes
+ // (tools/merge3-q8.patch, tools/merge3-f16.patch): the same groups, leaf and
+ // tree, each weight upconverted on load; a copy, so the F32 kernel's code
+@@ -7413,6 +7440,74 @@
+   u32* __restrict__ y, u32 n, u32 d) {
+   warp_dq4k(W, rb, cg, x, y, n, d);
+ }
++
++// llb_warp over Q6_K rows (tools/q6k.patch): the same groups, leaf and
++// tree, each weight dequantized on load; a copy, so the gated kernels stay
++// untouched
++__device__ __forceinline__ void warp_dq6k(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  const u32 ch = 1u << (d - 9);
++  float4 xv[16];
++  if (ch == 1) {
++    warp_x(xv, x, 0, l);
++  }
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const u8* row = W + (u64)r * rb;
++    float s[4];
++    for (u32 k = 0; k < ch; k++) {
++      if (ch > 1) {
++        warp_x(xv, x, k, l);
++      }
++      float4 w[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        u32 g = 512 * k + 32 * i + l;
++        w[i] = g < cg ? q6k_w(row, g)
++          : make_float4(0.f, 0.f, 0.f, 0.f);
++      }
++      float v[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        float4 a = w[i], b = xv[i];
++        v[i] = __fadd_rn(__fadd_rn(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)),
++          __fadd_rn(__fmul_rn(a.z, b.z), __fmul_rn(a.w, b.w)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i++) {
++          float o = __shfl_xor_sync(0xffffffffu, v[i], m);
++          v[i] = (l & m) ? __fadd_rn(o, v[i]) : __fadd_rn(v[i], o);
++        }
++      }
++      #pragma unroll
++      for (u32 st = 1; st < 16; st <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i += 2 * st) {
++          v[i] = __fadd_rn(v[i], v[i + st]);
++        }
++      }
++      s[k] = v[0];
++    }
++    for (u32 st = 1; st < ch; st <<= 1) {
++      for (u32 k = 0; k < ch; k += 2 * st) {
++        s[k] = __fadd_rn(s[k], s[k + st]);
++      }
++    }
++    if (l == 0) {
++      y[r] = __float_as_uint(s[0]);
++    }
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q6k(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  warp_dq6k(W, rb, cg, x, y, n, d);
++}
+ #endif
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+@@ -7542,25 +7637,28 @@
+     Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
+     u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
+     u32      d  = at ? 9 : (u32)H[a + 6], rw = (u32)H[a + (at ? 9 : 7)];
+-    // fm: 0 F32, 1 Q8_0, 2 F16. Tagged words (tools/quant-fix.patch; the
+-    // engine's rw, from the manifest) set bit 30, fm in bits 28-29, the row's
+-    // bytes below. Untagged, the old sniff: F16 rows (tools/merge3-f16.patch)
++    // fm: 0 F32, 1 Q8_0, 2 F16, 3 Q4_K, 4 Q6_K. Tagged words (tools/quant-fix.patch;
++    // the engine's rw, from the manifest) set bit 30, fm in bits 28-29, the row's
++    // bytes below; tools/q6k.patch adds format 4 (Q6_K): a tagged word with bit 31
++    // set carries fm + 4 in bits 28-29 (bit 31 was a refusal before). Untagged, the
++    // old sniff: F16 rows (tools/merge3-f16.patch)
+     // carry bit 31, the row's 2c bytes below; Q8_0 rows (tools/merge3-q8.patch)
+     // are rb = c * 17 / 16, 4 | rb for the u32 quant loads; F32 rows are 4c.
+     // An untagged 17 | rb that is also 16 | rb reads as F32 (c = rb / 4) or
+     // Q8_0 (c = rb * 16 / 17): refused, as is a Q8_0 tag without 17 | rb
+     bool     tg = rw >> 30 & 1;
+     u32      rb = rw & (tg ? 0x0fffffffu : 0x7fffffffu);
+-    u32      fm = tg ? rw >> 28 & 3 : rw >> 31 ? 2 : rb % 17 == 0;
+-    if (tg ? rw >> 31 != 0 || (fm == 1 && rb % 17 != 0)
+-      || (fm == 3 && rb % 144 != 0) : fm == 1 && rb % 16 == 0) {
++    u32      fm = tg ? (rw >> 28 & 3) + ((rw >> 31 & 1) << 2) : rw >> 31 ? 2 : rb % 17 == 0;
++    if (tg ? (fm >= 5) || (fm == 1 && rb % 17 != 0)
++      || (fm == 3 && rb % 144 != 0) || (fm == 4 && rb % 210 != 0)
++      : fm == 1 && rb % 16 == 0) {
+       bad = bad != 0 ? bad : 4;
+     }
+     StrParts p  = str_peek_ro(e, H[a + 1]);
+     const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 11
+       || (fm == 1 ? rb / 17 % 4 != 0 : fm == 3 ? rb % 144 != 0
+-        : rb % (fm ? 8 : 16) != 0)
++        : fm == 4 ? rb % 210 != 0 : rb % (fm ? 8 : 16) != 0)
+       || ((u64)w & 15) != 0
+       || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
+       || term_tag(y) == TAG_ARR || blk_cls(x) < (ff ? 11 : d + 2)
+@@ -7621,15 +7719,15 @@
+       u32  rv = (u32)H[a + 11];
+       bool gt = rv >> 30 & 1;
+       u32  rg = rv & (gt ? 0x0fffffffu : 0x7fffffffu);
+-      u32  gm = gt ? rv >> 28 & 3 : rv >> 31 ? 2 : rg % 17 == 0;
+-      if (gt ? rv >> 31 != 0 || (gm == 1 && rg % 17 != 0)
+-        || (gm == 3 && rg % 144 != 0) : gm == 1 && rg % 16 == 0) {
++      u32  gm = gt ? (rv >> 28 & 3) + ((rv >> 31 & 1) << 2) : rv >> 31 ? 2 : rg % 17 == 0;
++      if (gt ? (gm >= 5) || (gm == 1 && rg % 17 != 0)
++        || (gm == 3 && rg % 144 != 0) || (gm == 4 && rg % 210 != 0) : gm == 1 && rg % 16 == 0) {
+         bad = bad != 0 ? bad : 4;
+       }
+       const u8* wb = (const u8*)(H + term_peek_ro(e, p.data)) + p.off;
+-      if (n != 2048 || blk_cls(x) != 11 || gm != fm
+-        || (fm == 1 ? rg / 17 % 4 != 0 : fm == 3 ? rg % 144 != 0
+-          : rg % (fm ? 8 : 16) != 0)
++      if (n != 2048 || blk_cls(x) != 11
++        || (gm == 1 ? rg / 17 % 4 != 0 : gm == 3 ? rg % 144 != 0
++          : gm == 4 ? rg % 210 != 0 : rg % (gm ? 8 : 16) != 0)
+         || ((u64)(wb + gb) & 15) != 0
+         || ((u64)(wb + ub) & 15) != 0 || (u64)gb + 6144ull * rg > p.len
+         || (u64)ub + 6144ull * rg > p.len || an % 4 != 0
+@@ -7640,6 +7738,7 @@
+       o->v  = (u64)(wb + ub);
+       o->wn = (u64)(wb + an);
+       o->c  = rg;
++      o->gm = gm;
+       o->r  = o->x;
+     }
+     // the GEMV-add bang (tools/interiors-add.patch): y := r + y, n = 2048
+@@ -8191,6 +8290,7 @@
+     || cuModuleGetFunction(&gpu_warpq, gpu_lib, "llb_warp_q8") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warph, gpu_lib, "llb_warp_f16") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpk, gpu_lib, "llb_warp_q4k") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warp6, gpu_lib, "llb_warp_q6k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
+@@ -8277,11 +8377,12 @@
+   for (u32 j = 0; j < m; j += 1) {
+     volatile WarpOp* o = &gpu_mail->op[j];
+     u64 w = o->w, xp = o->x, yp = o->y;
+-    // Q8_0 / F16 / Q4_K (llb_warp_q8 / llb_warp_f16 / llb_warp_q4k): rq is
+-    // the row's bytes; cg = c / 4 = rb / 17 * 4 (Q8_0), rb / 8 (F16),
+-    // rb / 144 * 64 (Q4_K)
++    // Q8_0 / F16 / Q4_K / Q6_K (llb_warp_q8 / llb_warp_f16 / llb_warp_q4k /
++    // llb_warp_q6k): rq is the row's bytes; cg = c / 4 = rb / 17 * 4 (Q8_0),
++    // rb / 8 (F16), rb / 144 * 64 (Q4_K), rb / 210 * 64 (Q6_K)
+     u32 n = o->n, d = o->d, fm = o->fm, rq = fm ? o->rb : o->rb / 16;
+     u32 cg = fm == 1 ? o->rb / 17 * 4 : fm == 3 ? o->rb / 144 * 64
++      : fm == 4 ? o->rb / 210 * 64
+       : o->rb / (fm ? 8 : 16);
+     CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
+     // attention (f, +wt, +q, +kc, +vc, +c, y, +wo, +r): its o GEMV reads
+@@ -8312,9 +8413,11 @@
+     // 6144 slots of gpu_act; the down GEMV below reads the silu slot
+     if (o->kind == 5) {
+       u64 wn = o->wn, wg = o->k, wu = o->v;
+-      u32 rg = o->c, nf = 6144, df = 9;
+-      u32 gq = fm ? rg : rg / 16, gc = fm == 1 ? rg / 17 * 4
+-        : fm == 3 ? rg / 144 * 64 : rg / (fm ? 8 : 16);
++      u32 rg = o->c, gm = o->gm, nf = 6144, df = 9;
++      // gate/up carry their own format (gm), which may differ from the down
++      // rows' (fm) in a Q4_K_M mixture
++      u32 gq = gm ? rg : rg / 16, gc = gm == 1 ? rg / 17 * 4
++        : gm == 3 ? rg / 144 * 64 : gm == 4 ? rg / 210 * 64 : rg / (gm ? 8 : 16);
+       CUdeviceptr ga = gpu_act + (CUdeviceptr)j * 3 * 6144 * 4;
+       CUdeviceptr ua = ga + 6144 * 4, sa = ua + 6144 * 4;
+       void* ra[] = { &xp, &wn, &op };
+@@ -8322,9 +8425,9 @@
+       void* ua_[] = { &wu, &gq, &gc, &op, &ua, &nf, &df };
+       void* sa_[] = { &ga, &ua, &sa, &nf };
+       if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ga_, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ua_,
+           NULL) != CUDA_SUCCESS
+         || cuLaunchKernel(gpu_silu, 24, 1, 1, 256, 1, 1, 0, NULL, sa_, NULL)
+@@ -8334,7 +8437,7 @@
+       xp = sa;
+     }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+-    if (cuLaunchKernel(fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
++    if (cuLaunchKernel(fm == 4 ? gpu_warp6 : fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
+       1, 1, 128, 1, 1, 0,
+       NULL, args, NULL)
+       != CUDA_SUCCESS) {

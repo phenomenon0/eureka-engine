@@ -1,0 +1,5 @@
+usage: llb pull MODEL [-y]
+
+Download MODEL into $LLB_MODELS (or ~/models). Shows the size first,
+resumes a partial download, and asks before anything over 5 GB (-y skips).
+exit 0

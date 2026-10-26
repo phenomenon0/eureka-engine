@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"outage":{"type":"noul","noul":0.975417532869249},"urgency":{"type":"score","score":1.7905283020629263,"legend":{"0":"Low","1":"Medium","2":"High"},"probabilities":{"0":0.04609363661191584,"1":0.11728442471324188,"2":0.8366219386748422},"confidence":0.6857924530943897}},"usage":{"input_tokens":229,"output_tokens":0}}

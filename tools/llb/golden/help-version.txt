@@ -1,0 +1,2 @@
+usage: llb version
+exit 0

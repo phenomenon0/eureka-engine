@@ -1,0 +1,162 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2900,7 +2900,7 @@
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+-    || is_qknorm(k) || is_hyb(k) || is_rnorm(k);
++    || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k);
+ }
+ 
+ // The standalone rms_norm bang (tools/payload-rmsnorm.patch): the host runs
+@@ -2909,6 +2909,16 @@
+   return k === "llb.rmsnorm_warp" || k.endsWith(".llb.rmsnorm_warp");
+ }
+ 
++// The elementwise vadd / vmul bangs (tools/payload-vadd.patch): the host runs
++// llb_vadd / llb_vmul into the bang's output y (field index 3).
++function is_vadd(k: Name): boolean {
++  return k === "llb.vadd_warp" || k.endsWith(".llb.vadd_warp");
++}
++
++function is_vmul(k: Name): boolean {
++  return k === "llb.vmul_warp" || k.endsWith(".llb.vmul_warp");
++}
++
+ // The Qwen3.5 hybrid ops (tools/payload-hybrid.patch): the host runs
+ // llb_l2norm / llb_conv1d / llb_gated_rmsnorm / llb_gated_delta into the bang's
+ // output y (field index 3, so the generic delivery hands y to the continuation).
+@@ -4067,7 +4077,8 @@
+       : is_ffn(k) ? "LLB_FFN_FID" : is_qknorm(k) ? "LLB_QKNORM_FID"
+       : is_l2n(k) ? "LLB_L2N_FID" : is_conv(k) ? "LLB_CONV_FID"
+       : is_grn(k) ? "LLB_GRN_FID" : is_gdl(k) ? "LLB_GDL_FID"
+-      : is_rnorm(k) ? "LLB_RNORM_FID"
++      : is_rnorm(k) ? "LLB_RNORM_FID" : is_vadd(k) ? "LLB_VADD_FID"
++      : is_vmul(k) ? "LLB_VMUL_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4801,6 +4812,8 @@
+ static CUfunction gpu_grn;
+ static CUfunction gpu_gdl;
+ static CUfunction gpu_rnorm;
++static CUfunction gpu_vadd;
++static CUfunction gpu_vmul;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+@@ -6988,6 +7001,12 @@
+ #ifndef LLB_RNORM_FID
+ #define LLB_RNORM_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_VADD_FID
++#define LLB_VADD_FID 0xFFFFFFFFu
++#endif
++#ifndef LLB_VMUL_FID
++#define LLB_VMUL_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -6996,7 +7015,8 @@
+   || (u32)term_aux(t) == LLB_QKNORM_FID \
+   || (u32)term_aux(t) == LLB_L2N_FID || (u32)term_aux(t) == LLB_CONV_FID \
+   || (u32)term_aux(t) == LLB_GRN_FID || (u32)term_aux(t) == LLB_GDL_FID \
+-  || (u32)term_aux(t) == LLB_RNORM_FID)
++  || (u32)term_aux(t) == LLB_RNORM_FID \
++  || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7573,6 +7593,21 @@
+     o->n  = 1u << d;
+     return true;
+   }
++  if (aux == LLB_VADD_FID || aux == LLB_VMUL_FID) {
++    Term xt = H[a + 1], zt = H[a + 2], y = H[a + 3];
++    u32  d = (u32)H[a + 4];
++    if (term_tag(xt) == TAG_ARR || term_tag(zt) == TAG_ARR || term_tag(y) == TAG_ARR
++      || d < 5 || d > 14) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = aux == LLB_VADD_FID ? 11 : 12;
++    o->x = (u64)(H + blk_loc(H, xt));
++    o->k = (u64)(H + blk_loc(H, zt));
++    o->y = (u64)(H + blk_loc(H, y));
++    o->n = 1u << d;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7612,7 +7647,8 @@
+     {
+       u32 hx = (u32)term_aux(t);
+       if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
+-        || hx == LLB_GDL_FID || hx == LLB_RNORM_FID) {
++        || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
++        || hx == LLB_VADD_FID || hx == LLB_VMUL_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -7983,6 +8019,24 @@
+   }
+ }
+ 
++// K.vadd / K.vmul (tools/payload-vadd.patch): pure elementwise maps, so the
++// flat index kernel reproduces their tree leaf for leaf.
++extern "C" __global__ void llb_vadd(const float* __restrict__ x,
++  const float* __restrict__ z, float* __restrict__ y, u32 n) {
++  const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < n) {
++    y[i] = __fadd_rn(x[i], z[i]);
++  }
++}
++
++extern "C" __global__ void llb_vmul(const float* __restrict__ x,
++  const float* __restrict__ z, float* __restrict__ y, u32 n) {
++  const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < n) {
++    y[i] = __fmul_rn(x[i], z[i]);
++  }
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -8454,6 +8508,8 @@
+     || cuModuleGetFunction(&gpu_grn, gpu_lib, "llb_gated_rmsnorm") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_gdl, gpu_lib, "llb_gated_delta") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rnorm, gpu_lib, "llb_rmsnorm") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_vadd, gpu_lib, "llb_vadd") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_vmul, gpu_lib, "llb_vmul") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+@@ -8620,7 +8676,7 @@
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
+-      } else {
++      } else if (o->kind == 10) {
+         // the standalone rms_norm bang (tools/payload-rmsnorm.patch)
+         u64 xp10 = o->x, wp10 = o->w;
+         u32 n10 = o->n;
+@@ -8629,6 +8685,16 @@
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else {
++        // the elementwise vadd / vmul bangs (tools/payload-vadd.patch)
++        u64 xp11 = o->x, zp11 = o->k;
++        u32 n11 = o->n;
++        u32 g11 = (n11 + 1023) / 1024;
++        void* hy[] = { &xp11, &zp11, &yp, &n11 };
++        if (cuLaunchKernel(o->kind == 11 ? gpu_vadd : gpu_vmul, g11, 1, 1, 1024, 1, 1, 0,
++          NULL, hy, NULL) != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       }
+       continue;
+     }

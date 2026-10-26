@@ -1,0 +1,264 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2894,12 +2894,21 @@
+   file_push(fl, `WL_PUSHN(${ws.length});`);
+ }
+ 
++// The warp GEMV (tools/remap.patch): a bang the device parks and the host
++// runs as one kernel; a sequential lane cannot park it, so there it faults.
++function is_warp(k: Name): boolean {
++  return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp");
++}
++
+ // A self-jump reads its parameters back: the device's loop carries them
+ // typed, not as words (raytrace GPU 1.72x).
+ function emit_jump(fl: File, args: string[], k: Name,
+   bang?: boolean): void {
+   const fid = seg_fid(k);
+   fl.seg.fork ||= bang;
++  if (bang && is_warp(k)) {
++    file_push(fl, "if (DEVICE && seq) { err_post(e.mem, ERR_FIDS); return 0; }");
++  }
+   if (bang || fl.seg.def !== k) {
+     block(fl, `if (${bang ? "!seq" : `!DEVICE && !seq && fid_nofk(${fid})`}) {`, () =>
+       file_push(fl, `return term_tsk(${fid}, ${
+@@ -3972,6 +3981,8 @@
+     `    if ((N) <= ${i}) break; ${r} = e.mem[(A) + ${i}]; \\\n`).join("");
+   const last = rs.map((r, i) =>
+     `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
++  defs.push(...[...fl.bangs].filter(is_warp)
++    .map((k) => `#define LLB_WARP_FID ${seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+   `#define WL_BANK Term ${ws.join(", ")};`, "",
+   `#define WL_LOAD(A, N) \\\n  do { \\\n${load}  } while (0);`, "",
+@@ -4687,6 +4698,7 @@
+ static CUdevice   gpu_dev;
+ static CUmodule   gpu_lib;
+ static CUfunction gpu_pso;
++static CUfunction gpu_warp;
+ #endif
+ static bool io_gpu;
+ static Stk  io_stk;
+@@ -6786,6 +6798,31 @@
+ }
+ #endif
+ 
++// Warp GEMV
++// =========
++
++// A warp GEMV task (LLB_WARP_FID) is parked, not run: the host takes the
++// parked ones once the frontier drains, runs each as one launch (llb_warp)
++// and delivers y to its continuation.
++#define H_WARP_N (2 * LINE + 1)
++#define H_WARP   (3 * LINE + 1)
++#define WARP_MAX (LINE - 1)
++
++INLINE void warp_park(Corpus H, Term t) {
++  u32 i = a32_add(a32_at(H, H_WARP_N), 1);
++  if (i >= WARP_MAX) {
++    err_post(H, ERR_RING);
++    return;
++  }
++  H[H_WARP + i] = t;
++}
++
++#if defined(BEND_RTC) && defined(LLB_WARP_FID)
++#define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID)
++#else
++#define warp_is(t) false
++#endif
++
+ // Monk
+ // ====
+ 
+@@ -6806,6 +6843,10 @@
+     return 0;
+   }
+   a32_store(get, *get + 1);
++  if (warp_is(t)) {
++    warp_park(H, t);
++    return 2;
++  }
+   u32 spin = 0;
+   for (;;) {
+     Reply r = work_loop(e, stk, t, seq);
+@@ -6816,6 +6857,10 @@
+       if (err_spun(H, &spin)) {
+         return 2;
+       }
++      if (warp_is(r)) {
++        warp_park(H, r);
++        return 2;
++      }
+       if (stride != 0 && fid_nofk((u32)term_aux(r))) {
+         ring_push(H, ring_pick(base, stride, cur), r);
+         return 2;
+@@ -6989,6 +7034,81 @@
+   return (u32)term_loc(t) & 0xFFFFFF;
+ }
+ 
++#if defined(BEND_RTC) && defined(LLB_WARP_FID)
++// The contract GEMV (reports/llb-headprobe.md (c)): a warp per row; in each
++// chunk of 512 groups lane l owns groups 32i+l (one coalesced 512 B LDG.128
++// per warp per i); leaf (w0*x0 + w1*x1) + (w2*x2 + w3*x3), padding 0*x; group
++// bits 0..4 by xor butterfly, lower index on the left, bits 5..8 pairwise in
++// registers, chunk bits pairwise: ops.bend's balanced tree over 2^d groups.
++// W: rq float4 a row; cg groups are in the row; x: 4 << d f32 bits.
++INLINE void warp_x(float4* xv, const u32* __restrict__ x, u32 k, u32 l) {
++  #pragma unroll
++  for (u32 i = 0; i < 16; i++) {
++    u32 g = 4 * (512 * k + 32 * i + l);
++    xv[i] = make_float4(__uint_as_float(x[g]), __uint_as_float(x[g + 1]),
++      __uint_as_float(x[g + 2]), __uint_as_float(x[g + 3]));
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp(
++  const float4* __restrict__ W, u32 rq, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  const u32 ch = 1u << (d - 9);
++  float4 xv[16];
++  if (ch == 1) {
++    warp_x(xv, x, 0, l);
++  }
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const float4* row = W + (u64)r * rq;
++    float s[8];
++    for (u32 k = 0; k < ch; k++) {
++      if (ch > 1) {
++        warp_x(xv, x, k, l);
++      }
++      float4 w[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        u32 g = 512 * k + 32 * i + l;
++        w[i] = g < cg ? row[g] : make_float4(0.f, 0.f, 0.f, 0.f);
++      }
++      float v[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        float4 a = w[i], b = xv[i];
++        v[i] = __fadd_rn(__fadd_rn(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)),
++          __fadd_rn(__fmul_rn(a.z, b.z), __fmul_rn(a.w, b.w)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i++) {
++          float o = __shfl_xor_sync(0xffffffffu, v[i], m);
++          v[i] = (l & m) ? __fadd_rn(o, v[i]) : __fadd_rn(v[i], o);
++        }
++      }
++      #pragma unroll
++      for (u32 st = 1; st < 16; st <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i += 2 * st) {
++          v[i] = __fadd_rn(v[i], v[i + st]);
++        }
++      }
++      s[k] = v[0];
++    }
++    for (u32 st = 1; st < ch; st <<= 1) {
++      for (u32 k = 0; k < ch; k += 2 * st) {
++        s[k] = __fadd_rn(s[k], s[k + st]);
++      }
++    }
++    if (l == 0) {
++      y[r] = __float_as_uint(s[0]);
++    }
++  }
++}
++#endif
++
+ #ifdef BEND_RTC
+ extern "C" __global__ void window_dev(Corpus H, Term root, u32 w, u32 h,
+   u32 k, u32* out) {
+@@ -7423,6 +7543,11 @@
+   if (cuModuleGetFunction(&gpu_pso, gpu_lib, "bend_dev") != CUDA_SUCCESS) {
+     err_fail("cannot load the GPU program");
+   }
++#ifdef LLB_WARP_FID
++  if (cuModuleGetFunction(&gpu_warp, gpu_lib, "llb_warp") != CUDA_SUCCESS) {
++    err_fail("cannot load the GPU program");
++  }
++#endif
+ }
+ 
+ static void gpu_kernel(u32 pass, u32 groups) {
+@@ -7462,6 +7587,65 @@
+ 
+ #endif
+ 
++#if BEND_CUDA && defined(LLB_WARP_FID)
++// The parked warp GEMVs (warp_park), args (f, +wb, +x, y, +base, +n, +d, +rb)
++// as flat.bend's gemv: each runs as one llb_warp launch (LLB_WARP_GRID
++// blocks of 128, default 164), then y goes to its continuation; a join that
++// completes reopens the frontier on ring 0.
++static bool warp_serve(Corpus H) {
++  u32 m = a32_load(a32_at(H, H_WARP_N));
++  if (m == 0) {
++    return false;
++  }
++  const char* gs   = getenv("LLB_WARP_GRID");
++  u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 164;
++  Env         e    = { H, ALC[0] };
++  for (u32 j = 0; j < m; j += 1) {
++    Loc      a  = term_loc(H[H_WARP + j]);
++    Term     x  = H[a + 2], y = H[a + 3];
++    u32      bs = (u32)H[a + 4], n = (u32)H[a + 5], d = (u32)H[a + 6];
++    u32      rb = (u32)H[a + 7];
++    StrParts p  = str_peek_ro(e, H[a + 1]);
++    const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
++    if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
++      || rb % 16 != 0 || ((uintptr_t)w & 15) != 0
++      || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
++      || term_tag(y) == TAG_ARR || blk_cls(x) < d + 2
++      || n > 1ull << blk_cls(y)) {
++      err_fail("warp GEMV: unsupported operands");
++    }
++    u32   rq = rb / 16, cg = rb / 16;
++    const u32* xp = (const u32*)(H + blk_loc(H, x));
++    u32*  yp = (u32*)(H + blk_loc(H, y));
++    void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
++    if (cuLaunchKernel(gpu_warp, grid, 1, 1, 128, 1, 1, 0, NULL, args, NULL)
++      != CUDA_SUCCESS) {
++      err_fail("device launch failed");
++    }
++  }
++  if (cuCtxSynchronize() != CUDA_SUCCESS) {
++    err_fail("device fault");
++  }
++  u32 k = 0;
++  for (u32 j = 0; j < m; j += 1) {
++    Term t  = H[H_WARP + j];
++    Loc  tl = task_tail(t);
++    Term rv[WL_RESW];
++    rv[0]   = H[term_loc(t) + 3];
++    Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
++    if (c != 0) {
++      ring_push(H, 0, c);
++      k += 1;
++    }
++  }
++  a32_store(a32_at(H, H_WARP_N), 0);
++  a32_store(a32_at(H, H_CURSOR), k);
++  return true;
++}
++#else
++#define warp_serve(H) false
++#endif
++
+ // Cube
+ // ====
+ 
+@@ -7477,7 +7661,7 @@
+     if (root_done(H)) {
+       return;
+     }
+-    if (a32_load(a32_at(H, H_FRONT)) == 0) {
++    if (a32_load(a32_at(H, H_FRONT)) == 0 && !warp_serve(H)) {
+       err_fail("frontier drained without a result");
+     }
+   }

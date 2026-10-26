@@ -1,0 +1,22 @@
+--- a/bend2/comp.ts	2026-09-30 21:42:15.808991108 -0500
++++ b/bend2/comp.ts	2026-09-30 22:20:58.422177440 -0500
+@@ -9128,7 +9128,9 @@
+   const u32 t = threadIdx.x;
+   const u64 off = (u64)blockIdx.x * (qk != 0 ? 512 : 256);
+   const float* xr = x + off;
+-  float* yr = y + off;
++  // q heads land at h * 256 and the gates after all of them (2^d * 256 + h *
++  // 256), so ful's split_qg is one top-level ANode (tools/payload-sqg.patch)
++  float* yr = y + (u64)blockIdx.x * 256;
+   const float xv = xr[t];
+   const float xb = xr[t + 32];
+   const float xg = qk != 0 ? xr[256 + t] : 0.0f;
+@@ -9163,7 +9165,7 @@
+     yr[t] = v;
+   }
+   if (qk != 0) {
+-    yr[256 + t] = xg;
++    yr[(u64)gridDim.x * 256 + t] = xg;
+   }
+ }
+ 

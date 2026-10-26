@@ -1,0 +1,87 @@
+--- a/bend2/comp.ts	2026-09-28 19:36:05.429937991 -0500
++++ b/bend2/comp.ts	2026-09-28 19:36:12.481604637 -0500
+@@ -7200,12 +7200,15 @@
+   }
+ }
+ 
+-// f16 bits -> f32, exact for finite h: (implicit | m) * 2^(max(e, 1) - 25)
++// f16 bits -> f32, exact: (implicit | m) * 2^(max(e, 1) - 25) for finite h;
++// e = 31 is inf/NaN, the payload shifted up (tools/quant-fix.patch: numpy's
++// and ggml's inf/NaN, where the product gave 65536 / 98304)
+ INLINE float llb_f16(u32 h) {
+-  u32   e   = (h >> 10) & 31, m = h & 1023;
++  u32   e   = (h >> 10) & 31, m = h & 1023, s = (h >> 15) << 31;
+   float mag = __fmul_rn((float)(e ? m + 1024 : m),
+     __uint_as_float(((e ? e : 1) + 102) << 23));
+-  return __uint_as_float(__float_as_uint(mag) | ((h >> 15) << 31));
++  return __uint_as_float(e == 31 ? s | 0x7f800000u | m << 13
++    : __float_as_uint(mag) | s);
+ }
+ 
+ // group g of a Q8_0 row (tools/q8_pack.py: [c int8 q][c/32 f16le d], c =
+@@ -7410,7 +7413,7 @@
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ // warp_serve's operand reads and checks, on the device (bad: 1 GEMV,
+-// 2 attention, 3 rms operands unsupported); one thread
++// 2 attention, 3 rms operands unsupported, 4 a refused row format); one thread
+ extern "C" __global__ void llb_mail(Corpus H, Mail* M) {
+   Env e = { H, NULL };
+   M->err   = a32_load(a32_at(H, H_ERROR_CODE));
+@@ -7432,11 +7435,20 @@
+     Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
+     u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
+     u32      d  = at ? 9 : (u32)H[a + 6], rw = (u32)H[a + (at ? 9 : 7)];
+-    // fm: 0 F32, 1 Q8_0, 2 F16. F16 rows (tools/merge3-f16.patch) carry rb's
+-    // top bit, the row's 2c bytes below. Q8_0 rows (tools/merge3-q8.patch):
+-    // rb = c * 17 / 16, 4 | rb for the u32 quant loads; F32 rows are 4c, and
+-    // the model's c (2048, 6144) has no factor 17
+-    u32      rb = rw & 0x7fffffffu, fm = rw >> 31 ? 2 : rb % 17 == 0;
++    // fm: 0 F32, 1 Q8_0, 2 F16. Tagged words (tools/quant-fix.patch; the
++    // engine's rw, from the manifest) set bit 30, fm in bits 28-29, the row's
++    // bytes below. Untagged, the old sniff: F16 rows (tools/merge3-f16.patch)
++    // carry bit 31, the row's 2c bytes below; Q8_0 rows (tools/merge3-q8.patch)
++    // are rb = c * 17 / 16, 4 | rb for the u32 quant loads; F32 rows are 4c.
++    // An untagged 17 | rb that is also 16 | rb reads as F32 (c = rb / 4) or
++    // Q8_0 (c = rb * 16 / 17): refused, as is a Q8_0 tag without 17 | rb
++    bool     tg = rw >> 30 & 1;
++    u32      rb = rw & (tg ? 0x0fffffffu : 0x7fffffffu);
++    u32      fm = tg ? rw >> 28 & 3 : rw >> 31 ? 2 : rb % 17 == 0;
++    if (tg ? rw >> 31 != 0 || fm == 3 || (fm == 1 && rb % 17 != 0)
++      : fm == 1 && rb % 16 == 0) {
++      bad = bad != 0 ? bad : 4;
++    }
+     StrParts p  = str_peek_ro(e, H[a + 1]);
+     const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
+@@ -7495,10 +7507,17 @@
+     // bytes a row, the down rows' format), 6144 rows, d = 9 each
+     if (ff) {
+       u32 gb = (u32)H[a + 8], ub = (u32)H[a + 9], an = (u32)H[a + 10];
+-      // rg's format (tools/merge3-f16.patch: F16 carries the top bit) must be
+-      // the down rows'
+-      u32 rg = (u32)H[a + 11] & 0x7fffffffu;
+-      u32 gm = (u32)H[a + 11] >> 31 ? 2 : rg % 17 == 0;
++      // rg's format (tools/merge3-f16.patch: F16 carries the top bit;
++      // tools/quant-fix.patch: tagged as rw, refused as rw) must be the
++      // down rows'
++      u32  rv = (u32)H[a + 11];
++      bool gt = rv >> 30 & 1;
++      u32  rg = rv & (gt ? 0x0fffffffu : 0x7fffffffu);
++      u32  gm = gt ? rv >> 28 & 3 : rv >> 31 ? 2 : rg % 17 == 0;
++      if (gt ? rv >> 31 != 0 || gm == 3 || (gm == 1 && rg % 17 != 0)
++        : gm == 1 && rg % 16 == 0) {
++        bad = bad != 0 ? bad : 4;
++      }
+       const u8* wb = (const u8*)(H + term_peek_ro(e, p.data)) + p.off;
+       if (n != 2048 || blk_cls(x) != 11 || gm != fm
+         || (fm == 1 ? rg / 17 % 4 != 0 : rg % (fm ? 8 : 16) != 0)
+@@ -8097,6 +8116,8 @@
+   if (gpu_mail->bad != 0) {
+     err_fail(gpu_mail->bad == 2 ? "warp attention: unsupported operands"
+       : gpu_mail->bad == 3 ? "warp rms: unsupported operands"
++      : gpu_mail->bad == 4 ? "warp GEMV: row format refused (untagged"
++        " 17 | rb reads as F32 or Q8_0, or a bad tag)"
+       : "warp GEMV: unsupported operands");
+   }
+   const char* gs   = getenv("LLB_WARP_GRID");

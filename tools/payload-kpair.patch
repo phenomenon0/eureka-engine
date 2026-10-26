@@ -1,0 +1,569 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4911,6 +4911,7 @@
+ static CUfunction gpu_warph;
+ static CUfunction gpu_warpk;
+ static CUfunction gpu_warp6;
++static CUfunction gpu_warp5;
+ static CUfunction gpu_warp3;
+ static CUfunction gpu_warp2;
+ static CUfunction gpu_warpq2;
+@@ -4935,7 +4936,7 @@
+ static CUfunction gpu_slot;
+ static CUfunction gpu_amax;
+ static CUfunction gpu_amaxp;
+-static CUfunction gpu_embed;
++static CUfunction gpu_embed, gpu_embedk;
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
+ static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc;
+@@ -8015,6 +8016,296 @@
+   warp_dq<true>(W, rb, cg, x, y, n, d);
+ }
+ 
++// The K-quant pair GEMV (tools/payload-kpair.patch; hand-ported from
++// llama-bend-k0 tools/k0/kq_tuned.cuh, K0b stage 3, k_pair R 2 + pad vote).
++// One warp step = a pair of 512-col vblocks = 1024 cols = 4 superblocks; lane
++// l decodes 32 weights of superblock l >> 3, two 16-col spans. The engine's
++// tree over the 2^d groups is kept: (w0x0 + w1x1) + (w2x2 + w3x3) leaves, the
++// span tree in-lane, kp_tlo / kp_thi across lanes, then the carry over the NP =
++// 2^(d - 8) pairs; pad pairs take one per-block x vote (canonical NaN if any
++// x is inf / NaN, else -0 iff every x has its sign set, else +0), the value
++// their 0 * x leaves would sum to. Same FP ops in the same order as
++// warp_dq4k / warp_dq6k (K0b: bit-identical on every K0a row, d 10..13, pad-x
++// adversarial). Needs cg % 256 == 0 (whole superblock quads per pair).
++// Q5_K (H5): qh holds the fifth bits, bit 2 * group (lo) and + 1 (hi) of
++// byte i; Q4_K passes H5 false and the same ops run
++// llb_f16 with normal halves (exponent 1..30) as a rebias, the same value
++__device__ __forceinline__ float kp_f16(u32 h) {
++  return ((h >> 10) & 31) - 1 < 30 ? __uint_as_float((((h & 0x7fffu) << 13) + 0x38000000u) | (h >> 15) << 31)
++    : llb_f16(h);
++}
++template <bool H5>
++__device__ __forceinline__ void kp_dec4(uint4 h, uint4 q, uint4 qh, u32 l, float wl[16], float wh[16]) {
++  u32 k = (l >> 1) & 1, hi2 = (l >> 2) & 1, g2 = 2 * ((l >> 1) & 3);
++  // scale bytes sc[0..11] = header bytes 4..15 = h.y, h.z, h.w
++  // sb = 4 hi2 + 2k + t: sb < 4 iff hi2 = 0, so the 6-bit unpack is
++  // ((A >> sA) & mA) | (Cw & mC), the lane's (sA, mA, mC) = (0, 63, 0) or
++  // (2, 0x30, 15); likewise ((Bz >> sA) & mA) | ((Cw >> 4) & mC)
++  u32 dsc[2], msc[2];
++  const u32 sA = 2 * hi2, mA = hi2 ? 0x30u : 63u, mC = hi2 ? 15u : 0u;
++  #pragma unroll
++  for (u32 t = 0; t < 2; t++) {
++    u32 kk = 8 * (2 * k + t);
++    dsc[t] = ((h.y >> (kk + sA)) & mA) | ((h.w >> kk) & mC);
++    msc[t] = ((h.z >> (kk + sA)) & mA) | ((h.w >> (kk + 4)) & mC);
++  }
++  u32 dh = h.x & 0xffff;
++  float d = kp_f16(dh), dm = kp_f16(h.x >> 16);
++  float d1[2], m1[2], nd[2];
++  #pragma unroll
++  for (u32 t = 0; t < 2; t++) {
++    d1[t] = __fmul_rn(d, (float)dsc[t]); m1[t] = __fmul_rn(dm, (float)msc[t]);
++    nd[t] = __fmul_rn(d1[t], -8388608.0f);
++  }
++  // the magic floats 2^23 + n, one PRMT a weight from 4-byte-masked words
++  u32 qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {qh.x, qh.y, qh.z, qh.w};
++  u32 ml[16], mh[16];
++  #pragma unroll
++  for (u32 k = 0; k < 4; k++) {
++    u32 lo = qw[k] & 0x0F0F0F0Fu, hi = (qw[k] >> 4) & 0x0F0F0F0Fu;
++    if (H5) { lo |= ((hw[k] >> g2) & 0x01010101u) << 4; hi |= ((hw[k] >> (g2 + 1)) & 0x01010101u) << 4; }
++    #pragma unroll
++    for (u32 t = 0; t < 4; t++) {
++      ml[4 * k + t] = __byte_perm(lo, 0x4B000000u, 0x7540 + t);
++      mh[4 * k + t] = __byte_perm(hi, 0x4B000000u, 0x7540 + t);
++    }
++  }
++  // d1 * n as one FFMA(d1, 2^23 + n, -d1 * 2^23): the exact product rounded
++  // once, = __fmul_rn(d1, (float)n) for d1 >= +0 finite; an f16 d with its
++  // sign set or exponent 31 takes the plain product ((float)n = magic - 2^23, exact)
++  if (dh < 0x7C00u) {
++    #pragma unroll
++    for (u32 i = 0; i < 16; i++) {
++      wl[i] = __fsub_rn(__fmaf_rn(d1[0], __uint_as_float(ml[i]), nd[0]), m1[0]);
++      wh[i] = __fsub_rn(__fmaf_rn(d1[1], __uint_as_float(mh[i]), nd[1]), m1[1]);
++    }
++  } else {
++    #pragma unroll
++    for (u32 i = 0; i < 16; i++) {
++      wl[i] = __fsub_rn(__fmul_rn(d1[0], __fsub_rn(__uint_as_float(ml[i]), 8388608.0f)), m1[0]);
++      wh[i] = __fsub_rn(__fmul_rn(d1[1], __fsub_rn(__uint_as_float(mh[i]), 8388608.0f)), m1[1]);
++    }
++  }
++}
++// a 16-col span: (L0 + L1) + (L2 + L3), L = (w0x0 + w1x1) + (w2x2 + w3x3)
++__device__ __forceinline__ float kp_span(const float w[16], const float4 xv[4]) {
++  float L[4];
++  #pragma unroll
++  for (u32 t = 0; t < 4; t++) {
++    float4 a = xv[t];
++    L[t] = __fadd_rn(__fadd_rn(__fmul_rn(w[4 * t], a.x), __fmul_rn(w[4 * t + 1], a.y)),
++      __fadd_rn(__fmul_rn(w[4 * t + 2], a.z), __fmul_rn(w[4 * t + 3], a.w)));
++  }
++  return __fadd_rn(__fadd_rn(L[0], L[1]), __fadd_rn(L[2], L[3]));
++}
++__device__ __forceinline__ float kp_span0(const float4 xv[4]) {
++  float w[16];
++  #pragma unroll
++  for (u32 i = 0; i < 16; i++) w[i] = 0.f;
++  return kp_span(w, xv);
++}
++// a pair's tree from the lane's two spans: the in-lane add is span bit KIN,
++// so lane bits 0..KIN-1 shuffle first on both spans
++template <u32 KIN> __device__ __forceinline__ float kp_tlo(float lo, float hi) {
++  #pragma unroll
++  for (u32 m = 1; m < (1u << KIN); m <<= 1) {
++    lo = __fadd_rn(lo, __shfl_xor_sync(0xffffffffu, lo, m));
++    hi = __fadd_rn(hi, __shfl_xor_sync(0xffffffffu, hi, m));
++  }
++  return __fadd_rn(lo, hi);
++}
++// the tree's lane bits KIN..4. After kp_tlo lanes l and l ^ 1 hold the same
++// value (KIN >= 1, add commutes), so lane parity picks the row: the rest of
++// the tree runs once for both rows, lane 0 ends with row 0 and lane 1 with
++// row 1, each the same adds in the same order as a per-row tree
++template <u32 KIN> __device__ __forceinline__ float kp_thi(float v) {
++  #pragma unroll
++  for (u32 m = 1u << KIN; m < 32; m <<= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, m));
++  return v;
++}
++template <u32 LP> __device__ __forceinline__ uint4 kp_ld(const u8* p) {
++  if (LP == 1) {
++    uint4 v;
++    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
++      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
++    return v;
++  }
++  return *(const uint4*)p;
++}
++// the carry over pairs, constant slot indices; 7 slots = NP 32 (d 13)
++#define KP_NS 7
++__device__ __forceinline__ void kp_carry(float v, float* slot, u32& occ) {
++  u32 b = 0;
++  #pragma unroll
++  for (u32 t = 0; t < KP_NS; t++) {
++    if (b == t && (occ & (1u << t))) { v = __fadd_rn(slot[t], v); occ &= ~(1u << t); b = t + 1; }
++  }
++  #pragma unroll
++  for (u32 t = 0; t < KP_NS; t++) if (b == t) slot[t] = v;
++  occ |= 1u << b;
++}
++__device__ __forceinline__ float kp_top(const float* slot, u32 occ) {
++  float o = slot[0];
++  #pragma unroll
++  for (u32 t = 1; t < KP_NS; t++) if (occ >> t) o = slot[t];
++  return o;
++}
++__device__ __forceinline__ float4 kp_x(const u32* __restrict__ x, u32 col) {
++  uint4 v = *(const uint4*)(x + col);
++  return make_float4(__uint_as_float(v.x), __uint_as_float(v.y), __uint_as_float(v.z), __uint_as_float(v.w));
++}
++// Q6_K (210 B: ql[128], qh[64], int8 sc[16] at 192, f16 d at 208); col c's
++// span c / 16 is its scale index. Lane j = l & 7 takes ql[16j..16j+15]: lo
++// nibbles = span (j & 3) + 8(j >> 2), hi = + 4; the 2-bit highs from
++// qh[32(j >> 2) + 16(j & 1) + i] at shift 2((j >> 1) & 1). Superblocks are
++// 2-aligned: each 16 B is two aligned uint4 and a funnel shift by the even
++// offset, never outside the superblock's own 16-aligned span
++__device__ __forceinline__ uint4 kp_algn(uint4 a, uint4 b, u32 off) {
++  u32 w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w}, v[6], u[5];
++  #pragma unroll
++  for (u32 k = 0; k < 6; k++) v[k] = off & 8 ? w[k + 2] : w[k];
++  #pragma unroll
++  for (u32 k = 0; k < 5; k++) u[k] = off & 4 ? v[k + 1] : v[k];
++  u32 s = (off & 2) * 8;
++  return make_uint4(__funnelshift_r(u[0], u[1], s), __funnelshift_r(u[1], u[2], s),
++    __funnelshift_r(u[2], u[3], s), __funnelshift_r(u[3], u[4], s));
++}
++struct KpQ6 { uint4 a0, a1, h0, h1; u32 off, scl, sch, dh; };
++template <u32 FMT> struct KQ;
++template <> struct KQ<4> {
++  static const u32 SB = 144, KIN = 1;
++  struct Raw { uint4 h, q; };
++  static __device__ __forceinline__ u32 slo(u32 l) { return 4 * (l >> 1) + (l & 1); }
++  template <u32 LP> static __device__ __forceinline__ Raw ld(const u8* B, u32 l) {
++    Raw r = {kp_ld<LP>(B), kp_ld<LP>(B + 16 + 32 * ((l >> 1) & 3) + 16 * (l & 1))};
++    return r;
++  }
++  static __device__ __forceinline__ void dec(const Raw& r, u32 l, float* wl, float* wh) {
++    kp_dec4<false>(r.h, r.q, make_uint4(0, 0, 0, 0), l, wl, wh);
++  }
++};
++// Q5_K (176 B: f16 d, dmin, sc[12], qh[32] at 16, qs[128] at 48): Q4_K's
++// lanes and spans; lane l's 16 qs bytes pair with qh[16(l & 1)..+15].
++// 176 = 11 * 16, so every load is an aligned uint4. KQ<9>: the registry's code
++template <> struct KQ<9> {
++  static const u32 SB = 176, KIN = 1;
++  struct Raw { uint4 h, qh, q; };
++  static __device__ __forceinline__ u32 slo(u32 l) { return 4 * (l >> 1) + (l & 1); }
++  template <u32 LP> static __device__ __forceinline__ Raw ld(const u8* B, u32 l) {
++    Raw r = {kp_ld<LP>(B), kp_ld<LP>(B + 16 + 16 * (l & 1)), kp_ld<LP>(B + 48 + 32 * ((l >> 1) & 3) + 16 * (l & 1))};
++    return r;
++  }
++  static __device__ __forceinline__ void dec(const Raw& r, u32 l, float* wl, float* wh) {
++    kp_dec4<true>(r.h, r.q, r.qh, l, wl, wh);
++  }
++};
++template <> struct KQ<6> {
++  static const u32 SB = 210, KIN = 2;
++  typedef KpQ6 Raw;
++  static __device__ __forceinline__ u32 slo(u32 l) { u32 j = l & 7; return 16 * (l >> 3) + (j & 3) + 8 * (j >> 2); }
++  template <u32 LP> static __device__ __forceinline__ Raw ld(const u8* B, u32 l) {
++    Raw r; u32 j = l & 7, s = (j & 3) + 8 * (j >> 2);
++    r.off = (u32)(u64)B & 15;
++    const u8* A = B - r.off + 16 * j;
++    const u8* H = B - r.off + 128 + 32 * (j >> 2) + 16 * (j & 1);
++    r.a0 = kp_ld<LP>(A); r.a1 = kp_ld<LP>(A + 16); r.h0 = kp_ld<LP>(H); r.h1 = kp_ld<LP>(H + 16);
++    r.scl = B[192 + s]; r.sch = B[196 + s]; r.dh = *(const unsigned short*)(B + 208);
++    return r;
++  }
++  // w = (d * sc) * ((float)q - 32), the q - 32 one exact FSUB of the magic float
++  static __device__ __forceinline__ void dec(const Raw& r, u32 l, float* wl, float* wh) {
++    uint4 q = kp_algn(r.a0, r.a1, r.off), h = kp_algn(r.h0, r.h1, r.off);
++    float d = kp_f16(r.dh);
++    float dl = __fmul_rn(d, (float)(int)(signed char)r.scl), dg = __fmul_rn(d, (float)(int)(signed char)r.sch);
++    u32 sh = 2 * ((l >> 1) & 1), qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
++    #pragma unroll
++    for (u32 k = 0; k < 4; k++) {
++      u32 lo = (qw[k] & 0x0F0F0F0Fu) | ((hw[k] >> sh) & 0x03030303u) << 4;
++      u32 hi = ((qw[k] >> 4) & 0x0F0F0F0Fu) | ((hw[k] >> (sh + 4)) & 0x03030303u) << 4;
++      #pragma unroll
++      for (u32 t = 0; t < 4; t++) {
++        wl[4 * k + t] = __fmul_rn(dl, __fsub_rn(__uint_as_float(__byte_perm(lo, 0x4B000000u, 0x7540 + t)), 8388640.0f));
++        wh[4 * k + t] = __fmul_rn(dg, __fsub_rn(__uint_as_float(__byte_perm(hi, 0x4B000000u, 0x7540 + t)), 8388640.0f));
++      }
++    }
++  }
++};
++// two rows a warp (R 2: x loads shared); LP 1 = L1::no_allocate weight loads
++template <u32 FMT, u32 NP, u32 LP>
++__device__ __forceinline__ void kp_pair(const u8* __restrict__ W, u32 rb, u32 cg,
++  const u32* __restrict__ x, u32* __restrict__ y, u32 n) {
++  typedef KQ<FMT> F;
++  const u32 R = 2;
++  __shared__ float pvs[NP];
++  const u32 l = threadIdx.x & 31, w = threadIdx.x >> 5;
++  const u32 npr = cg >> 8;
++  for (u32 p = npr + w; p < NP; p += blockDim.x >> 5) {
++    bool nf = false, ps = false;
++    #pragma unroll
++    for (u32 i = 0; i < 8; i++) {
++      uint4 v = *(const uint4*)(x + 1024 * p + 4 * (32 * i + l));
++      u32 ws[4] = {v.x, v.y, v.z, v.w};
++      #pragma unroll
++      for (u32 t = 0; t < 4; t++) {
++        nf |= (ws[t] & 0x7f800000u) == 0x7f800000u;
++        ps |= (ws[t] >> 31) == 0;
++      }
++    }
++    nf = __any_sync(0xffffffffu, nf);
++    ps = __any_sync(0xffffffffu, ps);
++    if (l == 0) pvs[p] = nf ? __uint_as_float(0x7fffffffu) : ps ? 0.f : -0.f;
++  }
++  __syncthreads();
++  const u32 nw = gridDim.x * (blockDim.x >> 5);
++  const u32 sbk = l >> 3, slo = F::slo(l), shi = slo + (1u << F::KIN);
++  for (u32 r0 = (blockIdx.x * (blockDim.x >> 5) + w) * R; r0 < n; r0 += nw * R) {
++    const u8* row[R];
++    #pragma unroll
++    for (u32 j = 0; j < R; j++) row[j] = W + (u64)min(r0 + j, n - 1) * rb;
++    float slot[KP_NS];  // row r0 + (l & 1)
++    #pragma unroll
++    for (u32 t = 0; t < KP_NS; t++) slot[t] = 0.f;
++    u32 occ = 0;
++    #pragma unroll 1
++    for (u32 p = 0; p < NP; p++) {
++      float u;
++      const u32 xb = 1024 * p;
++      if (p >= npr) u = pvs[p];
++      else {
++        float4 xl[4], xh[4];
++        #pragma unroll
++        for (u32 t = 0; t < 4; t++) {
++          xl[t] = kp_x(x, xb + 16 * slo + 4 * t);
++          xh[t] = kp_x(x, xb + 16 * shi + 4 * t);
++        }
++        typename F::Raw rw[R];
++        #pragma unroll
++        for (u32 j = 0; j < R; j++) rw[j] = F::template ld<LP>(row[j] + (u64)(4 * p + sbk) * F::SB, l);
++        float v[R];
++        #pragma unroll
++        for (u32 j = 0; j < R; j++) {
++          float wl[16], wh[16];
++          F::dec(rw[j], l, wl, wh);
++          v[j] = kp_tlo<F::KIN>(kp_span(wl, xl), kp_span(wh, xh));
++        }
++        u = kp_thi<F::KIN>(l & 1 ? v[1] : v[0]);
++      }
++      kp_carry(u, slot, occ);
++    }
++    if (l < R && r0 + l < n) y[r0 + l] = __float_as_uint(kp_top(slot, occ));
++  }
++}
++// d 9..13 (the envelope admits a K-quant pair body only there)
++template <u32 FMT, u32 LP>
++__device__ __forceinline__ void kp_warp(const u8* __restrict__ W, u32 rb, u32 cg,
++  const u32* __restrict__ x, u32* __restrict__ y, u32 n, u32 d) {
++  if (d == 9) kp_pair<FMT, 2, LP>(W, rb, cg, x, y, n);
++  else if (d == 10) kp_pair<FMT, 4, LP>(W, rb, cg, x, y, n);
++  else if (d == 11) kp_pair<FMT, 8, LP>(W, rb, cg, x, y, n);
++  else if (d == 12) kp_pair<FMT, 16, LP>(W, rb, cg, x, y, n);
++  else kp_pair<FMT, 32, LP>(W, rb, cg, x, y, n);
++}
++
+ // llb_warp over Q4_K rows (tools/q4k.patch): the same groups, leaf and
+ // tree, each weight dequantized on load; a copy, so the gated kernels stay
+ // untouched
+@@ -8077,10 +8368,16 @@
+   }
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(128) llb_warp_q4k(
++extern "C" __global__ void __launch_bounds__(128, 4) llb_warp_q4k(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+-  warp_dq4k(W, rb, cg, x, y, n, d);
++  // the pair body where it applies (K0b m4r2: no_allocate loads); the tile
++  // body (d <= 11) for rows not a whole number of superblock quads
++  if (cg % 256 == 0 && d >= 9 && d <= 13) {
++    kp_warp<4, 1>(W, rb, cg, x, y, n, d);
++  } else {
++    warp_dq4k(W, rb, cg, x, y, n, d);
++  }
+ }
+ 
+ // group g of a Q3_K row (tools/q3k.py: GGUF block layout, 110 bytes a
+@@ -8180,10 +8477,24 @@
+   }
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(128) llb_warp_q6k(
++extern "C" __global__ void __launch_bounds__(128, 4) llb_warp_q6k(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+-  warp_dq6k(W, rb, cg, x, y, n, d);
++  // the pair body where it applies (K0b p6r2: default loads, the second
++  // aligned uint4 is the next lane's first); else the tile body (d <= 11)
++  if (cg % 256 == 0 && d >= 9 && d <= 13) {
++    kp_warp<6, 0>(W, rb, cg, x, y, n, d);
++  } else {
++    warp_dq6k(W, rb, cg, x, y, n, d);
++  }
++}
++
++// Q5_K: the pair body only (no tile body); the envelope admits whole
++// superblock quads (rb % 704) at d 9..13
++extern "C" __global__ void __launch_bounds__(128, 4) llb_warp_q5k(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  kp_warp<9, 1>(W, rb, cg, x, y, n, d);
+ }
+ 
+ // group g of a Q2_0 (qk = 64) or PQ2_0 (qk = 128) row (tools/q20.py): f16 d +
+@@ -9111,7 +9422,8 @@
+ // list, x (2), y (3, output), the lin / full Offs records flattened into the
+ // task (4..23, 24..43), c = dT | pos << 5 (44), the Q8 row words rg (45, 4096
+ // cols) and rd (46, 12288 cols), the first layer s (47) and the count k (48),
+-// the fold words (49..55) and the shape record (56..63, LlbShape). Each
++// the fold words (49..55), the shape record (56..63, LlbShape), the table
++// (64) and the embedding row word (65, tools/payload-kpair.patch). Each
+ // layer's blob gets the checks of the linb or fulb decode and the fbn's, sized
+ // by the record; a record outside the compiled kernels' envelope is refused.
+ __device__ static void pass_mail(Env e, Corpus H, Loc a, Mail* M, WarpOp* o, u32* bad) {
+@@ -9129,7 +9441,7 @@
+   // plain pass (x in, y out), else y gets the head's four words and x is unused
+   Term eb = H[a + 49], hb = H[a + 51];
+   u32  eat = (u32)H[a + 50], noff = (u32)H[a + 52], ooff = (u32)H[a + 53];
+-  u32  nh = (u32)H[a + 54], rwh = (u32)H[a + 55];
++  u32  nh = (u32)H[a + 54], rwh = (u32)H[a + 55], ewh = (u32)H[a + 65];
+   bool fold = nh != 0;
+   LlbShape sh = { (u32)H[a + 56], (u32)H[a + 57], (u32)H[a + 58], (u32)H[a + 59],
+     (u32)H[a + 60], (u32)H[a + 61], (u32)H[a + 62], (u32)H[a + 63] };
+@@ -9151,13 +9463,20 @@
+   o->w = 0;
+   if (ok && fold) {
+     StrParts qe = str_peek_ro(e, eb), qh = str_peek_ro(e, hb);
+-    bool     tg = rwh >> 30 & 1;
+-    u32      rbh = rwh & (tg ? 0x0fffffffu : 0x7fffffffu);
+-    u32      fmh = tg ? rwh >> 28 & 3 : (rwh >> 31 ? 2 : (rbh % 17 == 0));
++    // rwh / ewh (word 65): the head and embedding rows as tagged row words
++    // (as llb_mail: bit 30, fm in bits 28-29, 31, 27, the row bytes below);
++    // heads with a GEMV body, embeddings with a row kernel (Q8_0, Q4_K)
++    bool     tg = rwh >> 30 & 1, te = ewh >> 30 & 1;
++    u32      rbh = rwh & (tg ? 0x07ffffffu : 0x7fffffffu), rbe = ewh & 0x07ffffffu;
++    u32      fmh = tg ? (rwh >> 28 & 3) + ((rwh >> 31 & 1) << 2) + ((rwh >> 27 & 1) << 3)
++      : (rwh >> 31 ? 2 : (rbh % 17 == 0));
++    u32      fme = (ewh >> 28 & 3) + ((ewh >> 31 & 1) << 2) + ((ewh >> 27 & 1) << 3);
+     ok = s == 0 && term_tag(eb) == TAG_STR && str_nar(qe) == 2
+-      && (u64)eat + dm / 32 * 34 <= qe.len
+-      && term_tag(hb) == TAG_STR && str_nar(qh) == 2 && fmh == 1
+-      && rbh == dm / 32 * 34 && noff % 4 == 0 && ooff % 16 == 0 && nh <= (1u << 18) - 4 * AMAX_G
++      && te && (fme == LLB_FM_Q8_0 || fme == LLB_FM_Q4_K) && rbe == LLB_FM_RB(fme, dm)
++      && (u64)eat + rbe <= qe.len
++      && term_tag(hb) == TAG_STR && str_nar(qh) == 2
++      && (fmh == LLB_FM_Q8_0 || fmh == LLB_FM_Q4_K || fmh == LLB_FM_Q6_K || fmh == LLB_FM_Q5_K)
++      && rbh == LLB_FM_RB(fmh, dm) && noff % 4 == 0 && ooff % 16 == 0 && nh <= (1u << 18) - 4 * AMAX_G
+       && (u64)noff + dm * 4 <= qh.len && (u64)ooff + (u64)nh * rbh <= qh.len;
+     if (ok) {
+       o->w  = (u64)((const u8*)(H + term_peek_ro(e, qe.data)) + qe.off + eat);
+@@ -9165,6 +9484,8 @@
+       o->v  = (u64)((const u8*)(H + term_peek_ro(e, qh.data)) + qh.off + ooff);
+       o->gm = nh;
+       o->bq = rbh;
++      o->bg = fmh;
++      o->bb = fme;
+     }
+   }
+   // the table (task word 64): a 32-word row per layer, [0] the layer's bytes,
+@@ -9201,48 +9522,55 @@
+       break;
+     }
+     const u8* base = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
+-    // the layer's present tensors and which are Q8_0 GEMVs (the rest F32);
+-    // phase 1 admits no other format
++    // the layer's present tensors and which are GEMVs (the rest F32): a GEMV
++    // is Q8_0 or a K-quant with a pair body (tools/payload-kpair.patch), whole
++    // superblock quads (cols % 1024: d_model and nh * hd are 4096 by the
++    // envelope, d_ff is checked); PRB(f, cols) its row bytes in its format
+     bool full = (i + 1) % 4 == 0;
+     u32  has = full ? 0xFC01Fu : 0x3FFFu, q8 = full ? 0x9C01Cu : 0x21FCu;
+     u32  p[20];
+     ok = tw[i * 32] == q.len;
+     for (u32 f = 0; f < 20; f += 1) {
+-      u32 w = tw[i * 32 + 1 + f], fm = w >> 28;
++      u32  w = tw[i * 32 + 1 + f], fm = w >> 28;
++      bool kq = fm == LLB_FM_Q4_K || fm == LLB_FM_Q6_K || fm == LLB_FM_Q5_K;
+       p[f] = w & 0x0fffffffu;
+-      ok = ok && (!(has >> f & 1) || fm == (q8 >> f & 1 ? LLB_FM_Q8_0 : LLB_FM_F32));
++      ok = ok && (!(has >> f & 1) || (q8 >> f & 1 ? fm == LLB_FM_Q8_0 || kq || (!full && (f == 7 || f == 8) && fm == LLB_FM_F32) : fm == LLB_FM_F32));
+     }
++#define PRB(f, c) ((u64)LLB_FM_RB(tw[i * 32 + 1 + (f)] >> 28, (u32)(c)))
++    ok = ok && (tw[i * 32 + 5] >> 28 == LLB_FM_Q8_0 || df % 1024 == 0);
+     // fbn: post, fg, fu, fd at Offs words 1..4
+     ok = ok && p[1] % 4 == 0 && ((u64)(base + p[2]) & 15) == 0
+       && ((u64)(base + p[3]) & 15) == 0 && ((u64)(base + p[4]) & 15) == 0
+       && (u64)p[1] + dm * 4 <= q.len
+-      && (u64)p[2] + df * rg <= q.len
+-      && (u64)p[3] + df * rg <= q.len
+-      && (u64)p[4] + dm * rd <= q.len;
++      && (u64)p[2] + df * PRB(2, dm) <= q.len
++      && (u64)p[3] + df * PRB(3, dm) <= q.len
++      && (u64)p[4] + dm * PRB(4, df) <= q.len;
+     if (full) {
+       // fulb: an 0, q 14, k 15, v 16, q-norm 17, k-norm 18, o 19
+       ok = ok && p[0] % 4 == 0 && p[17] % 4 == 0 && p[18] % 4 == 0
+         && ((u64)(base + p[14]) & 15) == 0 && ((u64)(base + p[15]) & 15) == 0
+         && ((u64)(base + p[16]) & 15) == 0 && ((u64)(base + p[19]) & 15) == 0
+-        && (u64)p[0] + dm * 4 <= q.len && (u64)p[14] + 2 * qa * rg <= q.len
+-        && (u64)p[15] + kv * rg <= q.len && (u64)p[16] + kv * rg <= q.len
+-        && (u64)p[19] + dm * ro <= q.len
++        && (u64)p[0] + dm * 4 <= q.len && (u64)p[14] + 2 * qa * PRB(14, dm) <= q.len
++        && (u64)p[15] + kv * PRB(15, dm) <= q.len && (u64)p[16] + kv * PRB(16, dm) <= q.len
++        && (u64)p[19] + dm * PRB(19, qa) <= q.len
+         && (u64)p[17] + sh.hd * 4 <= q.len && (u64)p[18] + sh.hd * 4 <= q.len;
+     } else {
+       // linb: an 0, qkv 5, gate 6, beta 7, alpha 8, ssm_a 9, dt 10, conv 11,
+       // ssm_norm 12, ssm_out 13
+       ok = ok && ((u64)(base + p[6]) & 15) == 0 && ((u64)(base + p[7]) & 15) == 0
+         && ((u64)(base + p[8]) & 15) == 0 && ((u64)(base + p[13]) & 15) == 0
++        && (tw[i * 32 + 6] >> 28 == LLB_FM_Q8_0 || ((u64)(base + p[5]) & 15) == 0)
+         && (u64)p[0] + dm * 4 <= q.len
+-        && (u64)p[5] + cv * rg <= q.len
+-        && (u64)p[6] + lv * rg <= q.len
+-        && (u64)p[7] + (u64)sh.lvh * rg <= q.len
+-        && (u64)p[8] + (u64)sh.lvh * rg <= q.len
+-        && (u64)p[13] + dm * ro <= q.len
++        && (u64)p[5] + cv * PRB(5, dm) <= q.len
++        && (u64)p[6] + lv * PRB(6, dm) <= q.len
++        && (u64)p[7] + (u64)sh.lvh * PRB(7, dm) <= q.len
++        && (u64)p[8] + (u64)sh.lvh * PRB(8, dm) <= q.len
++        && (u64)p[13] + dm * PRB(13, lv) <= q.len
+         && (u64)p[9] + sh.lvh * 4 <= q.len && (u64)p[10] + sh.lvh * 4 <= q.len
+         && (u64)p[11] + cv * 4 * 4 <= q.len && (u64)p[12] + sh.sd * 4 <= q.len;
+     }
+     M->pw[i - s] = (u64)base;
++#undef PRB
+   }
+   if (!ok) {
+     *bad = *bad != 0 ? *bad : 5;
+@@ -9320,12 +9648,19 @@
+       || (fm == 3 && rb % 144 != 0) || (fm == 4 && rb % 210 != 0)
+       || (fm == 5 && rb % 110 != 0) || (fm == 6 && rb % 18 != 0)
+       || (fm == 7 && rb % 34 != 0) || (fm == 8 && rb % 136 != 0)
++      || (fm == 9 && rb % 704 != 0) || fm > 9
+       : fm == 1 && rb % 16 == 0) {
+       bad = bad != 0 ? bad : 4;
+     }
+     StrParts p  = str_peek_ro(e, H[a + 1]);
+     const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+-    if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
++    // d: 9..12; a K-quant row the pair body takes (tools/payload-kpair.patch:
++    // whole superblock quads) to 13, any other K-quant row to 11 (the tile
++    // body's s[4]); Q5_K (9) has the pair body only: whole quads, refused
++    // above otherwise; fm > 9 has no body
++    bool kp = (fm == 3 && rb % 576 == 0) || (fm == 4 && rb % 840 == 0) || fm == 9;
++    if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9
++      || d > (kp ? 13 : fm == 3 || fm == 4 ? 11 : 12)
+       || (fm == 1 ? rb / 17 % 4 != 0 : fm == 3 ? rb % 144 != 0
+         : fm == 4 ? rb % 210 != 0 : fm == 5 ? rb % 110 != 0
+         : fm == 6 ? rb % 18 != 0 : fm == 7 ? rb % 34 != 0
+@@ -9395,7 +9730,7 @@
+       if (gt ? (gm == 1 && rg % 17 != 0)
+         || (gm == 3 && rg % 144 != 0) || (gm == 4 && rg % 210 != 0)
+         || (gm == 5 && rg % 110 != 0) || (gm == 6 && rg % 18 != 0)
+-        || (gm == 7 && rg % 34 != 0) || (gm == 8 && rg % 136 != 0)
++        || (gm == 7 && rg % 34 != 0) || (gm == 8 && rg % 136 != 0) || gm > 8
+         : gm == 1 && rg % 16 == 0) {
+         bad = bad != 0 ? bad : 4;
+       }
+@@ -9853,6 +10188,25 @@
+   }
+ }
+ 
++// The folded step's Q4_K embedding row (tools/payload-kpair.patch): the
++// twin's deq_row (tools/qwen35_engine.c, ggml dequantize_row_q4_K), one
++// element a thread: w = d1 * q - m1, d1 = d * sc, m1 = dmin * m, no contraction
++extern "C" __global__ void llb_embedk(const u8* __restrict__ row, u32 c,
++  float* __restrict__ y) {
++  u32 i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < c) {
++    const u8* b = row + (i >> 8) * 144;
++    const u8* sc = b + 4;
++    u32 g = (i >> 6) & 3, hi = (i >> 5) & 1, l = i & 31, j = 2 * g + hi;
++    u32 sd = j < 4 ? sc[j] & 63 : (sc[j + 4] & 15) | (sc[j - 4] >> 6) << 4;
++    u32 sm = j < 4 ? sc[j + 4] & 63 : (sc[j + 4] >> 4) | (sc[j] >> 6) << 4;
++    u32 q = b[16 + 32 * g + l];
++    float d1 = __fmul_rn(llb_f16(b[0] | b[1] << 8), (float)sd);
++    float m1 = __fmul_rn(llb_f16(b[2] | b[3] << 8), (float)sm);
++    y[i] = __fsub_rn(__fmul_rn(d1, (float)(hi ? q >> 4 : q & 15)), m1);
++  }
++}
++
+ // flat.bend's argmax twice over z[0 .. n), y := [v, i, w, j] (ids as exact
+ // F32), the head bang's tail (tools/payload-head.patch). K.amax.pick (the
+ // first NaN, else the first max) is the least by (not NaN, value, index), so
+@@ -10471,6 +10825,7 @@
+     || cuModuleGetFunction(&gpu_warph, gpu_lib, "llb_warp_f16") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpk, gpu_lib, "llb_warp_q4k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp6, gpu_lib, "llb_warp_q6k") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warp5, gpu_lib, "llb_warp_q5k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp3, gpu_lib, "llb_warp_q3k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp2, gpu_lib, "llb_warp_q2_0") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_pq2_0") != CUDA_SUCCESS
+@@ -10496,6 +10851,7 @@
+     || cuModuleGetFunction(&gpu_amax, gpu_lib, "llb_amax") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_amaxp, gpu_lib, "llb_amax_part") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_embed, gpu_lib, "llb_embed") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_embedk, gpu_lib, "llb_embedk") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mid, gpu_lib, "llb_mid32") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rnadd, gpu_lib, "llb_rmsnorm_add") != CUDA_SUCCESS
+@@ -10506,6 +10862,8 @@
+     || cuModuleGetFunction(&gpu_warpqc, gpu_lib, "llb_warp_q8_cat") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_blk, 49152 * 4) != CUDA_SUCCESS
++    // zeroed: the down GEMV's x pad tail (aab + f, d 12) is read, never written
++    || cuMemsetD32(gpu_blk, 0, 49152) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_headh, 4096 * 4) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_atts, (size_t)2 * 16 * (1u << 17) * 4) != CUDA_SUCCESS

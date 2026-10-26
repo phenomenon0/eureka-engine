@@ -1,0 +1,184 @@
+--- a/bend2/comp.ts	2026-10-07 18:35:31
++++ b/bend2/comp.ts	2026-10-07 18:56:46
+@@ -15440,6 +15440,68 @@
+   llb_mr[3] = n == 0 ? 0 : n - (nx > ny ? nx : ny);
+ }
+ 
++// (ENGINE-VISION2 V5, patches/metal-vision.patch) embedding injection. The
++// prompt carries the image as a run of n <|image_pad|> ids (LLB_IMG_PAD) where
++// mtmd puts its n embedding rows (<|vision_start|> pads <|vision_end|>). The
++// rows come from vision/host/llbv.c (linked only in a VISION=1 build): the
++// in-process tower (LLB_VIS_IMAGE + LLB_VIS_MMPROJ) or a file (LLB_VIS_EMBD),
++// loaded at the pass reserve into a region of gpu_scr past the chunk area
++// (llb_img_at). f27_chunk gathers every row by id as before (llb_f27_embt; a
++// pad id is an in-range row), then llb_img_splice overwrites the pad rows of
++// the batch (F27_X) with the image rows, in order, and at the first pad sets
++// the rope's image map (llb_mr_set: s0 = that slot). Image rows go through the
++// fast chunk only: a pad at the exact step, or a pad run that is not exactly
++// the image's n rows, is refused. No image asked = nothing allocated, nothing
++// launched: the text-only path as before. LLB_VIS_DUMPX=<file>: the batch rows
++// (after the splice) of the first LLB_IMG_DCAP slots, written at exit (the
++// V5 gate's row-for-row receipt)
++#define LLB_IMG_PAD 248056u
++extern int llbv_requested(void);
++extern int llbv_rows(u32 d, float** rows, u32* n, u32* nx, u32* ny, char* err);
++static u32 llb_img_n, llb_img_nx, llb_img_ny, llb_img_seen, llb_img_s0, llb_img_dn, llb_img_dcap, llb_img_d;
++static u64 llb_img_at, llb_img_dump;
++static float* llb_img_rows;
++static id<MTLBuffer> llb_img_buf;
++
++static void llb_img_atexit(void) {
++  const char* f = getenv("LLB_VIS_DUMPX");
++  FILE* o = f != NULL && llb_img_buf != nil ? fopen(f, "wb") : NULL;
++  if (o != NULL) {
++    fwrite((const u8*)[llb_img_buf contents] + (llb_img_dump - SA_SCR), 4,
++      (size_t)llb_img_dn * llb_img_d, o);
++    fclose(o);
++    fprintf(stderr, "vision: batch rows 0 .. %u (d %u) -> %s\n", llb_img_dn, llb_img_d, f);
++  }
++}
++
++// the bytes the reserve adds (0: no image asked); loads the rows the first time
++static u64 llb_img_bytes(u32 d) {
++  if (!llbv_requested()) {
++    return 0;
++  }
++  if (llb_img_rows == NULL) {
++    char err[256] = {0};
++    if (d % 256 != 0 || llbv_rows(d, &llb_img_rows, &llb_img_n, &llb_img_nx, &llb_img_ny, err) != 0) {
++      fprintf(stderr, "vision: %s\n", d % 256 != 0 ? "the model width is not a multiple of 256" : err);
++      err_fail("vision: no image rows");
++    }
++    llb_img_d = d;
++    llb_img_dcap = getenv("LLB_VIS_DUMPX") != NULL ? llb_img_n + 512 : 0;
++  }
++  return ((u64)llb_img_n + llb_img_dcap) * d * 4;
++}
++
++// the region's place once the reserve allocated g (off = its byte offset in g)
++static void llb_img_place(id<MTLBuffer> g, u64 off) {
++  llb_img_at = SA_SCR + off;
++  memcpy((u8*)[g contents] + off, llb_img_rows, (size_t)llb_img_n * llb_img_d * 4);
++  if (llb_img_dcap != 0) {
++    llb_img_dump = llb_img_at + (u64)llb_img_n * llb_img_d * 4;
++    llb_img_buf = g;
++    atexit(llb_img_atexit);
++  }
++}
++
+ static void m9_args(HybArgs* A, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
+   u64 a5, u64 a6, u32 n, u32 c, u32 k, f32 f) {
+   memset(A, 0, sizeof *A);
+@@ -15962,13 +16024,21 @@
+   // (ENGINE-PREFILL, patches/metal-4bpf.patch) and the 4B's d_model 2560 so
+   u64 fch = R->d == 5120 || ((R->d == 4096 || R->d == 2560) && f9_want)
+     ? F27_BYTES : 0;
+-  id<MTLBuffer> g = [gpu_dev newBufferWithLength:M9_SCR + n + fch
++  // (ENGINE-VISION2 V5) + the image rows (and the dump rows) past the chunk area
++  u64 vis = llb_img_bytes(R->d);
++  if (vis != 0 && fch == 0) {
++    err_fail("vision: image rows need the fast chunk (the first pass bang must be a fast chunk)");
++  }
++  id<MTLBuffer> g = [gpu_dev newBufferWithLength:M9_SCR + n + fch + vis
+     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+   if (!g) {
+     err_fail("warp pass: cannot allocate the layer state");
+   }
+   memcpy([g contents], [gpu_scr contents], M9_SCR);
+-  memset((u8*)[g contents] + M9_SCR, 0, n + fch);
++  memset((u8*)[g contents] + M9_SCR, 0, n + fch + vis);
++  if (vis != 0) {
++    llb_img_place(g, M9_SCR + n + fch);
++  }
+   gpu_scr  = g;
+   pass_top = SA_SCR + M9_SCR;
+   pass_end = pass_top + n;
+@@ -16449,6 +16519,54 @@
+   f27_go(en, gpu_t27_elem, &T, sizeof T, (d + 255) / 256, nt, 256);
+ }
+ 
++// (ENGINE-VISION2 V5) the batch's pad rows := the image rows (llb_m_slott, <= 1024
++// columns a launch: d 4096 = 4 x 1024, d 2560 = 1024 + 1024 + 512), then (LLB_VIS_DUMPX)
++// every batch row of the chunk to the dump rows at its slot
++static void llb_img_splice(id<MTLComputeCommandEncoder> en, const u32* ids, u32 nt, u32 pos0, u32 d) {
++  for (u32 r = 0; r < nt;) {
++    if (ids[r] != LLB_IMG_PAD) {
++      r += 1;
++      continue;
++    }
++    u32 r1 = r;
++    while (r1 < nt && ids[r1] == LLB_IMG_PAD) {
++      r1 += 1;
++    }
++    if (llb_img_n == 0) {
++      err_fail("vision: an <|image_pad|> row but no image (LLB_VIS_IMAGE / LLB_VIS_EMBD)");
++    }
++    if (llb_img_seen == 0) {
++      llb_img_s0 = pos0 + r;
++      llb_mr_set(llb_img_s0, llb_img_n, llb_img_nx, llb_img_ny);
++      fprintf(stderr, "vision: image rows at slots %u .. %u, grid %u x %u, rope map {s0 %u, n %u, nx %u, sh %u}\n",
++        llb_img_s0, llb_img_s0 + llb_img_n - 1, llb_img_nx, llb_img_ny, llb_mr[0], llb_mr[1], llb_mr[2], llb_mr[3]);
++    }
++    if (pos0 + r != llb_img_s0 + llb_img_seen || llb_img_seen + (r1 - r) > llb_img_n) {
++      err_fail("vision: the <|image_pad|> ids must be one run of exactly the image's rows");
++    }
++    for (u32 c = 0; c < d; c += 1024) {
++      HybTArgs T;
++      f27_targs(&T, d - c < 1024 ? d - c : 1024, 0, 0, 0.0f);
++      T.a[0] = llb_img_at + ((u64)llb_img_seen * d + c) * 4; T.s[0] = (u64)d * 4;
++      T.a[1] = f27_base + F27_X * 4 + (u64)r * F27_TS + (u64)c * 4; T.s[1] = F27_TS;
++      f27_go(en, gpu_t27_slot, &T, sizeof T, 1, r1 - r, d - c < 1024 ? d - c : 1024);
++    }
++    llb_img_seen += r1 - r;
++    r = r1;
++  }
++  if (llb_img_dcap != 0 && pos0 < llb_img_dcap) {
++    u32 m = pos0 + nt <= llb_img_dcap ? nt : llb_img_dcap - pos0;
++    for (u32 c = 0; c < d; c += 1024) {
++      HybTArgs T;
++      f27_targs(&T, d - c < 1024 ? d - c : 1024, 0, 0, 0.0f);
++      T.a[0] = f27_base + F27_X * 4 + (u64)c * 4; T.s[0] = F27_TS;
++      T.a[1] = llb_img_dump + ((u64)pos0 * d + c) * 4; T.s[1] = (u64)d * 4;
++      f27_go(en, gpu_t27_slot, &T, sizeof T, 1, m, d - c < 1024 ? d - c : 1024);
++    }
++    llb_img_dn = pos0 + m > llb_img_dn ? pos0 + m : llb_img_dn;
++  }
++}
++
+ // the chunk: nt (1 .. F27_CH) tokens at pos0 .. through all S0->nl layers,
+ // head-less. ids / erow: the tokens and the embedding region (Q4_K rows of
+ // 2880 B); pw / tw / po as m9_pass_run's (the table required)
+@@ -16486,6 +16604,9 @@
+     f27_go(en, gpu_f27_embt, &E, (u32)(32 + nt * sizeof(u32)),
+       S0->d / 256, nt, 256);
+   }
++  if (llb_img_n != 0) {
++    llb_img_splice(en, ids, nt, pos0, S0->d);
++  }
+   for (u32 i = 0; i < S0->nl; i += 1) {
+     bool full = (i + 1) % 4 == 0;
+     for (u32 t = 0; t < nt; t += 1) {
+@@ -16682,6 +16803,11 @@
+   bool     k6 = dm == 2560 && term_tag(ep) == TAG_STR
+     && (u64)qe.len == 248320ull * 2100;
+   u32      tok = (u32)H[a + 56], rb, fm;
++  // (ENGINE-VISION2 V5) image rows only through the fast chunk; by the first
++  // exact step every image row must have been spliced
++  if (llb_img_n != 0 && (tok == LLB_IMG_PAD || llb_img_seen != llb_img_n)) {
++    err_fail("vision: image rows go through the fast chunk only (a pad at the exact step, or pads != the image's rows)");
++  }
+   u32      erb = k4 ? dm / 256 * 144 : k6 ? dm / 256 * 210 : dm / 32 * 34;
+   bool     rok = m9_rw(hw, &rb, &fm);
+   bool     ok = str_nar(q) == 2 && term_tag(ep) == TAG_STR && str_nar(qe) == 2
+@@ -20713,6 +20839,11 @@
+   memset(pass_x, 0, sizeof pass_x); memset(pass_r, 0, sizeof pass_r);
+   memset(pass_pos, 0, sizeof pass_pos); memset(pass_on, 0, sizeof pass_on);
+   f27_base = 0; f9_want = false; pass_top = 0; pass_end = 0; pass_dT = 0; m24_fin = 0;
++  // (ENGINE-VISION2) the image map and rows back to "no image" (a reopened run starts text-only)
++  memset(llb_mr, 0, sizeof llb_mr);
++  free(llb_img_rows); llb_img_rows = NULL; llb_img_buf = nil;
++  llb_img_n = 0; llb_img_nx = 0; llb_img_ny = 0; llb_img_seen = 0; llb_img_s0 = 0;
++  llb_img_dn = 0; llb_img_dcap = 0; llb_img_d = 0; llb_img_at = 0; llb_img_dump = 0;
+   gpu_f27_gdl = nil; gpu_f27_attn = nil; gpu_f9_attn = nil;
+   gpu_f27_conv = nil; gpu_f27_copy = nil; gpu_f27_embt = nil;
+   gpu_t27_rnorm = nil; gpu_t27_addrms = nil; gpu_t27_elem = nil;

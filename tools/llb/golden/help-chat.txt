@@ -1,0 +1,7 @@
+usage: llb chat MODEL [options]
+
+Chat on the terminal, one line per message; Ctrl-D ends.
+The model is reloaded for every turn (27b: about 17 s before each answer starts).
+Thinking is off by default; --think turns it on (the reply then starts
+with the model's reasoning). Options as for llb run: -n, --exact, --fast, --spec, -v.
+exit 0

@@ -1,0 +1,1 @@
+{"model":"clef","state":"The order arrived with a broken screen.","questions":{"route":{"type":"choice","instructions":"Classify the report.","criteria":{"technical":"Software issue","shipping":"Damaged delivery","billing":"Incorrect charge"}}}}

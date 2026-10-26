@@ -1,0 +1,256 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4919,6 +4919,8 @@
+ static CUfunction gpu_qkr;
+ static CUfunction gpu_slot;
+ static CUfunction gpu_amax;
++static CUfunction gpu_amaxp;
++static CUfunction gpu_embed;
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
+ static CUdeviceptr gpu_act;
+@@ -7048,6 +7050,9 @@
+ #define H_WARP_N (2 * LINE + 1)
+ #define H_WARP   (3 * LINE + 1)
+ #define WARP_MAX (LINE - 1)
++// llb_amax_part's grid and block (tools/payload-fold.patch)
++#define AMAX_G 128u
++#define AMAX_T 256u
+ 
+ // The handoff mailbox (tools/payload-hand.patch): pinned host memory that
+ // llb_mail fills after every batch with the header words the host polls and
+@@ -8627,7 +8632,7 @@
+     if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fm != 1
+       || noff % 4 != 0 || ooff % 16 != 0
+       || term_tag(x) == TAG_ARR || term_tag(y) == TAG_ARR || blk_cls(y) < 2
+-      || n < 1 || n > 1u << 18
++      || n < 1 || n > (1u << 18) - 4 * AMAX_G
+       || (u64)noff + 4096 * 4 > q.len
+       || (u64)ooff + (u64)n * (u64)rb > q.len) {
+       *bad = *bad != 0 ? *bad : 5;
+@@ -8930,10 +8935,37 @@
+   u32  rd = rdw & (rdt ? 0x0fffffffu : 0x7fffffffu);
+   u32  fgm = rgt ? rgw >> 28 & 3 : (rgw >> 31 ? 2 : rg % 17 == 0);
+   u32  fdm = rdt ? rdw >> 28 & 3 : (rdw >> 31 ? 2 : rd % 17 == 0);
++  // the folded step (tools/payload-fold.patch): eb / eat the embedding Bytes and
++  // the token row's byte offset, hb the head Bytes (output.weight then
++  // output_norm, as llb.head_warp), noff / ooff, nh rows of rwh; nh = 0 is the
++  // plain pass (x in, y out), else y gets the head's four words and x is unused
++  Term eb = H[a + 49], hb = H[a + 51];
++  u32  eat = (u32)H[a + 50], noff = (u32)H[a + 52], ooff = (u32)H[a + 53];
++  u32  nh = (u32)H[a + 54], rwh = (u32)H[a + 55];
++  bool fold = nh != 0;
+   bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+     && dT >= 1 && dT <= 17 && pos < (1u << dT) && k >= 1 && s + k <= 32
+     && term_tag(x) != TAG_ARR && term_tag(y) != TAG_ARR
+-    && blk_cls(x) == 12 && blk_cls(y) >= 12;
++    && (fold || blk_cls(x) == 12) && blk_cls(y) >= (fold ? 2 : 12);
++  o->w = 0;
++  if (ok && fold) {
++    StrParts qe = str_peek_ro(e, eb), qh = str_peek_ro(e, hb);
++    bool     tg = rwh >> 30 & 1;
++    u32      rbh = rwh & (tg ? 0x0fffffffu : 0x7fffffffu);
++    u32      fmh = tg ? rwh >> 28 & 3 : (rwh >> 31 ? 2 : (rbh % 17 == 0));
++    ok = s == 0 && term_tag(eb) == TAG_STR && str_nar(qe) == 2
++      && (u64)eat + 4096 + 256 <= qe.len
++      && term_tag(hb) == TAG_STR && str_nar(qh) == 2 && fmh == 1
++      && rbh == 4352 && noff % 4 == 0 && ooff % 16 == 0 && nh <= (1u << 18) - 4 * AMAX_G
++      && (u64)noff + 4096 * 4 <= qh.len && (u64)ooff + (u64)nh * rbh <= qh.len;
++    if (ok) {
++      o->w  = (u64)((const u8*)(H + term_peek_ro(e, qe.data)) + qe.off + eat);
++      o->k  = (u64)((const u8*)(H + term_peek_ro(e, qh.data)) + qh.off + noff);
++      o->v  = (u64)((const u8*)(H + term_peek_ro(e, qh.data)) + qh.off + ooff);
++      o->gm = nh;
++      o->bq = rbh;
++    }
++  }
+   for (u32 f = 0; f < 40; f += 1) {
+     M->po[f] = (u32)H[a + 4 + f];
+   }
+@@ -9483,6 +9515,18 @@
+   }
+ }
+ 
++// The folded step's embedding row (tools/payload-fold.patch): y[i] = q[i] *
++// d[i >> 5] over a Q8_0 row of c columns ([c int8 q][c/32 f16le d]), exact
++// as flat.bend's q8.load (<= 19 significant bits).
++extern "C" __global__ void llb_embed(const u8* __restrict__ row, u32 c,
++  float* __restrict__ y) {
++  u32 i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < c) {
++    y[i] = __fmul_rn((float)(signed char)row[i],
++      llb_f16(*(const unsigned short*)(row + c + 2 * (i >> 5))));
++  }
++}
++
+ // flat.bend's argmax twice over z[0 .. n), y := [v, i, w, j] (ids as exact
+ // F32), the head bang's tail (tools/payload-head.patch). K.amax.pick (the
+ // first NaN, else the first max) is the least by (not NaN, value, index), so
+@@ -9496,41 +9540,67 @@
+   return a > b || (a == b && ia < ib);
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(1024) llb_amax(
+-  const float* __restrict__ z, u32 n, float* __restrict__ y) {
+-  __shared__ float sv[1024];
+-  __shared__ u32   si[1024];
+-  const u32 t    = threadIdx.x;
+-  u32       skip = 0xFFFFFFFFu;
+-  for (u32 k = 0; k < 2; k += 1) {
+-    float bv = __uint_as_float(0xFF800000u);
+-    u32   bi = 0xFFFFFFFFu;
+-    for (u32 i = t; i < n; i += 1024) {
+-      const float v = i == skip ? __uint_as_float(0xFF800000u) : z[i];
+-      if (amax_lt(v, i, bv, bi)) {
+-        bv = v;
+-        bi = i;
+-      }
+-    }
+-    sv[t] = bv;
+-    si[t] = bi;
+-    __syncthreads();
+-    for (u32 st = 512; st > 0; st >>= 1) {
+-      if (t < st && amax_lt(sv[t + st], si[t + st], sv[t], si[t])) {
+-        sv[t] = sv[t + st];
+-        si[t] = si[t + st];
+-      }
+-      __syncthreads();
+-    }
+-    if (t == 0) {
+-      y[2 * k]     = sv[0];
+-      y[2 * k + 1] = (float)si[0];
++// The top two in two launches (tools/payload-fold.patch): llb_amax_part's
++// AMAX_G blocks keep each thread's top two of its stride, merge them per
++// block and park [v, i, w, j] in z's tail past n (gpu_logit holds 2^18);
++// llb_amax merges the AMAX_G pairs. The order is total, so the top two of
++// the union is the top two of the parts: the same picks as twice over z.
++INLINE void amax_put(float v, u32 i, float* b1, u32* j1, float* b2, u32* j2) {
++  if (amax_lt(v, i, *b1, *j1)) {
++    *b2 = *b1; *j2 = *j1; *b1 = v; *j1 = i;
++  } else if (amax_lt(v, i, *b2, *j2)) {
++    *b2 = v; *j2 = i;
++  }
++}
++
++// merge the T pairs in shared memory into slot 0 (T a power of two)
++INLINE void amax_tree(float* s1, u32* x1, float* s2, u32* x2, u32 t, u32 T) {
++  __syncthreads();
++  for (u32 st = T / 2; st > 0; st >>= 1) {
++    if (t < st) {
++      float b1 = s1[t], b2 = s2[t];
++      u32   j1 = x1[t], j2 = x2[t];
++      amax_put(s1[t + st], x1[t + st], &b1, &j1, &b2, &j2);
++      amax_put(s2[t + st], x2[t + st], &b1, &j1, &b2, &j2);
++      s1[t] = b1; x1[t] = j1; s2[t] = b2; x2[t] = j2;
+     }
+-    skip = si[0];
+     __syncthreads();
+   }
+ }
+ 
++extern "C" __global__ void __launch_bounds__(AMAX_T) llb_amax_part(
++  float* __restrict__ z, u32 n) {
++  __shared__ float s1[AMAX_T], s2[AMAX_T];
++  __shared__ u32   x1[AMAX_T], x2[AMAX_T];
++  const u32 t = threadIdx.x;
++  float b1 = __uint_as_float(0xFF800000u), b2 = b1;
++  u32   j1 = 0xFFFFFFFFu, j2 = 0xFFFFFFFFu;
++  for (u32 i = blockIdx.x * AMAX_T + t; i < n; i += AMAX_G * AMAX_T) {
++    amax_put(z[i], i, &b1, &j1, &b2, &j2);
++  }
++  s1[t] = b1; x1[t] = j1; s2[t] = b2; x2[t] = j2;
++  amax_tree(s1, x1, s2, x2, t, AMAX_T);
++  if (t == 0) {
++    float* p = z + (1u << 18) - 4 * AMAX_G + 4 * blockIdx.x;
++    p[0] = s1[0]; p[1] = __uint_as_float(x1[0]);
++    p[2] = s2[0]; p[3] = __uint_as_float(x2[0]);
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(AMAX_G) llb_amax(
++  const float* __restrict__ z, u32 n, float* __restrict__ y) {
++  __shared__ float s1[AMAX_G], s2[AMAX_G];
++  __shared__ u32   x1[AMAX_G], x2[AMAX_G];
++  const u32 t = threadIdx.x;
++  const float* p = z + (1u << 18) - 4 * AMAX_G + 4 * t;
++  s1[t] = p[0]; x1[t] = __float_as_uint(p[1]);
++  s2[t] = p[2]; x2[t] = __float_as_uint(p[3]);
++  amax_tree(s1, x1, s2, x2, t, AMAX_G);
++  if (t == 0) {
++    y[0] = s1[0]; y[1] = (float)x1[0]; y[2] = s2[0]; y[3] = (float)x2[0];
++  }
++}
++
+ // K.put's 1024-f32 slot (tools/payload-slot.patch): y is already the slot
+ extern "C" __global__ void llb_slot(const float* __restrict__ x,
+   float* __restrict__ y) {
+@@ -10098,6 +10168,8 @@
+     || cuModuleGetFunction(&gpu_qkr, gpu_lib, "llb_qkr") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_slot, gpu_lib, "llb_slot") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_amax, gpu_lib, "llb_amax") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_amaxp, gpu_lib, "llb_amax_part") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_embed, gpu_lib, "llb_embed") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mid, gpu_lib, "llb_mid32") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+@@ -10365,6 +10437,18 @@
+     err_fail("warp pass: dT changed");
+   }
+   u64 cur = o->x;
++  bool fold = o->w != 0;
++  if (fold) {
++    // the folded step: the token's embedding row into pass_x[0]
++    u64 er = o->w, x0 = pass_x[0];
++    u32 c4 = 4096;
++    void* ea[] = { &er, &c4, &x0 };
++    if (cuLaunchKernel(gpu_embed, 16, 1, 1, 256, 1, 1, 0, NULL, ea, NULL)
++      != CUDA_SUCCESS) {
++      err_fail("device launch failed");
++    }
++    cur = x0;
++  }
+   for (u32 j = 0; j < k; j += 1) {
+     u32  i = s + j;
+     bool full = (i + 1) % 4 == 0;
+@@ -10409,10 +10493,29 @@
+     WarpOp ff = {0};
+     ff.w = base + p[1]; ff.k = base + p[2]; ff.v = base + p[3]; ff.wn = base + p[4];
+     ff.x = cur; ff.r = pass_x[2]; ff.n = 4096; ff.rb = o->brg; ff.d = o->rb; ff.fm = 1;
+-    u64 nxt = j + 1 == k ? yp : pass_x[cur == pass_x[0] ? 1 : 0];
++    u64 nxt = j + 1 == k && !fold ? yp : pass_x[cur == pass_x[0] ? 1 : 0];
+     llb_fbn_run(&ff, nxt, grid);
+     cur = nxt;
+   }
++  if (fold) {
++    // the head bang's chain (kind 14): rms_final -> gpu_headh, the head GEMV
++    // into gpu_logit, llb_amax's four words into y
++    u64 wn = o->k, wo = o->v, op2 = gpu_headh, lg = gpu_logit;
++    u32 n4 = 4096, nh = o->gm, rq = o->bq, cg = o->bq / 17 * 4, dh = 10;
++    void* ra[] = { &cur, &wn, &op2, &n4 };
++    void* ga[] = { &wo, &rq, &cg, &op2, &lg, &nh, &dh };
++    void* am[] = { &lg, &nh, &yp };
++    if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
++      != CUDA_SUCCESS
++      || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, ga, NULL)
++        != CUDA_SUCCESS
++      || cuLaunchKernel(gpu_amaxp, AMAX_G, 1, 1, AMAX_T, 1, 1, 0, NULL, am, NULL)
++        != CUDA_SUCCESS
++      || cuLaunchKernel(gpu_amax, 1, 1, 1, AMAX_G, 1, 1, 0, NULL, am, NULL)
++        != CUDA_SUCCESS) {
++      err_fail("device launch failed");
++    }
++  }
+ }
+ #endif
+ 
+@@ -10587,7 +10690,9 @@
+           != CUDA_SUCCESS
+           || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, ga, NULL)
+             != CUDA_SUCCESS
+-          || cuLaunchKernel(gpu_amax, 1, 1, 1, 1024, 1, 1, 0, NULL, am, NULL)
++          || cuLaunchKernel(gpu_amaxp, AMAX_G, 1, 1, AMAX_T, 1, 1, 0, NULL, am, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_amax, 1, 1, 1, AMAX_G, 1, 1, 0, NULL, am, NULL)
+             != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }

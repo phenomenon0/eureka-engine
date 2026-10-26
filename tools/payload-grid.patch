@@ -1,0 +1,11 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -8845,7 +8845,7 @@
+       : "warp GEMV: unsupported operands");
+   }
+   const char* gs   = getenv("LLB_WARP_GRID");
+-  u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 164;
++  u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 1024;
+   for (u32 j = 0; j < m; j += 1) {
+     volatile WarpOp* o = &gpu_mail->op[j];
+     u64 w = o->w, xp = o->x, yp = o->y;

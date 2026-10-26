@@ -1,0 +1,141 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2902,7 +2902,14 @@
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+     || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k) || is_fbn(k)
+-    || is_linb(k);
++    || is_linb(k) || is_aob(k);
++}
++
++// The full-attention output tail bang (tools/payload-aob.patch): attn4, the
++// output gate and the o GEMV as one host-served task, into the bang's output y
++// (field index 3).
++function is_aob(k: Name): boolean {
++  return k === "llb.attn_out_warp" || k.endsWith(".llb.attn_out_warp");
+ }
+ 
+ // The linear (gated-delta-net) attention block bang (tools/payload-linb.patch):
+@@ -4124,7 +4131,7 @@
+       : is_vmul(k) ? "LLB_VMUL_FID" : is_og(k) ? "LLB_OG_FID"
+       : is_head(k) ? "LLB_HEAD_FID" : is_attn4(k) ? "LLB_ATTN4_FID"
+       : is_silumul(k) ? "LLB_SILUMUL_FID" : is_fbn(k) ? "LLB_FBN_FID"
+-      : is_linb(k) ? "LLB_LINB_FID"
++      : is_linb(k) ? "LLB_LINB_FID" : is_aob(k) ? "LLB_AOB_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -7080,6 +7087,9 @@
+ #ifndef LLB_LINB_FID
+ #define LLB_LINB_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_AOB_FID
++#define LLB_AOB_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7092,7 +7102,8 @@
+   || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID \
+   || (u32)term_aux(t) == LLB_OG_FID || (u32)term_aux(t) == LLB_HEAD_FID \
+   || (u32)term_aux(t) == LLB_ATTN4_FID || (u32)term_aux(t) == LLB_SILUMUL_FID \
+-  || (u32)term_aux(t) == LLB_FBN_FID || (u32)term_aux(t) == LLB_LINB_FID)
++  || (u32)term_aux(t) == LLB_FBN_FID || (u32)term_aux(t) == LLB_LINB_FID \
++  || (u32)term_aux(t) == LLB_AOB_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7912,6 +7923,41 @@
+     o->brg = rg;
+     return true;
+   }
++  // The full-attention output tail bang (tools/payload-aob.patch): wb (1), q
++  // (2), gate (3), kc (4), vc (5), y (6, output), the o weight byte offset (7),
++  // the packed c = dT | pos << 5 (8) and the o Q8 row word (9). One task runs
++  // attn4 -> outputgate -> the o GEMV.
++  if (aux == LLB_AOB_FID) {
++    Term wbt = H[a + 1], qt = H[a + 2], gt = H[a + 3], kct = H[a + 4];
++    Term vct = H[a + 5], y = H[a + 6];
++    u32  wo = (u32)H[a + 7], c = (u32)H[a + 8], rgw = (u32)H[a + 9];
++    u32  dT = c & 31;
++    StrParts q = str_peek_ro(e, wbt);
++    bool rgt = rgw >> 30 & 1;
++    u32  rg = rgw & (rgt ? 0x0fffffffu : 0x7fffffffu);
++    u32  fm = rgt ? rgw >> 28 & 3 : (rgw >> 31 ? 2 : rg % 17 == 0);
++    const u8* base = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fm != 1
++      || dT < 1 || dT > 17
++      || term_tag(qt) == TAG_ARR || term_tag(gt) == TAG_ARR
++      || term_tag(kct) == TAG_ARR || term_tag(vct) == TAG_ARR
++      || term_tag(y) == TAG_ARR
++      || (u64)wo + (u64)4096 * rg > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 19;
++    o->w  = (u64)(base + wo);
++    o->x  = (u64)(H + blk_loc(H, qt));
++    o->k  = (u64)(H + blk_loc(H, gt));
++    o->v  = (u64)(H + blk_loc(H, kct));
++    o->wn = (u64)(H + blk_loc(H, vct));
++    o->y  = (u64)(H + blk_loc(H, y));
++    o->c  = c;
++    o->rb = rg;
++    o->fm = 1;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7954,7 +8000,7 @@
+         || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
+         || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
+         || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID || hx == LLB_SILUMUL_FID
+-        || hx == LLB_FBN_FID || hx == LLB_LINB_FID) {
++        || hx == LLB_FBN_FID || hx == LLB_LINB_FID || hx == LLB_AOB_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -8435,10 +8481,12 @@
+     Term t  = H[H_WARP + j];
+     Loc  tl = task_tail(t);
+     Term rv[WL_RESW];
+-    // attn4's y is its 4th term (tools/payload-attn4.patch); the others' is
+-    // their 3rd, and the llama attention's is its 6th
++    // attn4's y is its 4th term (tools/payload-attn4.patch); the aob block's
++    // is its 6th (tools/payload-aob.patch); the others' is their 3rd, and the
++    // llama attention's is its 6th
+     rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6
+-      : (u32)term_aux(t) == LLB_ATTN4_FID ? 4 : 3)];
++      : (u32)term_aux(t) == LLB_ATTN4_FID ? 4
++      : (u32)term_aux(t) == LLB_AOB_FID ? 6 : 3)];
+     Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
+     if (c != 0) {
+       ring_push(H, 0, c);
+@@ -9239,6 +9287,26 @@
+             != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 19) {
++        // the full-attention output tail bang (tools/payload-aob.patch):
++        // attn4(q, kc, vc) -> outputgate(attn, gate) -> the o GEMV into y
++        u64 qp19 = o->x, gp19 = o->k, kcp19 = o->v, vcp19 = o->wn;
++        u64 wao19 = o->w;
++        u32 c19 = o->c, rg19 = o->rb, cg19 = rg19 / 17 * 4;
++        u64 s19 = gpu_atts, p19 = gpu_atts + ((u64)16 << 17) * 4;
++        CUdeviceptr attn19 = gpu_blk, gated19 = attn19 + 4096 * 4;
++        u32 n4_19 = 4096, d10_19 = 10, gog19 = (4096 + 1023) / 1024;
++        void* a19[] = { &qp19, &kcp19, &vcp19, &attn19, &s19, &p19, &c19 };
++        void* g19[] = { &attn19, &gp19, &gated19, &n4_19 };
++        void* o19[] = { &wao19, &rg19, &cg19, &gated19, &yp, &n4_19, &d10_19 };
++        if (cuLaunchKernel(gpu_attn4, 16, 1, 1, 256, 1, 1, 0, NULL, a19, NULL)
++          != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_og, gog19, 1, 1, 1024, 1, 1, 0, NULL, g19, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, o19, NULL)
++            != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else {
+         // the output gate bang (tools/payload-og.patch)
+         u64 xp13 = o->x, gp13 = o->k;

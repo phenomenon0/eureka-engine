@@ -1,0 +1,79 @@
+diff -ru bend-astra2-pristine/bend2/comp.ts bend-grow-work/bend2/comp.ts
+--- bend-astra2-pristine/bend2/comp.ts	2026-09-27 19:11:22.775280913 -0500
++++ bend-grow-work/bend2/comp.ts	2026-09-27 19:12:44.605408177 -0500
+@@ -4620,6 +4620,7 @@
+ #define H_BUMP       0
+ #define H_CAP        1
+ #define H_CURSOR     LINE
++#define H_FRONT      (H_CURSOR + 1)
+ #define H_ROOT_DONE  (2 * LINE)
+ #define H_ERROR_CODE (3 * LINE)
+ #define H_ROOT_WORD  (4 * LINE)
+@@ -6818,6 +6819,22 @@
+   u32 row   = blockIdx.x;
+   u32 lane  = threadIdx.x;
+ #endif
++#ifndef __METAL_VERSION__
++  // CUDA queues iterations blind: grow(1) opens each one, taking the cursor
++  // into H_FRONT (~0 once done or failed), and every pass skips itself as
++  // the host's per-iteration launch choice would have.
++  if (pass == 0 && grids == 1 && lane == 0) {
++    u32 f = a32_load(a32_at(H, H_CURSOR));
++    a32_store(a32_at(H, H_CURSOR), 0);
++    a32_store(a32_at(H, H_FRONT), root_done(H) || err_seen(H) ? ~0u : f);
++  }
++  BAR();
++  u32 front = a32_load(a32_at(H, H_FRONT));
++  if (front == 0 || front == ~0u
++    || (pass == 0 && front >= (grids == 1 ? CUBE_T : LANES))) {
++    return;
++  }
++#endif
+   if (pass == 2) {
+     bank_pack(H, lane);
+     return;
+@@ -7340,8 +7357,20 @@
+   }
+ }
+ 
++#ifndef GPU_BATCH
++#define GPU_BATCH 16
++#endif
++
++// Iterations are queued GPU_BATCH at a time: the device picks each one's
++// passes, so the host neither syncs nor touches the corpus between them.
+ static void gpu_pass(u32 f) {
+-  gpu_run(f);
++  (void)f;
++  for (u32 i = 0; i < GPU_BATCH; i += 1) {
++    gpu_kernel(0, 1);
++    gpu_kernel(0, CUBE_G);
++    gpu_kernel(1, CUBE_G);
++    gpu_kernel(2, 1);
++  }
+   if (cuCtxSynchronize() != CUDA_SUCCESS) {
+     err_fail("device fault");
+   }
+@@ -7361,6 +7390,22 @@
+ // ====
+ 
+ static void cube_run(Corpus H, bool gpu) {
++#if BEND_CUDA
++  // The device owns the cursor; the host reads the corpus once per batch.
++  while (gpu) {
++    gpu_pass(0);
++    u32 ec = a32_load(a32_at(H, H_ERROR_CODE));
++    if (ec != 0) {
++      err_post(H, ec);
++    }
++    if (root_done(H)) {
++      return;
++    }
++    if (a32_load(a32_at(H, H_FRONT)) == 0) {
++      err_fail("frontier drained without a result");
++    }
++  }
++#endif
+   for (;;) {
+     u32 f = a32_load(a32_at(H, H_CURSOR));
+     a32_store(a32_at(H, H_CURSOR), 0);

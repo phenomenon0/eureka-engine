@@ -1,0 +1,211 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4747,6 +4747,7 @@
+ static CUfunction gpu_warp;
+ static CUfunction gpu_warpq;
+ static CUfunction gpu_warph;
++static CUfunction gpu_warpk;
+ static CUfunction gpu_attn;
+ static CUfunction gpu_rms;
+ static CUfunction gpu_mailk;
+@@ -7242,6 +7243,33 @@
+     llb_f16(v.y & 65535), llb_f16(v.y >> 16));
+ }
+ 
++// group g of a Q4_K row (tools/q4k.py: GGUF block layout, 144 bytes a
++// super-block): w = d * sc * nib - dmin * m, ggml's dequantize_row_q4_K. The
++// products d*sc and dmin*m are exact (f16 significand * 6-bit int); d1*nib is
++// exact (4-bit int); only d1*nib - m1 rounds, the same f32 subtract as ggml.
++// tools/q4k.patch
++INLINE float4 q4k_w(const u8* __restrict__ row, u32 g) {
++  u32  c4 = 4 * g, blk = c4 >> 8, rr = c4 & 255;
++  u32  b = rr >> 6, r = rr & 63, l = r & 31, hi = r >> 5;
++  const u8* B = row + (u64)blk * 144;
++  float d  = llb_f16(*(const unsigned short*)(B + 0));
++  float dm = llb_f16(*(const unsigned short*)(B + 2));
++  const u8* sc = B + 4;
++  u32  sb = 2 * b + hi, dsc, msc;
++  if (sb < 4) {
++    dsc = sc[sb] & 63; msc = sc[sb + 4] & 63;
++  } else {
++    dsc = (sc[sb + 4] & 15) | ((u32)(sc[sb - 4] >> 6) << 4);
++    msc = (sc[sb + 4] >> 4) | ((u32)(sc[sb] >> 6) << 4);
++  }
++  float d1 = __fmul_rn(d, (float)dsc), m1 = __fmul_rn(dm, (float)msc);
++  u32  v = *(const u32*)(B + 16 + b * 32 + l) >> (hi * 4);
++  return make_float4(__fsub_rn(__fmul_rn(d1, (float)(v & 15)), m1),
++    __fsub_rn(__fmul_rn(d1, (float)((v >> 8) & 15)), m1),
++    __fsub_rn(__fmul_rn(d1, (float)((v >> 16) & 15)), m1),
++    __fsub_rn(__fmul_rn(d1, (float)((v >> 24) & 15)), m1));
++}
++
+ // llb_warp over Q8_0 (H false) or F16 (H true) rows of rb bytes
+ // (tools/merge3-q8.patch, tools/merge3-f16.patch): the same groups, leaf and
+ // tree, each weight upconverted on load; a copy, so the F32 kernel's code
+@@ -7317,6 +7345,74 @@
+   u32* __restrict__ y, u32 n, u32 d) {
+   warp_dq<true>(W, rb, cg, x, y, n, d);
+ }
++
++// llb_warp over Q4_K rows (tools/q4k.patch): the same groups, leaf and
++// tree, each weight dequantized on load; a copy, so the gated kernels stay
++// untouched
++__device__ __forceinline__ void warp_dq4k(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  const u32 ch = 1u << (d - 9);
++  float4 xv[16];
++  if (ch == 1) {
++    warp_x(xv, x, 0, l);
++  }
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const u8* row = W + (u64)r * rb;
++    float s[4];
++    for (u32 k = 0; k < ch; k++) {
++      if (ch > 1) {
++        warp_x(xv, x, k, l);
++      }
++      float4 w[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        u32 g = 512 * k + 32 * i + l;
++        w[i] = g < cg ? q4k_w(row, g)
++          : make_float4(0.f, 0.f, 0.f, 0.f);
++      }
++      float v[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        float4 a = w[i], b = xv[i];
++        v[i] = __fadd_rn(__fadd_rn(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)),
++          __fadd_rn(__fmul_rn(a.z, b.z), __fmul_rn(a.w, b.w)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i++) {
++          float o = __shfl_xor_sync(0xffffffffu, v[i], m);
++          v[i] = (l & m) ? __fadd_rn(o, v[i]) : __fadd_rn(v[i], o);
++        }
++      }
++      #pragma unroll
++      for (u32 st = 1; st < 16; st <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i += 2 * st) {
++          v[i] = __fadd_rn(v[i], v[i + st]);
++        }
++      }
++      s[k] = v[0];
++    }
++    for (u32 st = 1; st < ch; st <<= 1) {
++      for (u32 k = 0; k < ch; k += 2 * st) {
++        s[k] = __fadd_rn(s[k], s[k + st]);
++      }
++    }
++    if (l == 0) {
++      y[r] = __float_as_uint(s[0]);
++    }
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q4k(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  warp_dq4k(W, rb, cg, x, y, n, d);
++}
+ #endif
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+@@ -7456,14 +7552,15 @@
+     bool     tg = rw >> 30 & 1;
+     u32      rb = rw & (tg ? 0x0fffffffu : 0x7fffffffu);
+     u32      fm = tg ? rw >> 28 & 3 : rw >> 31 ? 2 : rb % 17 == 0;
+-    if (tg ? rw >> 31 != 0 || fm == 3 || (fm == 1 && rb % 17 != 0)
+-      : fm == 1 && rb % 16 == 0) {
++    if (tg ? rw >> 31 != 0 || (fm == 1 && rb % 17 != 0)
++      || (fm == 3 && rb % 144 != 0) : fm == 1 && rb % 16 == 0) {
+       bad = bad != 0 ? bad : 4;
+     }
+     StrParts p  = str_peek_ro(e, H[a + 1]);
+     const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 11
+-      || (fm == 1 ? rb / 17 % 4 != 0 : rb % (fm ? 8 : 16) != 0)
++      || (fm == 1 ? rb / 17 % 4 != 0 : fm == 3 ? rb % 144 != 0
++        : rb % (fm ? 8 : 16) != 0)
+       || ((u64)w & 15) != 0
+       || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
+       || term_tag(y) == TAG_ARR || blk_cls(x) < (ff ? 11 : d + 2)
+@@ -7525,13 +7622,14 @@
+       bool gt = rv >> 30 & 1;
+       u32  rg = rv & (gt ? 0x0fffffffu : 0x7fffffffu);
+       u32  gm = gt ? rv >> 28 & 3 : rv >> 31 ? 2 : rg % 17 == 0;
+-      if (gt ? rv >> 31 != 0 || gm == 3 || (gm == 1 && rg % 17 != 0)
+-        : gm == 1 && rg % 16 == 0) {
++      if (gt ? rv >> 31 != 0 || (gm == 1 && rg % 17 != 0)
++        || (gm == 3 && rg % 144 != 0) : gm == 1 && rg % 16 == 0) {
+         bad = bad != 0 ? bad : 4;
+       }
+       const u8* wb = (const u8*)(H + term_peek_ro(e, p.data)) + p.off;
+       if (n != 2048 || blk_cls(x) != 11 || gm != fm
+-        || (fm == 1 ? rg / 17 % 4 != 0 : rg % (fm ? 8 : 16) != 0)
++        || (fm == 1 ? rg / 17 % 4 != 0 : fm == 3 ? rg % 144 != 0
++          : rg % (fm ? 8 : 16) != 0)
+         || ((u64)(wb + gb) & 15) != 0
+         || ((u64)(wb + ub) & 15) != 0 || (u64)gb + 6144ull * rg > p.len
+         || (u64)ub + 6144ull * rg > p.len || an % 4 != 0
+@@ -8092,6 +8190,7 @@
+   if (cuModuleGetFunction(&gpu_warp, gpu_lib, "llb_warp") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq, gpu_lib, "llb_warp_q8") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warph, gpu_lib, "llb_warp_f16") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpk, gpu_lib, "llb_warp_q4k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
+@@ -8178,10 +8277,12 @@
+   for (u32 j = 0; j < m; j += 1) {
+     volatile WarpOp* o = &gpu_mail->op[j];
+     u64 w = o->w, xp = o->x, yp = o->y;
+-    // Q8_0 / F16 (llb_warp_q8 / llb_warp_f16): rq is the row's bytes; cg =
+-    // c / 4 = rb / 17 * 4 (Q8_0), rb / 8 (F16)
++    // Q8_0 / F16 / Q4_K (llb_warp_q8 / llb_warp_f16 / llb_warp_q4k): rq is
++    // the row's bytes; cg = c / 4 = rb / 17 * 4 (Q8_0), rb / 8 (F16),
++    // rb / 144 * 64 (Q4_K)
+     u32 n = o->n, d = o->d, fm = o->fm, rq = fm ? o->rb : o->rb / 16;
+-    u32 cg = fm == 1 ? o->rb / 17 * 4 : o->rb / (fm ? 8 : 16);
++    u32 cg = fm == 1 ? o->rb / 17 * 4 : fm == 3 ? o->rb / 144 * 64
++      : o->rb / (fm ? 8 : 16);
+     CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
+     // attention (f, +wt, +q, +kc, +vc, +c, y, +wo, +r): its o GEMV reads
+     // llb_attn's output, a slot of gpu_att (2048 x 2048 rows of wo, d = 9);
+@@ -8212,7 +8313,8 @@
+     if (o->kind == 5) {
+       u64 wn = o->wn, wg = o->k, wu = o->v;
+       u32 rg = o->c, nf = 6144, df = 9;
+-      u32 gq = fm ? rg : rg / 16, gc = fm == 1 ? rg / 17 * 4 : rg / (fm ? 8 : 16);
++      u32 gq = fm ? rg : rg / 16, gc = fm == 1 ? rg / 17 * 4
++        : fm == 3 ? rg / 144 * 64 : rg / (fm ? 8 : 16);
+       CUdeviceptr ga = gpu_act + (CUdeviceptr)j * 3 * 6144 * 4;
+       CUdeviceptr ua = ga + 6144 * 4, sa = ua + 6144 * 4;
+       void* ra[] = { &xp, &wn, &op };
+@@ -8220,9 +8322,9 @@
+       void* ua_[] = { &wu, &gq, &gc, &op, &ua, &nf, &df };
+       void* sa_[] = { &ga, &ua, &sa, &nf };
+       if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ga_, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ua_,
+           NULL) != CUDA_SUCCESS
+         || cuLaunchKernel(gpu_silu, 24, 1, 1, 256, 1, 1, 0, NULL, sa_, NULL)
+@@ -8232,7 +8334,7 @@
+       xp = sa;
+     }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+-    if (cuLaunchKernel(fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
++    if (cuLaunchKernel(fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
+       1, 1, 128, 1, 1, 0,
+       NULL, args, NULL)
+       != CUDA_SUCCESS) {

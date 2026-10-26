@@ -1,0 +1,4 @@
+usage: llb models
+
+List the known models and where each one was found.
+exit 0

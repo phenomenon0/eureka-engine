@@ -1,0 +1,270 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4750,6 +4750,8 @@
+ static CUfunction gpu_warpk;
+ static CUfunction gpu_warp6;
+ static CUfunction gpu_warp3;
++static CUfunction gpu_warp2;
++static CUfunction gpu_warpq2;
+ static CUfunction gpu_attn;
+ static CUfunction gpu_rms;
+ static CUfunction gpu_mailk;
+@@ -7442,7 +7444,6 @@
+   warp_dq4k(W, rb, cg, x, y, n, d);
+ }
+ 
+-
+ // group g of a Q3_K row (tools/q3k.py: GGUF block layout, 110 bytes a
+ // super-block): w = d * (scales[is] - 32) * code, ggml's dequantize_row_q3_K;
+ // both products are exact (f16 significand * 6-bit int, * 3-bit code), in
+@@ -7546,6 +7547,22 @@
+   warp_dq6k(W, rb, cg, x, y, n, d);
+ }
+ 
++// group g of a Q2_0 (qk = 64) or PQ2_0 (qk = 128) row (tools/q20.py): f16 d +
++// qs[qk/4], 18 or 34 bytes a block. Weight j = ((qs[j/4] >> (j%4)*2) & 3 - 1)
++// * d, ggml's dequantize_row_q2_0 / _pq2_0; (q-1)*d is exact. A group of four
++// columns is exactly one qs byte. tools/q20.patch
++INLINE float4 q20_w(const u8* __restrict__ row, u32 g, u32 qk) {
++  u32 c = 4 * g, blk = c / qk, rr = c % qk;
++  const u8* B = row + (u64)blk * (2 + qk / 4);
++  float d = llb_f16(*(const unsigned short*)B);
++  u32 v = B[2 + (rr >> 2)];
++  return make_float4(
++    __fmul_rn(d, (float)((int)(v & 3) - 1)),
++    __fmul_rn(d, (float)((int)((v >> 2) & 3) - 1)),
++    __fmul_rn(d, (float)((int)((v >> 4) & 3) - 1)),
++    __fmul_rn(d, (float)((int)((v >> 6) & 3) - 1)));
++}
++
+ // llb_warp over Q3_K rows (tools/q3k.patch): the same groups, leaf and tree,
+ // each weight dequantized on load
+ __device__ __forceinline__ void warp_dq3k(
+@@ -7612,6 +7629,138 @@
+   u32* __restrict__ y, u32 n, u32 d) {
+   warp_dq3k(W, rb, cg, x, y, n, d);
+ }
++
++
++__device__ __forceinline__ void warp_dqq2_0(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  const u32 ch = 1u << (d - 9);
++  float4 xv[16];
++  if (ch == 1) {
++    warp_x(xv, x, 0, l);
++  }
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const u8* row = W + (u64)r * rb;
++    float s[4];
++    for (u32 k = 0; k < ch; k++) {
++      if (ch > 1) {
++        warp_x(xv, x, k, l);
++      }
++      float4 w[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        u32 g = 512 * k + 32 * i + l;
++        w[i] = g < cg ? q20_w(row, g, 64u)
++          : make_float4(0.f, 0.f, 0.f, 0.f);
++      }
++      float v[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        float4 a = w[i], b = xv[i];
++        v[i] = __fadd_rn(__fadd_rn(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)),
++          __fadd_rn(__fmul_rn(a.z, b.z), __fmul_rn(a.w, b.w)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i++) {
++          float o = __shfl_xor_sync(0xffffffffu, v[i], m);
++          v[i] = (l & m) ? __fadd_rn(o, v[i]) : __fadd_rn(v[i], o);
++        }
++      }
++      #pragma unroll
++      for (u32 st = 1; st < 16; st <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i += 2 * st) {
++          v[i] = __fadd_rn(v[i], v[i + st]);
++        }
++      }
++      s[k] = v[0];
++    }
++    for (u32 st = 1; st < ch; st <<= 1) {
++      for (u32 k = 0; k < ch; k += 2 * st) {
++        s[k] = __fadd_rn(s[k], s[k + st]);
++      }
++    }
++    if (l == 0) {
++      y[r] = __float_as_uint(s[0]);
++    }
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q2_0(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  warp_dqq2_0(W, rb, cg, x, y, n, d);
++}
++
++__device__ __forceinline__ void warp_dqpq2_0(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  const u32 ch = 1u << (d - 9);
++  float4 xv[16];
++  if (ch == 1) {
++    warp_x(xv, x, 0, l);
++  }
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const u8* row = W + (u64)r * rb;
++    float s[4];
++    for (u32 k = 0; k < ch; k++) {
++      if (ch > 1) {
++        warp_x(xv, x, k, l);
++      }
++      float4 w[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        u32 g = 512 * k + 32 * i + l;
++        w[i] = g < cg ? q20_w(row, g, 128u)
++          : make_float4(0.f, 0.f, 0.f, 0.f);
++      }
++      float v[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        float4 a = w[i], b = xv[i];
++        v[i] = __fadd_rn(__fadd_rn(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)),
++          __fadd_rn(__fmul_rn(a.z, b.z), __fmul_rn(a.w, b.w)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i++) {
++          float o = __shfl_xor_sync(0xffffffffu, v[i], m);
++          v[i] = (l & m) ? __fadd_rn(o, v[i]) : __fadd_rn(v[i], o);
++        }
++      }
++      #pragma unroll
++      for (u32 st = 1; st < 16; st <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i += 2 * st) {
++          v[i] = __fadd_rn(v[i], v[i + st]);
++        }
++      }
++      s[k] = v[0];
++    }
++    for (u32 st = 1; st < ch; st <<= 1) {
++      for (u32 k = 0; k < ch; k += 2 * st) {
++        s[k] = __fadd_rn(s[k], s[k + st]);
++      }
++    }
++    if (l == 0) {
++      y[r] = __float_as_uint(s[0]);
++    }
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp_pq2_0(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  warp_dqpq2_0(W, rb, cg, x, y, n, d);
++}
++
+ #endif
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+@@ -7753,9 +7902,10 @@
+     bool     tg = rw >> 30 & 1;
+     u32      rb = rw & (tg ? 0x0fffffffu : 0x7fffffffu);
+     u32      fm = tg ? (rw >> 28 & 3) + ((rw >> 31 & 1) << 2) : rw >> 31 ? 2 : rb % 17 == 0;
+-    if (tg ? (fm >= 6) || (fm == 1 && rb % 17 != 0)
++    if (tg ? (fm == 1 && rb % 17 != 0)
+       || (fm == 3 && rb % 144 != 0) || (fm == 4 && rb % 210 != 0)
+-      || (fm == 5 && rb % 110 != 0)
++      || (fm == 5 && rb % 110 != 0) || (fm == 6 && rb % 18 != 0)
++      || (fm == 7 && rb % 34 != 0)
+       : fm == 1 && rb % 16 == 0) {
+       bad = bad != 0 ? bad : 4;
+     }
+@@ -7764,6 +7914,7 @@
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 11
+       || (fm == 1 ? rb / 17 % 4 != 0 : fm == 3 ? rb % 144 != 0
+         : fm == 4 ? rb % 210 != 0 : fm == 5 ? rb % 110 != 0
++        : fm == 6 ? rb % 18 != 0 : fm == 7 ? rb % 34 != 0
+         : rb % (fm ? 8 : 16) != 0)
+       || ((u64)w & 15) != 0
+       || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
+@@ -7826,15 +7977,17 @@
+       bool gt = rv >> 30 & 1;
+       u32  rg = rv & (gt ? 0x0fffffffu : 0x7fffffffu);
+       u32  gm = gt ? (rv >> 28 & 3) + ((rv >> 31 & 1) << 2) : rv >> 31 ? 2 : rg % 17 == 0;
+-      if (gt ? (gm >= 6) || (gm == 1 && rg % 17 != 0)
++      if (gt ? (gm == 1 && rg % 17 != 0)
+         || (gm == 3 && rg % 144 != 0) || (gm == 4 && rg % 210 != 0)
+-        || (gm == 5 && rg % 110 != 0) : gm == 1 && rg % 16 == 0) {
++        || (gm == 5 && rg % 110 != 0) || (gm == 6 && rg % 18 != 0)
++        || (gm == 7 && rg % 34 != 0) : gm == 1 && rg % 16 == 0) {
+         bad = bad != 0 ? bad : 4;
+       }
+       const u8* wb = (const u8*)(H + term_peek_ro(e, p.data)) + p.off;
+       if (n != 2048 || blk_cls(x) != 11
+         || (gm == 1 ? rg / 17 % 4 != 0 : gm == 3 ? rg % 144 != 0
+           : gm == 4 ? rg % 210 != 0 : gm == 5 ? rg % 110 != 0
++          : gm == 6 ? rg % 18 != 0 : gm == 7 ? rg % 34 != 0
+           : rg % (gm ? 8 : 16) != 0)
+         || ((u64)(wb + gb) & 15) != 0
+         || ((u64)(wb + ub) & 15) != 0 || (u64)gb + 6144ull * rg > p.len
+@@ -8400,6 +8553,8 @@
+     || cuModuleGetFunction(&gpu_warpk, gpu_lib, "llb_warp_q4k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp6, gpu_lib, "llb_warp_q6k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp3, gpu_lib, "llb_warp_q3k") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warp2, gpu_lib, "llb_warp_q2_0") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_pq2_0") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
+@@ -8492,6 +8647,7 @@
+     u32 n = o->n, d = o->d, fm = o->fm, rq = fm ? o->rb : o->rb / 16;
+     u32 cg = fm == 1 ? o->rb / 17 * 4 : fm == 3 ? o->rb / 144 * 64
+       : fm == 4 ? o->rb / 210 * 64 : fm == 5 ? o->rb / 110 * 64
++      : fm == 6 ? o->rb / 18 * 16 : fm == 7 ? o->rb / 34 * 32
+       : o->rb / (fm ? 8 : 16);
+     CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
+     // attention (f, +wt, +q, +kc, +vc, +c, y, +wo, +r): its o GEMV reads
+@@ -8527,7 +8683,8 @@
+       // rows' (fm) in a Q4_K_M mixture
+       u32 gq = gm ? rg : rg / 16, gc = gm == 1 ? rg / 17 * 4
+         : gm == 3 ? rg / 144 * 64 : gm == 4 ? rg / 210 * 64
+-        : gm == 5 ? rg / 110 * 64 : rg / (gm ? 8 : 16);
++        : gm == 5 ? rg / 110 * 64 : gm == 6 ? rg / 18 * 16
++        : gm == 7 ? rg / 34 * 32 : rg / (gm ? 8 : 16);
+       CUdeviceptr ga = gpu_act + (CUdeviceptr)j * 3 * 6144 * 4;
+       CUdeviceptr ua = ga + 6144 * 4, sa = ua + 6144 * 4;
+       void* ra[] = { &xp, &wn, &op };
+@@ -8535,9 +8692,9 @@
+       void* ua_[] = { &wu, &gq, &gc, &op, &ua, &nf, &df };
+       void* sa_[] = { &ga, &ua, &sa, &nf };
+       if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ga_, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ua_,
+           NULL) != CUDA_SUCCESS
+         || cuLaunchKernel(gpu_silu, 24, 1, 1, 256, 1, 1, 0, NULL, sa_, NULL)
+@@ -8547,7 +8704,7 @@
+       xp = sa;
+     }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+-    if (cuLaunchKernel(fm == 5 ? gpu_warp3 : fm == 4 ? gpu_warp6 : fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
++    if (cuLaunchKernel(fm == 7 ? gpu_warpq2 : fm == 6 ? gpu_warp2 : fm == 5 ? gpu_warp3 : fm == 4 ? gpu_warp6 : fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
+       1, 1, 128, 1, 1, 0,
+       NULL, args, NULL)
+       != CUDA_SUCCESS) {

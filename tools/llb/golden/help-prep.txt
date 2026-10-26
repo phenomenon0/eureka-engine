@@ -1,0 +1,4 @@
+usage: llb prep MODEL
+
+Write the tokenizer and sidecar for MODEL into the cache (llb run does this on first use).
+exit 0

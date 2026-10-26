@@ -1,0 +1,1 @@
+{"model":"clef","state":"I would like to apply for an engineering position.","questions":{"route":{"type":"choice","instructions":"Which department should handle this?","criteria":{"sales":"Buying a product","support":"Product help","hr":"Employment","finance":"Accounting","legal":"Legal matters"}}}}

@@ -1,0 +1,120 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -16,6 +16,10 @@
+       .replace(/^#include "(llb_\w+\.h)"$/gm, (_, h: string) => read(h));
+   return `#if BEND_CUDA\n${read("llb_backend_cuda.h")}\n#endif\n${read("llb_host.c")}`;
+ };
++// The format registry (tools/payload-table.patch): host/llb_formats.h, generated
++// from tools/formats.tsv, for the device checks.
++const llb_formats = (): string =>
++  fs.readFileSync(`${process.env.LLB_HOST_DIR}/llb_formats.h`, "utf8").replace(/\n$/, "");
+ 
+ // Comp
+ // ====
+@@ -7078,6 +7082,7 @@
+ // d_ff, n_heads, n_kv_heads, head_dim, ssm_group_count, ssm_time_step_rank
+ // and ssm_state_size, as task words 56..63; pass_mail copies it to the Mail.
+ typedef struct { u32 d, f, nh, nkv, hd, lkh, lvh, sd; } LlbShape;
++${llb_formats()}
+ 
+ // brg: the Q8 row bytes of the d_model-column GEMVs; bro: the attn_output /
+ // ssm_out rows' (nh * hd = lvh * sd columns, d_model only on the 9B)
+@@ -7089,10 +7094,13 @@
+ 
+ typedef struct Mail {
+   u32    front, err, done, m, bad;
+-  // the pass bang's layer weight bases and its lin / full Offs words
+-  // (tools/payload-pass.patch)
++  // the pass bang's layer weight bases (tools/payload-pass.patch) and the
++  // format table (tools/payload-table.patch): table.bin's words 1..20 per
++  // absolute layer (offset | fm << 28); tbk/wlk/skk key the last validated
++  // pass (table address, layer list, s | k << 16)
+   u64    pw[32];
+-  u32    po[40];
++  u64    tbk, wlk, skk;
++  u32    pt[32][20];
+   LlbShape sh;
+   WarpOp op[WARP_MAX];
+ } Mail;
+@@ -9159,11 +9167,24 @@
+       o->bq = rbh;
+     }
+   }
+-  for (u32 f = 0; f < 40; f += 1) {
+-    M->po[f] = (u32)H[a + 4 + f];
+-  }
++  // the table (task word 64): a 32-word row per layer, [0] the layer's bytes,
++  // [1..20] offset | fm << 28 in Offs order; the Offs words 4..43 are unread
++  Term tbt = H[a + 64];
++  StrParts qt = str_peek_ro(e, tbt);
++  const u32* tw = NULL;
++  ok = ok && term_tag(tbt) == TAG_STR && str_nar(qt) == 2 && (u64)(s + k) * 128 <= qt.len;
++  if (ok) {
++    tw = (const u32*)((const u8*)(H + term_peek_ro(e, qt.data)) + qt.off);
++    ok = ((u64)tw & 3) == 0;
++  }
++  // the table, the layer list and the range are immutable Bend values: a pass
++  // over the same three as the last validated one skips the walk (pw/pt hold)
++  // ponytail: keyed on addresses, a freed-and-reused model at the same
++  // addresses would hit stale; key on content if models are ever swapped
++  u64  skk = s | (u64)k << 16;
++  bool hit = ok && M->tbk == (u64)tw && M->wlk == (u64)wl && M->skk == skk;
+   Term t = wl;
+-  for (u32 i = 0; ok && i < s + k; i += 1) {
++  for (u32 i = 0; ok && !hit && i < s + k; i += 1) {
+     if (term_tag(t) != TAG_CTR || (u32)term_aux(t) != CID_CON) {
+       ok = false;
+       break;
+@@ -9180,15 +9201,25 @@
+       break;
+     }
+     const u8* base = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
+-    const u32* p = M->po + ((i + 1) % 4 == 0 ? 20 : 0);
++    // the layer's present tensors and which are Q8_0 GEMVs (the rest F32);
++    // phase 1 admits no other format
++    bool full = (i + 1) % 4 == 0;
++    u32  has = full ? 0xFC01Fu : 0x3FFFu, q8 = full ? 0x9C01Cu : 0x21FCu;
++    u32  p[20];
++    ok = tw[i * 32] == q.len;
++    for (u32 f = 0; f < 20; f += 1) {
++      u32 w = tw[i * 32 + 1 + f], fm = w >> 28;
++      p[f] = w & 0x0fffffffu;
++      ok = ok && (!(has >> f & 1) || fm == (q8 >> f & 1 ? LLB_FM_Q8_0 : LLB_FM_F32));
++    }
+     // fbn: post, fg, fu, fd at Offs words 1..4
+-    ok = p[1] % 4 == 0 && ((u64)(base + p[2]) & 15) == 0
++    ok = ok && p[1] % 4 == 0 && ((u64)(base + p[2]) & 15) == 0
+       && ((u64)(base + p[3]) & 15) == 0 && ((u64)(base + p[4]) & 15) == 0
+       && (u64)p[1] + dm * 4 <= q.len
+       && (u64)p[2] + df * rg <= q.len
+       && (u64)p[3] + df * rg <= q.len
+       && (u64)p[4] + dm * rd <= q.len;
+-    if ((i + 1) % 4 == 0) {
++    if (full) {
+       // fulb: an 0, q 14, k 15, v 16, q-norm 17, k-norm 18, o 19
+       ok = ok && p[0] % 4 == 0 && p[17] % 4 == 0 && p[18] % 4 == 0
+         && ((u64)(base + p[14]) & 15) == 0 && ((u64)(base + p[15]) & 15) == 0
+@@ -9217,6 +9248,15 @@
+     *bad = *bad != 0 ? *bad : 5;
+     return;
+   }
++  if (!hit) {
++    u32 nr = qt.len / 128 < 32 ? (u32)(qt.len / 128) : 32;
++    for (u32 i = 0; i < nr; i += 1) {
++      for (u32 f = 0; f < 20; f += 1) {
++        M->pt[i][f] = tw[i * 32 + 1 + f];
++      }
++    }
++    M->tbk = (u64)tw; M->wlk = (u64)wl; M->skk = skk;
++  }
+   o->kind = 23;
+   o->x = (u64)(H + blk_loc(H, x));
+   o->y = (u64)(H + blk_loc(H, y));
+@@ -10476,6 +10516,7 @@
+     || cuMemAlloc(&gpu_att, 2048 * 4 * LINE) != CUDA_SUCCESS) {
+     err_fail("cannot load the GPU program");
+   }
++  memset((void*)gpu_mail, 0, sizeof(Mail));
+ #endif
+ }
+ 

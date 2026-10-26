@@ -1,0 +1,1 @@
+{"model":"clef","state":"All customers cannot place orders. Engineers need to respond immediately.","questions":{"urgency":{"type":"score","instructions":"How urgent is this?","criteria":["Can wait","This week","Now"]}}}

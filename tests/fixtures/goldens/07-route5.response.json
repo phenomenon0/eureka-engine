@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"route":{"type":"choice","choice":"hr","probabilities":{"finance":0.006044577147513175,"hr":0.9708250415073453,"legal":0.004577120552906316,"sales":0.007092794164392253,"support":0.011460466627842916},"confidence":0.9635313018841815}},"usage":{"input_tokens":189,"output_tokens":0}}

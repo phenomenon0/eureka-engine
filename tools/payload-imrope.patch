@@ -1,0 +1,45 @@
+--- a/bend2/comp.ts	2026-10-13 13:58:27.134456693 -0500
++++ b/bend2/comp.ts	2026-10-13 13:58:27.134906886 -0500
+@@ -11358,6 +11358,24 @@
+   y[threadIdx.x] = x[threadIdx.x];
+ }
+ 
++#ifndef LLB_MR_DEF
++#define LLB_MR_DEF
++// (FUS-V46 V4, tools/payload-imrope.patch) IMRoPE: the image map llb_mr = {s0, n, nx, sh, p0}, set by the host
++// (llb_host.c llb_img_step) at each image's first <|image_pad|> slot, zero otherwise. The rope kernels'
++// pos stays the KV SLOT; the rope ANGLE of rotary pair t is llb_mrp(slot, t): mtmd's MROPE (t, h, w) =
++// (p0, p0 + i / nx, p0 + i % nx) for image row i = slot - s0, by sector t % 3 (ggml imrope, sections
++// [11, 11, 10], every t < 32 inside them); slots after the image resume at slot - sh (MIMG: p0 and sh carry
++// the earlier images' n - max(nx, ny), mtmd's n_pos); n == 0 (every text-only run) is the slot: the old expression
++__device__ u32 llb_mr[5];
++__device__ __forceinline__ u32 llb_mrp(u32 s, u32 t) {
++  const u32 s0 = llb_mr[0], n = llb_mr[1];
++  if (n == 0 || s < s0) return s;
++  if (s - s0 >= n) return s - llb_mr[3];
++  const u32 i = s - s0, c = t % 3, p0 = llb_mr[4];
++  return c == 0 ? p0 : c == 1 ? p0 + i / llb_mr[2] : p0 + i % llb_mr[2];
++}
++#endif
++
+ // K.qg.go / K.kr.go (tools/payload-qkr.patch): per-head qk-norm (rms over 256
+ // with the 256 gain) then the partial NEOX rope (nd 64, base 1e7, the first 64
+ // dims of each head). qk 1: 2^d = 16 heads of [q(256), gate(256)], rope q and
+@@ -11394,7 +11412,7 @@
+   const float s = sv;
+   const float v = __fmul_rn(__fmul_rn(xv, s), w[t]);
+   if (t < 32) {
+-    const float th = __fmul_rn((float)pos, (float)pow((double)10000000.0f,
++    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)10000000.0f,
+       (double)__fdiv_rn(-(float)(2 * t), 64.0f)));
+     const float co = (float)cos((double)th), si = (float)sin((double)th);
+     const float b = __fmul_rn(__fmul_rn(xb, s), w[t + 32]);
+@@ -11573,7 +11591,7 @@
+   const float s = sv;
+   const float v = __fmul_rn(__fmul_rn(xv, s), w[t]);
+   if (t < 32) {
+-    const float th = __fmul_rn((float)pos, (float)pow((double)10000000.0f,
++    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)10000000.0f,
+       (double)__fdiv_rn(-(float)(2 * t), 64.0f)));
+     const float co = (float)cos((double)th), si = (float)sin((double)th);
+     const float b = __fmul_rn(__fmul_rn(xb, s), w[t + 32]);

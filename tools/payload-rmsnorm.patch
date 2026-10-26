@@ -1,0 +1,165 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2900,7 +2900,13 @@
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+-    || is_qknorm(k) || is_hyb(k);
++    || is_qknorm(k) || is_hyb(k) || is_rnorm(k);
++}
++
++// The standalone rms_norm bang (tools/payload-rmsnorm.patch): the host runs
++// llb_rmsnorm into the bang's output y (field index 3).
++function is_rnorm(k: Name): boolean {
++  return k === "llb.rmsnorm_warp" || k.endsWith(".llb.rmsnorm_warp");
+ }
+ 
+ // The Qwen3.5 hybrid ops (tools/payload-hybrid.patch): the host runs
+@@ -4061,6 +4067,7 @@
+       : is_ffn(k) ? "LLB_FFN_FID" : is_qknorm(k) ? "LLB_QKNORM_FID"
+       : is_l2n(k) ? "LLB_L2N_FID" : is_conv(k) ? "LLB_CONV_FID"
+       : is_grn(k) ? "LLB_GRN_FID" : is_gdl(k) ? "LLB_GDL_FID"
++      : is_rnorm(k) ? "LLB_RNORM_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4793,6 +4800,7 @@
+ static CUfunction gpu_conv;
+ static CUfunction gpu_grn;
+ static CUfunction gpu_gdl;
++static CUfunction gpu_rnorm;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+@@ -6977,6 +6985,9 @@
+ #ifndef LLB_GDL_FID
+ #define LLB_GDL_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_RNORM_FID
++#define LLB_RNORM_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -6984,7 +6995,8 @@
+   || (u32)term_aux(t) == LLB_PUT_FID || (u32)term_aux(t) == LLB_FFN_FID \
+   || (u32)term_aux(t) == LLB_QKNORM_FID \
+   || (u32)term_aux(t) == LLB_L2N_FID || (u32)term_aux(t) == LLB_CONV_FID \
+-  || (u32)term_aux(t) == LLB_GRN_FID || (u32)term_aux(t) == LLB_GDL_FID)
++  || (u32)term_aux(t) == LLB_GRN_FID || (u32)term_aux(t) == LLB_GDL_FID \
++  || (u32)term_aux(t) == LLB_RNORM_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7544,6 +7556,23 @@
+     o->n = 1u << k;
+     return true;
+   }
++  if (aux == LLB_RNORM_FID) {
++    Term    wbt = H[a + 1], x = H[a + 2], y = H[a + 3];
++    u32     at = (u32)H[a + 4], d = (u32)H[a + 5];
++    StrParts q = str_peek_ro(e, wbt);
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || d < 11 || d > 12
++      || at % 4 != 0 || term_tag(x) == TAG_ARR || term_tag(y) == TAG_ARR
++      || (u64)at + ((u64)1 << d) * 4 > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 10;
++    o->w  = (u64)((const u8*)(H + term_peek_ro(e, q.data)) + q.off + at);
++    o->x  = (u64)(H + blk_loc(H, x));
++    o->y  = (u64)(H + blk_loc(H, y));
++    o->n  = 1u << d;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7583,7 +7612,7 @@
+     {
+       u32 hx = (u32)term_aux(t);
+       if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
+-        || hx == LLB_GDL_FID) {
++        || hx == LLB_GDL_FID || hx == LLB_RNORM_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -7915,6 +7944,45 @@
+   y[((u64)h << 7) + j] = hyb_dot_128(Srow, q + ((u64)h << 7));
+ }
+ 
++// K.rms_norm over n = 2^d (d = 11 or 12): s = 1 / sqrt(sumsq / n + eps),
++// h = (x * s) * w. sumsq is the balanced tree of x*x: a balanced local tree
++// over the n / 1024 elements a thread owns, then the shared halving strides --
++// the same order as K.sumsq and llb_rms (tools/payload-rmsnorm.patch).
++extern "C" __global__ void __launch_bounds__(1024) llb_rmsnorm(
++  const float* __restrict__ x, const float* __restrict__ w,
++  float* __restrict__ y, u32 n) {
++  __shared__ float a[1024];
++  __shared__ float sv;
++  const u32 t = threadIdx.x;
++  const u32 q = n >> 10;
++  const float* xp = x + (u64)t * q;
++  float acc;
++  if (q == 4) {
++    const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
++    const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
++    acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
++  } else {
++    acc = __fadd_rn(__fmul_rn(xp[0], xp[0]), __fmul_rn(xp[1], xp[1]));
++  }
++  a[t] = acc;
++  __syncthreads();
++  for (u32 st = 1; st < 1024; st <<= 1) {
++    if ((t & (2 * st - 1)) == 0) {
++      a[t] = __fadd_rn(a[t], a[t + st]);
++    }
++    __syncthreads();
++  }
++  if (t == 0) {
++    sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], (float)n),
++      __uint_as_float(0x358637BDu))));
++  }
++  __syncthreads();
++  const float s = sv;
++  for (u32 i = t; i < n; i += 1024) {
++    y[i] = __fmul_rn(__fmul_rn(x[i], s), w[i]);
++  }
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -8385,6 +8453,7 @@
+     || cuModuleGetFunction(&gpu_conv, gpu_lib, "llb_conv1d") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_grn, gpu_lib, "llb_gated_rmsnorm") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_gdl, gpu_lib, "llb_gated_delta") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_rnorm, gpu_lib, "llb_rmsnorm") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+@@ -8543,7 +8612,7 @@
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
+-      } else {
++      } else if (o->kind == 9) {
+         u64 Sp = o->w, qp = o->x, kkp = o->k, vp = o->v, decp = o->wn, betp = o->r;
+         u32 hs = o->n;
+         void* hy[] = { &Sp, &qp, &kkp, &vp, &decp, &betp, &yp, &hs };
+@@ -8551,6 +8620,15 @@
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else {
++        // the standalone rms_norm bang (tools/payload-rmsnorm.patch)
++        u64 xp10 = o->x, wp10 = o->w;
++        u32 n10 = o->n;
++        void* hy[] = { &xp10, &wp10, &yp, &n10 };
++        if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, hy, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       }
+       continue;
+     }

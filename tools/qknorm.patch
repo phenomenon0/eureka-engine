@@ -1,0 +1,107 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2898,7 +2898,13 @@
+ // runs as one kernel; a sequential lane cannot park it, so there it faults.
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+-    || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k);
++    || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
++    || is_qknorm(k);
++}
++
++// The qk-norm op (tools/qknorm.patch): per-head RMSNorm on q/k with gain g.
++function is_qknorm(k: Name): boolean {
++  return k === "llb.qknorm_warp" || k.endsWith(".llb.qknorm_warp");
+ }
+ 
+ // The FFN bang (tools/interiors-ffn.patch): the host runs llb_rms, the gate
+@@ -4020,7 +4026,7 @@
+     .map((k) => `#define ${is_attn(k) ? "LLB_ATTN_FID"
+       : is_rms(k) ? "LLB_RMS_FID" : is_dadd(k) ? "LLB_DADD_FID"
+       : is_rope(k) ? "LLB_ROPE_FID" : is_put(k) ? "LLB_PUT_FID"
+-      : is_ffn(k) ? "LLB_FFN_FID"
++      : is_ffn(k) ? "LLB_FFN_FID" : is_qknorm(k) ? "LLB_QKNORM_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4748,6 +4754,7 @@
+ static CUfunction gpu_add;
+ static CUfunction gpu_rope;
+ static CUfunction gpu_silu;
++static CUfunction gpu_qknorm;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+@@ -6906,11 +6913,15 @@
+ #ifndef LLB_FFN_FID
+ #define LLB_FFN_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_QKNORM_FID
++#define LLB_QKNORM_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+   || (u32)term_aux(t) == LLB_DADD_FID || (u32)term_aux(t) == LLB_ROPE_FID \
+-  || (u32)term_aux(t) == LLB_PUT_FID || (u32)term_aux(t) == LLB_FFN_FID)
++  || (u32)term_aux(t) == LLB_PUT_FID || (u32)term_aux(t) == LLB_FFN_FID \
++  || (u32)term_aux(t) == LLB_QKNORM_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7582,6 +7593,47 @@
+   }
+ }
+ 
++// Qwen2.5 qk-norm (tools/qknorm.patch): per-head RMSNorm on v[rows][128] with
++// gain g[128]. For each row r: s = 1 / sqrt(sumsq / 128 + eps), sumsq the
++// balanced tree of v * v over 128 elements (64 pairs, then halves up in shared
++// memory); out = (v * s) * g. Block size 64, gridDim.x = rows.
++extern "C" __global__ void __launch_bounds__(64) llb_qknorm(
++  const float* __restrict__ v, const float* __restrict__ g,
++  float* __restrict__ out, u32 rows) {
++  __shared__ float a[64];
++  __shared__ float sv;
++  const u32 t = threadIdx.x;
++  for (u32 r = blockIdx.x; r < rows; r += gridDim.x) {
++    const float2* __restrict__ row2 = (const float2*)(v + r * 128);
++    const float2 x = row2[t];
++    const float x0 = x.x;
++    const float x1 = x.y;
++    a[t] = __fadd_rn(__fmul_rn(x0, x0), __fmul_rn(x1, x1));
++    __syncthreads();
++    #pragma unroll
++    for (u32 st = 1; st < 64; st <<= 1) {
++      if ((t & (2 * st - 1)) == 0) {
++        a[t] = __fadd_rn(a[t], a[t + st]);
++      }
++      __syncthreads();
++    }
++    if (t == 0) {
++      sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 128.0f),
++        __uint_as_float(0x358637BDu))));
++    }
++    __syncthreads();
++    const float s = sv;
++    const float2* __restrict__ g2 = (const float2*)g;
++    const float2 gv = g2[t];
++    float2* __restrict__ out2 = (float2*)(out + r * 128);
++    out2[t] = make_float2(
++      __fmul_rn(__fmul_rn(x0, s), gv.x),
++      __fmul_rn(__fmul_rn(x1, s), gv.y)
++    );
++    __syncthreads();
++  }
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -8047,6 +8099,7 @@
+     || cuModuleGetFunction(&gpu_add, gpu_lib, "llb_add") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rope, gpu_lib, "llb_rope") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_silu, gpu_lib, "llb_silu") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_qknorm, gpu_lib, "llb_qknorm") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS

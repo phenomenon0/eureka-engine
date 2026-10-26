@@ -1,0 +1,31 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -8931,14 +8931,26 @@
+ }
+ 
+ #ifndef GPU_BATCH
+-#define GPU_BATCH 16
++#define GPU_BATCH 2
+ #endif
+ 
+ // Iterations are queued GPU_BATCH at a time: the device picks each one's
+ // passes, so the host neither syncs nor touches the corpus between them.
++// A2 drain probe: the batch is tunable at runtime (LLB_GPU_BATCH) so the
++// zero-work tail is measurable without a rebuild.
++static u32 gpu_batch(void) {
++  static int v = -1;
++  if (v < 0) {
++    const char* s = getenv("LLB_GPU_BATCH");
++    v = s != NULL && atoi(s) > 0 ? atoi(s) : GPU_BATCH;
++  }
++  return (u32)v;
++}
++
+ static void gpu_pass(u32 f) {
+   (void)f;
+-  for (u32 i = 0; i < GPU_BATCH; i += 1) {
++  u32 batch = gpu_batch();
++  for (u32 i = 0; i < batch; i += 1) {
+     gpu_kernel(0, 1);
+     gpu_kernel(0, CUBE_G);
+     gpu_kernel(1, CUBE_G);

@@ -1,0 +1,4 @@
+usage: llb doctor
+
+Check the GPU, driver, engine, cache and models. Exit code = number of FAILs.
+exit 0

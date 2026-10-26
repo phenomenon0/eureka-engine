@@ -1,0 +1,36 @@
+--- a/bend2/comp.ts	2026-10-13 23:05:43.633713124 -0500
++++ b/bend2/comp.ts	2026-10-13 23:05:43.637089111 -0500
+@@ -5013,6 +5013,8 @@
+   "  --gpu on|off|4GB  run ! calls on the GPU, over this much of its memory\n"
+   "                    (default: on if present, over 2GB on Metal)\n"
+   "  --gpu-build       write the GPU program and exit\n"
++  "  --prefill-chunk N fast prefill chunk rows (LLB_PREFILL=fast; sets LLB_PF_T)\n"
++  "  --prefill-ms M    cap each fast prefill chunk at about M ms (sets LLB_PF_MS)\n"
+   "  --help            show this text\n"
+   "  --                the rest are the program's arguments (IO.args)\n";
+ 
+@@ -13737,6 +13739,14 @@
+         cli_fail("cannot write ", gpu_path());
+       }
+       return 0;
++    } else if (strcmp(a, "--prefill-chunk") == 0 || strcmp(a, "--prefill-ms") == 0) {
++      char*  end = NULL;
++      double n   = v != NULL ? strtod(v, &end) : 0;
++      if (n <= 0 || end == NULL || *end != '\0') {
++        cli_fail("expected a positive number after ", a);
++      }
++      setenv(a[10] == 'c' ? "LLB_PF_T" : "LLB_PF_MS", v, 1);
++      i += 1;
+     } else if (strcmp(a, "--threads") == 0) {
+       char* end = NULL;
+       thr = v != NULL ? strtol(v, &end, 10) : 0;
+@@ -13871,7 +13881,8 @@
+     } else if (argv[i] === "--help") {
+       io_out(1, io_bytes("usage: " + process.argv[1] + "\n"));
+       process.exit(0);
+-    } else if (argv[i] === "--threads" || argv[i] === "--workers" || argv[i] === "--gpu") {
++    } else if (argv[i] === "--threads" || argv[i] === "--workers" || argv[i] === "--gpu"
++      || argv[i] === "--prefill-chunk" || argv[i] === "--prefill-ms") {
+       i += 1;
+     } else {
+       cli_args.push(argv[i]);

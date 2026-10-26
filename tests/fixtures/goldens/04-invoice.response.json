@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"status":{"type":"choice","choice":"overdue","probabilities":{"draft":0.01095173109943657,"overdue":0.9699879426377068,"paid":0.019060326262856676},"confidence":0.9549819139565601},"large":{"type":"noul","noul":0.973149041004666}},"usage":{"input_tokens":258,"output_tokens":0}}

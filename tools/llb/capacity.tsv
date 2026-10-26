@@ -1,0 +1,6 @@
+# alias minimum-free-MiB evidence; - means no target completed all three prompts as RUN
+# RTX 3090 ballast evidence only; threshold is max achieved free MiB of selected cells.
+27b	-	receipts/pkg3/capacity-derivation.json#models/27b
+9b-q8	-	receipts/pkg3/capacity-derivation.json#models/9b-q8
+9b	8192	receipts/pkg3/capacity-derivation.json#models/9b
+08b	8192	receipts/pkg3/capacity-derivation.json#models/08b

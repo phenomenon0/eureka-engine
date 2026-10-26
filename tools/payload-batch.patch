@@ -1,0 +1,143 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -9988,6 +9988,140 @@
+   kp_warp<6, 0, KpRes>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, x1);
+ }
+ 
++// BATCH-NATIVE (tools/payload-batch.patch): T-row twins of the exact pair bodies
++// (kp_pair / kp_warp: Q4_K, Q5_K, Q6_K, Q4_K + residual) for N independent
++// sequences in one launch. One weight load and decode per row pair and superblock
++// feeds T rows; each row t then runs kp_pair's own ops on its own x: the pad
++// vote, kp_tlo / kp_thi, kp_carry and the EP store, in kp_pair's
++// order. So row t of a T launch == the T = 1 kernel on row t's x (the bytes are
++// the gate, BATCH-NATIVE S1-G1). Row t's x / y / epilogue vector: B.x[t] etc.
++struct BxRows { u64 x[8]; u64 y[8]; u64 e[8]; };
++template <u32 FMT, u32 NP, u32 LP, class EP, u32 T>
++__device__ __forceinline__ void bx_pair(const u8* __restrict__ W, u32 rb, u32 cg,
++  const BxRows& B, u32 n, u32 bx, u32 gx) {
++  typedef KQ<FMT> F;
++  const u32 R = 2;
++  __shared__ float pvs[T][NP];
++  const u32 l = threadIdx.x & 31, w = threadIdx.x >> 5;
++  const u32 npr = cg >> 8;
++  #pragma unroll 1
++  for (u32 tt = 0; tt < T; tt++) {
++    const u32* __restrict__ x = (const u32*)B.x[tt];
++    for (u32 p = npr + w; p < NP; p += blockDim.x >> 5) {
++      bool nf = false, ps = false;
++      #pragma unroll
++      for (u32 i = 0; i < 8; i++) {
++        uint4 v = *(const uint4*)(x + 1024 * p + 4 * (32 * i + l));
++        u32 ws[4] = {v.x, v.y, v.z, v.w};
++        #pragma unroll
++        for (u32 t = 0; t < 4; t++) {
++          nf |= (ws[t] & 0x7f800000u) == 0x7f800000u;
++          ps |= (ws[t] >> 31) == 0;
++        }
++      }
++      nf = __any_sync(0xffffffffu, nf);
++      ps = __any_sync(0xffffffffu, ps);
++      if (l == 0) pvs[tt][p] = nf ? __uint_as_float(0x7fffffffu) : ps ? 0.f : -0.f;
++    }
++  }
++  __syncthreads();
++  const u32 nw = gx * (blockDim.x >> 5);
++  const u32 sbk = l >> 3, slo = F::slo(l), shi = slo + (1u << F::KIN);
++  for (u32 r0 = (bx * (blockDim.x >> 5) + w) * R; r0 < n; r0 += nw * R) {
++    const u8* row[R];
++    #pragma unroll
++    for (u32 j = 0; j < R; j++) row[j] = W + (u64)min(r0 + j, n - 1) * rb;
++    float slot[T][KP_NS];
++    u32 occ[T];
++    #pragma unroll
++    for (u32 tt = 0; tt < T; tt++) {
++      occ[tt] = 0;
++      #pragma unroll
++      for (u32 t = 0; t < KP_NS; t++) slot[tt][t] = 0.f;
++    }
++    #pragma unroll 1
++    for (u32 p = 0; p < NP; p++) {
++      const u32 xb = 1024 * p;
++      // the R rows' weights decoded once (F::dec is pure: every row t reads the same values)
++      float wl[R][16], wh[R][16];
++      if (p < npr) {
++        #pragma unroll
++        for (u32 j = 0; j < R; j++) {
++          typename F::Raw rw = F::template ld<LP>(row[j] + (u64)(4 * p + sbk) * F::SB, l);
++          F::dec(rw, l, wl[j], wh[j]);
++        }
++      }
++      #pragma unroll
++      for (u32 tt = 0; tt < T; tt++) {
++        float u;
++        if (p >= npr) u = pvs[tt][p];
++        else {
++          const u32* __restrict__ x = (const u32*)B.x[tt];
++          float4 xl[4], xh[4];
++          #pragma unroll
++          for (u32 t = 0; t < 4; t++) {
++            xl[t] = kp_x(x, xb + 16 * slo + 4 * t);
++            xh[t] = kp_x(x, xb + 16 * shi + 4 * t);
++          }
++          float v[R];
++          #pragma unroll
++          for (u32 j = 0; j < R; j++) v[j] = kp_tlo<F::KIN>(kp_span(wl[j], xl), kp_span(wh[j], xh));
++          u = kp_thi<F::KIN>(l & 1 ? v[1] : v[0]);
++        }
++        kp_carry(u, slot[tt], occ[tt]);
++      }
++    }
++    #pragma unroll
++    for (u32 tt = 0; tt < T; tt++) {
++      if (l < R && r0 + l < n) ((u32*)B.y[tt])[r0 + l] = __float_as_uint(EP::st((const float*)B.e[tt], r0 + l, kp_top(slot[tt], occ[tt])));
++    }
++  }
++}
++template <u32 FMT, u32 LP, class EP, u32 T>
++__device__ __forceinline__ void bx_warp(const u8* __restrict__ W, u32 rb, u32 cg, const BxRows& B, u32 n, u32 d) {
++  if (d == 9) bx_pair<FMT, 2, LP, EP, T>(W, rb, cg, B, n, blockIdx.x, gridDim.x);
++  else if (d == 10) bx_pair<FMT, 4, LP, EP, T>(W, rb, cg, B, n, blockIdx.x, gridDim.x);
++  else if (d == 11) bx_pair<FMT, 8, LP, EP, T>(W, rb, cg, B, n, blockIdx.x, gridDim.x);
++  else if (d == 12) bx_pair<FMT, 16, LP, EP, T>(W, rb, cg, B, n, blockIdx.x, gridDim.x);
++  else bx_pair<FMT, 32, LP, EP, T>(W, rb, cg, B, n, blockIdx.x, gridDim.x);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q4k_2(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<4, 1, KpPlain, 2>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q5k_2(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<9, 1, KpPlain, 2>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q6k_2(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<6, 0, KpPlain, 2>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q4kr_2(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<4, 1, KpRes, 2>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q4k_4(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<4, 1, KpPlain, 4>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q5k_4(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<9, 1, KpPlain, 4>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q6k_4(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<6, 0, KpPlain, 4>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q4kr_4(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<4, 1, KpRes, 4>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q4k_8(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<4, 1, KpPlain, 8>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q5k_8(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<9, 1, KpPlain, 8>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q6k_8(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<6, 0, KpPlain, 8>(W, rb, cg, B, n, d);
++}
++extern "C" __global__ void __launch_bounds__(128) llb_bx_q4kr_8(const u8* __restrict__ W, u32 rb, u32 cg, BxRows B, u32 n, u32 d) {
++  bx_warp<4, 1, KpRes, 8>(W, rb, cg, B, n, d);
++}
++
+ // linb's z (Q4_K pair body) and beta / alpha (Q8_0, d 10, nb rows each) in
+ // one launch: blocks 0 .. 2 nb - 1 take a beta / alpha row each (block a
+ // row, as llb_warp_q8 runs n < 4 grid), the rest the pair body

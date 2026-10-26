@@ -1,0 +1,149 @@
+--- a/bend2/comp.ts	2026-09-30 18:25:00.558667189 -0500
++++ b/bend2/comp.ts	2026-09-30 21:42:15.808991108 -0500
+@@ -2902,7 +2902,7 @@
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+     || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k) || is_fbn(k)
+-    || is_linb(k) || is_aob(k) || is_qkrq(k) || is_qkrk(k);
++    || is_linb(k) || is_aob(k) || is_qkrq(k) || is_qkrk(k) || is_slot(k);
+ }
+ 
+ // The full-attention output tail bang (tools/payload-aob.patch): attn4, the
+@@ -2957,6 +2957,13 @@
+   return k === "llb.knorm_rope_warp" || k.endsWith(".llb.knorm_rope_warp");
+ }
+ 
++// The KV-cache slot write (tools/payload-slot.patch): K.put of a 1024-f32 row
++// into the cache y at slot pos, in place (the interpreter's put re-copies the
++// whole cache per tree level); y is the output (field index 3).
++function is_slot(k: Name): boolean {
++  return k === "llb.slot_warp" || k.endsWith(".llb.slot_warp");
++}
++
+ // The head bang (tools/payload-head.patch): the host runs llb_rmsnorm, the
+ // output GEMV (llb_warp_q8) into gpu_logit and llb_amax; only the top two
+ // logits reach y.
+@@ -4144,6 +4151,7 @@
+       : is_silumul(k) ? "LLB_SILUMUL_FID" : is_fbn(k) ? "LLB_FBN_FID"
+       : is_linb(k) ? "LLB_LINB_FID" : is_aob(k) ? "LLB_AOB_FID"
+       : is_qkrq(k) ? "LLB_QKRQ_FID" : is_qkrk(k) ? "LLB_QKRK_FID"
++      : is_slot(k) ? "LLB_SLOT_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4887,6 +4895,7 @@
+ static CUfunction gpu_vmul;
+ static CUfunction gpu_og;
+ static CUfunction gpu_qkr;
++static CUfunction gpu_slot;
+ static CUfunction gpu_amax;
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
+@@ -7115,6 +7124,9 @@
+ #ifndef LLB_QKRK_FID
+ #define LLB_QKRK_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_SLOT_FID
++#define LLB_SLOT_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7129,7 +7141,8 @@
+   || (u32)term_aux(t) == LLB_ATTN4_FID || (u32)term_aux(t) == LLB_SILUMUL_FID \
+   || (u32)term_aux(t) == LLB_FBN_FID || (u32)term_aux(t) == LLB_LINB_FID \
+   || (u32)term_aux(t) == LLB_AOB_FID \
+-  || (u32)term_aux(t) == LLB_QKRQ_FID || (u32)term_aux(t) == LLB_QKRK_FID)
++  || (u32)term_aux(t) == LLB_QKRQ_FID || (u32)term_aux(t) == LLB_QKRK_FID \
++  || (u32)term_aux(t) == LLB_SLOT_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -8515,6 +8528,25 @@
+     o->r = pos;
+     return true;
+   }
++  // the KV-cache slot write (tools/payload-slot.patch): x (2) the 1024-f32
++  // row, y (3) the cache of 2^(dT + 10) f32, c (4) = dT | pos << 5. y is
++  // consumed and owned (a plain block, or a handle whose count is 1, as
++  // str_take takes one), so the write is the functional put.
++  if (aux == LLB_SLOT_FID) {
++    Term xt = H[a + 2], y = H[a + 3];
++    u32  c = (u32)H[a + 4], dT = c & 31, pos = c >> 5;
++    if (term_tag(xt) == TAG_ARR || term_tag(y) == TAG_ARR
++      || (blk_shr(y) && (H[term_loc(y)] & RFC_CNT) != 1)
++      || dT > 17 || blk_cls(xt) != 10 || blk_cls(y) != dT + 10
++      || pos >= (1u << dT)) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 21;
++    o->x = (u64)(H + blk_loc(H, xt));
++    o->y = (u64)(H + blk_loc(H, y)) + (u64)pos * 1024 * 4;
++    return true;
++  }
+   if (aux == LLB_AOB_FID) {
+     Term wbt = H[a + 1], qt = H[a + 2], gt = H[a + 3], kct = H[a + 4];
+     Term vct = H[a + 5], y = H[a + 6];
+@@ -8589,7 +8621,7 @@
+         || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
+         || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID || hx == LLB_SILUMUL_FID
+         || hx == LLB_FBN_FID || hx == LLB_LINB_FID || hx == LLB_AOB_FID
+-        || hx == LLB_QKRQ_FID || hx == LLB_QKRK_FID) {
++        || hx == LLB_QKRQ_FID || hx == LLB_QKRK_FID || hx == LLB_SLOT_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -9077,6 +9109,12 @@
+   }
+ }
+ 
++// K.put's 1024-f32 slot (tools/payload-slot.patch): y is already the slot
++extern "C" __global__ void llb_slot(const float* __restrict__ x,
++  float* __restrict__ y) {
++  y[threadIdx.x] = x[threadIdx.x];
++}
++
+ // K.qg.go / K.kr.go (tools/payload-qkr.patch): per-head qk-norm (rms over 256
+ // with the 256 gain) then the partial NEOX rope (nd 64, base 1e7, the first 64
+ // dims of each head). qk 1: 2^d = 16 heads of [q(256), gate(256)], rope q and
+@@ -9143,6 +9181,16 @@
+     rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6
+       : (u32)term_aux(t) == LLB_ATTN4_FID ? 4
+       : (u32)term_aux(t) == LLB_AOB_FID ? 6 : 3)];
++    // the aob block's caches come lent (the caller kept them; the body it
++    // skips would drop them): return the lend, so llb.slot_warp finds the
++    // cache unique next step (tools/payload-slot.patch)
++    for (u32 f = 4; (u32)term_aux(t) == LLB_AOB_FID && f < 6; f += 1) {
++      Term kv = H[term_loc(t) + f];
++      if (!term_triv(kv) && term_rfc(kv)
++        && (H[term_loc(kv)] & RFC_CNT) > 1) {
++        a32_sub_rel(a32_at(H, term_loc(kv)), 1);
++      }
++    }
+     Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
+     if (c != 0) {
+       ring_push(H, 0, c);
+@@ -9615,6 +9663,7 @@
+     || cuModuleGetFunction(&gpu_vmul, gpu_lib, "llb_vmul") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_og, gpu_lib, "llb_outputgate") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_qkr, gpu_lib, "llb_qkr") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_slot, gpu_lib, "llb_slot") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_amax, gpu_lib, "llb_amax") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mid, gpu_lib, "llb_mid32") != CUDA_SUCCESS
+@@ -9829,6 +9878,14 @@
+           NULL, hy, NULL) != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 21) {
++        // the KV-cache slot write (tools/payload-slot.patch)
++        u64 xp21 = o->x;
++        void* hy[] = { &xp21, &yp };
++        if (cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, hy, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else if (o->kind == 20) {
+         // the qk-norm + neox rope bangs (tools/payload-qkr.patch)
+         u64 xp20 = o->x, wp20 = o->w;

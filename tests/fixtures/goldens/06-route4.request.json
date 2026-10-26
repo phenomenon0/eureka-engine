@@ -1,0 +1,1 @@
+{"model":"clef","state":"Please delete my account and all stored personal data.","questions":{"route":{"type":"choice","instructions":"Which team should handle this?","criteria":{"billing":"Payments","shipping":"Delivery","technical":"Outage","privacy":"Personal data and deletion"}}}}

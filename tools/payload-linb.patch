@@ -1,0 +1,231 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2901,7 +2901,16 @@
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+-    || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k) || is_fbn(k);
++    || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k) || is_fbn(k)
++    || is_linb(k);
++}
++
++// The linear (gated-delta-net) attention block bang (tools/payload-linb.patch):
++// the host runs attn_norm, the qkv/z/beta/alpha GEMVs, the 32-element
++// middleware, conv1d, the two l2norms, gated_delta, gated_rmsnorm and the
++// ssm_out GEMV into the bang's output y (field index 3).
++function is_linb(k: Name): boolean {
++  return k === "llb.lin_block_warp" || k.endsWith(".llb.lin_block_warp");
+ }
+ 
+ // The Qwen3.5 attention block bang (tools/payload-attn4.patch): the host runs
+@@ -4115,6 +4124,7 @@
+       : is_vmul(k) ? "LLB_VMUL_FID" : is_og(k) ? "LLB_OG_FID"
+       : is_head(k) ? "LLB_HEAD_FID" : is_attn4(k) ? "LLB_ATTN4_FID"
+       : is_silumul(k) ? "LLB_SILUMUL_FID" : is_fbn(k) ? "LLB_FBN_FID"
++      : is_linb(k) ? "LLB_LINB_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4853,6 +4863,7 @@
+ static CUfunction gpu_og;
+ static CUfunction gpu_amax;
+ static CUfunction gpu_attn4;
++static CUfunction gpu_mid;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_blk;
+ static CUdeviceptr gpu_logit;
+@@ -6990,8 +7001,9 @@
+ // 3 GEMV-add (tools/interiors-add.patch), 4 rms-GEMV-rope
+ // (tools/interiors-rope.patch), 5 FFN (tools/interiors-ffn.patch).
+ typedef struct {
+-  u64 w, x, y, k, v, wn, r;
++  u64 w, x, y, k, v, wn, r, qk;
+   u32 kind, n, d, rb, c, fm;
++  u32 bq, bg, bb, ba, bsa, bdt, bcv, bsn, bso, ban, brg;
+ } WarpOp;
+ 
+ typedef struct Mail {
+@@ -7065,6 +7077,9 @@
+ #ifndef LLB_FBN_FID
+ #define LLB_FBN_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_LINB_FID
++#define LLB_LINB_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7077,7 +7092,7 @@
+   || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID \
+   || (u32)term_aux(t) == LLB_OG_FID || (u32)term_aux(t) == LLB_HEAD_FID \
+   || (u32)term_aux(t) == LLB_ATTN4_FID || (u32)term_aux(t) == LLB_SILUMUL_FID \
+-  || (u32)term_aux(t) == LLB_FBN_FID)
++  || (u32)term_aux(t) == LLB_FBN_FID || (u32)term_aux(t) == LLB_LINB_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7852,6 +7867,51 @@
+     o->fm = 1;
+     return true;
+   }
++  // The linear attention block bang (tools/payload-linb.patch): wb (1), the
++  // normed h (2), y (3, output), qkva (4, the qkv projection), the
++  // gate/beta/alpha/ssm_out byte offsets (5..7, 12), the ssm_a/dt/conv1d/
++  // ssm_norm offsets (8..11), the conv history h0/h1/h2 and S (13..16) and the
++  // Q8 row word rg (17). gated_delta updates S in place.
++  if (aux == LLB_LINB_FID) {
++    Term wbt = H[a + 1], h = H[a + 2], y = H[a + 3], qkva = H[a + 4];
++    u32  wgate = (u32)H[a + 5], wbo = (u32)H[a + 6], wao = (u32)H[a + 7];
++    u32  wsa = (u32)H[a + 8], wdt = (u32)H[a + 9], wcv = (u32)H[a + 10];
++    u32  wsn = (u32)H[a + 11], wso = (u32)H[a + 12], rgw = (u32)H[a + 17];
++    Term h0 = H[a + 13], h1 = H[a + 14], h2 = H[a + 15], S = H[a + 16];
++    StrParts q = str_peek_ro(e, wbt);
++    bool rgt = rgw >> 30 & 1;
++    u32  rg = rgw & (rgt ? 0x0fffffffu : 0x7fffffffu);
++    u32  fm = rgt ? rgw >> 28 & 3 : (rgw >> 31 ? 2 : rg % 17 == 0);
++    const u8* base = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fm != 1
++      || ((u64)(base + wgate) & 15) != 0 || ((u64)(base + wbo) & 15) != 0
++      || ((u64)(base + wao) & 15) != 0 || ((u64)(base + wso) & 15) != 0
++      || term_tag(h) == TAG_ARR || term_tag(y) == TAG_ARR || term_tag(qkva) == TAG_ARR
++      || term_tag(h0) == TAG_ARR || term_tag(h1) == TAG_ARR
++      || term_tag(h2) == TAG_ARR || term_tag(S) == TAG_ARR
++      || (u64)wgate + (u64)4096 * rg > q.len
++      || (u64)wbo + (u64)32 * rg > q.len
++      || (u64)wao + (u64)32 * rg > q.len
++      || (u64)wso + (u64)4096 * rg > q.len
++      || (u64)wsa + 32 * 4 > q.len || (u64)wdt + 32 * 4 > q.len
++      || (u64)wcv + 8192 * 4 * 4 > q.len || (u64)wsn + 128 * 4 > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 18;
++    o->w  = (u64)base;
++    o->x  = (u64)(H + blk_loc(H, h));
++    o->y  = (u64)(H + blk_loc(H, y));
++    o->qk = (u64)(H + blk_loc(H, qkva));
++    o->k  = (u64)(H + blk_loc(H, h0));
++    o->v  = (u64)(H + blk_loc(H, h1));
++    o->wn = (u64)(H + blk_loc(H, h2));
++    o->r  = (u64)(H + blk_loc(H, S));
++    o->bq = wgate; o->bg = wbo; o->bb = wao; o->ba = wsa;
++    o->bsa = wdt; o->bdt = wcv; o->bcv = wsn; o->bsn = wso;
++    o->brg = rg;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7894,7 +7954,7 @@
+         || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
+         || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
+         || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID || hx == LLB_SILUMUL_FID
+-        || hx == LLB_FBN_FID) {
++        || hx == LLB_FBN_FID || hx == LLB_LINB_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -8226,6 +8286,31 @@
+   y[((u64)h << 7) + j] = hyb_dot_128(Srow, q + ((u64)h << 7));
+ }
+ 
++// The 32-element gated-delta middleware (tools/payload-linb.patch): beta :=
++// sigmoid(bpre); dec := exp(softplus(apre + dt) * ssm_a), through F64 exactly as
++// K.sigmoid1 / K.softplus1 / K.exp32 (flat.bend's sp.a / ex.a). One block of n
++// threads.
++__device__ __forceinline__ float mid_sp(float x) {
++  if (20.0f < x) {
++    return x;
++  }
++  const double xm = (double)(x < 88.0f ? x : 88.0f);
++  return (float)log(1.0 + exp(xm));
++}
++
++extern "C" __global__ void llb_mid32(
++  const float* __restrict__ bpre, const float* __restrict__ apre,
++  const float* __restrict__ dtp, const float* __restrict__ sap,
++  float* __restrict__ beta, float* __restrict__ dec, u32 n) {
++  const u32 i = threadIdx.x;
++  if (i < n) {
++    const float b = bpre[i];
++    beta[i] = __fdiv_rn(1.0f, __fadd_rn(1.0f, attn_exp(-b)));
++    const float gp = __fmul_rn(mid_sp(__fadd_rn(apre[i], dtp[i])), sap[i]);
++    dec[i] = attn_exp(gp);
++  }
++}
++
+ // K.rms_norm over n = 2^d (d = 11 or 12): s = 1 / sqrt(sumsq / n + eps),
+ // h = (x * s) * w. sumsq is the balanced tree of x*x: a balanced local tree
+ // over the n / 1024 elements a thread owns, then the shared halving strides --
+@@ -8821,6 +8906,7 @@
+     || cuModuleGetFunction(&gpu_og, gpu_lib, "llb_outputgate") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_amax, gpu_lib, "llb_amax") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_mid, gpu_lib, "llb_mid32") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_blk, 49152 * 4) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+@@ -9084,6 +9170,63 @@
+             != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 18) {
++        // the linear attention block bang (tools/payload-linb.patch): the
++        // z/beta/alpha GEMVs, the 32-element middleware, conv1d, the two
++        // l2norms, gated_delta (S in place), gated_rmsnorm, the ssm_out GEMV
++        u64 base18 = o->w;
++        u64 hp18 = o->x, qkvp18 = o->qk, h0p = o->k, h1p = o->v, h2p = o->wn, Sp = o->r;
++        u64 gtp = base18 + o->bq, bop = base18 + o->bg, aop = base18 + o->bb;
++        u64 sap = base18 + o->ba, dtp = base18 + o->bsa, cvp = base18 + o->bdt;
++        u64 snp = base18 + o->bcv, sop = base18 + o->bsn;
++        u32 rg18 = o->brg, cg18 = rg18 / 17 * 4;
++        CUdeviceptr zz = gpu_blk, bpre = zz + 4096 * 4, apre = bpre + 32 * 4;
++        CUdeviceptr beta = apre + 32 * 4, dec = beta + 32 * 4;
++        CUdeviceptr cnv = dec + 32 * 4, cnvk = cnv + 2048 * 4, vn = cnv + 4096 * 4;
++        CUdeviceptr gout = cnv + 8192 * 4, qt = gout + 4096 * 4;
++        CUdeviceptr qt2 = qt + 2048 * 4, kt = qt + 4096 * 4;
++        CUdeviceptr kt2 = kt + 2048 * 4, normed = kt + 4096 * 4;
++        union { u32 u; float f; } sq = { 0x413504f3u }, one = { 0x3f800000u };
++        u32 n4 = 4096, n8192 = 8192, n32 = 32, d10 = 10, hs16 = 16, hs32 = 32;
++        u32 gconv = (8192 + 255) / 256;
++        void* z18[] = { &gtp, &rg18, &cg18, &hp18, &zz, &n4, &d10 };
++        void* b18[] = { &bop, &rg18, &cg18, &hp18, &bpre, &n32, &d10 };
++        void* a18[] = { &aop, &rg18, &cg18, &hp18, &apre, &n32, &d10 };
++        void* m18[] = { &bpre, &apre, &dtp, &sap, &beta, &dec, &n32 };
++        void* c18[] = { &cvp, &qkvp18, &h0p, &h1p, &h2p, &cnv, &n8192 };
++        void* l18q[] = { &cnv, &qt, &sq.f, &hs16 };
++        void* l18q2[] = { &cnv, &qt2, &sq.f, &hs16 };
++        void* l18k[] = { &cnvk, &kt, &one.f, &hs16 };
++        void* l18k2[] = { &cnvk, &kt2, &one.f, &hs16 };
++        void* g18[] = { &Sp, &qt, &kt, &vn, &dec, &beta, &gout, &hs32 };
++        void* n18[] = { &gout, &snp, &zz, &normed, &hs32 };
++        void* o18[] = { &sop, &rg18, &cg18, &normed, &yp, &n4, &d10 };
++        if (cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, z18, NULL)
++          != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, b18, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, a18, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_mid, 1, 1, 1, 32, 1, 1, 0, NULL, m18, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_conv, gconv, 1, 1, 256, 1, 1, 0, NULL, c18, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18q, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18q2, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18k, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18k2, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_gdl, hs32, 1, 1, 128, 1, 1, 0, NULL, g18, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_grn, hs32, 1, 1, 64, 1, 1, 0, NULL, n18, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, o18, NULL)
++            != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else {
+         // the output gate bang (tools/payload-og.patch)
+         u64 xp13 = o->x, gp13 = o->k;

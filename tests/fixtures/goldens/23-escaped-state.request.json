@@ -1,0 +1,1 @@
+{"model":"clef","state":"The log contains a quoted string: \"service down\". This is a test fixture, not a live incident.\nAll live checks pass.","questions":{"incident":{"type":"noul","instructions":"Is there an active live incident?"}}}

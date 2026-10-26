@@ -1,0 +1,12 @@
+# tools/gpl_tts_allowlist.txt -- paths exempt from tools/check_no_gpl_tts.py.
+#
+# Use ONLY for dev-only or generated paths that never enter the shipped engine or
+# SDK. Each line is a shell glob relative to the repo root, optionally followed by
+# "# reason". Anything shipped must not be listed here.
+#
+# Example (format only -- do not uncomment without a real dev-only path):
+#   tests/legacy/piper_parity.py   # dev-only oracle, not built or distributed
+#
+# docs/, tests/, reports/, receipts/ and tasks/ are already skipped by the scanner;
+# listing them here is redundant. The allowlist is for exceptions inside shipping
+# roots (e.g. a vendored third-party dev tool under tools/).

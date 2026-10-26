@@ -1,0 +1,181 @@
+diff -ru a/bend2/comp.ts b/bend2/comp.ts
+--- a/bend2/comp.ts	2026-09-28 19:31:18.153824473 -0500
++++ b/bend2/comp.ts	2026-09-28 19:31:44.114732231 -0500
+@@ -4740,6 +4740,7 @@
+ static CUfunction gpu_pso;
+ static CUfunction gpu_warp;
+ static CUfunction gpu_warpq;
++static CUfunction gpu_warph;
+ static CUfunction gpu_attn;
+ static CUfunction gpu_rms;
+ static CUfunction gpu_mailk;
+@@ -6870,7 +6871,7 @@
+ // (tools/interiors-rope.patch), 5 FFN (tools/interiors-ffn.patch).
+ typedef struct {
+   u64 w, x, y, k, v, wn, r;
+-  u32 kind, n, d, rb, c, q8;
++  u32 kind, n, d, rb, c, fm;
+ } WarpOp;
+ 
+ typedef struct Mail {
+@@ -7219,10 +7220,20 @@
+     __fmul_rn((float)(signed char)(v >> 24), s));
+ }
+ 
+-// llb_warp over Q8_0 rows of rb bytes (tools/merge3-q8.patch): the same
+-// groups, leaf and tree, each weight dequantized on load; a copy, so the F32
+-// kernel's code stays the gated one
+-extern "C" __global__ void __launch_bounds__(128) llb_warp_q8(
++// group g of an F16 row (tools/merge3-f16.patch: f16le, 8 bytes a group):
++// each half upconverted exactly (llb_f16, subnormals included)
++INLINE float4 h16_w(const u8* __restrict__ row, u32 g) {
++  uint2 v = *(const uint2*)(row + 8 * g);
++  return make_float4(llb_f16(v.x & 65535), llb_f16(v.x >> 16),
++    llb_f16(v.y & 65535), llb_f16(v.y >> 16));
++}
++
++// llb_warp over Q8_0 (H false) or F16 (H true) rows of rb bytes
++// (tools/merge3-q8.patch, tools/merge3-f16.patch): the same groups, leaf and
++// tree, each weight upconverted on load; a copy, so the F32 kernel's code
++// stays the gated one
++template <bool H>
++__device__ __forceinline__ void warp_dq(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+   const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
+@@ -7243,7 +7254,8 @@
+       #pragma unroll
+       for (u32 i = 0; i < 16; i++) {
+         u32 g = 512 * k + 32 * i + l;
+-        w[i] = g < cg ? q8_w(row, cg, g) : make_float4(0.f, 0.f, 0.f, 0.f);
++        w[i] = g < cg ? (H ? h16_w(row, g) : q8_w(row, cg, g))
++          : make_float4(0.f, 0.f, 0.f, 0.f);
+       }
+       float v[16];
+       #pragma unroll
+@@ -7279,6 +7291,18 @@
+     }
+   }
+ }
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q8(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  warp_dq<false>(W, rb, cg, x, y, n, d);
++}
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp_f16(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  warp_dq<true>(W, rb, cg, x, y, n, d);
++}
+ #endif
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+@@ -7407,15 +7431,17 @@
+     bool     ff = (u32)term_aux(t) == LLB_FFN_FID;
+     Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
+     u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
+-    u32      d  = at ? 9 : (u32)H[a + 6], rb = (u32)H[a + (at ? 9 : 7)];
+-    // Q8_0 rows (tools/merge3-q8.patch): rb = c * 17 / 16, 4 | rb for the
+-    // u32 quant loads; F32 rows are 4c, and the model's c (2048, 6144) has
+-    // no factor 17
+-    bool     q8 = rb % 17 == 0;
++    u32      d  = at ? 9 : (u32)H[a + 6], rw = (u32)H[a + (at ? 9 : 7)];
++    // fm: 0 F32, 1 Q8_0, 2 F16. F16 rows (tools/merge3-f16.patch) carry rb's
++    // top bit, the row's 2c bytes below. Q8_0 rows (tools/merge3-q8.patch):
++    // rb = c * 17 / 16, 4 | rb for the u32 quant loads; F32 rows are 4c, and
++    // the model's c (2048, 6144) has no factor 17
++    u32      rb = rw & 0x7fffffffu, fm = rw >> 31 ? 2 : rb % 17 == 0;
+     StrParts p  = str_peek_ro(e, H[a + 1]);
+     const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
+-      || (q8 ? rb / 17 % 4 != 0 : rb % 16 != 0) || ((u64)w & 15) != 0
++      || (fm == 1 ? rb / 17 % 4 != 0 : rb % (fm ? 8 : 16) != 0)
++      || ((u64)w & 15) != 0
+       || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
+       || term_tag(y) == TAG_ARR || blk_cls(x) < (ff ? 11 : d + 2)
+       || n > 1ull << blk_cls(y)) {
+@@ -7429,7 +7455,7 @@
+     o->n = n;
+     o->d = d;
+     o->rb = rb;
+-    o->q8 = q8;
++    o->fm = fm;
+     if (at) {
+       Term kc = H[a + 3], vc = H[a + 4];
+       u32  c  = (u32)H[a + 5], dT = c & 31;
+@@ -7469,10 +7495,14 @@
+     // bytes a row, the down rows' format), 6144 rows, d = 9 each
+     if (ff) {
+       u32 gb = (u32)H[a + 8], ub = (u32)H[a + 9], an = (u32)H[a + 10];
+-      u32 rg = (u32)H[a + 11];
++      // rg's format (tools/merge3-f16.patch: F16 carries the top bit) must be
++      // the down rows'
++      u32 rg = (u32)H[a + 11] & 0x7fffffffu;
++      u32 gm = (u32)H[a + 11] >> 31 ? 2 : rg % 17 == 0;
+       const u8* wb = (const u8*)(H + term_peek_ro(e, p.data)) + p.off;
+-      if (n != 2048 || blk_cls(x) != 11 || (rg % 17 == 0) != q8
+-        || (q8 ? rg / 17 % 4 != 0 : rg % 16 != 0) || ((u64)(wb + gb) & 15) != 0
++      if (n != 2048 || blk_cls(x) != 11 || gm != fm
++        || (fm == 1 ? rg / 17 % 4 != 0 : rg % (fm ? 8 : 16) != 0)
++        || ((u64)(wb + gb) & 15) != 0
+         || ((u64)(wb + ub) & 15) != 0 || (u64)gb + 6144ull * rg > p.len
+         || (u64)ub + 6144ull * rg > p.len || an % 4 != 0
+         || (u64)an + 2048 * 4 > p.len) {
+@@ -7990,6 +8020,7 @@
+ #ifdef LLB_WARP_FID
+   if (cuModuleGetFunction(&gpu_warp, gpu_lib, "llb_warp") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq, gpu_lib, "llb_warp_q8") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warph, gpu_lib, "llb_warp_f16") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
+@@ -8073,9 +8104,10 @@
+   for (u32 j = 0; j < m; j += 1) {
+     volatile WarpOp* o = &gpu_mail->op[j];
+     u64 w = o->w, xp = o->x, yp = o->y;
+-    // Q8_0 (llb_warp_q8): rq is the row's bytes, cg = c / 4 = rb / 17 * 4
+-    u32 n = o->n, d = o->d, q8 = o->q8, rq = q8 ? o->rb : o->rb / 16;
+-    u32 cg = q8 ? o->rb / 17 * 4 : o->rb / 16;
++    // Q8_0 / F16 (llb_warp_q8 / llb_warp_f16): rq is the row's bytes; cg =
++    // c / 4 = rb / 17 * 4 (Q8_0), rb / 8 (F16)
++    u32 n = o->n, d = o->d, fm = o->fm, rq = fm ? o->rb : o->rb / 16;
++    u32 cg = fm == 1 ? o->rb / 17 * 4 : o->rb / (fm ? 8 : 16);
+     CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
+     // attention (f, +wt, +q, +kc, +vc, +c, y, +wo, +r): its o GEMV reads
+     // llb_attn's output, a slot of gpu_att (2048 x 2048 rows of wo, d = 9);
+@@ -8106,7 +8138,7 @@
+     if (o->kind == 5) {
+       u64 wn = o->wn, wg = o->k, wu = o->v;
+       u32 rg = o->c, nf = 6144, df = 9;
+-      u32 gq = q8 ? rg : rg / 16, gc = q8 ? rg / 17 * 4 : rg / 16;
++      u32 gq = fm ? rg : rg / 16, gc = fm == 1 ? rg / 17 * 4 : rg / (fm ? 8 : 16);
+       CUdeviceptr ga = gpu_act + (CUdeviceptr)j * 3 * 6144 * 4;
+       CUdeviceptr ua = ga + 6144 * 4, sa = ua + 6144 * 4;
+       void* ra[] = { &xp, &wn, &op };
+@@ -8114,9 +8146,10 @@
+       void* ua_[] = { &wu, &gq, &gc, &op, &ua, &nf, &df };
+       void* sa_[] = { &ga, &ua, &sa, &nf };
+       if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(q8 ? gpu_warpq : gpu_warp, grid, 1, 1, 128, 1, 1, 0, NULL, ga_,
+-          NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(q8 ? gpu_warpq : gpu_warp, grid, 1, 1, 128, 1, 1, 0, NULL, ua_,
++        || cuLaunchKernel(fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++          1, 1, 0, NULL, ga_, NULL) != CUDA_SUCCESS
++        || cuLaunchKernel(fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++          1, 1, 0, NULL, ua_,
+           NULL) != CUDA_SUCCESS
+         || cuLaunchKernel(gpu_silu, 24, 1, 1, 256, 1, 1, 0, NULL, sa_, NULL)
+           != CUDA_SUCCESS) {
+@@ -8125,7 +8158,8 @@
+       xp = sa;
+     }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+-    if (cuLaunchKernel(q8 ? gpu_warpq : gpu_warp, grid, 1, 1, 128, 1, 1, 0,
++    if (cuLaunchKernel(fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
++      1, 1, 128, 1, 1, 0,
+       NULL, args, NULL)
+       != CUDA_SUCCESS) {
+       err_fail("device launch failed");
+Only in a/bend2: comp.ts.orig

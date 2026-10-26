@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"route":{"type":"choice","choice":"billing","probabilities":{"billing":0.9036605951133936,"shipping":0.04922064204243291,"technical":0.04711876284417355},"confidence":0.8554908926700904}},"usage":{"input_tokens":155,"output_tokens":0}}

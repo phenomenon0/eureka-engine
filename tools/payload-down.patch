@@ -1,0 +1,118 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -7868,11 +7868,103 @@
+   }
+ }
+ 
+-// fbn's down GEMV with the residual add (tools/payload-fuse.patch): d = 12
+-extern "C" __global__ void __launch_bounds__(128) llb_warp_q8_res(
++// One perfect 4-vblock subtree of a row (vblocks j0 .. j0 + 3): the leaves,
++// butterfly and carry of warp_dq_q8_split's loop, 4 iterations.
++__device__ __forceinline__ float q8_sub4(const u8* __restrict__ row, u32 cg,
++  const u32* __restrict__ x, u32 j0, u32 l) {
++  float slot[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++  u32 occ = 0;
++  #pragma unroll 1
++  for (u32 jj = 0; jj < 4; jj++) {
++    u32 g0 = 128 * (j0 + jj) + 4 * l;
++    float v;
++    if (g0 + 3 < cg) {
++      uint4 q = q8_wld(row + 4 * g0);
++      float s = llb_f16(*(const unsigned short*)
++        (row + 4 * cg + 2 * (g0 >> 3)));
++      v = __fadd_rn(__fadd_rn(q8_dot(q.x, s, xg(x, g0)),
++        q8_dot(q.y, s, xg(x, g0 + 1))),
++        __fadd_rn(q8_dot(q.z, s, xg(x, g0 + 2)),
++          q8_dot(q.w, s, xg(x, g0 + 3))));
++    } else {
++      v = __fadd_rn(__fadd_rn(q8_leaf_g(row, cg, g0, x),
++        q8_leaf_g(row, cg, g0 + 1, x)),
++        __fadd_rn(q8_leaf_g(row, cg, g0 + 2, x),
++          q8_leaf_g(row, cg, g0 + 3, x)));
++    }
++    #pragma unroll
++    for (u32 m = 1; m < 32; m <<= 1) {
++      float o = __shfl_xor_sync(0xffffffffu, v, m);
++      v = (l & m) ? __fadd_rn(o, v) : __fadd_rn(v, o);
++    }
++    u32 b = 0;
++    #pragma unroll
++    for (u32 t = 0; t < 6; t++) {
++      if (b == t && (occ & (1u << t))) {
++        v = __fadd_rn(slot[t], v);
++        occ &= ~(1u << t);
++        b = t + 1;
++      }
++    }
++    #pragma unroll
++    for (u32 t = 0; t < 6; t++) {
++      if (b == t) {
++        slot[t] = v;
++      }
++    }
++    occ |= 1u << b;
++  }
++  float o = slot[0];
++  #pragma unroll
++  for (u32 t = 1; t < 6; t++) {
++    if (occ >> t) {
++      o = slot[t];
++    }
++  }
++  return o;
++}
++
++// fbn's down GEMV with the residual add (tools/payload-fuse.patch): d = 12,
++// 24 of the 32 vblocks real (cg = 3072), so the quarter split left warp 3 all
++// padding. Six warps take the halves H0..H5 (perfect 4-vblock subtrees) and
++// the row is ((H0 + H1) + (H2 + H3)) + ((H4 + H5) + P), P = H6 + H7, the
++// padding halves: each leaf there is +0 * x for x the block's words 4 cg ..
++// 16383, so P is the canonical NaN if any such x is inf / NaN, else -0 if
++// every x has its sign bit set, else +0, in any order (fadd / fmul return
++// the canonical NaN; tools/pad_rule_check.cu). P is the same for every row:
++// one block-wide vote. The same bits (P3-3i).
++extern "C" __global__ void __launch_bounds__(192) llb_warp_q8_res(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, const float* __restrict__ res) {
+-  warp_dq_q8_split<32>(W, rb, cg, x, y, n, blockIdx.x, gridDim.x, res);
++  __shared__ float hs[2][6];
++  const u32 l = threadIdx.x & 31, w = threadIdx.x >> 5;
++  int nf = 0, ng = 1;
++  #pragma unroll 2
++  for (u32 g = cg + threadIdx.x; g < 128 * 32; g += blockDim.x) {
++    const uint4 v = *(const uint4*)(x + 4 * g);
++    nf |= (v.x & 0x7f800000u) == 0x7f800000u | (v.y & 0x7f800000u) == 0x7f800000u
++      | (v.z & 0x7f800000u) == 0x7f800000u | (v.w & 0x7f800000u) == 0x7f800000u;
++    ng &= (v.x & v.y & v.z & v.w) >> 31;
++  }
++  nf = __syncthreads_or(nf);
++  ng = __syncthreads_and(ng);
++  const float p = nf ? __uint_as_float(0x7fffffffu) : ng ? -0.f : 0.f;
++  u32 par = 0;
++  for (u32 r = blockIdx.x; r < n; r += gridDim.x, par ^= 1) {
++    const u8* row = W + (u64)r * rb;
++    float a = q8_sub4(row, cg, x, 4 * w, l);
++    if (l == 0) {
++      hs[par][w] = a;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++      const float* h = hs[par];
++      float o = __fadd_rn(
++        __fadd_rn(__fadd_rn(h[0], h[1]), __fadd_rn(h[2], h[3])),
++        __fadd_rn(__fadd_rn(h[4], h[5]), p));
++      y[r] = __float_as_uint(__fadd_rn(res[r], o));
++    }
++  }
+ }
+ 
+ // d = 10 GEMVs over one x in one launch, a warp a row (tools/payload-cat.patch)
+@@ -10445,7 +10537,7 @@
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_silu, siluG, 1, 1, 256, 1, 1, 0, NULL, ss17, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpqr, grid, 1, 1, 128, 1, 1, 0, NULL, dd17, NULL)
++    || cuLaunchKernel(gpu_warpqr, 82 * 8, 1, 1, 192, 1, 1, 0, NULL, dd17, NULL)
+       != CUDA_SUCCESS) {
+     err_fail("device launch failed");
+   }

@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"color":{"type":"choice","choice":"blue","probabilities":{"blue":0.9748260519314481,"green":0.013853419362998935,"red":0.011320528705553065},"confidence":0.962239077897172}},"usage":{"input_tokens":138,"output_tokens":0}}

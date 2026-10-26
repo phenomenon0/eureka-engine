@@ -1,0 +1,153 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4912,6 +4912,9 @@
+ static CUfunction gpu_warpk;
+ static CUfunction gpu_warp6;
+ static CUfunction gpu_warp5;
++static CUfunction gpu_warpke;
++static CUfunction gpu_warp6e;
++static CUfunction gpu_warpkba;
+ static CUfunction gpu_warp3;
+ static CUfunction gpu_warp2;
+ static CUfunction gpu_warpq2;
+@@ -8231,9 +8234,15 @@
+   }
+ };
+ // two rows a warp (R 2: x loads shared); LP 1 = L1::no_allocate weight loads
+-template <u32 FMT, u32 NP, u32 LP>
++// the store: y[r] = EP::st(e, r, row value) (KpPlain: the value; tools/payload-q4glue.patch's
++// epilogues fold the next glue op's per-row map into it)
++struct KpPlain {
++  static __device__ __forceinline__ float st(const float*, u32, float v) { return v; }
++};
++template <u32 FMT, u32 NP, u32 LP, class EP>
+ __device__ __forceinline__ void kp_pair(const u8* __restrict__ W, u32 rb, u32 cg,
+-  const u32* __restrict__ x, u32* __restrict__ y, u32 n) {
++  const u32* __restrict__ x, u32* __restrict__ y, u32 n, u32 bx, u32 gx,
++  const float* __restrict__ e) {
+   typedef KQ<FMT> F;
+   const u32 R = 2;
+   __shared__ float pvs[NP];
+@@ -8256,9 +8265,9 @@
+     if (l == 0) pvs[p] = nf ? __uint_as_float(0x7fffffffu) : ps ? 0.f : -0.f;
+   }
+   __syncthreads();
+-  const u32 nw = gridDim.x * (blockDim.x >> 5);
++  const u32 nw = gx * (blockDim.x >> 5);
+   const u32 sbk = l >> 3, slo = F::slo(l), shi = slo + (1u << F::KIN);
+-  for (u32 r0 = (blockIdx.x * (blockDim.x >> 5) + w) * R; r0 < n; r0 += nw * R) {
++  for (u32 r0 = (bx * (blockDim.x >> 5) + w) * R; r0 < n; r0 += nw * R) {
+     const u8* row[R];
+     #pragma unroll
+     for (u32 j = 0; j < R; j++) row[j] = W + (u64)min(r0 + j, n - 1) * rb;
+@@ -8292,18 +8301,19 @@
+       }
+       kp_carry(u, slot, occ);
+     }
+-    if (l < R && r0 + l < n) y[r0 + l] = __float_as_uint(kp_top(slot, occ));
++    if (l < R && r0 + l < n) y[r0 + l] = __float_as_uint(EP::st(e, r0 + l, kp_top(slot, occ)));
+   }
+ }
+ // d 9..13 (the envelope admits a K-quant pair body only there)
+-template <u32 FMT, u32 LP>
++template <u32 FMT, u32 LP, class EP = KpPlain>
+ __device__ __forceinline__ void kp_warp(const u8* __restrict__ W, u32 rb, u32 cg,
+-  const u32* __restrict__ x, u32* __restrict__ y, u32 n, u32 d) {
+-  if (d == 9) kp_pair<FMT, 2, LP>(W, rb, cg, x, y, n);
+-  else if (d == 10) kp_pair<FMT, 4, LP>(W, rb, cg, x, y, n);
+-  else if (d == 11) kp_pair<FMT, 8, LP>(W, rb, cg, x, y, n);
+-  else if (d == 12) kp_pair<FMT, 16, LP>(W, rb, cg, x, y, n);
+-  else kp_pair<FMT, 32, LP>(W, rb, cg, x, y, n);
++  const u32* __restrict__ x, u32* __restrict__ y, u32 n, u32 d, u32 bx, u32 gx,
++  const float* __restrict__ e) {
++  if (d == 9) kp_pair<FMT, 2, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
++  else if (d == 10) kp_pair<FMT, 4, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
++  else if (d == 11) kp_pair<FMT, 8, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
++  else if (d == 12) kp_pair<FMT, 16, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
++  else kp_pair<FMT, 32, LP, EP>(W, rb, cg, x, y, n, bx, gx, e);
+ }
+ 
+ // llb_warp over Q4_K rows (tools/q4k.patch): the same groups, leaf and
+@@ -8374,7 +8384,7 @@
+   // the pair body where it applies (K0b m4r2: no_allocate loads); the tile
+   // body (d <= 11) for rows not a whole number of superblock quads
+   if (cg % 256 == 0 && d >= 9 && d <= 13) {
+-    kp_warp<4, 1>(W, rb, cg, x, y, n, d);
++    kp_warp<4, 1>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
+   } else {
+     warp_dq4k(W, rb, cg, x, y, n, d);
+   }
+@@ -8483,7 +8493,7 @@
+   // the pair body where it applies (K0b p6r2: default loads, the second
+   // aligned uint4 is the next lane's first); else the tile body (d <= 11)
+   if (cg % 256 == 0 && d >= 9 && d <= 13) {
+-    kp_warp<6, 0>(W, rb, cg, x, y, n, d);
++    kp_warp<6, 0>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
+   } else {
+     warp_dq6k(W, rb, cg, x, y, n, d);
+   }
+@@ -8494,7 +8504,7 @@
+ extern "C" __global__ void __launch_bounds__(128, 4) llb_warp_q5k(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+-  kp_warp<9, 1>(W, rb, cg, x, y, n, d);
++  kp_warp<9, 1>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
+ }
+ 
+ // group g of a Q2_0 (qk = 64) or PQ2_0 (qk = 128) row (tools/q20.py): f16 d +
+@@ -9803,6 +9813,45 @@
+   }
+ }
+ 
++// fbn's residual folded into the K down GEMV's store (tools/payload-q4glue.patch):
++// y[r] = x1[r] + dd[r], llb_vadd's op on the row value. (silu in the up's
++// store is not here: its F64 exp on 2 lanes a warp cost more than llb_silu)
++struct KpRes {
++  static __device__ __forceinline__ float st(const float* x1, u32 r, float v) {
++    return __fadd_rn(x1[r], v);
++  }
++};
++
++// the pair body only: the host takes these where cg % 256 == 0 and d is 9..13
++extern "C" __global__ void __launch_bounds__(128, 4) llb_warp_q4k_res(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d, const float* __restrict__ x1) {
++  kp_warp<4, 1, KpRes>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, x1);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 4) llb_warp_q6k_res(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d, const float* __restrict__ x1) {
++  kp_warp<6, 0, KpRes>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, x1);
++}
++
++// linb's z (Q4_K pair body) and beta / alpha (Q8_0, d 10, nb rows each) in
++// one launch: blocks 0 .. 2 nb - 1 take a beta / alpha row each (block a
++// row, as llb_warp_q8 runs n < 4 grid), the rest the pair body
++extern "C" __global__ void __launch_bounds__(128, 4) llb_warp_q4k_ba(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d, const u8* __restrict__ Wb,
++  const u8* __restrict__ Wa, u32 rbq, u32 cgq, u32* __restrict__ yb,
++  u32* __restrict__ ya, u32 nb) {
++  if (blockIdx.x < 2 * nb) {
++    const u32 k = blockIdx.x >= nb;
++    warp_dq_q8_split<8>(k ? Wa : Wb, rbq, cgq, x, k ? ya : yb, nb, blockIdx.x - (k ? nb : 0), nb,
++      nullptr);
++  } else {
++    kp_warp<4, 1>(W, rb, cg, x, y, n, d, blockIdx.x - 2 * nb, gridDim.x - 2 * nb, nullptr);
++  }
++}
++
+ // Qwen2.5 qk-norm (tools/qknorm.patch): per-head RMSNorm on v[rows][128] with
+ // gain g[128]. For each row r: s = 1 / sqrt(sumsq / 128 + eps), sumsq the
+ // balanced tree of v * v over 128 elements (64 pairs, then halves up in shared
+@@ -10826,6 +10875,9 @@
+     || cuModuleGetFunction(&gpu_warpk, gpu_lib, "llb_warp_q4k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp6, gpu_lib, "llb_warp_q6k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp5, gpu_lib, "llb_warp_q5k") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpke, gpu_lib, "llb_warp_q4k_res") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warp6e, gpu_lib, "llb_warp_q6k_res") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpkba, gpu_lib, "llb_warp_q4k_ba") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp3, gpu_lib, "llb_warp_q3k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp2, gpu_lib, "llb_warp_q2_0") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_pq2_0") != CUDA_SUCCESS

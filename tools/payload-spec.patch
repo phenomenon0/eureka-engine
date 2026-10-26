@@ -1,0 +1,282 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4920,6 +4920,23 @@
+ static CUfunction gpu_q4dpre;
+ static CUfunction gpu_siluq, gpu_rnaddq, gpu_rnormq;
+ static CUfunction gpu_q8x2, gpu_q4dp2gu, gpu_q4dp2re, gpu_q8dp2, gpu_q8dp2c, gpu_q6dp2;
++// tools/payload-spec.patch: the T-row leaves (index T = 1 .. 8), q4s, the out-of-place gdl
++static CUfunction gpu_sgu[9], gpu_sre[9], gpu_sq8[9], gpu_sq6[9], gpu_sq4s, gpu_sgdl;
++static bool spec_load(CUmodule m) {
++  const char* nm[4] = { "gu", "re", "q8", "q6" };
++  CUfunction* f[4] = { gpu_sgu, gpu_sre, gpu_sq8, gpu_sq6 };
++  char        b[32];
++  for (u32 t = 1; t <= 8; t += 1) {
++    for (u32 j = 0; j < 4; j += 1) {
++      snprintf(b, sizeof b, "llb_spec_%s%u", nm[j], t);
++      if (cuModuleGetFunction(&f[j][t], m, b) != CUDA_SUCCESS) {
++        return false;
++      }
++    }
++  }
++  return cuModuleGetFunction(&gpu_sq4s, m, "llb_spec_q4s") == CUDA_SUCCESS
++    && cuModuleGetFunction(&gpu_sgdl, m, "llb_spec_gdl") == CUDA_SUCCESS;
++}
+ static CUfunction gpu_warp3;
+ static CUfunction gpu_warp2;
+ static CUfunction gpu_warpq2;
+@@ -9600,6 +9617,8 @@
+       o->bq = rbh;
+       o->bg = fmh;
+       o->bb = fme;
++      // tools/payload-spec.patch: the embedding base (the token id is (w - r) / its row bytes)
++      o->r  = (u64)((const u8*)(H + term_peek_ro(e, qe.data)) + qe.off);
+     }
+   }
+   // the table (task word 64): a 32-word row per layer, [0] the layer's bytes,
+@@ -10507,6 +10526,238 @@
+   }
+ }
+ 
++// MTP27's T-row verify (tools/payload-spec.patch, LLB_SPEC): T-row twins of the two-plane
++// dp4a leaves (llb_q4dp2_gu / _res, llb_q8dp2 / _cat, llb_q6dp2), as tools/mtp27/mT.cu
++// (its bit check: row tt of a T launch == the T = 1 leaf on token tt's x). One weight
++// read, T tokens' dots, each token's float ops the leaf's. Activations token-major:
++// qx [T][2c] (both planes), dx [T][c / 32], y [T][n]; Q4 also S [T][c / 8] (llb_spec_q4s).
++// warps 1..3 into warp 0 in order, then the xor butterfly (q4dp2_row's order)
++template <u32 N>
++__device__ __forceinline__ void spec_red(float (&a)[N], float (*part)[3][32]) {
++  const u32 t = threadIdx.x, l = t & 31, w = t >> 5;
++  if (w > 0)
++    for (u32 i = 0; i < N; i++) part[i][w - 1][l] = a[i];
++  __syncthreads();
++  if (w > 0) return;
++  #pragma unroll
++  for (u32 i = 0; i < N; i++) {
++    a[i] = __fadd_rn(a[i], part[i][0][l]);
++    a[i] = __fadd_rn(a[i], part[i][1][l]);
++    a[i] = __fadd_rn(a[i], part[i][2][l]);
++    #pragma unroll
++    for (u32 m = 16; m > 0; m >>= 1) a[i] = __fadd_rn(a[i], __shfl_xor_sync(0xffffffffu, a[i], m));
++  }
++}
++// S[j][k] = 127 (bytesum(q int k of block j) + bytesum(q int k + 4)) + the same on plane
++// 2: q4dp2_sb's s0 / s1 for lane k, exact ints. Grid (c / 8 / 256, T)
++extern "C" __global__ void llb_spec_q4s(const signed char* __restrict__ qx, int* __restrict__ S, u32 c) {
++  const u32 i = blockIdx.x * 256 + threadIdx.x, tt = blockIdx.y;
++  if (i >= c / 8) return;
++  const u32 j = i >> 2, k = i & 3;
++  const int* u = (const int*)(qx + 2 * c * tt + 32 * j + 4 * k);
++  const int* w = (const int*)(qx + 2 * c * tt + c + 32 * j + 4 * k);
++  S[c / 8 * tt + i] = 127 * __dp4a(0x01010101, u[4], __dp4a(0x01010101, u[0], 0)) + __dp4a(0x01010101, w[4], __dp4a(0x01010101, w[0], 0));
++}
++struct SpecQ4w { int l0, l1, h0, h1, sc0, sc1, m0, m1; float d, dm; };
++__device__ __forceinline__ SpecQ4w spec_q4w(const u8* __restrict__ B, u32 g, u32 k) {
++  const u32 dm = *(const u32*)B;
++  const unsigned short* s16 = (const unsigned short*)(B + 4);
++  u32 a0, a1;
++  if (g < 2) { a0 = s16[g] & 0x3f3fu; a1 = s16[g + 2] & 0x3f3fu; }
++  else {
++    a0 = ((s16[g + 2] >> 0) & 0x0f0fu) | ((s16[g - 2] & 0xc0c0u) >> 2);
++    a1 = ((s16[g + 2] >> 4) & 0x0f0fu) | ((s16[g] & 0xc0c0u) >> 2);
++  }
++  const int* q4 = (const int*)(B + 16 + 32 * g + 4 * k);
++  const int v0 = q4[0], v1 = q4[4];
++  return { v0 & 0x0F0F0F0F, v1 & 0x0F0F0F0F, (v0 >> 4) & 0x0F0F0F0F, (v1 >> 4) & 0x0F0F0F0F,
++    (int)(a0 & 0xff), (int)(a0 >> 8), (int)(a1 & 0xff), (int)(a1 >> 8), q4dp_f16(dm), q4dp_f16(dm >> 16) };
++}
++struct SpecQ4x { int u00, u01, u10, u11, w00, w01, w10, w11, s0, s1; float e0, e1; };
++__device__ __forceinline__ SpecQ4x spec_q4x(const signed char* __restrict__ qx, const float* __restrict__ dx,
++  const int* __restrict__ S, u32 c, u32 sb, u32 g, u32 k) {
++  const u32 j0 = 8 * sb + 2 * g;
++  const int* u = (const int*)(qx + 32 * j0 + 4 * k);
++  const int* w = (const int*)(qx + c + 32 * j0 + 4 * k);
++  return { u[0], u[4], u[8], u[12], w[0], w[4], w[8], w[12], S[4 * j0 + k], S[4 * j0 + 4 + k], dx[j0], dx[j0 + 1] };
++}
++// == q4dp2_sb's value, op for op
++__device__ __forceinline__ float spec_q4dot(const SpecQ4w& W, const SpecQ4x& X) {
++  const int t0 = 127 * __dp4a(W.l1, X.u01, __dp4a(W.l0, X.u00, 0)) + __dp4a(W.l1, X.w01, __dp4a(W.l0, X.w00, 0));
++  const int t1 = 127 * __dp4a(W.h1, X.u11, __dp4a(W.h0, X.u10, 0)) + __dp4a(W.h1, X.w11, __dp4a(W.h0, X.w10, 0));
++  float A = __fmul_rn(X.e0, (float)(t0 * W.sc0));
++  A = __fmaf_rn(X.e1, (float)(t1 * W.sc1), A);
++  float M = __fmul_rn(X.e0, (float)(X.s0 * W.m0));
++  M = __fmaf_rn(X.e1, (float)(X.s1 * W.m1), M);
++  return __fmaf_rn(W.d, A, -__fmul_rn(W.dm, M));
++}
++// Q4_K: NW weight matrices (gu: 2), R rows a block, T tokens; y[w][tt n + r] (+ x1 for res)
++template <u32 T, u32 R, u32 NW, bool RES>
++__device__ __forceinline__ void spec_q4v(const u8* __restrict__ W0, const u8* __restrict__ W1, u32 rb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, const int* __restrict__ S,
++  float* __restrict__ y0, float* __restrict__ y1, u32 n, const float* __restrict__ x1) {
++  __shared__ float p[NW * R * T][3][32];
++  const u32 t = threadIdx.x, g = (t >> 2) & 3, k = t & 3, nsb = rb / 144, r0 = blockIdx.x * R, c = 256 * nsb;
++  float a[NW * R * T];
++  #pragma unroll
++  for (u32 i = 0; i < NW * R * T; i++) a[i] = 0.0f;
++  for (u32 sb = t >> 4; sb < nsb; sb += 8) {
++    SpecQ4w w[NW * R];
++    #pragma unroll
++    for (u32 m = 0; m < NW * R; m++) w[m] = spec_q4w((m < R ? W0 : W1) + (u64)(r0 + m % R) * rb + 144 * sb, g, k);
++    #pragma unroll
++    for (u32 i = 0; i < T; i++) {
++      const SpecQ4x x = spec_q4x(qx + 2 * c * i, dx + c / 32 * i, S + c / 8 * i, c, sb, g, k);
++      #pragma unroll
++      for (u32 m = 0; m < NW * R; m++) a[m * T + i] = __fadd_rn(a[m * T + i], spec_q4dot(w[m], x));
++    }
++  }
++  spec_red<NW * R * T>(a, p);
++  if (t == 0)
++    for (u32 m = 0; m < NW * R; m++)
++      for (u32 i = 0; i < T; i++) {
++        const u32 r = r0 + m % R;
++        float* y = m < R ? y0 : y1;
++        y[i * n + r] = RES ? __fadd_rn(x1[i * n + r], a[m * T + i]) : a[m * T + i];
++      }
++}
++// Q8_0 over llb_q8dp2_cat's members, one row a block (mT.cu's q8T): token tt of member
++// k's row i into y[k][tt n_k + i]; ring (the SSM conv ring, 16 slots of n_0): member 0's
++// token tt into slot (p0 + tt) % 16 instead. A plain GEMV is the one-member cat
++template <u32 T>
++__device__ __forceinline__ void spec_q8c(u32 rb, const signed char* __restrict__ qx,
++  const float* __restrict__ dx, Q8Cat cc, u32 ring, u32 p0) {
++  __shared__ float p[T][3][32];
++  const u32 r = blockIdx.x, k = (r >= cc.end[0]) + (r >= cc.end[1]) + (r >= cc.end[2]);
++  const u32 lo = k == 0 ? 0 : k == 1 ? cc.end[0] : k == 2 ? cc.end[1] : cc.end[2];
++  const u32 nk = (k == 0 ? cc.end[0] : k == 1 ? cc.end[1] : k == 2 ? cc.end[2] : cc.end[3]) - lo, ri = r - lo;
++  const u8* row = (k == 0 ? cc.W[0] : k == 1 ? cc.W[1] : k == 2 ? cc.W[2] : cc.W[3]) + (u64)ri * rb;
++  u32* y = k == 0 ? cc.y[0] : k == 1 ? cc.y[1] : k == 2 ? cc.y[2] : cc.y[3];
++  const u32 t = threadIdx.x, c = rb / 17 * 16;
++  float a[T];
++  #pragma unroll
++  for (u32 i = 0; i < T; i++) a[i] = 0.0f;
++  for (u32 o = 16 * t; o < c; o += 2048) {
++    const int4 wv = *(const int4*)(row + o);
++    const float s = llb_f16(*(const unsigned short*)(row + c + 2 * (o >> 5)));
++    #pragma unroll
++    for (u32 i = 0; i < T; i++) {
++      const int4 u = *(const int4*)(qx + 2 * c * i + o), v = *(const int4*)(qx + 2 * c * i + c + o);
++      const int A = __dp4a(wv.w, u.w, __dp4a(wv.z, u.z, __dp4a(wv.y, u.y, __dp4a(wv.x, u.x, 0))));
++      const int B = __dp4a(wv.w, v.w, __dp4a(wv.z, v.z, __dp4a(wv.y, v.y, __dp4a(wv.x, v.x, 0))));
++      a[i] = __fmaf_rn(__fmul_rn(s, dx[c / 32 * i + (o >> 5)]), (float)(127 * A + B), a[i]);
++    }
++  }
++  spec_red<T>(a, p);
++  if (t == 0)
++    for (u32 i = 0; i < T; i++)
++      y[(u64)(ring && k == 0 ? (p0 + i) & 15 : i) * nk + ri] = __float_as_uint(a[i]);
++}
++// Q6_K: a warp R rows (rows 4 R blockIdx + R warp + m), a block 4 warps; y[tt ys + r]
++template <u32 T, u32 R>
++__device__ __forceinline__ void spec_q6v(const u8* __restrict__ W, u32 rb,
++  const signed char* __restrict__ qx, const float* __restrict__ dx, float* __restrict__ y, u32 n, u32 ys) {
++  const u32 r0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * R, l32 = threadIdx.x & 31;
++  if (r0 >= n) return;
++  const u32 c = rb / 210 * 256, nu = c / 32;
++  float acc[R * T];
++  #pragma unroll
++  for (u32 i = 0; i < R * T; i++) acc[i] = 0.0f;
++  for (u32 u = l32; u < nu; u += 32) {
++    const u32 b = u >> 3, hn = (u >> 2) & 1, l = 8 * (u & 3);
++    u32 La[R][2], Lb[R][2], H[R][2]; float d[R]; const u8* B[R];
++    #pragma unroll
++    for (u32 m = 0; m < R; m++) {
++      B[m] = W + (u64)(r0 + m) * rb + 210 * b;
++      for (u32 k = 0; k < 2; k++) {
++        La[m][k] = q6dp2_w4(B[m] + 64 * hn + l + 4 * k);
++        Lb[m][k] = q6dp2_w4(B[m] + 64 * hn + 32 + l + 4 * k);
++        H[m][k] = q6dp2_w4(B[m] + 128 + 32 * hn + l + 4 * k);
++      }
++      d[m] = llb_f16(*(const unsigned short*)(B[m] + 208));
++    }
++    #pragma unroll
++    for (u32 q = 0; q < 4; q++) {
++      const u32 xb = 8 * b + 4 * hn + q;
++      int w[R][2]; float ds[R];
++      #pragma unroll
++      for (u32 m = 0; m < R; m++) {
++        #pragma unroll
++        for (u32 k = 0; k < 2; k++) {
++          const u32 L = q & 1 ? Lb[m][k] : La[m][k];
++          w[m][k] = (int)__vsub4(((q >= 2 ? L >> 4 : L) & 0x0f0f0f0fu) | ((H[m][k] >> (2 * q)) & 0x03030303u) << 4, 0x20202020u);
++        }
++        ds[m] = __fmul_rn(d[m], (float)(signed char)B[m][192 + 8 * hn + 2 * q + (l >> 4)]);
++      }
++      #pragma unroll
++      for (u32 i = 0; i < T; i++) {
++        const int2 xa = *(const int2*)(qx + 2 * c * i + 32 * xb + l), xc = *(const int2*)(qx + 2 * c * i + c + 32 * xb + l);
++        const float e = dx[c / 32 * i + xb];
++        #pragma unroll
++        for (u32 m = 0; m < R; m++) {
++          const int A = __dp4a(w[m][1], xa.y, __dp4a(w[m][0], xa.x, 0)), S2 = __dp4a(w[m][1], xc.y, __dp4a(w[m][0], xc.x, 0));
++          acc[m * T + i] = __fmaf_rn(__fmul_rn(ds[m], e), (float)(127 * A + S2), acc[m * T + i]);
++        }
++      }
++    }
++  }
++  #pragma unroll
++  for (u32 i = 0; i < R * T; i++) {
++    #pragma unroll
++    for (u32 m = 16; m > 0; m >>= 1) acc[i] = __fadd_rn(acc[i], __shfl_xor_sync(0xffffffffu, acc[i], m));
++  }
++  if (l32 == 0)
++    for (u32 m = 0; m < R; m++)
++      for (u32 i = 0; i < T; i++) y[(u64)i * ys + r0 + m] = acc[m * T + i];
++}
++// R per class from mT.cu's sweep (receipts/mtp27/s0/mT-v1.txt): gu 2, down 4, Q6_K 4; Q8 1
++#define SPEC_T(T) \
++extern "C" __global__ void __launch_bounds__(128) llb_spec_gu##T(const u8* __restrict__ Wg, const u8* __restrict__ Wu, u32 rb, \
++  const signed char* __restrict__ qx, const float* __restrict__ dx, const int* __restrict__ S, float* __restrict__ yg, float* __restrict__ yu, u32 n) { \
++  spec_q4v<T, 2, 2, false>(Wg, Wu, rb, qx, dx, S, yg, yu, n, nullptr); } \
++extern "C" __global__ void __launch_bounds__(128) llb_spec_re##T(const u8* __restrict__ W, u32 rb, \
++  const signed char* __restrict__ qx, const float* __restrict__ dx, const int* __restrict__ S, float* __restrict__ y, u32 n, const float* __restrict__ x1) { \
++  spec_q4v<T, 4, 1, true>(W, nullptr, rb, qx, dx, S, y, nullptr, n, x1); } \
++extern "C" __global__ void __launch_bounds__(128) llb_spec_q8##T(u32 rb, const signed char* __restrict__ qx, \
++  const float* __restrict__ dx, Q8Cat cc, u32 ring, u32 p0) { spec_q8c<T>(rb, qx, dx, cc, ring, p0); } \
++extern "C" __global__ void __launch_bounds__(128) llb_spec_q6##T(const u8* __restrict__ W, u32 rb, \
++  const signed char* __restrict__ qx, const float* __restrict__ dx, float* __restrict__ y, u32 n, u32 ys) { \
++  spec_q6v<T, 4>(W, rb, qx, dx, y, n, ys); }
++SPEC_T(1) SPEC_T(2) SPEC_T(3) SPEC_T(4) SPEC_T(5) SPEC_T(6) SPEC_T(7) SPEC_T(8)
++#undef SPEC_T
++// llb_gated_delta out of place: S_out := the step from S_in (a spec row's state goes to
++// its own buffer, so a rejected row costs no copy back). Same ops, same order
++extern "C" __global__ void __launch_bounds__(128) llb_spec_gdl(
++  const float* __restrict__ Si, float* __restrict__ So, const float* __restrict__ q,
++  const float* __restrict__ kk, const float* __restrict__ v, const float* __restrict__ dec,
++  const float* __restrict__ bet, float* __restrict__ y, u32 heads) {
++  const u32 h = blockIdx.x, l = threadIdx.x & 31;
++  const u32 j = blockIdx.y * 4 + (threadIdx.x >> 5);
++  if (h >= heads) {
++    return;
++  }
++  const u64 so = ((u64)h * 128 + j) << 7;
++  const float4 k4 = ((const float4*)(kk + ((u64)h << 7)))[l];
++  const float4 q4 = ((const float4*)(q + ((u64)h << 7)))[l];
++  const float  decay = dec[h], beta = bet[h];
++  float4 s4 = ((const float4*)(Si + so))[l];
++  s4.x = __fmul_rn(s4.x, decay);
++  s4.y = __fmul_rn(s4.y, decay);
++  s4.z = __fmul_rn(s4.z, decay);
++  s4.w = __fmul_rn(s4.w, decay);
++  const float kv = gd_dot(s4, k4);
++  const float delta = __fmul_rn(__fsub_rn(v[((u64)h << 7) + j], kv), beta);
++  s4.x = __fadd_rn(s4.x, __fmul_rn(k4.x, delta));
++  s4.y = __fadd_rn(s4.y, __fmul_rn(k4.y, delta));
++  s4.z = __fadd_rn(s4.z, __fmul_rn(k4.z, delta));
++  s4.w = __fadd_rn(s4.w, __fmul_rn(k4.w, delta));
++  ((float4*)(So + so))[l] = s4;
++  const float yv = gd_dot(s4, q4);
++  if (l == 0) {
++    y[((u64)h << 7) + j] = yv;
++  }
++}
++
+ // The 32-element gated-delta middleware (tools/payload-linb.patch): beta :=
+ // sigmoid(bpre); dec := exp(softplus(apre + dt) * ssm_a), through F64 exactly as
+ // K.sigmoid1 / K.softplus1 / K.exp32 (flat.bend's sp.a / ex.a). One block of n
+@@ -11493,6 +11744,7 @@
+     || cuModuleGetFunction(&gpu_q8dp2, gpu_lib, "llb_q8dp2") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_q8dp2c, gpu_lib, "llb_q8dp2_cat") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_q6dp2, gpu_lib, "llb_q6dp2") != CUDA_SUCCESS
++    || !spec_load(gpu_lib)
+     || cuModuleGetFunction(&gpu_warp3, gpu_lib, "llb_warp_q3k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp2, gpu_lib, "llb_warp_q2_0") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_pq2_0") != CUDA_SUCCESS

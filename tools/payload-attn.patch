@@ -1,0 +1,192 @@
+--- a/bend2/comp.ts	2026-09-28 04:15:44.722308228 -0500
++++ b/bend2/comp.ts	2026-09-28 04:29:20.924621909 -0500
+@@ -2897,7 +2897,13 @@
+ // The warp GEMV (tools/remap.patch): a bang the device parks and the host
+ // runs as one kernel; a sequential lane cannot park it, so there it faults.
+ function is_warp(k: Name): boolean {
+-  return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp");
++  return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k);
++}
++
++// The attention bang (tools/payload-attn.patch): parked as a warp GEMV is; the
++// host runs llb_attn and then the o GEMV (llb_warp) on its output.
++function is_attn(k: Name): boolean {
++  return k === "llb.attn_warp" || k.endsWith(".llb.attn_warp");
+ }
+ 
+ // A self-jump reads its parameters back: the device's loop carries them
+@@ -3982,7 +3988,8 @@
+   const last = rs.map((r, i) =>
+     `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
+   defs.push(...[...fl.bangs].filter(is_warp)
+-    .map((k) => `#define LLB_WARP_FID ${seg_fid(k)}`));
++    .map((k) => `#define ${is_attn(k) ? "LLB_ATTN_FID" : "LLB_WARP_FID"} ${
++      seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+   `#define WL_BANK Term ${ws.join(", ")};`, "",
+   `#define WL_LOAD(A, N) \\\n  do { \\\n${load}  } while (0);`, "",
+@@ -4699,6 +4706,8 @@
+ static CUmodule   gpu_lib;
+ static CUfunction gpu_pso;
+ static CUfunction gpu_warp;
++static CUfunction gpu_attn;
++static CUdeviceptr gpu_att;
+ #endif
+ static bool io_gpu;
+ static Stk  io_stk;
+@@ -6817,8 +6826,12 @@
+   H[H_WARP + i] = t;
+ }
+ 
++#ifndef LLB_ATTN_FID
++#define LLB_ATTN_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+-#define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID)
++#define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
++  || (u32)term_aux(t) == LLB_ATTN_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7109,6 +7122,78 @@
+ }
+ #endif
+ 
++#if defined(BEND_RTC) && defined(LLB_WARP_FID)
++// K.exp32: through F64, as the interpreter's device lane evaluates it.
++INLINE float attn_exp(float x) {
++  return (float)exp((double)x);
++}
++
++// A balanced pairwise sum pushed leaf by leaf (lower index on the left): the
++// tree of flat.bend's dot / esum / vsum over 2^k leaves; sp: the stack depth.
++INLINE void attn_push(float* st, u32* sp, u32 t, float v) {
++  for (; t & 1; t >>= 1) {
++    v = __fadd_rn(st[--*sp], v);
++  }
++  st[(*sp)++] = v;
++}
++
++// flat.bend's k.score, k.prob and k.wsum of all 16 heads, a block a head: q
++// 16 x 128, kc / vc 2^dT slots of 256 (head h reads kv head h >> 3), c = dT
++// | pos << 5; att: 16 x 128. Slots t > pos are masked to -inf.
++extern "C" __global__ void __launch_bounds__(128) llb_attn(
++  const float* __restrict__ q, const float* __restrict__ kc,
++  const float* __restrict__ vc, float* __restrict__ att, u32 c) {
++  __shared__ float sc[1024];
++  __shared__ float pr[1024];
++  const u32 h = blockIdx.x, dT = c & 31, pos = c >> 5, T = 1u << dT;
++  const u32 g = (h >> 3) * 128;
++  const float scale = __fdiv_rn(1.0f, __fsqrt_rn(128.0f));
++  for (u32 t = threadIdx.x; t < T; t += blockDim.x) {
++    const float* k = kc + t * 256 + g;
++    const float* x = q + h * 128;
++    float st[8];
++    u32   sp = 0;
++    for (u32 i = 0; i < 128; i++) {
++      attn_push(st, &sp, i, __fmul_rn(k[i], x[i]));
++    }
++    sc[t] = __fmul_rn(st[0], scale);
++  }
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    const float ninf = __uint_as_float(0xFF800000u);
++    float st[11];
++    u32   sp = 0;
++    for (u32 t = 0; t < T; t++) {
++      float v = t <= pos ? sc[t] : ninf;
++      u32   i = t;
++      for (; i & 1; i >>= 1) {
++        float a = st[--sp];
++        v = a < v ? v : a;
++      }
++      st[sp++] = v;
++    }
++    const float m = st[0];
++    sp = 0;
++    for (u32 t = 0; t < T; t++) {
++      pr[t] = attn_exp(__fsub_rn(t <= pos ? sc[t] : ninf, m));
++      attn_push(st, &sp, t, pr[t]);
++    }
++    const float z = st[0];
++    for (u32 t = 0; t < T; t++) {
++      pr[t] = __fdiv_rn(pr[t], z);
++    }
++  }
++  __syncthreads();
++  const u32 j = threadIdx.x;
++  float st[11];
++  u32   sp = 0;
++  for (u32 t = 0; t < T; t++) {
++    attn_push(st, &sp, t, __fmul_rn(vc[g + j + t * 256], pr[t]));
++  }
++  att[h * 128 + j] = st[0];
++}
++#endif
++
+ #ifdef BEND_RTC
+ extern "C" __global__ void window_dev(Corpus H, Term root, u32 w, u32 h,
+   u32 k, u32* out) {
+@@ -7544,7 +7629,9 @@
+     err_fail("cannot load the GPU program");
+   }
+ #ifdef LLB_WARP_FID
+-  if (cuModuleGetFunction(&gpu_warp, gpu_lib, "llb_warp") != CUDA_SUCCESS) {
++  if (cuModuleGetFunction(&gpu_warp, gpu_lib, "llb_warp") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
++    || cuMemAlloc(&gpu_att, 2048 * 4 * LINE) != CUDA_SUCCESS) {
+     err_fail("cannot load the GPU program");
+   }
+ #endif
+@@ -7601,10 +7688,14 @@
+   u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 164;
+   Env         e    = { H, ALC[0] };
+   for (u32 j = 0; j < m; j += 1) {
+-    Loc      a  = term_loc(H[H_WARP + j]);
+-    Term     x  = H[a + 2], y = H[a + 3];
+-    u32      bs = (u32)H[a + 4], n = (u32)H[a + 5], d = (u32)H[a + 6];
+-    u32      rb = (u32)H[a + 7];
++    // an attention task (f, +wt, +q, +kc, +vc, +c, y, +wo): its o GEMV reads
++    // llb_attn's output, a slot of gpu_att (2048 x 2048 rows of wo, d = 9)
++    Term     t  = H[H_WARP + j];
++    Loc      a  = term_loc(t);
++    bool     at = (u32)term_aux(t) == LLB_ATTN_FID;
++    Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
++    u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
++    u32      d  = at ? 9 : (u32)H[a + 6], rb = at ? 8192 : (u32)H[a + 7];
+     StrParts p  = str_peek_ro(e, H[a + 1]);
+     const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
+@@ -7617,6 +7708,23 @@
+     u32   rq = rb / 16, cg = rb / 16;
+     const u32* xp = (const u32*)(H + blk_loc(H, x));
+     u32*  yp = (u32*)(H + blk_loc(H, y));
++    if (at) {
++      Term kc = H[a + 3], vc = H[a + 4];
++      u32  c  = (u32)H[a + 5], dT = c & 31;
++      if (dT > 10 || term_tag(kc) == TAG_ARR || term_tag(vc) == TAG_ARR
++        || blk_cls(kc) < dT + 8 || blk_cls(vc) < dT + 8) {
++        err_fail("warp attention: unsupported operands");
++      }
++      const u32* kp = (const u32*)(H + blk_loc(H, kc));
++      const u32* vp = (const u32*)(H + blk_loc(H, vc));
++      CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
++      void* aa[] = { &xp, &kp, &vp, &op, &c };
++      if (cuLaunchKernel(gpu_attn, 16, 1, 1, 128, 1, 1, 0, NULL, aa, NULL)
++        != CUDA_SUCCESS) {
++        err_fail("device launch failed");
++      }
++      xp = (const u32*)(uintptr_t)op;
++    }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+     if (cuLaunchKernel(gpu_warp, grid, 1, 1, 128, 1, 1, 0, NULL, args, NULL)
+       != CUDA_SUCCESS) {
+@@ -7631,7 +7739,7 @@
+     Term t  = H[H_WARP + j];
+     Loc  tl = task_tail(t);
+     Term rv[WL_RESW];
+-    rv[0]   = H[term_loc(t) + 3];
++    rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6 : 3)];
+     Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
+     if (c != 0) {
+       ring_push(H, 0, c);

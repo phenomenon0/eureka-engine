@@ -1,0 +1,40 @@
+== G1 device bytes (LLB_GGUF_VERIFY: cuMemcpyDtoH readback of every region, sha256 per tensor)
+G1 9B Q4_K_M: 427 of 427 tensors' device bytes sha256 == pack manifest, 0 not ok, 0 not read by the engine [] -> PASS
+G1 27B Q4_K_M: 851 of 851 tensors' device bytes sha256 == pack manifest, 0 not ok, 0 not read by the engine [] -> PASS
+== G2 streams, LLB_GGUF on
+9B Q8 s8: tokens IDENTICAL, logits IDENTICAL (12 lines) vs receipts/w2speed3-w3-og8full -> PASS
+9B Q8 s64: tokens IDENTICAL, logits IDENTICAL (68 lines) vs receipts/integ-base188-x64 -> PASS
+g2-q8 stream sha256 5f07a4ec32f1 (want 5f07a4ec32f1)
+off-q8 stream sha256 5f07a4ec32f1 (want 5f07a4ec32f1)
+9B Q4_K_M p3b/q4-s8: tokens IDENTICAL, logits IDENTICAL (12 lines) vs receipts/q1/p3b/q4-s8 -> PASS
+9B Q4_K_M p3b/q4-s64: tokens IDENTICAL, logits IDENTICAL (68 lines) vs receipts/q1/p3b/q4-s64 -> PASS
+9B Q4_K_M p3c/eng-p2: tokens IDENTICAL, logits IDENTICAL (83 lines) vs receipts/q1/p3c/eng-p2 -> PASS
+9B Q4_K_M p3c/eng-long: tokens IDENTICAL, logits IDENTICAL (523 lines) vs receipts/q1/p3c/eng-long -> PASS
+27B mode 9 p1 x 64: tokens IDENTICAL, logits IDENTICAL (68 lines) vs receipts/q27c/final-ab/1-fz -> PASS
+== G2 flag off (pack path, build/g2)
+off 9B Q4_K_M q4-s64: tokens IDENTICAL, logits IDENTICAL (68 lines) vs receipts/q1/p3b/q4-s64 -> PASS
+off 9B Q8 s64: tokens IDENTICAL, logits IDENTICAL (68 lines) vs receipts/integ-base188-x64 -> PASS
+off 27B mode 9 p1 x 64: tokens IDENTICAL, logits IDENTICAL (68 lines) vs receipts/q27c/final-ab/1-fz -> PASS
+== G3 load (engine's load line) and memory (MiB / KiB)
+  g12-27b            ok  resident head 1758126080 bytes + layers in 67868 ms | gpu_peak_mib 508 card_used_peak_mib 19045 host_hwm_kb 1282972 | unit peak 1.7G
+  g12-9b             ok  resident head 1406500864 bytes + layers in 19572 ms | gpu_peak_mib 406 card_used_peak_mib 6149 host_hwm_kb 989176 | unit peak 3.7G
+  g2-q8              ok  resident head 2161393664 bytes + layers in 2479 ms | gpu_peak_mib 350 card_used_peak_mib 9771 host_hwm_kb 1293856 | unit peak 10.1G
+  g3-27b-gguf-cold   ok  resident head 1758126080 bytes + layers in 15367 ms | gpu_peak_mib 292 card_used_peak_mib 16349 host_hwm_kb 505864 | unit peak 2.1G
+  g3-27b-gguf-warm   ok  resident head 1758126080 bytes + layers in 18682 ms | gpu_peak_mib 292 card_used_peak_mib 18067 host_hwm_kb 1217600 | unit peak 2G
+  g3-q4-gguf-cold    ok  resident head 1406500864 bytes + layers in 5126 ms | gpu_peak_mib 292 card_used_peak_mib 4721 host_hwm_kb 2379868 | unit peak 6.4G
+  g3-q4-gguf-warm    ok  resident head 1406500864 bytes + layers in 1168 ms | gpu_peak_mib 292 card_used_peak_mib 8737 host_hwm_kb 1294128 | unit peak 6.2G
+  g3-q8-gguf-cold    ok  resident head 2161393664 bytes + layers in 8534 ms | gpu_peak_mib 292 card_used_peak_mib 8737 host_hwm_kb 1294128 | unit peak 10G
+  g3-q8-pack-cold    ok  resident head 2161393664 bytes + layers in 5660 ms | gpu_peak_mib 292 card_used_peak_mib 7641 host_hwm_kb 947996 | unit peak 10G
+  off-27b9           ok  resident head 1758126080 bytes + layers in 77799 ms | gpu_peak_mib 508 card_used_peak_mib 19039 host_hwm_kb 1123448 | unit peak 2.9G
+  off-q4             ok  resident head 1406500864 bytes + layers in 39610 ms | gpu_peak_mib 292 card_used_peak_mib 5575 host_hwm_kb 903808 | unit peak 1.7G
+  off-q8             ok  resident head 2161393664 bytes + layers in 4507 ms | gpu_peak_mib 350 card_used_peak_mib 9801 host_hwm_kb 1163452 | unit peak 10G
+  try1-g3-q4-gguf-warm ok  resident head 1406500864 bytes + layers in 7621 ms | gpu_peak_mib 292 card_used_peak_mib 5523 host_hwm_kb 921940 | unit peak 5.4G
+  try1-off-q4        ok  resident head 1406500864 bytes + layers in 20531 ms | gpu_peak_mib 350 card_used_peak_mib 6075 host_hwm_kb 920480 | unit peak 1.4G
+== G4 Kev-4B (unit-dev: engine refuses Kev's shapes, see g4.sh)
+  device mode: hashes of cuMemcpyDtoH readbacks of managed blocks
+  /data/sys1/models/Kev-4B-Q8_0.gguf: 428 tensors, 32 layers, pack_bytes 4472829952, header parsed in 0.228 s
+    428 of 428 tensors hashed, 0 failures, 4.47 GB in 56.8 s (79 MB/s, 8 threads)
+  clean: PASS
+  exit 0
+G4 -> PASS
+FAILED / NOT RUN: none

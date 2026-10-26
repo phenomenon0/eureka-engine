@@ -1,0 +1,4 @@
+usage: llb bench MODEL [-n N] [--exact|--fast] [--spec]
+
+Time one fixed chat prompt (default -n 128); prints the summary line only.
+exit 0

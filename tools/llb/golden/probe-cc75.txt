@@ -1,0 +1,6 @@
+PASS GPU 0 of 1: FAKE (LLB_PROBE_FAKE, test only), compute 7.5, 24576 MiB, L2 6144 KiB (engine bag CUBE_LOG 6)
+PASS driver supports CUDA 13.0; this engine needs 13.0 or newer
+FAIL compute capability 7.5: needs an Ampere or newer GPU (the kernels use int8 mma.sync and cp.async; NVRTC rejects sm_75)
+     fix: run on an RTX 30xx / A100 / A-series or newer GPU
+PASS concurrent managed memory access
+exit 1

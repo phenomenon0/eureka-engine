@@ -1,0 +1,108 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -3041,6 +3041,19 @@
+   return vals;
+ }
+ 
++// Opt-in application primitive. Borrowing/ownership still comes from its Bend
++// fallback; only CUDA executes the leaf below. No cooperative block barrier.
++function gemv_leaf(k: Name, spin: boolean): string[] {
++  if (k !== "llb.gemv_tile" && !k.endsWith(".llb.gemv_tile")) return [];
++  return ["#ifdef BEND_RTC",
++    "  if (r0 <= 11 && r7 <= 4) {",
++    "    Term tile[4];",
++    "    llb_gemv_tile(e, tile, r0, r1, r2, r3, r4, r5, r6, r7, r8);",
++    ...(spin ? ["    for (u32 i = 0; i < 4; ++i) o[i] = tile[i];", "    return 1;"]
++      : ["    r0 = tile[0]; r1 = tile[1]; r2 = tile[2]; r3 = tile[3];", "    WL_RETN(4);"]),
++    "  }", "#endif"];
++}
++
+ function emit_native(fl: File, ck: Call, ers: HTerm[]): string {
+   const key = [ck.k, ...ers.map((e) => JSON.stringify(lay_of(fl.book, e)))]
+     .join("|");
+@@ -3059,6 +3072,7 @@
+   emit_body(fl, tld.h as HTerm, tld.T, ers, vals, dst);
+   fl.spins.push({ fid: name, refs: seg.refs, text: [`${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
+     seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
++  ...gemv_leaf(ck.k, true),
+   "  u32 wpoll = 0;",
+   ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
+   ...seg_take(seg).map((l) => "  " + l),
+@@ -3978,7 +3992,7 @@
+   return fl.segs.map((seg) => {
+     const out = [`  WL_CASE(${seg.fid})`, "  {",
+       ...seg_take(seg).map((l) => "    " + l),
+-      "    WL_OPEN", ...seg.spin ? ["    WL_SPIN"] : [],
++      "    WL_OPEN", ...(seg.fid === seg_fid(seg.def) ? gemv_leaf(seg.def, false) : []), ...seg.spin ? ["    WL_SPIN"] : [],
+       ...seg.lines, ...seg.spin ? ["    WL_SPUN"] : [], "  }}"];
+     return (seg.host ? ["#if !DEVICE", ...out, "#endif"] : out).join("\n");
+   }).join("\n\n");
+@@ -5680,6 +5694,68 @@
+   return x;
+ }
+ 
++#ifdef BEND_RTC
++// Each carry joins adjacent, equally sized subtrees: left + right, never a
++// running sum. Padding uses actual 0*x, including signed zero and nonfinites.
++// With d >= 2, a step loads 4 groups (16 independent loads in flight) and
++// forms tree levels 0-1 in registers, (g0 + g1) + (g2 + g3), exactly the
++// subtrees the carry would form; the carry then resumes at level 2.
++INLINE void llb_gemv_tile(Env e, THR Term* out, u32 d, Term wb, Term x,
++  u32 base, u32 rb, u32 c, u32 lo, u32 n, u32 first) {
++  StrParts p = str_peek_ro(e, wb);
++  Loc wl = term_peek_ro(e, p.data), xl = blk_loc(e.mem, x);
++  u32 lu = d >= 2 ? 2 : 0, u = 1u << lu;
++  f32 tree[12][4];
++  for (u32 g = 0; g < (1u << d); g += u) {
++    f32 xv[4][4];
++    uint4 w[4][4];
++    #pragma unroll
++    for (u32 k = 0; k < 4; ++k) {
++      if (k >= u) break;
++      u32 i = 4 * (first + g + k);
++      #pragma unroll
++      for (u32 j = 0; j < 4; ++j)
++        xv[k][j] = f32_unbox(blk_read(e.mem, false, xl, blk_at(x, i + j, 0)));
++      #pragma unroll
++      for (u32 row = 0; row < 4; ++row) {
++        if (row >= n) break;
++        w[k][row] = make_uint4(0, 0, 0, 0);
++        if (i < c) {
++          u32 at = base + (lo + row) * rb + 16 * (first + g + k);
++          const u8* ptr = (const u8*)(e.mem + wl) + p.off + at;
++          if (str_nar(p) == 2 && at <= p.len && p.len - at >= 16 && ((u64)ptr & 15) == 0) {
++            w[k][row] = *(const uint4*)ptr;
++          } else {
++            w[k][row] = make_uint4(str_word_le_peek(e, wb, at), str_word_le_peek(e, wb, at + 4),
++              str_word_le_peek(e, wb, at + 8), str_word_le_peek(e, wb, at + 12));
++          }
++        }
++      }
++    }
++    #pragma unroll
++    for (u32 row = 0; row < 4; ++row) {
++      if (row >= n) break;
++      f32 s[4];
++      #pragma unroll
++      for (u32 k = 0; k < 4; ++k) {
++        if (k >= u) break;
++        s[k] = (f32_unbox(w[k][row].x) * xv[k][0] + f32_unbox(w[k][row].y) * xv[k][1])
++             + (f32_unbox(w[k][row].z) * xv[k][2] + f32_unbox(w[k][row].w) * xv[k][3]);
++      }
++      f32 v = u == 4 ? (s[0] + s[1]) + (s[2] + s[3]) : s[0];
++      u32 level = lu;
++      for (u32 carry = g >> lu; carry & 1; carry >>= 1) {
++        v = tree[level][row] + v;
++        ++level;
++      }
++      tree[level][row] = v;
++    }
++  }
++  for (u32 row = 0; row < 4; ++row)
++    out[row] = row < n ? f32_rewrap(tree[d][row]) : 0;
++}
++#endif
++
+ // how many cells from i are in [lo, hi)
+ INLINE Nat str_span_peek(Env e, Term s, Nat i, u32 lo, u32 hi) {
+   StrParts p = str_peek_ro(e, s);

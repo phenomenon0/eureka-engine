@@ -1,0 +1,198 @@
+--- a/bend2/comp.ts	2026-10-02 08:53:13.364690571 -0500
++++ b/bend2/comp.ts	2026-10-02 10:39:30.453106737 -0500
+@@ -2902,7 +2902,16 @@
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+     || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k) || is_fbn(k)
+-    || is_linb(k) || is_aob(k) || is_qkrq(k) || is_qkrk(k) || is_slot(k);
++    || is_linb(k) || is_aob(k) || is_qkrq(k) || is_qkrk(k) || is_slot(k)
++    || is_fulb(k);
++}
++
++// The full-attention block bang (tools/payload-fulb.patch): the host runs
++// attn_norm, the q GEMV, qk-norm-rope, the k GEMV, k-norm-rope, the v GEMV,
++// the two KV-cache slot writes (kc / vc in place), attn4, the output gate and
++// the o GEMV into the bang's output y (field index 3).
++function is_fulb(k: Name): boolean {
++  return k === "llb.ful_block_warp" || k.endsWith(".llb.ful_block_warp");
+ }
+ 
+ // The full-attention output tail bang (tools/payload-aob.patch): attn4, the
+@@ -4151,9 +4160,15 @@
+       : is_silumul(k) ? "LLB_SILUMUL_FID" : is_fbn(k) ? "LLB_FBN_FID"
+       : is_linb(k) ? "LLB_LINB_FID" : is_aob(k) ? "LLB_AOB_FID"
+       : is_qkrq(k) ? "LLB_QKRQ_FID" : is_qkrk(k) ? "LLB_QKRK_FID"
+-      : is_slot(k) ? "LLB_SLOT_FID"
++      : is_slot(k) ? "LLB_SLOT_FID" : is_fulb(k) ? "LLB_FULB_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
++  // the serve path is gated on LLB_WARP_FID: keep it when a fused bang took
++  // the program's last plain GEMV (tools/payload-fulb.patch); never a task aux
++  if (defs.some((d) => d.startsWith("#define LLB_"))
++    && !defs.some((d) => d.startsWith("#define LLB_WARP_FID "))) {
++    defs.push("#define LLB_WARP_FID 0xFFFFFFFFu");
++  }
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+   `#define WL_BANK Term ${ws.join(", ")};`, "",
+   `#define WL_LOAD(A, N) \\\n  do { \\\n${load}  } while (0);`, "",
+@@ -7127,6 +7142,9 @@
+ #ifndef LLB_SLOT_FID
+ #define LLB_SLOT_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_FULB_FID
++#define LLB_FULB_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7142,7 +7160,7 @@
+   || (u32)term_aux(t) == LLB_FBN_FID || (u32)term_aux(t) == LLB_LINB_FID \
+   || (u32)term_aux(t) == LLB_AOB_FID \
+   || (u32)term_aux(t) == LLB_QKRQ_FID || (u32)term_aux(t) == LLB_QKRK_FID \
+-  || (u32)term_aux(t) == LLB_SLOT_FID)
++  || (u32)term_aux(t) == LLB_SLOT_FID || (u32)term_aux(t) == LLB_FULB_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -8629,6 +8647,52 @@
+     o->y = (u64)(H + blk_loc(H, y)) + (u64)pos * 1024 * 4;
+     return true;
+   }
++  // The full-attention block bang (tools/payload-fulb.patch): wb (1), x (2),
++  // y (3, output), kc (4), vc (5), the attn_norm / q / k / v / q-norm /
++  // k-norm / o byte offsets (6..12), c = dT | pos << 5 (13) and the Q8 row
++  // word rg (14) of the q / k / v / o rows. kc / vc come lent (the caller
++  // keeps them): a cache is written in place only when the lend is its one
++  // other holder (count 2), the slot bang's uniqueness translated.
++  if (aux == LLB_FULB_FID) {
++    Term wbt = H[a + 1], x = H[a + 2], y = H[a + 3], kct = H[a + 4], vct = H[a + 5];
++    u32  an = (u32)H[a + 6], wq = (u32)H[a + 7], wk = (u32)H[a + 8];
++    u32  wv = (u32)H[a + 9], wqn = (u32)H[a + 10], wkn = (u32)H[a + 11];
++    u32  wo = (u32)H[a + 12], c = (u32)H[a + 13], rgw = (u32)H[a + 14];
++    u32  dT = c & 31, pos = c >> 5;
++    StrParts q = str_peek_ro(e, wbt);
++    bool rgt = rgw >> 30 & 1;
++    u32  rg = rgw & (rgt ? 0x0fffffffu : 0x7fffffffu);
++    u32  fm = rgt ? rgw >> 28 & 3 : (rgw >> 31 ? 2 : rg % 17 == 0);
++    const u8* base = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fm != 1 || rg % 17 != 0
++      || dT < 1 || dT > 17 || pos >= (1u << dT)
++      || ((u64)(base + wq) & 15) != 0 || ((u64)(base + wk) & 15) != 0
++      || ((u64)(base + wv) & 15) != 0 || ((u64)(base + wo) & 15) != 0
++      || an % 4 != 0 || wqn % 4 != 0 || wkn % 4 != 0
++      || term_tag(x) == TAG_ARR || term_tag(y) == TAG_ARR
++      || term_tag(kct) == TAG_ARR || term_tag(vct) == TAG_ARR
++      || blk_cls(x) != 12 || blk_cls(y) < 12
++      || blk_cls(kct) != dT + 10 || blk_cls(vct) != dT + 10
++      || (blk_shr(kct) && (H[term_loc(kct)] & RFC_CNT) != 2)
++      || (blk_shr(vct) && (H[term_loc(vct)] & RFC_CNT) != 2)
++      || (u64)an + 4096 * 4 > q.len || (u64)wq + (u64)8192 * rg > q.len
++      || (u64)wk + (u64)1024 * rg > q.len || (u64)wv + (u64)1024 * rg > q.len
++      || (u64)wo + (u64)4096 * rg > q.len
++      || (u64)wqn + 256 * 4 > q.len || (u64)wkn + 256 * 4 > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 22;
++    o->w   = (u64)base;
++    o->x   = (u64)(H + blk_loc(H, x));
++    o->y   = (u64)(H + blk_loc(H, y));
++    o->k   = (u64)(H + blk_loc(H, kct));
++    o->v   = (u64)(H + blk_loc(H, vct));
++    o->ban = an; o->bq = wq; o->bg = wk; o->bb = wv;
++    o->ba = wqn; o->bsa = wkn; o->bdt = wo;
++    o->c = c; o->brg = rg; o->fm = 1;
++    return true;
++  }
+   if (aux == LLB_AOB_FID) {
+     // q|gate as one 8192 buffer, q heads then gates (tools/payload-aqg.patch)
+     Term wbt = H[a + 1], qt = H[a + 2], kct = H[a + 3];
+@@ -8704,7 +8768,8 @@
+         || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
+         || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID || hx == LLB_SILUMUL_FID
+         || hx == LLB_FBN_FID || hx == LLB_LINB_FID || hx == LLB_AOB_FID
+-        || hx == LLB_QKRQ_FID || hx == LLB_QKRK_FID || hx == LLB_SLOT_FID) {
++        || hx == LLB_QKRQ_FID || hx == LLB_QKRK_FID || hx == LLB_SLOT_FID
++        || hx == LLB_FULB_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -9276,6 +9341,15 @@
+         a32_sub_rel(a32_at(H, term_loc(kv)), 1);
+       }
+     }
++    // the full-attention block's caches (fields 4, 5) come lent the same way
++    // (tools/payload-fulb.patch)
++    for (u32 f = 4; (u32)term_aux(t) == LLB_FULB_FID && f < 6; f += 1) {
++      Term kv = H[term_loc(t) + f];
++      if (!term_triv(kv) && term_rfc(kv)
++        && (H[term_loc(kv)] & RFC_CNT) > 1) {
++        a32_sub_rel(a32_at(H, term_loc(kv)), 1);
++      }
++    }
+     Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
+     if (c != 0) {
+       ring_push(H, 0, c);
+@@ -10120,6 +10194,62 @@
+             != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 22) {
++        // the full-attention block bang (tools/payload-fulb.patch): the
++        // kernels, grids and arguments of the rmsnorm, q GEMV, qkr(q), k
++        // GEMV, qkr(k), v GEMV, slot, slot and aob bangs, in that order, on
++        // gpu_blk scratch instead of the interpreter's arrays
++        if (m != 1) {
++          err_fail("warp fulb: gpu_blk scratch needs a one-task batch");
++        }
++        u64 base22 = o->w, xp22 = o->x, kcp22 = o->k, vcp22 = o->v;
++        u64 anp22 = base22 + o->ban, wqp22 = base22 + o->bq, wkp22 = base22 + o->bg;
++        u64 wvp22 = base22 + o->bb, wqnp22 = base22 + o->ba, wknp22 = base22 + o->bsa;
++        u64 wop22 = base22 + o->bdt;
++        u32 c22 = o->c, pos22 = c22 >> 5, rg22 = o->brg, cg22 = rg22 / 17 * 4;
++        u64 kslot22 = kcp22 + (u64)pos22 * 1024 * 4, vslot22 = vcp22 + (u64)pos22 * 1024 * 4;
++        u64 s22 = gpu_atts, p22 = gpu_atts + ((u64)16 << 17) * 4;
++        CUdeviceptr attn22 = gpu_blk, gated22 = attn22 + 4096 * 4;
++        CUdeviceptr h22 = gpu_blk + 8192 * 4, qgn22 = h22 + 4096 * 4;
++        CUdeviceptr qg22 = qgn22 + 8192 * 4, gate22 = qg22 + 4096 * 4;
++        CUdeviceptr kb22 = qg22 + 8192 * 4, kn22 = kb22 + 1024 * 4, vb22 = kn22 + 1024 * 4;
++        u32 n4 = 4096, n8192 = 8192, n1024 = 1024, d10 = 10, one = 1, zero = 0;
++        u32 rq22 = 8192 / 512, rk22 = 1024 / 256, gog22 = (4096 + 1023) / 1024;
++        void* r22[] = { &xp22, &anp22, &h22, &n4 };
++        void* q22[] = { &wqp22, &rg22, &cg22, &h22, &qgn22, &n8192, &d10 };
++        void* qr22[] = { &qgn22, &wqnp22, &qg22, &n8192, &one, &pos22 };
++        void* k22[] = { &wkp22, &rg22, &cg22, &h22, &kb22, &n1024, &d10 };
++        void* kr22[] = { &kb22, &wknp22, &kn22, &n1024, &zero, &pos22 };
++        void* v22[] = { &wvp22, &rg22, &cg22, &h22, &vb22, &n1024, &d10 };
++        void* sk22[] = { &kn22, &kslot22 };
++        void* sv22[] = { &vb22, &vslot22 };
++        void* a22[] = { &qg22, &kcp22, &vcp22, &attn22, &s22, &p22, &c22 };
++        void* g22[] = { &attn22, &gate22, &gated22, &n4 };
++        void* o22[] = { &wop22, &rg22, &cg22, &gated22, &yp, &n4, &d10 };
++        if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, r22, NULL)
++          != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, q22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_qkr, rq22, 1, 1, 256, 1, 1, 0, NULL, qr22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, k22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_qkr, rk22, 1, 1, 256, 1, 1, 0, NULL, kr22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, v22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, sk22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, sv22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_attn4, 16, 1, 1, 256, 1, 1, 0, NULL, a22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_og, gog22, 1, 1, 1024, 1, 1, 0, NULL, g22, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, o22, NULL)
++            != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else if (o->kind == 19) {
+         // the full-attention output tail bang (tools/payload-aob.patch):
+         // attn4(q, kc, vc) -> outputgate(attn, gate) -> the o GEMV into y

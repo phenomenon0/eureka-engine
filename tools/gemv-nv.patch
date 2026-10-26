@@ -1,0 +1,173 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -7676,21 +7676,35 @@
+   return q8_dot(*(const u32*)(row + 4 * g), s, xg(x, g));
+ }
+ 
++// The vblock count NV = 2^(d - 7) as a template parameter (tools/gemv-nv.patch):
++// the loop over vblocks and the carry tree's occ / b fold to constants, the
++// same leaves, butterfly and tree in the same order (bit-exact; gated). The
++// quant words load with L1::no_allocate so the streamed weights do not evict
++// x from L1 (x is 4 bytes a weight byte); a cache policy, not a value change.
++__device__ __forceinline__ uint4 q8_wld(const u8* p) {
++  uint4 v;
++  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
++    : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
++  return v;
++}
++
++template <u32 NV>
+ __device__ __forceinline__ void warp_dq_q8_rw(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+   const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
+-  const u32 nv = 1u << (d - 7);
++  const u32 nv = NV != 0 ? NV : 1u << (d - 7);
+   for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
+     r += nw) {
+     const u8* row = W + (u64)r * rb;
+     float slot[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+     u32 occ = 0;
++    #pragma unroll 1
+     for (u32 j = 0; j < nv; j++) {
+       u32 g0 = 128 * j + 4 * l;
+       float v;
+       if (g0 + 3 < cg) {
+-        uint4 q = *(const uint4*)(row + 4 * g0);
++        uint4 q = q8_wld(row + 4 * g0);
+         float s = llb_f16(*(const unsigned short*)
+           (row + 4 * cg + 2 * (g0 >> 3)));
+         v = __fadd_rn(__fadd_rn(q8_dot(q.x, s, xg(x, g0)),
+@@ -7708,17 +7722,109 @@
+         float o = __shfl_xor_sync(0xffffffffu, v, m);
+         v = (l & m) ? __fadd_rn(o, v) : __fadd_rn(v, o);
+       }
++      // the carry: slot b absorbs v while occupied, low slots first, as
++      // the shipped while loop, with constant slot indices
+       u32 b = 0;
+-      while (occ & (1u << b)) {
+-        v = __fadd_rn(slot[b], v);
+-        occ &= ~(1u << b);
+-        b += 1;
++      #pragma unroll
++      for (u32 t = 0; t < 6; t++) {
++        if (b == t && (occ & (1u << t))) {
++          v = __fadd_rn(slot[t], v);
++          occ &= ~(1u << t);
++          b = t + 1;
++        }
++      }
++      #pragma unroll
++      for (u32 t = 0; t < 6; t++) {
++        if (b == t) {
++          slot[t] = v;
++        }
+       }
+-      slot[b] = v;
+       occ |= 1u << b;
+     }
+     if (l == 0) {
+-      y[r] = __float_as_uint(slot[31 - __clz(occ)]);
++      float o = slot[0];
++      #pragma unroll
++      for (u32 t = 1; t < 6; t++) {
++        if (occ >> t) {
++          o = slot[t];
++        }
++      }
++      y[r] = __float_as_uint(o);
++    }
++  }
++}
++
++// A block a row, warp w its quarter: vblocks w NV/4 .. (w + 1) NV/4 - 1. With NV
++// a power of 2 the carry tree is perfect, each quarter is one of its subtrees,
++// and the row is (Q0 + Q1) + (Q2 + Q3): the same bits as a warp a row. For
++// rows past the grid's warps (n < 4 gridDim) and the 12288-wide rows, where a
++// warp a row leaves a latency-bound tail.
++template <u32 NV>
++__device__ __forceinline__ void warp_dq_q8_split(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n) {
++  __shared__ float qs[2][4];
++  const u32 l = threadIdx.x & 31, w = threadIdx.x >> 5;
++  u32 par = 0;
++  for (u32 r = blockIdx.x; r < n; r += gridDim.x, par ^= 1) {
++    const u8* row = W + (u64)r * rb;
++    float slot[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++    u32 occ = 0;
++    #pragma unroll 1
++    for (u32 jj = 0; jj < NV / 4; jj++) {
++      u32 j = w * (NV / 4) + jj;
++      u32 g0 = 128 * j + 4 * l;
++      float v;
++      if (g0 + 3 < cg) {
++        uint4 q = q8_wld(row + 4 * g0);
++        float s = llb_f16(*(const unsigned short*)
++          (row + 4 * cg + 2 * (g0 >> 3)));
++        v = __fadd_rn(__fadd_rn(q8_dot(q.x, s, xg(x, g0)),
++          q8_dot(q.y, s, xg(x, g0 + 1))),
++          __fadd_rn(q8_dot(q.z, s, xg(x, g0 + 2)),
++            q8_dot(q.w, s, xg(x, g0 + 3))));
++      } else {
++        v = __fadd_rn(__fadd_rn(q8_leaf_g(row, cg, g0, x),
++          q8_leaf_g(row, cg, g0 + 1, x)),
++          __fadd_rn(q8_leaf_g(row, cg, g0 + 2, x),
++            q8_leaf_g(row, cg, g0 + 3, x)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        float o = __shfl_xor_sync(0xffffffffu, v, m);
++        v = (l & m) ? __fadd_rn(o, v) : __fadd_rn(v, o);
++      }
++      u32 b = 0;
++      #pragma unroll
++      for (u32 t = 0; t < 6; t++) {
++        if (b == t && (occ & (1u << t))) {
++          v = __fadd_rn(slot[t], v);
++          occ &= ~(1u << t);
++          b = t + 1;
++        }
++      }
++      #pragma unroll
++      for (u32 t = 0; t < 6; t++) {
++        if (b == t) {
++          slot[t] = v;
++        }
++      }
++      occ |= 1u << b;
++    }
++    if (l == 0) {
++      float o = slot[0];
++      #pragma unroll
++      for (u32 t = 1; t < 6; t++) {
++        if (occ >> t) {
++          o = slot[t];
++        }
++      }
++      qs[par][w] = o;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++      y[r] = __float_as_uint(__fadd_rn(__fadd_rn(qs[par][0], qs[par][1]),
++        __fadd_rn(qs[par][2], qs[par][3])));
+     }
+   }
+ }
+@@ -7726,7 +7832,15 @@
+ extern "C" __global__ void __launch_bounds__(128) llb_warp_q8(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+-  warp_dq_q8_rw(W, rb, cg, x, y, n, d);
++  if (d == 10 && n < 4 * gridDim.x) {
++    warp_dq_q8_split<8>(W, rb, cg, x, y, n);
++  } else if (d == 10) {
++    warp_dq_q8_rw<8>(W, rb, cg, x, y, n, d);
++  } else if (d == 12) {
++    warp_dq_q8_split<32>(W, rb, cg, x, y, n);
++  } else {
++    warp_dq_q8_rw<0>(W, rb, cg, x, y, n, d);
++  }
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128) llb_warp_f16(

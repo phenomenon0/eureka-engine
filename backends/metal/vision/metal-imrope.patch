@@ -1,0 +1,94 @@
+--- a/bend2/comp.ts	2026-10-07 18:26:56
++++ b/bend2/comp.ts	2026-10-07 18:27:21
+@@ -7315,6 +7315,7 @@
+   u64 a[8];
+   u32 n, c, k;
+   f32 f;
++  u32 mr[4];
+ } HybArgs;
+ 
+ // lane m26 (tools/metal-f27.patch): the 27B fast chunk's arguments. HybTArgs:
+@@ -7326,7 +7327,25 @@
+   u64 a[8], s[8];
+   u32 n, c, k;
+   f32 f;
++  u32 mr[4];
+ } HybTArgs;
++
++// (ENGINE-VISION2 V4, patches/metal-imrope.patch) IMRoPE. The rope kernels' pos
++// is the KV SLOT (the cache row written and the causal bound); the rope ANGLE
++// takes the position LLB_MRP(A, slot, t) of rotary pair t (sector t % 3: 0 t,
++// 1 h, 2 w; ggml's imrope with sections [11, 11, 10], every t < 32 inside
++// them). mr = {s0, n, nx, sh}: one image of n rows at slots s0 .. s0 + n - 1 in
++// raster order of width nx gets (t, h, w) = (s0, s0 + i / nx, s0 + i % nx)
++// (mtmd's MTMD_POS_TYPE_MROPE, i = slot - s0); slots after it resume at
++// slot - sh (sh = n - max(nx, ny): mtmd's n_pos); slots before it are
++// themselves. mr[1] == 0 (every text-only run: m9_args / f27_targs copy the
++// host's llb_mr, zero unless an image prompt set it) is the slot in all three
++// sectors, the expression the kernels had
++#define LLB_MRP(A, s, t) ((A).mr[1] == 0 || (s) < (A).mr[0] ? (s) \
++  : (s) - (A).mr[0] >= (A).mr[1] ? (s) - (A).mr[3] \
++  : (t) % 3 == 0 ? (A).mr[0] \
++  : (t) % 3 == 1 ? (A).mr[0] + ((s) - (A).mr[0]) / (A).mr[2] \
++  : (A).mr[0] + ((s) - (A).mr[0]) % (A).mr[2])
+ 
+ typedef struct {
+   u64 w[4], y[4];
+@@ -11816,7 +11835,7 @@
+   const float s = 1.0f / sqrt(a[0] / 256.0f + as_type<float>(0x358637BDu));
+   const float v = (xv * s) * w[t];
+   if (t < 32) {
+-    const float th = (float)pos * x32_pow(10000000.0f, -(float)(2 * t) / 64.0f);
++    const float th = (float)LLB_MRP(A, pos, t) * x32_pow(10000000.0f, -(float)(2 * t) / 64.0f);
+     const float co = x32_cos(th), si = x32_sin(th);
+     const float b = (xb * s) * w[t + 32];
+     yr[2 * t]     = v * co - b * si;
+@@ -13370,7 +13389,7 @@
+   const float s = 1.0f / sqrt(a[0] / 256.0f + as_type<float>(0x358637BDu));
+   const float v = (xv * s) * w[t];
+   if (t < 32) {
+-    const float th = (float)pos * x32_pow(10000000.0f, -(float)(2 * t) / 64.0f);
++    const float th = (float)LLB_MRP(A, pos, t) * x32_pow(10000000.0f, -(float)(2 * t) / 64.0f);
+     const float co = x32_cos(th), si = x32_sin(th);
+     const float b = (xb * s) * w[t + 32];
+     yr[2 * t]     = v * co - b * si;
+@@ -13392,7 +13411,7 @@
+   device float* cs = sa_f(C, S, A.a[3]);
+   const u32 pos = A.k;
+   if (t < 32) {
+-    const float th = (float)pos * x32_pow(10000000.0f, -(float)(2 * t) / 64.0f);
++    const float th = (float)LLB_MRP(A, pos, t) * x32_pow(10000000.0f, -(float)(2 * t) / 64.0f);
+     const float co = x32_cos(th), si = x32_sin(th);
+     cs[t] = co;
+     cs[32 + t] = si;
+@@ -15412,12 +15431,22 @@
+   m28_bar(en);
+ }
+ 
++// (ENGINE-VISION2 V4) the image map every rope launch carries (LLB_MRP): zero
++// = text only; set by an image prompt (llb_mr_set), cleared when it ends
++static u32 llb_mr[4];
++
++static void llb_mr_set(u32 s0, u32 n, u32 nx, u32 ny) {
++  llb_mr[0] = s0; llb_mr[1] = n; llb_mr[2] = nx;
++  llb_mr[3] = n == 0 ? 0 : n - (nx > ny ? nx : ny);
++}
++
+ static void m9_args(HybArgs* A, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
+   u64 a5, u64 a6, u32 n, u32 c, u32 k, f32 f) {
+   memset(A, 0, sizeof *A);
+   A->a[0] = a0; A->a[1] = a1; A->a[2] = a2; A->a[3] = a3;
+   A->a[4] = a4; A->a[5] = a5; A->a[6] = a6;
+   A->n = n; A->c = c; A->k = k; A->f = f;
++  memcpy(A->mr, llb_mr, sizeof llb_mr);
+ }
+ 
+ // one llb_warp_q8 (fm 1) or llb_warp (fm 0) launch: n rows of rb bytes at
+@@ -16173,6 +16202,7 @@
+ static void f27_targs(HybTArgs* T, u32 n, u32 cc, u32 k, f32 f) {
+   memset(T, 0, sizeof *T);
+   T->n = n; T->c = cc; T->k = k; T->f = f;
++  memcpy(T->mr, llb_mr, sizeof llb_mr);
+ }
+ 
+ #define F27_TS ((u64)F27_TB * 4)

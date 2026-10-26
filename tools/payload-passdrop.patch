@@ -1,0 +1,25 @@
+--- a/bend2/comp.ts	2026-10-18 02:30:07.235184331 -0500
++++ b/bend2/comp.ts	2026-10-18 02:30:28.081888973 -0500
+@@ -11902,6 +11902,22 @@
+       ring_push(H, 0, c);
+       k += 1;
+     }
++    // the pass bang's body (skipped: the host served it) would sink its Terms ws,
++    // x, eb, hb, tb (fields 1, 2, 49, 51, 64; y, field 3, is the result) and
++    // FID_ENTER would free its words; a parked task does neither, so each step left
++    // x (2^12 F32), the task words and the lends: ~17 KB a token
++    // (tools/payload-passdrop.patch). Both here, on device lane 0's allocator:
++    // bend_dev runs on this stream, never beside it, and its dev_cut banks the rest
++    if ((u32)term_aux(t) == LLB_PASS_FID) {
++      Env pe = { H, H + ALC_OFF };
++      Loc pa = term_loc(t);
++      term_sink(pe, H[pa + 1]);
++      term_sink(pe, H[pa + 2]);
++      term_sink(pe, H[pa + 49]);
++      term_sink(pe, H[pa + 51]);
++      term_sink(pe, H[pa + 64]);
++      heap_free(pe, cls_fit(fid_arity(LLB_PASS_FID) + 2), pa);
++    }
+   }
+   a32_store(a32_at(H, H_WARP_N), 0);
+   a32_store(a32_at(H, H_CURSOR), k);

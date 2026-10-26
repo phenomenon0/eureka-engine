@@ -1,0 +1,164 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4923,7 +4923,7 @@
+ static CUfunction gpu_embed;
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
+-static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpq2;
++static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_blk;
+ static CUdeviceptr gpu_logit;
+@@ -7694,15 +7694,32 @@
+   return v;
+ }
+ 
+-template <u32 NV>
++// GEMVs over one x as one launch (P3-3h): row r of segment s (rows
++// end[s - 1] .. end[s] - 1) is W[s]'s row r - end[s - 1] into y[s]; a row's
++// body is unchanged, so each y is the same bits as its own launch.
++struct Q8Cat {
++  const u8* W[4];
++  u32*      y[4];
++  u32       end[4];
++};
++
++template <u32 NV, bool CAT = false>
+ __device__ __forceinline__ void warp_dq_q8_rw(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+-  u32* __restrict__ y, u32 n, u32 d) {
++  u32* __restrict__ y, u32 n, u32 d, Q8Cat cat = Q8Cat{}) {
+   const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
+   const u32 nv = NV != 0 ? NV : 1u << (d - 7);
+   for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
+     r += nw) {
+     const u8* row = W + (u64)r * rb;
++    u32*      yr  = y + r;
++    if (CAT) {
++      const u32 e0 = cat.end[0], e1 = cat.end[1], e2 = cat.end[2];
++      const u32 r0 = r < e0 ? r : r < e1 ? r - e0 : r < e2 ? r - e1 : r - e2;
++      row = (r < e0 ? cat.W[0] : r < e1 ? cat.W[1] : r < e2 ? cat.W[2] : cat.W[3])
++        + (u64)r0 * rb;
++      yr  = (r < e0 ? cat.y[0] : r < e1 ? cat.y[1] : r < e2 ? cat.y[2] : cat.y[3]) + r0;
++    }
+     float slot[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+     u32 occ = 0;
+     #pragma unroll 1
+@@ -7755,7 +7772,7 @@
+           o = slot[t];
+         }
+       }
+-      y[r] = __float_as_uint(o);
++      *yr = __float_as_uint(o);
+     }
+   }
+ }
+@@ -7858,6 +7875,12 @@
+   warp_dq_q8_split<32>(W, rb, cg, x, y, n, blockIdx.x, gridDim.x, res);
+ }
+ 
++// d = 10 GEMVs over one x in one launch, a warp a row (tools/payload-cat.patch)
++extern "C" __global__ void __launch_bounds__(128) llb_warp_q8_cat(
++  u32 rb, u32 cg, const u32* __restrict__ x, Q8Cat c) {
++  warp_dq_q8_rw<8, true>(c.W[0], rb, cg, x, c.y[0], c.end[3], 10, c);
++}
++
+ // two short d = 10 GEMVs over one x (linb's beta / alpha): half the grid each
+ extern "C" __global__ void __launch_bounds__(128) llb_warp_q8_two(
+   const u8* __restrict__ W0, const u8* __restrict__ W1, u32 rb, u32 cg,
+@@ -10311,7 +10334,8 @@
+     || cuModuleGetFunction(&gpu_l2qk, gpu_lib, "llb_l2norm_qk") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_midconv, gpu_lib, "llb_midconv") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpqr, gpu_lib, "llb_warp_q8_res") != CUDA_SUCCESS
+-    || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_q8_two") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpqt, gpu_lib, "llb_warp_q8_two") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warpqc, gpu_lib, "llb_warp_q8_cat") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_blk, 49152 * 4) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+@@ -10387,6 +10411,13 @@
+ // The fbn / linb / fulb chains (tools/payload-fbn, -linb, -fulb.patch) as
+ // functions of the op, its output y and the GEMV grid: their warp_serve
+ // branches and the pass bang (tools/payload-pass.patch) run the same launches
++// the device's Q8Cat as launch bytes: 4 + 4 device pointers, 4 row ends
++typedef struct {
++  u64 W[4];
++  u64 y[4];
++  u32 end[4];
++} Q8Cat;
++
+ static void llb_fbn_run(volatile WarpOp* o, u64 yp, u32 grid) {
+   // the FFN block bang (tools/payload-fbn.patch): rms(post, x + a), the
+   // gate and up GEMVs, silu, the down GEMV, the residual add -- one task
+@@ -10402,14 +10433,15 @@
+   void* rb17[] = { &xp17, &ap17, &postp17, &x1b, &h2b, &n4 };
+   void* gg17[] = { &fgp17, &rg17, &cgu, &h2b, &ggb, &ngu, &dgu };
+   void* uu17[] = { &fup17, &rg17, &cgu, &h2b, &uub, &ngu, &dgu };
++  Q8Cat c17 = { { fgp17, fup17, 0, 0 }, { ggb, uub, 0, 0 }, { ngu, 2 * ngu, 2 * ngu, 2 * ngu } };
++  void* gu17[] = { &rg17, &cgu, &h2b, &c17 };
++  (void)gg17; (void)uu17;
+   void* ss17[] = { &ggb, &uub, &aab, &ngu };
+   void* dd17[] = { &fdp17, &rd17, &cgd, &aab, &yp, &n4, &x1b };
+   (void)dfd; (void)ddb; (void)vaddG;
+   if (cuLaunchKernel(gpu_rnadd, 1, 1, 1, 1024, 1, 1, 0, NULL, rb17, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, gg17, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, uu17, NULL)
++    || cuLaunchKernel(gpu_warpqc, grid, 1, 1, 128, 1, 1, 0, NULL, gu17, NULL)
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_silu, siluG, 1, 1, 256, 1, 1, 0, NULL, ss17, NULL)
+       != CUDA_SUCCESS
+@@ -10444,6 +10476,10 @@
+   void* q18[] = { &wqkvp18, &rg18, &cg18, &hb18, &qkvp18, &n8192, &d10 };
+   void* z18[] = { &gtp, &rg18, &cg18, &hb18, &zz, &n4, &d10 };
+   void* ba18[] = { &bop, &aop, &rg18, &cg18, &hb18, &bpre, &apre, &n32 };
++  Q8Cat qc18 = { { wqkvp18, gtp, bop, aop }, { qkvp18, zz, bpre, apre },
++    { n8192, n8192 + n4, n8192 + n4 + n32, n8192 + n4 + 2 * n32 } };
++  void* c18[] = { &rg18, &cg18, &hb18, &qc18 };
++  (void)q18; (void)z18; (void)ba18;
+   void* mc18[] = { &bpre, &apre, &dtp, &sap, &beta, &dec, &n32,
+     &cvp, &qkvp18, &h0p, &h1p, &h2p, &cnv, &n8192 };
+   void* l18[] = { &cnv, &cnvk, &qt, &kt, &sq.f, &hs16 };
+@@ -10453,11 +10489,7 @@
+   void* o18[] = { &sop, &rg18, &cg18, &normed, &yp, &n4, &d10 };
+   if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, r18, NULL)
+     != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, q18, NULL)
+-      != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, z18, NULL)
+-    != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq2, 2 * n32, 1, 1, 128, 1, 1, 0, NULL, ba18, NULL)
++    || cuLaunchKernel(gpu_warpqc, grid, 1, 1, 128, 1, 1, 0, NULL, c18, NULL)
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_midconv, 1 + gconv, 1, 1, 256, 1, 1, 0, NULL, mc18, NULL)
+       != CUDA_SUCCESS
+@@ -10493,6 +10525,10 @@
+   void* k22[] = { &wkp22, &rg22, &cg22, &h22, &kb22, &n1024, &d10 };
+   void* kr22[] = { &kb22, &wknp22, &kn22, &n1024, &zero, &pos22 };
+   void* v22[] = { &wvp22, &rg22, &cg22, &h22, &vb22, &n1024, &d10 };
++  Q8Cat qc22 = { { wqp22, wkp22, wvp22, 0 }, { qgn22, kb22, vb22, 0 },
++    { n8192, n8192 + n1024, n8192 + 2 * n1024, n8192 + 2 * n1024 } };
++  void* qv22[] = { &rg22, &cg22, &h22, &qc22 };
++  (void)q22; (void)k22; (void)v22;
+   void* sk22[] = { &kn22, &kslot22 };
+   void* sv22[] = { &vb22, &vslot22 };
+   void* a22[] = { &qg22, &kcp22, &vcp22, &attn22, &s22, &p22, &c22 };
+@@ -10500,16 +10536,12 @@
+   void* o22[] = { &wop22, &rg22, &cg22, &gated22, &yp, &n4, &d10 };
+   if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, r22, NULL)
+     != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, q22, NULL)
++    || cuLaunchKernel(gpu_warpqc, grid, 1, 1, 128, 1, 1, 0, NULL, qv22, NULL)
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_qkr, rq22, 1, 1, 256, 1, 1, 0, NULL, qr22, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, k22, NULL)
+-      != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_qkr, rk22, 1, 1, 256, 1, 1, 0, NULL, kr22, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, v22, NULL)
+-      != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, sk22, NULL)
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_slot, 1, 1, 1, 1024, 1, 1, 0, NULL, sv22, NULL)

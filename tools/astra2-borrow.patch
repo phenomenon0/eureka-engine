@@ -1,0 +1,57 @@
+--- a/bend2/base.bend
++++ b/bend2/base.bend
+@@ -5782,6 +5782,14 @@
+ def Array.get(-T: Data, a: Array<T>, +i: U32) -> Array<T> & T:
+   Array.get.at(T, i, Array.size(T, a))
+
++# Scalar read with Array.get's wrapping; the native call borrows its handle.
++def Array.peek_f32.fin(r: Array<F32> & F32) -> F32:
++  (rest, value) = r
++  value
++
++def Array.peek_f32(a: Array<F32>, +i: U32) -> F32:
++  Array.peek_f32.fin(Array.get(F32, a, i))
++
+ # Array.get4: slots i..i+3, each wrapped as by Array.get (natively one
+ # range check for the four, so C can widen the loads).
+ def Array.get4.d(-T: Data, x0: T, x1: T, x2: T, r: Array<T> & T) ->
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -433,6 +433,10 @@
+     JS: "bytes_find_byte($0, $1, $2)" },
+   bytes_find_any: { C: "str_find_any_peek(e, $0, $1, $2, $3, $4, $5)", peek: [0],
+     JS: "bytes_find_any($0, $1, $2, $3, $4, $5)" },
++  array_peek_f32: {
++    C: "blk_read(e.mem, false, blk_loc(e.mem, $0), blk_at($0, $1, 0))",
++    peek: [0], JS: "$0[$1 % $0.length]",
++  },
+   // the C lane lays these out by the element (arr_op)
+   ...Object.fromEntries(Object.entries({
+     new: "array_new($0, $1)", set: "($0[$1 % $0.length] = $2, $0)",
+@@ -1790,12 +1794,12 @@
+   });
+ }
+
+-// A def's borrowed parameters (a box, not an Array, not owned), fixed a pass.
++// A def's borrowed parameters (a box, not owned), fixed a pass.
+ function brw_of(cb: Carb, k: Name): boolean[] {
+   return memo(BRWS, k, () => {
+-    const { live, lays } = sig_def(cb, k);
++    const { lays } = sig_def(cb, k);
+     return lays.map((l, i) => done_live(def_body(cb, k)) && l.ks.includes("box")
+-      && ty_adt(cb.book, live[i][2])?.k !== "Array" && !cb.own.has(k + "~" + i));
++      && !cb.own.has(k + "~" + i));
+   });
+ }
+
+@@ -4081,6 +4085,10 @@
+   if (intr !== null) {
+     const xs = exprs.map((e) => ATOM.test(e) || STRLIT.test(e)
+       ? e : emit_hold(fl, [e], "x")[0]);
++    // Finish the read before a later argument can mutate an alias.
++    if (k === "Array.peek_f32") {
++      return emit_hold(fl, [tpl(intr, xs)], "x")[0];
++    }
+     return tpl(intr, xs);
+   }
+   const call = js_sat(k) + "(" + exprs.join(", ") + ")";

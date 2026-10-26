@@ -1,0 +1,2 @@
+'<LLB_HOME>/bin/llb-tok' 'run' '<LLB_HOME>/18973870528-1791222753-6b0330ea8cfefdfe' '-m' '27b' '-P' '5' '--log' '<LLB_HOME>/last.log' '--' 'env' 'LLB_GGUF=<MODELS>/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf' 'LLB_Q4_DP4A=9' 'LLB_PREFILL=fast' 'stdbuf' '-oL' '<ENGINE>' '--gpu' '40GB' '--threads' '<T>' '--' '<LLB_HOME>/18973870528-1791222753-6b0330ea8cfefdfe' '760' '6511' '314' '9338' '369' '--steps' '16' 
+exit 0

@@ -1,0 +1,197 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -8278,47 +8278,86 @@
+   float* sh = sc + (u64)h * (1u << 17);
+   float* ph = pr + (u64)h * (1u << 17);
+   const float* qh = q + (u64)h * 256;
+-  for (u32 t = threadIdx.x; t < T; t += blockDim.x) {
++  // Only slots t <= pos are live: the trees run over T2 = the power of two
++  // >= pos + 1 (masked leaves -inf / +0 as before). The 2^dT tree is that tree
++  // with all-masked right subtrees, i.e. max(m, -inf) = m and r + (+0): so the
++  // pairwise levels below (lower index on the left, as attn_push) and one + 0
++  // when T2 < T give the same bits. Unwritten kc / vc slots are +0.
++  __shared__ float qs[256];
++  qs[threadIdx.x] = qh[threadIdx.x];
++  __syncthreads();
++  const u32 n = pos < T ? pos + 1 : T;
++  u32 T2 = 1;
++  while (T2 < n) {
++    T2 <<= 1;
++  }
++  for (u32 t = threadIdx.x; t < T2; t += blockDim.x) {
++    if (t >= n) {
++      ph[t] = sh[t] = ninf;
++      continue;
++    }
+     const float* k = kc + (u64)t * 1024 + g;
+     float st[9];
+     u32   sp = 0;
+-    for (u32 i = 0; i < 256; i++) {
+-      attn_push(st, &sp, i, __fmul_rn(k[i], qh[i]));
++    // 16 loads in flight, then their pushes in order (same tree)
++    for (u32 i0 = 0; i0 < 256; i0 += 16) {
++      float kk[16];
++#pragma unroll
++      for (u32 u = 0; u < 16; u++) {
++        kk[u] = k[i0 + u];
++      }
++#pragma unroll
++      for (u32 u = 0; u < 16; u++) {
++        attn_push(st, &sp, i0 + u, __fmul_rn(kk[u], qs[i0 + u]));
++      }
+     }
+-    sh[t] = __fmul_rn(st[0], scale);
++    ph[t] = sh[t] = __fmul_rn(st[0], scale);
+   }
+   __syncthreads();
+-  if (threadIdx.x == 0) {
+-    float st[18];
+-    u32   sp = 0;
+-    for (u32 t = 0; t < T; t++) {
+-      float v = t <= pos ? sh[t] : ninf;
+-      u32   i = t;
+-      for (; i & 1; i >>= 1) {
+-        float a = st[--sp];
+-        v = a < v ? v : a;
+-      }
+-      st[sp++] = v;
+-    }
+-    const float m = st[0];
+-    sp = 0;
+-    for (u32 t = 0; t < T; t++) {
+-      ph[t] = attn_exp(__fsub_rn(t <= pos ? sh[t] : ninf, m));
+-      attn_push(st, &sp, t, ph[t]);
+-    }
+-    const float z = st[0];
+-    for (u32 t = 0; t < T; t++) {
+-      ph[t] = __fdiv_rn(ph[t], z);
++  for (u32 s = 1; s < T2; s <<= 1) {
++    for (u32 t = threadIdx.x * 2 * s; t < T2; t += blockDim.x * 2 * s) {
++      const float a = ph[t], v = ph[t + s];
++      ph[t] = a < v ? v : a;
++    }
++    __syncthreads();
++  }
++  const float m = ph[0];
++  __syncthreads();
++  for (u32 t = threadIdx.x; t < T2; t += blockDim.x) {
++    ph[t] = sh[t] = attn_exp(__fsub_rn(sh[t], m));
++  }
++  __syncthreads();
++  for (u32 s = 1; s < T2; s <<= 1) {
++    for (u32 t = threadIdx.x * 2 * s; t < T2; t += blockDim.x * 2 * s) {
++      sh[t] = __fadd_rn(sh[t], sh[t + s]);
+     }
++    __syncthreads();
++  }
++  const float z = T2 < T ? __fadd_rn(sh[0], 0.0f) : sh[0];
++  for (u32 t = threadIdx.x; t < T2; t += blockDim.x) {
++    ph[t] = __fdiv_rn(ph[t], z);
+   }
+   __syncthreads();
+   const u32 j = threadIdx.x;
+   float st[18];
+   u32   sp = 0;
+-  for (u32 t = 0; t < T; t++) {
++  u32   t = 0;
++  for (; t + 16 <= T2; t += 16) {
++    float vv[16], pp[16];
++#pragma unroll
++    for (u32 u = 0; u < 16; u++) {
++      vv[u] = vc[(u64)(t + u) * 1024 + g + j];
++      pp[u] = ph[t + u];
++    }
++#pragma unroll
++    for (u32 u = 0; u < 16; u++) {
++      attn_push(st, &sp, t + u, __fmul_rn(vv[u], pp[u]));
++    }
++  }
++  for (; t < T2; t++) {
+     attn_push(st, &sp, t, __fmul_rn(vc[(u64)t * 1024 + g + j], ph[t]));
+   }
+-  att[(u64)h * 256 + j] = st[0];
++  att[(u64)h * 256 + j] = T2 < T ? __fadd_rn(st[0], 0.0f) : st[0];
+ }
+ #endif
+ 
+@@ -9192,29 +9231,49 @@
+ }
+ 
+ // K.gated_delta over heads value heads; S [heads,128,128] updated in place,
+-// y the readout [heads,128]. One block a head, one thread a row.
++// y the readout [heads,128]. A warp a row (grid heads x 32, 4 rows a block),
++// lane l holds elements 4l..4l+3: hyb_dot_128's tree is the lane's
++// (p0 + p1) + (p2 + p3), then the shuffle levels 1..16 (low + high; fadd
++// commutes, so both lanes of a pair get the same bits).
++__device__ static float gd_dot(float4 a, float4 b) {
++  float v = __fadd_rn(__fadd_rn(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)),
++    __fadd_rn(__fmul_rn(a.z, b.z), __fmul_rn(a.w, b.w)));
++  #pragma unroll
++  for (u32 o = 1; o < 32; o <<= 1) {
++    v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
++  }
++  return v;
++}
++
+ extern "C" __global__ void __launch_bounds__(128) llb_gated_delta(
+   float* __restrict__ S, const float* __restrict__ q, const float* __restrict__ kk,
+   const float* __restrict__ v, const float* __restrict__ dec,
+   const float* __restrict__ bet, float* __restrict__ y, u32 heads) {
+-  const u32 h = blockIdx.x, j = threadIdx.x;
++  const u32 h = blockIdx.x, l = threadIdx.x & 31;
++  const u32 j = blockIdx.y * 4 + (threadIdx.x >> 5);
+   if (h >= heads) {
+     return;
+   }
+-  float*       Srow = S + (((u64)h * 128 + j) << 7);
+-  const float* kk_h = kk + ((u64)h << 7);
++  float4* Srow = (float4*)(S + (((u64)h * 128 + j) << 7));
++  const float4 k4 = ((const float4*)(kk + ((u64)h << 7)))[l];
++  const float4 q4 = ((const float4*)(q + ((u64)h << 7)))[l];
+   const float  decay = dec[h], beta = bet[h];
+-  #pragma unroll
+-  for (u32 i = 0; i < 128; i += 1) {
+-    Srow[i] = __fmul_rn(Srow[i], decay);
+-  }
+-  const float kv = hyb_dot_128(Srow, kk_h);
++  float4 s4 = Srow[l];
++  s4.x = __fmul_rn(s4.x, decay);
++  s4.y = __fmul_rn(s4.y, decay);
++  s4.z = __fmul_rn(s4.z, decay);
++  s4.w = __fmul_rn(s4.w, decay);
++  const float kv = gd_dot(s4, k4);
+   const float delta = __fmul_rn(__fsub_rn(v[((u64)h << 7) + j], kv), beta);
+-  #pragma unroll
+-  for (u32 i = 0; i < 128; i += 1) {
+-    Srow[i] = __fadd_rn(Srow[i], __fmul_rn(kk_h[i], delta));
++  s4.x = __fadd_rn(s4.x, __fmul_rn(k4.x, delta));
++  s4.y = __fadd_rn(s4.y, __fmul_rn(k4.y, delta));
++  s4.z = __fadd_rn(s4.z, __fmul_rn(k4.z, delta));
++  s4.w = __fadd_rn(s4.w, __fmul_rn(k4.w, delta));
++  Srow[l] = s4;
++  const float yv = gd_dot(s4, q4);
++  if (l == 0) {
++    y[((u64)h << 7) + j] = yv;
+   }
+-  y[((u64)h << 7) + j] = hyb_dot_128(Srow, q + ((u64)h << 7));
+ }
+ 
+ // The 32-element gated-delta middleware (tools/payload-linb.patch): beta :=
+@@ -10096,7 +10155,7 @@
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_l2n, hs16, 1, 1, 64, 1, 1, 0, NULL, l18k2, NULL)
+       != CUDA_SUCCESS
+-    || cuLaunchKernel(gpu_gdl, hs32, 1, 1, 128, 1, 1, 0, NULL, g18, NULL)
++    || cuLaunchKernel(gpu_gdl, hs32, 32, 1, 128, 1, 1, 0, NULL, g18, NULL)
+       != CUDA_SUCCESS
+     || cuLaunchKernel(gpu_grn, hs32, 1, 1, 64, 1, 1, 0, NULL, n18, NULL)
+       != CUDA_SUCCESS
+@@ -10360,7 +10419,7 @@
+         u64 Sp = o->w, qp = o->x, kkp = o->k, vp = o->v, decp = o->wn, betp = o->r;
+         u32 hs = o->n;
+         void* hy[] = { &Sp, &qp, &kkp, &vp, &decp, &betp, &yp, &hs };
+-        if (cuLaunchKernel(gpu_gdl, hs, 1, 1, 128, 1, 1, 0, NULL, hy, NULL)
++        if (cuLaunchKernel(gpu_gdl, hs, 32, 1, 128, 1, 1, 0, NULL, hy, NULL)
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }

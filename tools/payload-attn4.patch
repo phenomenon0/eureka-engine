@@ -1,0 +1,203 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2901,7 +2901,14 @@
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+-    || is_og(k) || is_head(k);
++    || is_og(k) || is_head(k) || is_attn4(k);
++}
++
++// The Qwen3.5 attention block bang (tools/payload-attn4.patch): the host runs
++// llb_attn4 (scores, the causal softmax and the weighted V) into the bang's
++// output y (field index 3).
++function is_attn4(k: Name): boolean {
++  return k === "llb.attn4_warp" || k.endsWith(".llb.attn4_warp");
+ }
+ 
+ // The attention output gate bang (tools/payload-og.patch): the host runs
+@@ -4093,7 +4100,7 @@
+       : is_grn(k) ? "LLB_GRN_FID" : is_gdl(k) ? "LLB_GDL_FID"
+       : is_rnorm(k) ? "LLB_RNORM_FID" : is_vadd(k) ? "LLB_VADD_FID"
+       : is_vmul(k) ? "LLB_VMUL_FID" : is_og(k) ? "LLB_OG_FID"
+-      : is_head(k) ? "LLB_HEAD_FID"
++      : is_head(k) ? "LLB_HEAD_FID" : is_attn4(k) ? "LLB_ATTN4_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4831,9 +4838,11 @@
+ static CUfunction gpu_vmul;
+ static CUfunction gpu_og;
+ static CUfunction gpu_amax;
++static CUfunction gpu_attn4;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_logit;
+ static CUdeviceptr gpu_headh;
++static CUdeviceptr gpu_atts;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+ static CUdeviceptr gpu_maild;
+@@ -7032,6 +7041,9 @@
+ #ifndef LLB_HEAD_FID
+ #define LLB_HEAD_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_ATTN4_FID
++#define LLB_ATTN4_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7042,7 +7054,8 @@
+   || (u32)term_aux(t) == LLB_GRN_FID || (u32)term_aux(t) == LLB_GDL_FID \
+   || (u32)term_aux(t) == LLB_RNORM_FID \
+   || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID \
+-  || (u32)term_aux(t) == LLB_OG_FID || (u32)term_aux(t) == LLB_HEAD_FID)
++  || (u32)term_aux(t) == LLB_OG_FID || (u32)term_aux(t) == LLB_HEAD_FID \
++  || (u32)term_aux(t) == LLB_ATTN4_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7510,6 +7523,66 @@
+   }
+   att[h * 128 + j] = st[0];
+ }
++
++// Qwen3.5 attention: K.scores4 + K.probs + K.weighted4 of all 16 query heads,
++// a block a head (tools/payload-attn4.patch). q 16 x 256, kc / vc 2^dT slots of
++// 4 kv heads x 256 (head h reads kv head h >> 2), sc / pr the two scratch
++// planes of gpu_atts (16 slots of 2^17 floats each); att 16 x 256. Slots
++// t > pos are masked to -inf. c = dT | pos << 5; scale 1 / sqrt(256), as
++// K.scores4's sc. The trees are attn_push / attn_exp, flat.bend's.
++extern "C" __global__ void __launch_bounds__(256) llb_attn4(
++  const float* __restrict__ q, const float* __restrict__ kc,
++  const float* __restrict__ vc, float* __restrict__ att,
++  float* __restrict__ sc, float* __restrict__ pr, u32 c) {
++  const u32 h = blockIdx.x, dT = c & 31, pos = c >> 5, T = 1u << dT;
++  const u32 g = (h >> 2) * 256;
++  const float scale = __fdiv_rn(1.0f, __fsqrt_rn(256.0f));
++  const float ninf = __uint_as_float(0xFF800000u);
++  float* sh = sc + (u64)h * (1u << 17);
++  float* ph = pr + (u64)h * (1u << 17);
++  const float* qh = q + (u64)h * 256;
++  for (u32 t = threadIdx.x; t < T; t += blockDim.x) {
++    const float* k = kc + (u64)t * 1024 + g;
++    float st[9];
++    u32   sp = 0;
++    for (u32 i = 0; i < 256; i++) {
++      attn_push(st, &sp, i, __fmul_rn(k[i], qh[i]));
++    }
++    sh[t] = __fmul_rn(st[0], scale);
++  }
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    float st[18];
++    u32   sp = 0;
++    for (u32 t = 0; t < T; t++) {
++      float v = t <= pos ? sh[t] : ninf;
++      u32   i = t;
++      for (; i & 1; i >>= 1) {
++        float a = st[--sp];
++        v = a < v ? v : a;
++      }
++      st[sp++] = v;
++    }
++    const float m = st[0];
++    sp = 0;
++    for (u32 t = 0; t < T; t++) {
++      ph[t] = attn_exp(__fsub_rn(t <= pos ? sh[t] : ninf, m));
++      attn_push(st, &sp, t, ph[t]);
++    }
++    const float z = st[0];
++    for (u32 t = 0; t < T; t++) {
++      ph[t] = __fdiv_rn(ph[t], z);
++    }
++  }
++  __syncthreads();
++  const u32 j = threadIdx.x;
++  float st[18];
++  u32   sp = 0;
++  for (u32 t = 0; t < T; t++) {
++    attn_push(st, &sp, t, __fmul_rn(vc[(u64)t * 1024 + g + j], ph[t]));
++  }
++  att[(u64)h * 256 + j] = st[0];
++}
+ #endif
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+@@ -7681,6 +7754,25 @@
+     o->fm = fm;
+     return true;
+   }
++  // The Qwen3.5 attention block bang (tools/payload-attn4.patch): q (16 x 256),
++  // kc / vc (2^dT slots of 1024), y the 16 x 256 output; c = dT | pos << 5.
++  if (aux == LLB_ATTN4_FID) {
++    Term qt = H[a + 1], kct = H[a + 2], vct = H[a + 3], y = H[a + 4];
++    u32  c = (u32)H[a + 5], dT = c & 31;
++    if (term_tag(qt) == TAG_ARR || term_tag(kct) == TAG_ARR
++      || term_tag(vct) == TAG_ARR || term_tag(y) == TAG_ARR
++      || dT < 1 || dT > 17) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 15;
++    o->x = (u64)(H + blk_loc(H, qt));
++    o->k = (u64)(H + blk_loc(H, kct));
++    o->v = (u64)(H + blk_loc(H, vct));
++    o->y = (u64)(H + blk_loc(H, y));
++    o->c = c;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7722,7 +7814,7 @@
+       if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
+         || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
+         || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
+-        || hx == LLB_HEAD_FID) {
++        || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -8178,7 +8270,10 @@
+     Term t  = H[H_WARP + j];
+     Loc  tl = task_tail(t);
+     Term rv[WL_RESW];
+-    rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6 : 3)];
++    // attn4's y is its 4th term (tools/payload-attn4.patch); the others' is
++    // their 3rd, and the llama attention's is its 6th
++    rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6
++      : (u32)term_aux(t) == LLB_ATTN4_FID ? 4 : 3)];
+     Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
+     if (c != 0) {
+       ring_push(H, 0, c);
+@@ -8645,9 +8740,11 @@
+     || cuModuleGetFunction(&gpu_vmul, gpu_lib, "llb_vmul") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_og, gpu_lib, "llb_outputgate") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_amax, gpu_lib, "llb_amax") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_headh, 4096 * 4) != CUDA_SUCCESS
++    || cuMemAlloc(&gpu_atts, (size_t)2 * 16 * (1u << 17) * 4) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+     || cuMemHostGetDevicePointer(&gpu_maild, (void*)gpu_mail, 0)
+@@ -8849,6 +8946,17 @@
+             != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 15) {
++        // the Qwen3.5 attention block bang (tools/payload-attn4.patch): one
++        // block a query head, 256 threads (a dim each)
++        u64 qp15 = o->x, kp15 = o->k, vp15 = o->v;
++        u32 c15 = o->c;
++        u64 s15 = gpu_atts, p15 = gpu_atts + ((u64)16 << 17) * 4;
++        void* aa15[] = { &qp15, &kp15, &vp15, &yp, &s15, &p15, &c15 };
++        if (cuLaunchKernel(gpu_attn4, 16, 1, 1, 256, 1, 1, 0, NULL, aa15, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else {
+         // the output gate bang (tools/payload-og.patch)
+         u64 xp13 = o->x, gp13 = o->k;

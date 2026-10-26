@@ -1,0 +1,16 @@
+usage: llb COMMAND [args]
+
+  run MODEL [PROMPT]   generate text (prompt from stdin if absent)
+  chat MODEL           chat on the terminal
+  models               list known models and where they are
+  prep MODEL           prepare a model's cache (run does it on first use)
+  doctor               check this machine
+  bench MODEL          time a fixed prompt
+  tok enc|dec MODEL    tokenize / detokenize
+  pull MODEL           download a model
+  version              print the version
+  help [COMMAND]       help for a command
+
+Models: 27b, 9b, 9b-q8, or a path to a .gguf file.
+Environment: LLB_MODELS (model dirs), LLB_HOME (cache), LLB_ENGINE, NO_COLOR.
+exit 0

@@ -1,0 +1,19 @@
+PASS GPU N of N: NVIDIA GeForce RTX N, compute N, N MiB, LN N KiB (engine bag CUBE_LOG N)
+PASS driver supports CUDA N; this engine needs N or newer
+PASS compute capability N or newer (sm_N+)
+PASS concurrent managed memory access
+PASS GPU memory: N GB (Nb needs about N GB)
+PASS GPU idle
+PASS engine: <ENGINE>
+PASS engine libraries found (libcuda, libnvrtc)
+PASS GPU kernel cache: <ENGINE>.gpu
+PASS llb-tok found
+PASS stdbuf found (text streams as it is generated)
+PASS cache <LLB_HOME> writable, N GB free
+PASS RAM available: N GB
+PASS temp dir /tmp writable (llb writes only small files there)
+PASS /dev/shm: N MB used, N MB free (llb does not use it)
+PASS model Nb: <MODELS>/qwenN-Nb-qNkm/QwenN-NB-QN_K_M.gguf
+PASS model Nb: <MODELS>/qwenN-Nb/QwenN-NB-QN_K_M.gguf
+PASS model Nb-qN: <MODELS>/qwenN-Nb/QwenN-NB-QN_Ngguf
+exit 0

@@ -1,0 +1,104 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -7879,16 +7879,18 @@
+     return true;
+   }
+   // The linear attention block bang (tools/payload-linb.patch): wb (1), the
+-  // normed h (2), y (3, output), qkva (4, the qkv projection), the
+-  // gate/beta/alpha/ssm_out byte offsets (5..7, 12), the ssm_a/dt/conv1d/
+-  // ssm_norm offsets (8..11), the conv history h0/h1/h2 and S (13..16) and the
+-  // Q8 row word rg (17). gated_delta updates S in place.
++  // raw x (2), y (3, output), qkva (4, the qkv projection buffer the block
++  // fills), the attn_norm and attn_qkv byte offsets (5..6), the
++  // gate/beta/alpha/ssm_out offsets (7..9, 12), the ssm_a/dt/conv1d/ssm_norm
++  // offsets (10..13), the conv history h0/h1/h2 and S (15..18) and the Q8 row
++  // word rg (19). gated_delta updates S in place.
+   if (aux == LLB_LINB_FID) {
+-    Term wbt = H[a + 1], h = H[a + 2], y = H[a + 3], qkva = H[a + 4];
+-    u32  wgate = (u32)H[a + 5], wbo = (u32)H[a + 6], wao = (u32)H[a + 7];
+-    u32  wsa = (u32)H[a + 8], wdt = (u32)H[a + 9], wcv = (u32)H[a + 10];
+-    u32  wsn = (u32)H[a + 11], wso = (u32)H[a + 12], rgw = (u32)H[a + 17];
+-    Term h0 = H[a + 13], h1 = H[a + 14], h2 = H[a + 15], S = H[a + 16];
++    Term wbt = H[a + 1], x = H[a + 2], y = H[a + 3], qkva = H[a + 4];
++    u32  an = (u32)H[a + 5], wqkv = (u32)H[a + 6];
++    u32  wgate = (u32)H[a + 7], wbo = (u32)H[a + 8], wao = (u32)H[a + 9];
++    u32  wsa = (u32)H[a + 10], wdt = (u32)H[a + 11], wcv = (u32)H[a + 12];
++    u32  wsn = (u32)H[a + 13], wso = (u32)H[a + 14], rgw = (u32)H[a + 19];
++    Term h0 = H[a + 15], h1 = H[a + 16], h2 = H[a + 17], S = H[a + 18];
+     StrParts q = str_peek_ro(e, wbt);
+     bool rgt = rgw >> 30 & 1;
+     u32  rg = rgw & (rgt ? 0x0fffffffu : 0x7fffffffu);
+@@ -7897,9 +7899,11 @@
+     if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fm != 1
+       || ((u64)(base + wgate) & 15) != 0 || ((u64)(base + wbo) & 15) != 0
+       || ((u64)(base + wao) & 15) != 0 || ((u64)(base + wso) & 15) != 0
+-      || term_tag(h) == TAG_ARR || term_tag(y) == TAG_ARR || term_tag(qkva) == TAG_ARR
++      || term_tag(x) == TAG_ARR || term_tag(y) == TAG_ARR || term_tag(qkva) == TAG_ARR
+       || term_tag(h0) == TAG_ARR || term_tag(h1) == TAG_ARR
+       || term_tag(h2) == TAG_ARR || term_tag(S) == TAG_ARR
++      || (u64)an + 4096 * 4 > q.len
++      || (u64)wqkv + (u64)8192 * rg > q.len
+       || (u64)wgate + (u64)4096 * rg > q.len
+       || (u64)wbo + (u64)32 * rg > q.len
+       || (u64)wao + (u64)32 * rg > q.len
+@@ -7911,7 +7915,7 @@
+     }
+     o->kind = 18;
+     o->w  = (u64)base;
+-    o->x  = (u64)(H + blk_loc(H, h));
++    o->x  = (u64)(H + blk_loc(H, x));
+     o->y  = (u64)(H + blk_loc(H, y));
+     o->qk = (u64)(H + blk_loc(H, qkva));
+     o->k  = (u64)(H + blk_loc(H, h0));
+@@ -7920,6 +7924,7 @@
+     o->r  = (u64)(H + blk_loc(H, S));
+     o->bq = wgate; o->bg = wbo; o->bb = wao; o->ba = wsa;
+     o->bsa = wdt; o->bdt = wcv; o->bcv = wsn; o->bsn = wso;
++    o->ban = an; o->c = wqkv;
+     o->brg = rg;
+     return true;
+   }
+@@ -9235,12 +9240,14 @@
+         // z/beta/alpha GEMVs, the 32-element middleware, conv1d, the two
+         // l2norms, gated_delta (S in place), gated_rmsnorm, the ssm_out GEMV
+         u64 base18 = o->w;
+-        u64 hp18 = o->x, qkvp18 = o->qk, h0p = o->k, h1p = o->v, h2p = o->wn, Sp = o->r;
++        u64 xp18 = o->x, qkvp18 = o->qk, h0p = o->k, h1p = o->v, h2p = o->wn, Sp = o->r;
++        u64 anp18 = base18 + o->ban, wqkvp18 = base18 + o->c;
+         u64 gtp = base18 + o->bq, bop = base18 + o->bg, aop = base18 + o->bb;
+         u64 sap = base18 + o->ba, dtp = base18 + o->bsa, cvp = base18 + o->bdt;
+         u64 snp = base18 + o->bcv, sop = base18 + o->bsn;
+         u32 rg18 = o->brg, cg18 = rg18 / 17 * 4;
+         CUdeviceptr zz = gpu_blk, bpre = zz + 4096 * 4, apre = bpre + 32 * 4;
++        CUdeviceptr hb18 = gpu_blk + 39040 * 4;
+         CUdeviceptr beta = apre + 32 * 4, dec = beta + 32 * 4;
+         CUdeviceptr cnv = dec + 32 * 4, cnvk = cnv + 2048 * 4, vn = cnv + 4096 * 4;
+         CUdeviceptr gout = cnv + 8192 * 4, qt = gout + 4096 * 4;
+@@ -9249,9 +9256,11 @@
+         union { u32 u; float f; } sq = { 0x413504f3u }, one = { 0x3f800000u };
+         u32 n4 = 4096, n8192 = 8192, n32 = 32, d10 = 10, hs16 = 16, hs32 = 32;
+         u32 gconv = (8192 + 255) / 256;
+-        void* z18[] = { &gtp, &rg18, &cg18, &hp18, &zz, &n4, &d10 };
+-        void* b18[] = { &bop, &rg18, &cg18, &hp18, &bpre, &n32, &d10 };
+-        void* a18[] = { &aop, &rg18, &cg18, &hp18, &apre, &n32, &d10 };
++        void* r18[] = { &xp18, &anp18, &hb18, &n4 };
++        void* q18[] = { &wqkvp18, &rg18, &cg18, &hb18, &qkvp18, &n8192, &d10 };
++        void* z18[] = { &gtp, &rg18, &cg18, &hb18, &zz, &n4, &d10 };
++        void* b18[] = { &bop, &rg18, &cg18, &hb18, &bpre, &n32, &d10 };
++        void* a18[] = { &aop, &rg18, &cg18, &hb18, &apre, &n32, &d10 };
+         void* m18[] = { &bpre, &apre, &dtp, &sap, &beta, &dec, &n32 };
+         void* c18[] = { &cvp, &qkvp18, &h0p, &h1p, &h2p, &cnv, &n8192 };
+         void* l18q[] = { &cnv, &qt, &sq.f, &hs16 };
+@@ -9261,7 +9270,11 @@
+         void* g18[] = { &Sp, &qt, &kt, &vn, &dec, &beta, &gout, &hs32 };
+         void* n18[] = { &gout, &snp, &zz, &normed, &hs32 };
+         void* o18[] = { &sop, &rg18, &cg18, &normed, &yp, &n4, &d10 };
+-        if (cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, z18, NULL)
++        if (cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, r18, NULL)
++          != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, q18, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, z18, NULL)
+           != CUDA_SUCCESS
+           || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, b18, NULL)
+             != CUDA_SUCCESS

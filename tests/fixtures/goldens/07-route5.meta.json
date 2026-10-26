@@ -1,0 +1,17 @@
+{
+  "route": "/v1/systemone",
+  "status": 200,
+  "latency_ms": 52.614566,
+  "headers": [
+    "Server",
+    "llama.cpp",
+    "Access-Control-Allow-Origin",
+    "",
+    "Content-Type",
+    "application/json; charset=utf-8",
+    "Content-Length",
+    "309",
+    "Keep-Alive",
+    "timeout=5, max=100"
+  ]
+}

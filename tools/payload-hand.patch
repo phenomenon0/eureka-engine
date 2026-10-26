@@ -1,0 +1,294 @@
+--- a/bend2/comp.ts	2026-09-28 04:45:21.943459403 -0500
++++ b/bend2/comp.ts	2026-09-28 07:45:20.846865131 -0500
+@@ -4716,7 +4716,11 @@
+ static CUfunction gpu_warp;
+ static CUfunction gpu_attn;
+ static CUfunction gpu_rms;
++static CUfunction gpu_mailk;
++static CUfunction gpu_dlv;
+ static CUdeviceptr gpu_att;
++static volatile struct Mail* gpu_mail;
++static CUdeviceptr gpu_maild;
+ #endif
+ static bool io_gpu;
+ static Stk  io_stk;
+@@ -6826,6 +6830,22 @@
+ #define H_WARP   (3 * LINE + 1)
+ #define WARP_MAX (LINE - 1)
+ 
++// The handoff mailbox (tools/payload-hand.patch): pinned host memory that
++// llb_mail fills after every batch with the header words the host polls and
++// each parked task's launch operands; llb_deliver hands the results back on
++// the device. The host never touches the managed corpus between batches: a
++// host touch migrates the page, and the next grow launch faults it back
++// (~0.5 ms a serve, payload stage 1). kind: 0 GEMV, 1 attention, 2 rms.
++typedef struct {
++  u64 w, x, y, k, v, wn;
++  u32 kind, n, d, rb, c, pad;
++} WarpOp;
++
++typedef struct Mail {
++  u32    front, err, done, m, bad;
++  WarpOp op[WARP_MAX];
++} Mail;
++
+ INLINE void warp_park(Corpus H, Term t) {
+   u32 i = a32_add(a32_at(H, H_WARP_N), 1);
+   if (i >= WARP_MAX) {
+@@ -7237,6 +7257,84 @@
+ }
+ #endif
+ 
++#if defined(BEND_RTC) && defined(LLB_WARP_FID)
++// warp_serve's operand reads and checks, on the device (bad: 1 GEMV,
++// 2 attention, 3 rms operands unsupported); one thread
++extern "C" __global__ void llb_mail(Corpus H, Mail* M) {
++  Env e = { H, NULL };
++  M->err   = a32_load(a32_at(H, H_ERROR_CODE));
++  M->done  = a32_load_acq(a32_at(H, H_ROOT_DONE));
++  M->front = a32_load(a32_at(H, H_FRONT));
++  u32 m    = M->front == 0 ? a32_load(a32_at(H, H_WARP_N)) : 0;
++  u32 bad  = 0;
++  for (u32 j = 0; j < m && j < WARP_MAX; j += 1) {
++    Term     t  = H[H_WARP + j];
++    Loc      a  = term_loc(t);
++    bool     at = (u32)term_aux(t) == LLB_ATTN_FID;
++    bool     rm = (u32)term_aux(t) == LLB_RMS_FID;
++    Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
++    u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
++    u32      d  = at ? 9 : (u32)H[a + 6], rb = at ? 8192 : (u32)H[a + 7];
++    StrParts p  = str_peek_ro(e, H[a + 1]);
++    const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
++    if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
++      || rb % 16 != 0 || ((u64)w & 15) != 0
++      || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
++      || term_tag(y) == TAG_ARR || blk_cls(x) < d + 2
++      || n > 1ull << blk_cls(y)) {
++      bad = bad != 0 ? bad : 1;
++    }
++    WarpOp* o = &M->op[j];
++    o->kind = at ? 1 : rm ? 2 : 0;
++    o->w = (u64)w;
++    o->x = (u64)(H + blk_loc(H, x));
++    o->y = (u64)(H + blk_loc(H, y));
++    o->n = n;
++    o->d = d;
++    o->rb = rb;
++    if (at) {
++      Term kc = H[a + 3], vc = H[a + 4];
++      u32  c  = (u32)H[a + 5], dT = c & 31;
++      if (dT > 10 || term_tag(kc) == TAG_ARR || term_tag(vc) == TAG_ARR
++        || blk_cls(kc) < dT + 8 || blk_cls(vc) < dT + 8) {
++        bad = bad != 0 ? bad : 2;
++      }
++      o->k = (u64)(H + blk_loc(H, kc));
++      o->v = (u64)(H + blk_loc(H, vc));
++      o->c = c;
++    }
++    if (rm) {
++      u32 an = (u32)H[a + 8];
++      if (blk_cls(x) != 11 || an % 4 != 0 || (u64)an + 2048 * 4 > p.len) {
++        bad = bad != 0 ? bad : 3;
++      }
++      o->wn = (u64)((const u8*)(H + term_peek_ro(e, p.data)) + p.off + an);
++    }
++  }
++  M->bad = bad;
++  M->m   = m;
++}
++
++// warp_serve's delivery, on the device, after the task launches: y to each
++// continuation, a join that completes reopens the frontier on ring 0
++extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
++  u32 k = 0;
++  for (u32 j = 0; j < m; j += 1) {
++    Term t  = H[H_WARP + j];
++    Loc  tl = task_tail(t);
++    Term rv[WL_RESW];
++    rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6 : 3)];
++    Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
++    if (c != 0) {
++      ring_push(H, 0, c);
++      k += 1;
++    }
++  }
++  a32_store(a32_at(H, H_WARP_N), 0);
++  a32_store(a32_at(H, H_CURSOR), k);
++}
++#endif
++
+ #ifdef BEND_RTC
+ extern "C" __global__ void window_dev(Corpus H, Term root, u32 w, u32 h,
+   u32 k, u32* out) {
+@@ -7675,6 +7773,12 @@
+   if (cuModuleGetFunction(&gpu_warp, gpu_lib, "llb_warp") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_dlv, gpu_lib, "llb_deliver") != CUDA_SUCCESS
++    || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
++      CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
++    || cuMemHostGetDevicePointer(&gpu_maild, (void*)gpu_mail, 0)
++      != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_att, 2048 * 4 * LINE) != CUDA_SUCCESS) {
+     err_fail("cannot load the GPU program");
+   }
+@@ -7703,6 +7807,13 @@
+     gpu_kernel(1, CUBE_G);
+     gpu_kernel(2, 1);
+   }
++#ifdef LLB_WARP_FID
++  void* ma[] = { &CORPUS, &gpu_maild };
++  if (cuLaunchKernel(gpu_mailk, 1, 1, 1, 1, 1, 1, 0, NULL, ma, NULL)
++    != CUDA_SUCCESS) {
++    err_fail("device launch failed");
++  }
++#endif
+   if (cuCtxSynchronize() != CUDA_SUCCESS) {
+     err_fail("device fault");
+   }
+@@ -7721,69 +7832,48 @@
+ #if BEND_CUDA && defined(LLB_WARP_FID)
+ // The parked warp GEMVs (warp_park), args (f, +wb, +x, y, +base, +n, +d, +rb)
+ // as flat.bend's gemv: each runs as one llb_warp launch (LLB_WARP_GRID
+-// blocks of 128, default 164), then y goes to its continuation; a join that
+-// completes reopens the frontier on ring 0.
++// blocks of 128, default 164), then llb_deliver hands y to its continuation.
++// The operands come from the mailbox (llb_mail): the host reads no corpus
++// word, and the next batch queues behind these launches without a sync.
+ static bool warp_serve(Corpus H) {
+-  u32 m = a32_load(a32_at(H, H_WARP_N));
++  u32 m = gpu_mail->m;
+   if (m == 0) {
+     return false;
+   }
++  if (gpu_mail->bad != 0) {
++    err_fail(gpu_mail->bad == 2 ? "warp attention: unsupported operands"
++      : gpu_mail->bad == 3 ? "warp rms: unsupported operands"
++      : "warp GEMV: unsupported operands");
++  }
+   const char* gs   = getenv("LLB_WARP_GRID");
+   u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 164;
+-  Env         e    = { H, ALC[0] };
+   for (u32 j = 0; j < m; j += 1) {
+-    // an attention task (f, +wt, +q, +kc, +vc, +c, y, +wo): its o GEMV reads
++    volatile WarpOp* o = &gpu_mail->op[j];
++    u64 w = o->w, xp = o->x, yp = o->y;
++    u32 n = o->n, d = o->d, rq = o->rb / 16, cg = o->rb / 16;
++    CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
++    // attention (f, +wt, +q, +kc, +vc, +c, y, +wo): its o GEMV reads
+     // llb_attn's output, a slot of gpu_att (2048 x 2048 rows of wo, d = 9)
+-    Term     t  = H[H_WARP + j];
+-    Loc      a  = term_loc(t);
+-    bool     at = (u32)term_aux(t) == LLB_ATTN_FID;
+-    Term     x  = H[a + 2], y = H[a + (at ? 6 : 3)];
+-    u32      bs = (u32)H[a + (at ? 7 : 4)], n = at ? 2048 : (u32)H[a + 5];
+-    u32      d  = at ? 9 : (u32)H[a + 6], rb = at ? 8192 : (u32)H[a + 7];
+-    StrParts p  = str_peek_ro(e, H[a + 1]);
+-    const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+-    if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9 || d > 12
+-      || rb % 16 != 0 || ((uintptr_t)w & 15) != 0
+-      || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
+-      || term_tag(y) == TAG_ARR || blk_cls(x) < d + 2
+-      || n > 1ull << blk_cls(y)) {
+-      err_fail("warp GEMV: unsupported operands");
+-    }
+-    u32   rq = rb / 16, cg = rb / 16;
+-    const u32* xp = (const u32*)(H + blk_loc(H, x));
+-    u32*  yp = (u32*)(H + blk_loc(H, y));
+-    if (at) {
+-      Term kc = H[a + 3], vc = H[a + 4];
+-      u32  c  = (u32)H[a + 5], dT = c & 31;
+-      if (dT > 10 || term_tag(kc) == TAG_ARR || term_tag(vc) == TAG_ARR
+-        || blk_cls(kc) < dT + 8 || blk_cls(vc) < dT + 8) {
+-        err_fail("warp attention: unsupported operands");
+-      }
+-      const u32* kp = (const u32*)(H + blk_loc(H, kc));
+-      const u32* vp = (const u32*)(H + blk_loc(H, vc));
+-      CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
++    if (o->kind == 1) {
++      u64 kp = o->k, vp = o->v;
++      u32 c  = o->c;
+       void* aa[] = { &xp, &kp, &vp, &op, &c };
+       if (cuLaunchKernel(gpu_attn, 16, 1, 1, 128, 1, 1, 0, NULL, aa, NULL)
+         != CUDA_SUCCESS) {
+         err_fail("device launch failed");
+       }
+-      xp = (const u32*)(uintptr_t)op;
++      xp = op;
+     }
+-    // an rms task (f, +wb, +x, y, +base, +n, +d, +rb, +an): the GEMV reads
++    // rms (f, +wb, +x, y, +base, +n, +d, +rb, +an): the GEMV reads
+     // llb_rms(x, the 2048 f32 at byte an of wb), a slot of gpu_att
+-    if ((u32)term_aux(t) == LLB_RMS_FID) {
+-      u32 an = (u32)H[a + 8];
+-      if (blk_cls(x) != 11 || an % 4 != 0 || (u64)an + 2048 * 4 > p.len) {
+-        err_fail("warp rms: unsupported operands");
+-      }
+-      const u8* wn = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + an;
+-      CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
++    if (o->kind == 2) {
++      u64 wn = o->wn;
+       void* ra[] = { &xp, &wn, &op };
+       if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
+         != CUDA_SUCCESS) {
+         err_fail("device launch failed");
+       }
+-      xp = (const u32*)(uintptr_t)op;
++      xp = op;
+     }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+     if (cuLaunchKernel(gpu_warp, grid, 1, 1, 128, 1, 1, 0, NULL, args, NULL)
+@@ -7791,23 +7881,12 @@
+       err_fail("device launch failed");
+     }
+   }
+-  if (cuCtxSynchronize() != CUDA_SUCCESS) {
+-    err_fail("device fault");
+-  }
+-  u32 k = 0;
+-  for (u32 j = 0; j < m; j += 1) {
+-    Term t  = H[H_WARP + j];
+-    Loc  tl = task_tail(t);
+-    Term rv[WL_RESW];
+-    rv[0]   = H[term_loc(t) + ((u32)term_aux(t) == LLB_ATTN_FID ? 6 : 3)];
+-    Term c  = task_deliver(H, H[tl], (u32)(H[tl + 1] >> 32) & 0xFFFF, rv, 1);
+-    if (c != 0) {
+-      ring_push(H, 0, c);
+-      k += 1;
+-    }
++  void* da[] = { &H, &m };
++  if (cuLaunchKernel(gpu_dlv, 1, 1, 1, 1, 1, 1, 0, NULL, da, NULL)
++    != CUDA_SUCCESS) {
++    err_fail("device launch failed");
+   }
+-  a32_store(a32_at(H, H_WARP_N), 0);
+-  a32_store(a32_at(H, H_CURSOR), k);
++  gpu_mail->m = 0;
+   return true;
+ }
+ #else
+@@ -7822,14 +7901,21 @@
+   // The device owns the cursor; the host reads the corpus once per batch.
+   while (gpu) {
+     gpu_pass(0);
++#ifdef LLB_WARP_FID
++    // the mailbox's copies (llb_mail): no host read of the corpus
++    u32 ec = gpu_mail->err;
++    bool dn = gpu_mail->done != 0, fr = gpu_mail->front != 0;
++#else
+     u32 ec = a32_load(a32_at(H, H_ERROR_CODE));
++    bool dn = root_done(H), fr = a32_load(a32_at(H, H_FRONT)) != 0;
++#endif
+     if (ec != 0) {
+       err_post(H, ec);
+     }
+-    if (root_done(H)) {
++    if (dn) {
+       return;
+     }
+-    if (a32_load(a32_at(H, H_FRONT)) == 0 && !warp_serve(H)) {
++    if (!fr && !warp_serve(H)) {
+       err_fail("frontier drained without a result");
+     }
+   }

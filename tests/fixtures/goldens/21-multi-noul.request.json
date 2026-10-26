@@ -1,0 +1,1 @@
+{"model":"clef","state":{"checks":{"database":true,"cache":false,"api":true}},"questions":{"database":{"type":"noul","instructions":"Is the database check passing?"},"cache":{"type":"noul","instructions":"Is the cache check passing?"},"api":{"type":"noul","instructions":"Is the API check passing?"}}}

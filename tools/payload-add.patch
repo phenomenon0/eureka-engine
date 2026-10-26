@@ -1,0 +1,81 @@
+--- a/bend2/comp.ts	2026-09-28 07:45:20.846865131 -0500
++++ b/bend2/comp.ts	2026-09-28 07:50:14.130041616 -0500
+@@ -4718,6 +4718,7 @@
+ static CUfunction gpu_rms;
+ static CUfunction gpu_mailk;
+ static CUfunction gpu_dlv;
++static CUfunction gpu_add;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+ static CUdeviceptr gpu_maild;
+@@ -6837,7 +6838,7 @@
+ // host touch migrates the page, and the next grow launch faults it back
+ // (~0.5 ms a serve, payload stage 1). kind: 0 GEMV, 1 attention, 2 rms.
+ typedef struct {
+-  u64 w, x, y, k, v, wn;
++  u64 w, x, y, k, v, wn, r;
+   u32 kind, n, d, rb, c, pad;
+ } WarpOp;
+ 
+@@ -7302,6 +7303,12 @@
+       o->k = (u64)(H + blk_loc(H, kc));
+       o->v = (u64)(H + blk_loc(H, vc));
+       o->c = c;
++      // the residual (tools/payload-add.patch): y := r + y after the o GEMV
++      Term r = H[a + 8];
++      if (term_tag(r) == TAG_ARR || blk_cls(r) != 11) {
++        bad = bad != 0 ? bad : 2;
++      }
++      o->r = (u64)(H + blk_loc(H, r));
+     }
+     if (rm) {
+       u32 an = (u32)H[a + 8];
+@@ -7315,6 +7322,13 @@
+   M->m   = m;
+ }
+ 
++// the attention bang's residual add (K.vadd, flat.bend's k.add): y := r + y
++// over 2048, in place (tools/payload-add.patch); 8 blocks of 256
++extern "C" __global__ void llb_add(const float* __restrict__ r, float* y) {
++  const u32 i = blockIdx.x * 256 + threadIdx.x;
++  y[i] = __fadd_rn(r[i], y[i]);
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -7775,6 +7789,7 @@
+     || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_dlv, gpu_lib, "llb_deliver") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_add, gpu_lib, "llb_add") != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+     || cuMemHostGetDevicePointer(&gpu_maild, (void*)gpu_mail, 0)
+@@ -7852,8 +7867,9 @@
+     u64 w = o->w, xp = o->x, yp = o->y;
+     u32 n = o->n, d = o->d, rq = o->rb / 16, cg = o->rb / 16;
+     CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
+-    // attention (f, +wt, +q, +kc, +vc, +c, y, +wo): its o GEMV reads
+-    // llb_attn's output, a slot of gpu_att (2048 x 2048 rows of wo, d = 9)
++    // attention (f, +wt, +q, +kc, +vc, +c, y, +wo, +r): its o GEMV reads
++    // llb_attn's output, a slot of gpu_att (2048 x 2048 rows of wo, d = 9);
++    // then llb_add adds the residual r into y
+     if (o->kind == 1) {
+       u64 kp = o->k, vp = o->v;
+       u32 c  = o->c;
+@@ -7880,6 +7896,14 @@
+       != CUDA_SUCCESS) {
+       err_fail("device launch failed");
+     }
++    if (o->kind == 1) {
++      u64 rp = o->r;
++      void* ad[] = { &rp, &yp };
++      if (cuLaunchKernel(gpu_add, 8, 1, 1, 256, 1, 1, 0, NULL, ad, NULL)
++        != CUDA_SUCCESS) {
++        err_fail("device launch failed");
++      }
++    }
+   }
+   void* da[] = { &H, &m };
+   if (cuLaunchKernel(gpu_dlv, 1, 1, 1, 1, 1, 1, 0, NULL, da, NULL)

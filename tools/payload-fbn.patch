@@ -1,0 +1,169 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2901,7 +2901,7 @@
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+     || is_qknorm(k) || is_hyb(k) || is_rnorm(k) || is_vadd(k) || is_vmul(k)
+-    || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k);
++    || is_og(k) || is_head(k) || is_attn4(k) || is_silumul(k) || is_fbn(k);
+ }
+ 
+ // The Qwen3.5 attention block bang (tools/payload-attn4.patch): the host runs
+@@ -2917,6 +2917,13 @@
+   return k === "llb.silu_mul_warp" || k.endsWith(".llb.silu_mul_warp");
+ }
+ 
++// The FFN block bang (tools/payload-fbn.patch): the whole lay.res tail --
++// vadd + rms(post) + the gate/up GEMVs + silu + the down GEMV + vadd -- as one
++// serve boundary; the host runs it into the bang's output y (field index 3).
++function is_fbn(k: Name): boolean {
++  return k === "llb.ffn_block_warp" || k.endsWith(".llb.ffn_block_warp");
++}
++
+ // The attention output gate bang (tools/payload-og.patch): the host runs
+ // llb_outputgate into the bang's output y (field index 3).
+ function is_og(k: Name): boolean {
+@@ -4107,7 +4114,7 @@
+       : is_rnorm(k) ? "LLB_RNORM_FID" : is_vadd(k) ? "LLB_VADD_FID"
+       : is_vmul(k) ? "LLB_VMUL_FID" : is_og(k) ? "LLB_OG_FID"
+       : is_head(k) ? "LLB_HEAD_FID" : is_attn4(k) ? "LLB_ATTN4_FID"
+-      : is_silumul(k) ? "LLB_SILUMUL_FID"
++      : is_silumul(k) ? "LLB_SILUMUL_FID" : is_fbn(k) ? "LLB_FBN_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4847,6 +4854,7 @@
+ static CUfunction gpu_amax;
+ static CUfunction gpu_attn4;
+ static CUdeviceptr gpu_act;
++static CUdeviceptr gpu_blk;
+ static CUdeviceptr gpu_logit;
+ static CUdeviceptr gpu_headh;
+ static CUdeviceptr gpu_atts;
+@@ -7054,6 +7062,9 @@
+ #ifndef LLB_SILUMUL_FID
+ #define LLB_SILUMUL_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_FBN_FID
++#define LLB_FBN_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+@@ -7065,7 +7076,8 @@
+   || (u32)term_aux(t) == LLB_RNORM_FID \
+   || (u32)term_aux(t) == LLB_VADD_FID || (u32)term_aux(t) == LLB_VMUL_FID \
+   || (u32)term_aux(t) == LLB_OG_FID || (u32)term_aux(t) == LLB_HEAD_FID \
+-  || (u32)term_aux(t) == LLB_ATTN4_FID || (u32)term_aux(t) == LLB_SILUMUL_FID)
++  || (u32)term_aux(t) == LLB_ATTN4_FID || (u32)term_aux(t) == LLB_SILUMUL_FID \
++  || (u32)term_aux(t) == LLB_FBN_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7800,6 +7812,46 @@
+     o->n = 1u << d;
+     return true;
+   }
++  // The FFN block bang (tools/payload-fbn.patch): the whole lay.res tail as one
++  // task. wt at field 1; x (field 2), y (field 3, the output), a (field 4); the
++  // post norm and gate/up/down byte offsets (fields 5..8) and the gate/up and
++  // down row words (fields 9..10, Q8_0). rg / rd are the row bytes.
++  if (aux == LLB_FBN_FID) {
++    Term wbt = H[a + 1], x = H[a + 2], y = H[a + 3], at = H[a + 4];
++    u32  post = (u32)H[a + 5], fg = (u32)H[a + 6], fu = (u32)H[a + 7];
++    u32  fd = (u32)H[a + 8], rgw = (u32)H[a + 9], rdw = (u32)H[a + 10];
++    StrParts q = str_peek_ro(e, wbt);
++    bool rgt = rgw >> 30 & 1, rdt = rdw >> 30 & 1;
++    u32  rg = rgw & (rgt ? 0x0fffffffu : 0x7fffffffu);
++    u32  rd = rdw & (rdt ? 0x0fffffffu : 0x7fffffffu);
++    u32  fgm = rgt ? rgw >> 28 & 3 : (rgw >> 31 ? 2 : rg % 17 == 0);
++    u32  fdm = rdt ? rdw >> 28 & 3 : (rdw >> 31 ? 2 : rd % 17 == 0);
++    const u8* base = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || fgm != 1 || fdm != 1
++      || post % 4 != 0 || ((u64)(base + fg) & 15) != 0
++      || ((u64)(base + fu) & 15) != 0 || ((u64)(base + fd) & 15) != 0
++      || term_tag(x) == TAG_ARR || term_tag(y) == TAG_ARR || term_tag(at) == TAG_ARR
++      || (u64)post + 4096 * 4 > q.len
++      || (u64)fg + (u64)12288 * rg > q.len
++      || (u64)fu + (u64)12288 * rg > q.len
++      || (u64)fd + (u64)4096 * rd > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 17;
++    o->w  = (u64)(base + post);
++    o->x  = (u64)(H + blk_loc(H, x));
++    o->y  = (u64)(H + blk_loc(H, y));
++    o->r  = (u64)(H + blk_loc(H, at));
++    o->k  = (u64)(base + fg);
++    o->v  = (u64)(base + fu);
++    o->wn = (u64)(base + fd);
++    o->n  = 4096;
++    o->rb = rg;
++    o->d  = rd;
++    o->fm = 1;
++    return true;
++  }
+   {
+     Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
+     Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
+@@ -7841,7 +7893,8 @@
+       if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
+         || hx == LLB_GDL_FID || hx == LLB_RNORM_FID
+         || hx == LLB_VADD_FID || hx == LLB_VMUL_FID || hx == LLB_OG_FID
+-        || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID || hx == LLB_SILUMUL_FID) {
++        || hx == LLB_HEAD_FID || hx == LLB_ATTN4_FID || hx == LLB_SILUMUL_FID
++        || hx == LLB_FBN_FID) {
+         hyb_mail(e, H, a, hx, &M->op[j], &bad);
+         continue;
+       }
+@@ -8769,6 +8822,7 @@
+     || cuModuleGetFunction(&gpu_amax, gpu_lib, "llb_amax") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
++    || cuMemAlloc(&gpu_blk, 49152 * 4) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_logit, 4u << 18) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_headh, 4096 * 4) != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_atts, (size_t)2 * 16 * (1u << 17) * 4) != CUDA_SUCCESS
+@@ -8995,6 +9049,41 @@
+           != CUDA_SUCCESS) {
+           err_fail("device launch failed");
+         }
++      } else if (o->kind == 17) {
++        // the FFN block bang (tools/payload-fbn.patch): rms(post, x + a), the
++        // gate and up GEMVs, silu, the down GEMV, the residual add -- one task
++        u64 postp17 = o->w, fgp17 = o->k, fup17 = o->v, fdp17 = o->wn;
++        u64 xp17 = o->x, ap17 = o->r;
++        u32 rg17 = o->rb, rd17 = o->d;
++        u32 cgu = rg17 / 17 * 4, cgd = rd17 / 17 * 4;
++        CUdeviceptr x1b = gpu_blk, h2b = x1b + 4096 * 4;
++        CUdeviceptr ggb = h2b + 4096 * 4, uub = ggb + 12288 * 4;
++        CUdeviceptr aab = uub + 12288 * 4, ddb = aab + 12288 * 4;
++        u32 n4 = 4096, ngu = 12288, dgu = 10, dfd = 12;
++        u32 siluG = (12288 + 255) / 256, vaddG = (4096 + 1023) / 1024;
++        void* x1_[] = { &xp17, &ap17, &x1b, &n4 };
++        void* rb17[] = { &x1b, &postp17, &h2b, &n4 };
++        void* gg17[] = { &fgp17, &rg17, &cgu, &h2b, &ggb, &ngu, &dgu };
++        void* uu17[] = { &fup17, &rg17, &cgu, &h2b, &uub, &ngu, &dgu };
++        void* ss17[] = { &ggb, &uub, &aab, &ngu };
++        void* dd17[] = { &fdp17, &rd17, &cgd, &aab, &ddb, &n4, &dfd };
++        void* vv17[] = { &x1b, &ddb, &yp, &n4 };
++        if (cuLaunchKernel(gpu_vadd, vaddG, 1, 1, 1024, 1, 1, 0, NULL, x1_, NULL)
++          != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_rnorm, 1, 1, 1, 1024, 1, 1, 0, NULL, rb17, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, gg17, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, uu17, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_silu, siluG, 1, 1, 256, 1, 1, 0, NULL, ss17, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_warpq, grid, 1, 1, 128, 1, 1, 0, NULL, dd17, NULL)
++            != CUDA_SUCCESS
++          || cuLaunchKernel(gpu_vadd, vaddG, 1, 1, 1024, 1, 1, 0, NULL, vv17, NULL)
++            != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
+       } else {
+         // the output gate bang (tools/payload-og.patch)
+         u64 xp13 = o->x, gp13 = o->k;

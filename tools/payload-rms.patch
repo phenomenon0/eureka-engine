@@ -1,0 +1,119 @@
+--- a/bend2/comp.ts	2026-09-28 04:43:55.794220713 -0500
++++ b/bend2/comp.ts	2026-09-28 04:45:21.943459403 -0500
+@@ -2897,7 +2897,14 @@
+ // The warp GEMV (tools/remap.patch): a bang the device parks and the host
+ // runs as one kernel; a sequential lane cannot park it, so there it faults.
+ function is_warp(k: Name): boolean {
+-  return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k);
++  return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
++    || is_rms(k);
++}
++
++// The rms-GEMV bang (tools/payload-rms.patch): the host runs llb_rms, then
++// the GEMV (llb_warp) on its output.
++function is_rms(k: Name): boolean {
++  return k === "llb.rms_warp" || k.endsWith(".llb.rms_warp");
+ }
+ 
+ // The attention bang (tools/payload-attn.patch): parked as a warp GEMV is; the
+@@ -3988,7 +3995,8 @@
+   const last = rs.map((r, i) =>
+     `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
+   defs.push(...[...fl.bangs].filter(is_warp)
+-    .map((k) => `#define ${is_attn(k) ? "LLB_ATTN_FID" : "LLB_WARP_FID"} ${
++    .map((k) => `#define ${is_attn(k) ? "LLB_ATTN_FID"
++      : is_rms(k) ? "LLB_RMS_FID" : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+   `#define WL_BANK Term ${ws.join(", ")};`, "",
+@@ -4707,6 +4715,7 @@
+ static CUfunction gpu_pso;
+ static CUfunction gpu_warp;
+ static CUfunction gpu_attn;
++static CUfunction gpu_rms;
+ static CUdeviceptr gpu_att;
+ #endif
+ static bool io_gpu;
+@@ -6829,9 +6838,12 @@
+ #ifndef LLB_ATTN_FID
+ #define LLB_ATTN_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_RMS_FID
++#define LLB_RMS_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+-  || (u32)term_aux(t) == LLB_ATTN_FID)
++  || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7194,6 +7206,37 @@
+ }
+ #endif
+ 
++#if defined(BEND_RTC) && defined(LLB_WARP_FID)
++// flat.bend's rms over 2048: s = 1 / sqrt(sumsq / 2048 + eps), sumsq the
++// balanced tree of v * v (pairs, then halves up in shared memory); h = (x * s)
++// * w, w the norm's f32 words. One block of 1024.
++extern "C" __global__ void __launch_bounds__(1024) llb_rms(
++  const float* __restrict__ x, const float* __restrict__ w,
++  float* __restrict__ h) {
++  __shared__ float a[1024];
++  __shared__ float sv;
++  const u32 t = threadIdx.x;
++  a[t] = __fadd_rn(__fmul_rn(x[2 * t], x[2 * t]),
++    __fmul_rn(x[2 * t + 1], x[2 * t + 1]));
++  __syncthreads();
++  for (u32 st = 1; st < 1024; st <<= 1) {
++    if ((t & (2 * st - 1)) == 0) {
++      a[t] = __fadd_rn(a[t], a[t + st]);
++    }
++    __syncthreads();
++  }
++  if (t == 0) {
++    sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 2048.0f),
++      __uint_as_float(0x358637BDu))));
++  }
++  __syncthreads();
++  const float s = sv;
++  for (u32 i = t; i < 2048; i += 1024) {
++    h[i] = __fmul_rn(__fmul_rn(x[i], s), w[i]);
++  }
++}
++#endif
++
+ #ifdef BEND_RTC
+ extern "C" __global__ void window_dev(Corpus H, Term root, u32 w, u32 h,
+   u32 k, u32* out) {
+@@ -7631,6 +7674,7 @@
+ #ifdef LLB_WARP_FID
+   if (cuModuleGetFunction(&gpu_warp, gpu_lib, "llb_warp") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_att, 2048 * 4 * LINE) != CUDA_SUCCESS) {
+     err_fail("cannot load the GPU program");
+   }
+@@ -7723,6 +7767,22 @@
+         != CUDA_SUCCESS) {
+         err_fail("device launch failed");
+       }
++      xp = (const u32*)(uintptr_t)op;
++    }
++    // an rms task (f, +wb, +x, y, +base, +n, +d, +rb, +an): the GEMV reads
++    // llb_rms(x, the 2048 f32 at byte an of wb), a slot of gpu_att
++    if ((u32)term_aux(t) == LLB_RMS_FID) {
++      u32 an = (u32)H[a + 8];
++      if (blk_cls(x) != 11 || an % 4 != 0 || (u64)an + 2048 * 4 > p.len) {
++        err_fail("warp rms: unsupported operands");
++      }
++      const u8* wn = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + an;
++      CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
++      void* ra[] = { &xp, &wn, &op };
++      if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL)
++        != CUDA_SUCCESS) {
++        err_fail("device launch failed");
++      }
+       xp = (const u32*)(uintptr_t)op;
+     }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };

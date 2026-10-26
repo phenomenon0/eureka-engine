@@ -1,0 +1,37 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -11046,6 +11046,26 @@
+   return H;
+ }
+ 
++#if BEND_CUDA && CUDA_VERSION >= 13000
++// The bang seam: the host just wrote the header, ring 0's get/put rows, its
++// new slot and the heap's first page; move those pages to the device in one
++// pass before the bang, not as serialized device faults inside its first
++// round (P3-3f: round 1 had five ~70 us fault groups).
++static void seam_pf(Corpus H) {
++  // every host read precedes every prefetch: a read after one faults it back
++  u64 at[5] = { 0, (u64)(ring_word(H, 0, RING_LEN) - H),
++    (u64)(ring_word(H, 0, RING_LEN + 1) - H),
++    (u64)(ring_slot(H, 0, *ring_put(H, 0) - 1) - H), HEAP_OFF };
++  CUmemLocation lc = { CU_MEM_LOCATION_TYPE_DEVICE, gpu_dev };
++  for (u32 i = 0; i < 5; i += 1) {
++    CUdeviceptr p = (CUdeviceptr)(uintptr_t)(H + at[i]) & ~(CUdeviceptr)4095;
++    cuMemPrefetchAsync(p, 4096, lc, 0, NULL);
++  }
++}
++#else
++#define seam_pf(H)
++#endif
++
+ OUTLINE Term corpus_eval(Corpus H, Term t) {
+   Env  e = { H, ALC[0] };
+   Term rv[WL_RESW];
+@@ -11066,6 +11086,7 @@
+         H[tl]     = TERM_HOLE;
+         a32_store(a32_at(H, H_CURSOR), 1);
+         ring_push(H, 0, t);
++        seam_pf(H);
+         cube_run(H, true);
+         Term p = task_deliver(H, cont, idx, rv, root_take(H, rv));
+         if (root_done(H)) {

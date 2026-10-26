@@ -1,0 +1,279 @@
+--- a/host/llb_gguf.c
++++ b/host/llb_gguf.c
+@@ -502,7 +502,276 @@
+ }
+ 
+ // ---------------------------------------------------------------- the effect
++
++// ---------------------------------------------------------------- the mmproj (ENGINE-VISION V1)
++//
++// A second GGUF next to the backbone: the vision tower + merger (llama.cpp's "mmproj", clip.* keys, v.* / mm.*
++// tensors). Unlike gg_open (the backbone's pack layout, metadata ignored), this one keeps the clip.* hparams and
++// every tensor's shape, then validates the file against the exact tensor list clip.cpp loads for
++// clip.projector_type = qwen3vl_merger (tools/mtmd/clip.cpp, PROJECTOR_TYPE_QWEN3VL; qwen3vl.cpp graph):
++//   v.patch_embd.weight / .weight.1   [16,16,3,n_embd] F16  (conv3d split into its 2 temporal taps)
++//   v.patch_embd.bias                 [n_embd]
++//   v.position_embd.weight            [n_embd, (image_size/patch)^2]
++//   v.blk.L.{ln1,ln2}.{weight,bias}   [n_embd]
++//   v.blk.L.attn_qkv.{weight,bias}    [n_embd,3*n_embd] / [3*n_embd]
++//   v.blk.L.attn_out.{weight,bias}    [n_embd,n_embd]   / [n_embd]
++//   v.blk.L.ffn_up.{weight,bias}      [n_embd,n_ff]     / [n_ff]
++//   v.blk.L.ffn_down.{weight,bias}    [n_ff,n_embd]     / [n_embd]
++//   v.post_ln.{weight,bias}           [n_embd]
++//   mm.0.{weight,bias}                [4*n_embd,4*n_embd] / [4*n_embd]
++//   mm.2.{weight,bias}                [4*n_embd,proj_dim] / [proj_dim]      (proj_dim must == the backbone's n_embd)
++// Anything else refuses: another projector type, DeepStack layers (Qwen3-VL/Omni; our Qwen3.5/3.8 targets have
++// none), an extra or missing tensor, a shape off by one, a type other than F16/F32.
++// Upload: F32 tensors are read as is; F16 is either kept raw (gg_mm_raw, for a GPU F16 path) or widened to F32
++// exactly (gg_mm_f32; every F16 value is representable in F32).
++
++#define GG_MM_MAXDIM 4
++
++typedef struct {
++  char *name;
++  uint32_t ty;                // 0 = F32, 1 = F16
++  uint32_t nd;
++  uint64_t ne[GG_MM_MAXDIM];  // ggml order (ne[0] fastest), unused dims = 1
++  uint64_t src;               // absolute file offset
++  uint64_t rel;               // offset inside the data section (clip.cpp's "offset=")
++  uint64_t bytes;
++} GgMmT;
++
++typedef struct {
++  int fd;
++  GgMmT *t;
++  size_t nt;
++  char proj[64], name[128];
++  int has_vision, use_gelu, use_silu;
++  uint32_t n_embd, n_ff, n_layer, n_head, proj_dim, image_size, patch, n_merge, min_px, max_px;
++  float eps, mean[3], std[3];
++  uint32_t n_deepstack;       // count of true in clip.vision.is_deepstack_layers
++} GgMm;
++
++static void gg_mm_close(GgMm *m) {
++  if (m->t) for (size_t i = 0; i < m->nt; i++) free(m->t[i].name);
++  free(m->t);
++  if (m->fd > 0) close(m->fd);
++  memset(m, 0, sizeof *m);
++}
++
++// one metadata value: numbers land in *u / *f, strings in str (truncated to cap), f32[3] arrays in a3,
++// bool arrays counted into *ntrue
++static void gg_mm_val(GgRd *r, uint32_t t, uint64_t *u, float *f, char *str, size_t cap, float *a3, uint32_t *ntrue) {
++  if (t == 8) {
++    char *s = gg_str(r, 1);
++    if (s && str) snprintf(str, cap, "%s", s);
++    free(s);
++    return;
++  }
++  if (t == 9) {
++    uint32_t et = gg_u32(r);
++    uint64_t n = gg_u64(r);
++    if (et == 9 || et > 12) { r->bad = 1; return; }
++    for (uint64_t i = 0; i < n && !r->bad; i++) {
++      if (et == 8) { gg_str(r, 0); continue; }
++      uint64_t v = 0;
++      gg_rd_get(r, &v, (uint64_t)GG_KV[et]);
++      if (et == 6 && a3 && i < 3) { float x; uint32_t w = (uint32_t)v; memcpy(&x, &w, 4); a3[i] = x; }
++      if (et == 7 && ntrue && v) (*ntrue)++;
++    }
++    return;
++  }
++  if (t > 12) { r->bad = 1; return; }
++  uint64_t v = 0;
++  gg_rd_get(r, &v, (uint64_t)GG_KV[t]);
++  if (u) *u = v;
++  if (f && t == 6) { uint32_t w = (uint32_t)v; memcpy(f, &w, 4); }
++}
+ 
++// Parse the header of an mmproj GGUF. 0, or -1 with err set. Validation is gg_mm_check's job.
++static int gg_mm_open(GgMm *m, const char *path, char *err) {
++  memset(m, 0, sizeof *m);
++  m->fd = -1;
++  uint16_t one = 1;
++  if (*(uint8_t *)&one != 1) return gg_fail(err, "big-endian host unsupported");
++  m->fd = open(path, O_RDONLY);
++  if (m->fd < 0) return gg_fail(err, "open %s: %s", path, strerror(errno));
++  struct stat st;
++  if (fstat(m->fd, &st)) return gg_fail(err, "stat %s: %s", path, strerror(errno));
++  GgRd r = {m->fd, 0, 0, malloc(1 << 20), 0, 0};
++  if (!r.buf) return gg_fail(err, "out of memory");
++  char magic[4] = {0};
++  gg_rd_get(&r, magic, 4);
++  uint32_t ver = gg_u32(&r);
++  if (memcmp(magic, "GGUF", 4) || (ver != 2 && ver != 3)) { free(r.buf); return gg_fail(err, "%s: not a GGUF v2/v3", path); }
++  uint64_t nt = gg_u64(&r), nkv = gg_u64(&r), align = 32;
++  if (nt > 100000 || nkv > 100000) { free(r.buf); return gg_fail(err, "%s: corrupt header counts", path); }
++  for (uint64_t i = 0; i < nkv && !r.bad; i++) {
++    char *key = gg_str(&r, 1);
++    uint32_t t = gg_u32(&r);
++    uint64_t u = 0;
++    float f = 0;
++    const char *k = key ? key : "";
++#define GG_MM_U(K, F) else if (!strcmp(k, K)) { gg_mm_val(&r, t, &u, NULL, NULL, 0, NULL, NULL); m->F = (uint32_t)u; }
++    if (!strcmp(k, "clip.projector_type")) gg_mm_val(&r, t, NULL, NULL, m->proj, sizeof m->proj, NULL, NULL);
++    else if (!strcmp(k, "general.name")) gg_mm_val(&r, t, NULL, NULL, m->name, sizeof m->name, NULL, NULL);
++    else if (!strcmp(k, "general.alignment")) { gg_mm_val(&r, t, &u, NULL, NULL, 0, NULL, NULL); align = u; }
++    else if (!strcmp(k, "clip.has_vision_encoder")) { gg_mm_val(&r, t, &u, NULL, NULL, 0, NULL, NULL); m->has_vision = (int)u; }
++    else if (!strcmp(k, "clip.use_gelu")) { gg_mm_val(&r, t, &u, NULL, NULL, 0, NULL, NULL); m->use_gelu = (int)u; }
++    else if (!strcmp(k, "clip.use_silu")) { gg_mm_val(&r, t, &u, NULL, NULL, 0, NULL, NULL); m->use_silu = (int)u; }
++    GG_MM_U("clip.vision.embedding_length", n_embd)
++    GG_MM_U("clip.vision.feed_forward_length", n_ff)
++    GG_MM_U("clip.vision.block_count", n_layer)
++    GG_MM_U("clip.vision.attention.head_count", n_head)
++    GG_MM_U("clip.vision.projection_dim", proj_dim)
++    GG_MM_U("clip.vision.image_size", image_size)
++    GG_MM_U("clip.vision.patch_size", patch)
++    GG_MM_U("clip.vision.spatial_merge_size", n_merge)
++    GG_MM_U("clip.vision.image_min_pixels", min_px)
++    GG_MM_U("clip.vision.image_max_pixels", max_px)
++    else if (!strcmp(k, "clip.vision.attention.layer_norm_epsilon")) gg_mm_val(&r, t, NULL, &m->eps, NULL, 0, NULL, NULL);
++    else if (!strcmp(k, "clip.vision.image_mean")) gg_mm_val(&r, t, NULL, NULL, NULL, 0, m->mean, NULL);
++    else if (!strcmp(k, "clip.vision.image_std")) gg_mm_val(&r, t, NULL, NULL, NULL, 0, m->std, NULL);
++    else if (!strcmp(k, "clip.vision.is_deepstack_layers")) gg_mm_val(&r, t, NULL, NULL, NULL, 0, NULL, &m->n_deepstack);
++    else gg_val(&r, t);
++#undef GG_MM_U
++    (void)f;
++    free(key);
++  }
++  m->nt = (size_t)nt;
++  m->t = calloc(nt ? nt : 1, sizeof *m->t);
++  if (!m->t) { free(r.buf); return gg_fail(err, "out of memory"); }
++  for (size_t i = 0; i < m->nt && !r.bad; i++) {
++    GgMmT *t = &m->t[i];
++    t->name = gg_str(&r, 1);
++    t->nd = gg_u32(&r);
++    if (r.bad || t->nd < 1 || t->nd > GG_MM_MAXDIM) { r.bad = 1; break; }
++    uint64_t n = 1;
++    for (uint32_t j = 0; j < GG_MM_MAXDIM; j++) t->ne[j] = 1;
++    for (uint32_t j = 0; j < t->nd; j++) t->ne[j] = gg_u64(&r), n *= t->ne[j];
++    t->ty = gg_u32(&r);
++    t->rel = gg_u64(&r);
++    t->bytes = t->ty == 0 ? n * 4 : t->ty == 1 ? n * 2 : 0;  // other types: refused by gg_mm_check (bytes 0)
++  }
++  int bad = r.bad;
++  uint64_t data = r.off + r.p;
++  free(r.buf);
++  if (bad) return gg_fail(err, "%s: header truncated or corrupt", path);
++  if (!align) return gg_fail(err, "general.alignment 0");
++  data = (data + align - 1) / align * align;
++  for (size_t i = 0; i < m->nt; i++) {
++    m->t[i].src = data + m->t[i].rel;
++    if (m->t[i].ty <= 1 && m->t[i].src + m->t[i].bytes > (uint64_t)st.st_size) return gg_fail(err, "%s: data past the end of %s", m->t[i].name, path);
++  }
++  return 0;
++}
++
++static const GgMmT *gg_mm_find(const GgMm *m, const char *name) {
++  for (size_t i = 0; i < m->nt; i++) if (!strcmp(m->t[i].name, name)) return &m->t[i];
++  return NULL;
++}
++
++// one expected tensor: name, type rule (0 = F32, 1 = F16, 2 = F16 or F32), dims
++static int gg_mm_want(const GgMm *m, char *err, int *seen, const char *name, int ty, uint32_t nd,
++                      uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
++  const GgMmT *t = gg_mm_find(m, name);
++  if (!t) return gg_fail(err, "mmproj: missing tensor %s", name);
++  uint64_t want[4] = {a, b, c, d};
++  int ok = t->nd == nd;
++  for (int j = 0; j < 4; j++) ok &= t->ne[j] == want[j];
++  if (!ok) return gg_fail(err, "mmproj: %s has shape [%llu,%llu,%llu,%llu] (nd %u), want [%llu,%llu,%llu,%llu] (nd %u)", name,
++                          (unsigned long long)t->ne[0], (unsigned long long)t->ne[1], (unsigned long long)t->ne[2],
++                          (unsigned long long)t->ne[3], t->nd, (unsigned long long)a, (unsigned long long)b,
++                          (unsigned long long)c, (unsigned long long)d, nd);
++  if (ty != 2 && (int)t->ty != ty) return gg_fail(err, "mmproj: %s is type %u, want %s", name, t->ty, ty ? "F16" : "F32");
++  seen[t - m->t]++;
++  return 0;
++}
++
++// Validate against clip.cpp's qwen3vl_merger list. n_embd_llm = the backbone's embedding width (0 = skip that
++// check). 0, or -1 with err naming the first problem.
++static int gg_mm_check(const GgMm *m, uint32_t n_embd_llm, char *err) {
++  if (strcmp(m->proj, "qwen3vl_merger"))
++    return gg_fail(err, "mmproj: clip.projector_type '%s' refused (this engine takes qwen3vl_merger only)", m->proj[0] ? m->proj : "(none)");
++  for (size_t i = 0; i < m->nt; i++)
++    if (m->t[i].ty > 1) return gg_fail(err, "mmproj: %s is ggml type %u: the mmproj loader takes F32/F16 only", m->t[i].name, m->t[i].ty);
++  if (!m->has_vision) return gg_fail(err, "mmproj: clip.has_vision_encoder is false");
++  if (m->n_deepstack) return gg_fail(err, "mmproj: %u DeepStack layers (Qwen3-VL/Omni tower) refused: F1 targets Qwen3.5/3.8 (no DeepStack)", m->n_deepstack);
++  if (m->use_silu || !m->use_gelu) return gg_fail(err, "mmproj: ffn op is not GELU (use_gelu %d use_silu %d)", m->use_gelu, m->use_silu);
++  if (!m->n_embd || !m->n_head || m->n_embd % m->n_head || !m->n_ff || !m->n_layer || !m->patch || !m->image_size ||
++      m->image_size % m->patch)
++    return gg_fail(err, "mmproj: incomplete or inconsistent clip.vision hparams");
++  if (m->n_merge && m->n_merge != 2) return gg_fail(err, "mmproj: spatial_merge_size %u (want 2)", m->n_merge);
++  if (n_embd_llm && m->proj_dim != n_embd_llm)
++    return gg_fail(err, "mmproj: projection_dim %u != backbone n_embd %u (wrong mmproj for this model)", m->proj_dim, n_embd_llm);
++  int *seen = calloc(m->nt ? m->nt : 1, sizeof *seen);
++  if (!seen) return gg_fail(err, "out of memory");
++  const uint64_t E = m->n_embd, F = m->n_ff, P = m->patch, G = (uint64_t)(m->image_size / m->patch);
++  char nm[96];
++  int rc = 0;
++#define W(N, T, ND, A, B, C, D) if (!rc) rc = gg_mm_want(m, err, seen, N, T, ND, A, B, C, D)
++  W("v.patch_embd.weight", 1, 4, P, P, 3, E);
++  W("v.patch_embd.weight.1", 1, 4, P, P, 3, E);
++  W("v.patch_embd.bias", 0, 1, E, 1, 1, 1);
++  W("v.position_embd.weight", 2, 2, E, G * G, 1, 1);
++  for (uint32_t L = 0; L < m->n_layer && !rc; L++) {
++    static const char *nb[2] = {"ln1", "ln2"};
++    for (int k = 0; k < 2; k++) {
++      snprintf(nm, sizeof nm, "v.blk.%u.%s.weight", L, nb[k]); W(nm, 0, 1, E, 1, 1, 1);
++      snprintf(nm, sizeof nm, "v.blk.%u.%s.bias", L, nb[k]);   W(nm, 0, 1, E, 1, 1, 1);
++    }
++    snprintf(nm, sizeof nm, "v.blk.%u.attn_qkv.weight", L); W(nm, 2, 2, E, 3 * E, 1, 1);
++    snprintf(nm, sizeof nm, "v.blk.%u.attn_qkv.bias", L);   W(nm, 0, 1, 3 * E, 1, 1, 1);
++    snprintf(nm, sizeof nm, "v.blk.%u.attn_out.weight", L); W(nm, 2, 2, E, E, 1, 1);
++    snprintf(nm, sizeof nm, "v.blk.%u.attn_out.bias", L);   W(nm, 0, 1, E, 1, 1, 1);
++    snprintf(nm, sizeof nm, "v.blk.%u.ffn_up.weight", L);   W(nm, 2, 2, E, F, 1, 1);
++    snprintf(nm, sizeof nm, "v.blk.%u.ffn_up.bias", L);     W(nm, 0, 1, F, 1, 1, 1);
++    snprintf(nm, sizeof nm, "v.blk.%u.ffn_down.weight", L); W(nm, 2, 2, F, E, 1, 1);
++    snprintf(nm, sizeof nm, "v.blk.%u.ffn_down.bias", L);   W(nm, 0, 1, E, 1, 1, 1);
++  }
++  W("v.post_ln.weight", 0, 1, E, 1, 1, 1);
++  W("v.post_ln.bias", 0, 1, E, 1, 1, 1);
++  W("mm.0.weight", 2, 2, 4 * E, 4 * E, 1, 1);
++  W("mm.0.bias", 0, 1, 4 * E, 1, 1, 1);
++  W("mm.2.weight", 2, 2, 4 * E, m->proj_dim, 1, 1);
++  W("mm.2.bias", 0, 1, m->proj_dim, 1, 1, 1);
++#undef W
++  for (size_t i = 0; i < m->nt && !rc; i++)
++    if (seen[i] != 1) rc = gg_fail(err, "mmproj: unexpected tensor %s (not in clip.cpp's qwen3vl_merger list)", m->t[i].name);
++  free(seen);
++  return rc;
++}
++
++// IEEE half -> float, exact (subnormals, inf, nan included)
++static float gg_h2f(uint16_t h) {
++  uint32_t s = (uint32_t)(h >> 15) << 31, e = (h >> 10) & 31, f = h & 1023, w;
++  if (e == 31) w = s | 0x7f800000u | (f << 13);
++  else if (e) w = s | ((e + 112) << 23) | (f << 13);
++  else if (!f) w = s;
++  else {  // subnormal: normalize
++    e = 113;
++    while (!(f & 1024)) f <<= 1, e--;
++    w = s | (e << 23) | ((f & 1023) << 13);
++  }
++  float x;
++  memcpy(&x, &w, 4);
++  return x;
++}
++
++// the tensor's bytes as stored (F16 stays F16), into dst (t->bytes)
++static int gg_mm_raw(const GgMm *m, const GgMmT *t, void *dst, char *err) {
++  if (gg_pread(m->fd, dst, (size_t)t->bytes, t->src)) return gg_fail(err, "%s: read failed", t->name);
++  return 0;
++}
++
++// the tensor widened to F32, into dst (nelements floats)
++static int gg_mm_f32(const GgMm *m, const GgMmT *t, float *dst, char *err) {
++  uint64_t n = t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3];
++  if (!t->ty) return gg_mm_raw(m, t, dst, err);
++  uint16_t *h = malloc((size_t)t->bytes);
++  if (!h) return gg_fail(err, "out of memory");
++  if (gg_mm_raw(m, t, h, err)) { free(h); return -1; }
++  for (uint64_t i = 0; i < n; i++) dst[i] = gg_h2f(h[i]);
++  free(h);
++  return 0;
++}
++
+ #ifdef CID_GGUF_READ
+ 
+ // Gguf.read(which, off, n): one region into a Bytes. Like File.read_buf: the

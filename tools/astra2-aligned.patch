@@ -1,0 +1,14 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -5658,6 +5658,11 @@
+   Loc l = term_peek_ro(e, p.data);
+   u32 nar = str_nar(p), j = p.off + (u32)i, n = p.len - (u32)i, x = 0;
+   if (nar == 2 && n >= 4) {
++#ifdef BEND_RTC
++    if ((j & 3) == 0) {
++      return ((DEV u32*)(e.mem + l))[j >> 2];
++    }
++#endif
+     DEV u8* b = (DEV u8*)(e.mem + l) + j;
+     return (u32)b[0] | (u32)b[1] << 8 | (u32)b[2] << 16 | (u32)b[3] << 24;
+   }

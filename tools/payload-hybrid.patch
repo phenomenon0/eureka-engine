@@ -1,0 +1,377 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -2900,7 +2900,30 @@
+ function is_warp(k: Name): boolean {
+   return k === "llb.gemv_warp" || k.endsWith(".llb.gemv_warp") || is_attn(k)
+     || is_rms(k) || is_dadd(k) || is_rope(k) || is_put(k) || is_ffn(k)
+-    || is_qknorm(k);
++    || is_qknorm(k) || is_hyb(k);
++}
++
++// The Qwen3.5 hybrid ops (tools/payload-hybrid.patch): the host runs
++// llb_l2norm / llb_conv1d / llb_gated_rmsnorm / llb_gated_delta into the bang's
++// output y (field index 3, so the generic delivery hands y to the continuation).
++function is_hyb(k: Name): boolean {
++  return is_l2n(k) || is_conv(k) || is_grn(k) || is_gdl(k);
++}
++
++function is_l2n(k: Name): boolean {
++  return k === "llb.l2norm_warp" || k.endsWith(".llb.l2norm_warp");
++}
++
++function is_conv(k: Name): boolean {
++  return k === "llb.conv1d_warp" || k.endsWith(".llb.conv1d_warp");
++}
++
++function is_grn(k: Name): boolean {
++  return k === "llb.gated_rmsnorm_warp" || k.endsWith(".llb.gated_rmsnorm_warp");
++}
++
++function is_gdl(k: Name): boolean {
++  return k === "llb.gated_delta_warp" || k.endsWith(".llb.gated_delta_warp");
+ }
+ 
+ // The qk-norm op (tools/qknorm.patch): per-head RMSNorm on q/k with gain g.
+@@ -4036,6 +4059,8 @@
+       : is_rms(k) ? "LLB_RMS_FID" : is_dadd(k) ? "LLB_DADD_FID"
+       : is_rope(k) ? "LLB_ROPE_FID" : is_put(k) ? "LLB_PUT_FID"
+       : is_ffn(k) ? "LLB_FFN_FID" : is_qknorm(k) ? "LLB_QKNORM_FID"
++      : is_l2n(k) ? "LLB_L2N_FID" : is_conv(k) ? "LLB_CONV_FID"
++      : is_grn(k) ? "LLB_GRN_FID" : is_gdl(k) ? "LLB_GDL_FID"
+       : "LLB_WARP_FID"} ${
+       seg_fid(k)}`));
+   defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+@@ -4764,6 +4789,10 @@
+ static CUfunction gpu_rope;
+ static CUfunction gpu_silu;
+ static CUfunction gpu_qknorm;
++static CUfunction gpu_l2n;
++static CUfunction gpu_conv;
++static CUfunction gpu_grn;
++static CUfunction gpu_gdl;
+ static CUdeviceptr gpu_act;
+ static CUdeviceptr gpu_att;
+ static volatile struct Mail* gpu_mail;
+@@ -6936,12 +6965,26 @@
+ #ifndef LLB_QKNORM_FID
+ #define LLB_QKNORM_FID 0xFFFFFFFFu
+ #endif
++#ifndef LLB_L2N_FID
++#define LLB_L2N_FID 0xFFFFFFFFu
++#endif
++#ifndef LLB_CONV_FID
++#define LLB_CONV_FID 0xFFFFFFFFu
++#endif
++#ifndef LLB_GRN_FID
++#define LLB_GRN_FID 0xFFFFFFFFu
++#endif
++#ifndef LLB_GDL_FID
++#define LLB_GDL_FID 0xFFFFFFFFu
++#endif
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+ #define warp_is(t) ((u32)term_aux(t) == LLB_WARP_FID \
+   || (u32)term_aux(t) == LLB_ATTN_FID || (u32)term_aux(t) == LLB_RMS_FID \
+   || (u32)term_aux(t) == LLB_DADD_FID || (u32)term_aux(t) == LLB_ROPE_FID \
+   || (u32)term_aux(t) == LLB_PUT_FID || (u32)term_aux(t) == LLB_FFN_FID \
+-  || (u32)term_aux(t) == LLB_QKNORM_FID)
++  || (u32)term_aux(t) == LLB_QKNORM_FID \
++  || (u32)term_aux(t) == LLB_L2N_FID || (u32)term_aux(t) == LLB_CONV_FID \
++  || (u32)term_aux(t) == LLB_GRN_FID || (u32)term_aux(t) == LLB_GDL_FID)
+ #else
+ #define warp_is(t) false
+ #endif
+@@ -7443,6 +7486,87 @@
+ #endif
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
++// The Qwen3.5 hybrid bangs' operand reads (tools/payload-hybrid.patch): fill the
++// WarpOp from the task's fields; bad 5 = hybrid operands unsupported.
++__device__ static bool hyb_mail(Env e, Corpus H, Loc a, u32 aux, WarpOp* o, u32* bad) {
++  if (aux == LLB_L2N_FID) {
++    Term v = H[a + 1], y = H[a + 3];
++    u32  scb = (u32)H[a + 2], k = (u32)H[a + 4];
++    if (term_tag(v) == TAG_ARR || term_tag(y) == TAG_ARR || k != 4) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 6;
++    o->x = (u64)(H + blk_loc(H, v));
++    o->y = (u64)(H + blk_loc(H, y));
++    o->c = scb;
++    o->n = 1u << k;
++    return true;
++  }
++  if (aux == LLB_CONV_FID) {
++    Term    wbt = H[a + 1], y = H[a + 3], x = H[a + 4];
++    Term    h0 = H[a + 5], h1 = H[a + 6], h2 = H[a + 7];
++    u32     at = (u32)H[a + 2], d = (u32)H[a + 8];
++    StrParts q = str_peek_ro(e, wbt);
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || d < 9 || d > 15
++      || term_tag(y) == TAG_ARR || term_tag(x) == TAG_ARR
++      || term_tag(h0) == TAG_ARR || term_tag(h1) == TAG_ARR
++      || term_tag(h2) == TAG_ARR
++      || (u64)at + ((u64)1 << d) * 16 > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 7;
++    o->w  = (u64)((const u8*)(H + term_peek_ro(e, q.data)) + q.off + at);
++    o->y  = (u64)(H + blk_loc(H, y));
++    o->x  = (u64)(H + blk_loc(H, x));
++    o->k  = (u64)(H + blk_loc(H, h0));
++    o->v  = (u64)(H + blk_loc(H, h1));
++    o->wn = (u64)(H + blk_loc(H, h2));
++    o->n  = 1u << d;
++    return true;
++  }
++  if (aux == LLB_GRN_FID) {
++    Term    ot = H[a + 1], wbt = H[a + 2], y = H[a + 3], z = H[a + 5];
++    u32     at = (u32)H[a + 4], k = (u32)H[a + 6];
++    StrParts q = str_peek_ro(e, wbt);
++    if (term_tag(wbt) != TAG_STR || str_nar(q) != 2 || k != 5
++      || term_tag(ot) == TAG_ARR || term_tag(y) == TAG_ARR || term_tag(z) == TAG_ARR
++      || (u64)at + 128 * 4 > q.len) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 8;
++    o->x = (u64)(H + blk_loc(H, ot));
++    o->w = (u64)((const u8*)(H + term_peek_ro(e, q.data)) + q.off + at);
++    o->y = (u64)(H + blk_loc(H, y));
++    o->k = (u64)(H + blk_loc(H, z));
++    o->n = 1u << k;
++    return true;
++  }
++  {
++    Term qt = H[a + 1], S = H[a + 2], y = H[a + 3], kk = H[a + 4];
++    Term v = H[a + 5], dec = H[a + 6], bet = H[a + 7];
++    u32  k = (u32)H[a + 8];
++    if (term_tag(S) == TAG_ARR || term_tag(qt) == TAG_ARR || term_tag(y) == TAG_ARR
++      || term_tag(kk) == TAG_ARR || term_tag(v) == TAG_ARR || term_tag(dec) == TAG_ARR
++      || term_tag(bet) == TAG_ARR || k != 5) {
++      *bad = *bad != 0 ? *bad : 5;
++      return true;
++    }
++    o->kind = 9;
++    o->w  = (u64)(H + blk_loc(H, S));
++    o->x  = (u64)(H + blk_loc(H, qt));
++    o->y  = (u64)(H + blk_loc(H, y));
++    o->k  = (u64)(H + blk_loc(H, kk));
++    o->v  = (u64)(H + blk_loc(H, v));
++    o->wn = (u64)(H + blk_loc(H, dec));
++    o->r  = (u64)(H + blk_loc(H, bet));
++    o->n  = 1u << k;
++    return true;
++  }
++}
++
+ // warp_serve's operand reads and checks, on the device (bad: 1 GEMV,
+ // 2 attention, 3 rms operands unsupported, 4 a refused row format); one thread
+ extern "C" __global__ void llb_mail(Corpus H, Mail* M) {
+@@ -7455,6 +7579,15 @@
+   for (u32 j = 0; j < m && j < WARP_MAX; j += 1) {
+     Term     t  = H[H_WARP + j];
+     Loc      a  = term_loc(t);
++    // the Qwen3.5 hybrid bangs (tools/payload-hybrid.patch)
++    {
++      u32 hx = (u32)term_aux(t);
++      if (hx == LLB_L2N_FID || hx == LLB_CONV_FID || hx == LLB_GRN_FID
++        || hx == LLB_GDL_FID) {
++        hyb_mail(e, H, a, hx, &M->op[j], &bad);
++        continue;
++      }
++    }
+     bool     at = (u32)term_aux(t) == LLB_ATTN_FID;
+     bool     rm = (u32)term_aux(t) == LLB_RMS_FID;
+     bool     dd = (u32)term_aux(t) == LLB_DADD_FID;
+@@ -7654,6 +7787,134 @@
+   }
+ }
+ 
++// Qwen3.5 hybrid kernels (tools/payload-hybrid.patch): each reproduces
++// kernels/ops.bend's balanced tree leaf for leaf with __f*_rn (no FMA),
++// transcendentals through F64 (attn_exp), exactly as llb_rms does.
++
++// K.dot/K.sumsq's balanced tree over 128 (pairs, then halves up)
++__device__ static float hyb_dot_128(const float* __restrict__ a,
++  const float* __restrict__ b) {
++  float p[64];
++  #pragma unroll
++  for (u32 i = 0; i < 64; i += 1) {
++    p[i] = __fadd_rn(__fmul_rn(a[2 * i], b[2 * i]),
++      __fmul_rn(a[2 * i + 1], b[2 * i + 1]));
++  }
++  #pragma unroll
++  for (u32 st = 1; st < 64; st <<= 1) {
++    #pragma unroll
++    for (u32 i = 0; i < 64; i += 2 * st) {
++      p[i] = __fadd_rn(p[i], p[i + st]);
++    }
++  }
++  return p[0];
++}
++
++// K.l2norm over heads heads of 128: y := v * (1 / max(sqrt(sumsq), eps)) / sc
++extern "C" __global__ void __launch_bounds__(64) llb_l2norm(
++  const float* __restrict__ v, float* __restrict__ y, float sc, u32 heads) {
++  __shared__ float a[64];
++  __shared__ float sv;
++  const u32 h = blockIdx.x, t = threadIdx.x;
++  if (h >= heads || t >= 64) {
++    return;
++  }
++  const float2 x = ((const float2*)(v + ((u64)h << 7)))[t];
++  a[t] = __fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y));
++  __syncthreads();
++  #pragma unroll
++  for (u32 st = 1; st < 64; st <<= 1) {
++    if ((t & (2 * st - 1)) == 0) {
++      a[t] = __fadd_rn(a[t], a[t + st]);
++    }
++    __syncthreads();
++  }
++  if (t == 0) {
++    const float rt = __fsqrt_rn(a[0]);
++    const float ep = __uint_as_float(0x358637BDu);
++    sv = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
++  }
++  __syncthreads();
++  const float s = sv;
++  ((float2*)(y + ((u64)h << 7)))[t] = make_float2(__fmul_rn(x.x, s), __fmul_rn(x.y, s));
++}
++
++// K.conv1d (4-tap + SiLU) over nch channels; w [nch,4] F32
++extern "C" __global__ void __launch_bounds__(256) llb_conv1d(
++  const float* __restrict__ w, const float* __restrict__ x,
++  const float* __restrict__ h0, const float* __restrict__ h1,
++  const float* __restrict__ h2, float* __restrict__ y, u32 nch) {
++  const u32 c = blockIdx.x * 256 + threadIdx.x;
++  if (c >= nch) {
++    return;
++  }
++  const float a = __fadd_rn(__fmul_rn(h0[c], w[4 * c]), __fmul_rn(h1[c], w[4 * c + 1]));
++  const float b = __fadd_rn(__fmul_rn(h2[c], w[4 * c + 2]), __fmul_rn(x[c], w[4 * c + 3]));
++  const float u = __fadd_rn(a, b);
++  y[c] = __fdiv_rn(u, __fadd_rn(1.0f, attn_exp(-u)));
++}
++
++// K.gated_rmsnorm over heads heads of 128; w [128] shared
++extern "C" __global__ void __launch_bounds__(64) llb_gated_rmsnorm(
++  const float* __restrict__ o, const float* __restrict__ w,
++  const float* __restrict__ z, float* __restrict__ y, u32 heads) {
++  __shared__ float a[64];
++  __shared__ float sv;
++  const u32 h = blockIdx.x, t = threadIdx.x;
++  if (h >= heads || t >= 64) {
++    return;
++  }
++  const float2 x = ((const float2*)(o + ((u64)h << 7)))[t];
++  a[t] = __fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y));
++  __syncthreads();
++  #pragma unroll
++  for (u32 st = 1; st < 64; st <<= 1) {
++    if ((t & (2 * st - 1)) == 0) {
++      a[t] = __fadd_rn(a[t], a[t + st]);
++    }
++    __syncthreads();
++  }
++  if (t == 0) {
++    sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 128.0f),
++      __uint_as_float(0x358637BDu))));
++  }
++  __syncthreads();
++  const float s = sv;
++  const float2 wv = ((const float2*)w)[t];
++  const float2 zz = ((const float2*)(z + ((u64)h << 7)))[t];
++  const float zx = __fdiv_rn(zz.x, __fadd_rn(1.0f, attn_exp(-zz.x)));
++  const float zy = __fdiv_rn(zz.y, __fadd_rn(1.0f, attn_exp(-zz.y)));
++  ((float2*)(y + ((u64)h << 7)))[t] = make_float2(
++    __fmul_rn(__fmul_rn(__fmul_rn(x.x, s), wv.x), zx),
++    __fmul_rn(__fmul_rn(__fmul_rn(x.y, s), wv.y), zy));
++}
++
++// K.gated_delta over heads value heads; S [heads,128,128] updated in place,
++// y the readout [heads,128]. One block a head, one thread a row.
++extern "C" __global__ void __launch_bounds__(128) llb_gated_delta(
++  float* __restrict__ S, const float* __restrict__ q, const float* __restrict__ kk,
++  const float* __restrict__ v, const float* __restrict__ dec,
++  const float* __restrict__ bet, float* __restrict__ y, u32 heads) {
++  const u32 h = blockIdx.x, j = threadIdx.x;
++  if (h >= heads) {
++    return;
++  }
++  float*       Srow = S + (((u64)h * 128 + j) << 7);
++  const float* kk_h = kk + ((u64)h << 7);
++  const float  decay = dec[h], beta = bet[h];
++  #pragma unroll
++  for (u32 i = 0; i < 128; i += 1) {
++    Srow[i] = __fmul_rn(Srow[i], decay);
++  }
++  const float kv = hyb_dot_128(Srow, kk_h);
++  const float delta = __fmul_rn(__fsub_rn(v[((u64)h << 7) + j], kv), beta);
++  #pragma unroll
++  for (u32 i = 0; i < 128; i += 1) {
++    Srow[i] = __fadd_rn(Srow[i], __fmul_rn(kk_h[i], delta));
++  }
++  y[((u64)h << 7) + j] = hyb_dot_128(Srow, q + ((u64)h << 7));
++}
++
+ // warp_serve's delivery, on the device, after the task launches: y to each
+ // continuation, a join that completes reopens the frontier on ring 0
+ extern "C" __global__ void llb_deliver(Corpus H, u32 m) {
+@@ -8120,6 +8381,10 @@
+     || cuModuleGetFunction(&gpu_rope, gpu_lib, "llb_rope") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_silu, gpu_lib, "llb_silu") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_qknorm, gpu_lib, "llb_qknorm") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_l2n, gpu_lib, "llb_l2norm") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_conv, gpu_lib, "llb_conv1d") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_grn, gpu_lib, "llb_gated_rmsnorm") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_gdl, gpu_lib, "llb_gated_delta") != CUDA_SUCCESS
+     || cuMemAlloc(&gpu_act, 3 * 6144 * 4 * LINE) != CUDA_SUCCESS
+     || cuMemHostAlloc((void**)&gpu_mail, sizeof(Mail),
+       CU_MEMHOSTALLOC_DEVICEMAP) != CUDA_SUCCESS
+@@ -8251,6 +8516,44 @@
+       }
+       xp = sa;
+     }
++    // the Qwen3.5 hybrid bangs (tools/payload-hybrid.patch): one kernel a task
++    // into y; no generic GEMV follows
++    if (o->kind >= 6) {
++      if (o->kind == 6) {
++        union { u32 u; float f; } sc = { o->c };
++        u32 hs = o->n;
++        void* hy[] = { &xp, &yp, &sc.f, &hs };
++        if (cuLaunchKernel(gpu_l2n, hs, 1, 1, 64, 1, 1, 0, NULL, hy, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
++      } else if (o->kind == 7) {
++        u64 wp = o->w, xp2 = o->x, h0p = o->k, h1p = o->v, h2p = o->wn;
++        u32 nch = o->n;
++        void* hy[] = { &wp, &xp2, &h0p, &h1p, &h2p, &yp, &nch };
++        if (cuLaunchKernel(gpu_conv, (nch + 255) / 256, 1, 1, 256, 1, 1, 0, NULL,
++          hy, NULL) != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
++      } else if (o->kind == 8) {
++        u64 op8 = o->x, wp8 = o->w, zp = o->k;
++        u32 hs = o->n;
++        void* hy[] = { &op8, &wp8, &zp, &yp, &hs };
++        if (cuLaunchKernel(gpu_grn, hs, 1, 1, 64, 1, 1, 0, NULL, hy, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
++      } else {
++        u64 Sp = o->w, qp = o->x, kkp = o->k, vp = o->v, decp = o->wn, betp = o->r;
++        u32 hs = o->n;
++        void* hy[] = { &Sp, &qp, &kkp, &vp, &decp, &betp, &yp, &hs };
++        if (cuLaunchKernel(gpu_gdl, hs, 1, 1, 128, 1, 1, 0, NULL, hy, NULL)
++          != CUDA_SUCCESS) {
++          err_fail("device launch failed");
++        }
++      }
++      continue;
++    }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+     if (cuLaunchKernel(fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
+       1, 1, 128, 1, 1, 0,

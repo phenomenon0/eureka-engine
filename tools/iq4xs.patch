@@ -1,0 +1,215 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4752,6 +4752,7 @@
+ static CUfunction gpu_warp3;
+ static CUfunction gpu_warp2;
+ static CUfunction gpu_warpq2;
++static CUfunction gpu_warp4;
+ static CUfunction gpu_attn;
+ static CUfunction gpu_rms;
+ static CUfunction gpu_mailk;
+@@ -7300,6 +7301,34 @@
+     __fmul_rn(ds, (float)(int)(((ql[3] >> nsh) & 15) | (((qh[3] >> qsh) & 3) << 4)) - 32.0f));
+ }
+ 
++// kvalues_iq4nl, ggml-common.h:1120 (tools/iq4xs.py). A __constant__ table is
++// read directly by the device code and compiles under both nvcc and nvrtc.
++__constant__ signed char llb_kv[16] = {
++  -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
++};
++
++// group g of an IQ4_XS row (tools/iq4xs.py: GGUF block layout, 136 bytes a
++// super-block): dl = d * (ls - 32), w = dl * kvalues_iq4nl[code], ggml's
++// dequantize_row_iq4_xs. Every product is exact (f16 significand * 5-bit
++// (ls-32) * 7-bit codebook), so the two f32 multiplies are ggml's own, in
++// ggml's order, with no rounding. A group of four columns lies inside one
++// 16-wide half of a 32-weight sub-block, so one u32 qs load covers all four.
++// tools/iq4xs.patch
++INLINE float4 iq4xs_w(const u8* __restrict__ row, u32 g) {
++  u32  c4 = 4 * g, blk = c4 >> 8, rr = c4 & 255;
++  u32  ib = rr >> 5, r = rr & 31, l = r & 15, hi = r >> 4;
++  const u8* B = row + (u64)blk * 136;
++  float d = llb_f16(*(const unsigned short*)(B + 0));
++  u32  ls = ((u32)B[4 + (ib >> 1)] >> (4 * (ib & 1)) & 15u)
++    | ((((u32)(*(const unsigned short*)(B + 2)) >> (2 * ib)) & 3u) << 4);
++  float dl = __fmul_rn(d, (float)((int)ls - 32));
++  u32  v = *(const u32*)(B + 8 + ib * 16 + l) >> (hi * 4);
++  return make_float4(__fmul_rn(dl, (float)llb_kv[v & 15]),
++    __fmul_rn(dl, (float)llb_kv[(v >> 8) & 15]),
++    __fmul_rn(dl, (float)llb_kv[(v >> 16) & 15]),
++    __fmul_rn(dl, (float)llb_kv[(v >> 24) & 15]));
++}
++
+ // llb_warp over Q8_0 (H false) or F16 (H true) rows of rb bytes
+ // (tools/merge3-q8.patch, tools/merge3-f16.patch): the same groups, leaf and
+ // tree, each weight upconverted on load; a copy, so the F32 kernel's code
+@@ -7761,6 +7790,74 @@
+   warp_dqpq2_0(W, rb, cg, x, y, n, d);
+ }
+ 
++// llb_warp over IQ4_XS rows (tools/iq4xs.patch): the same groups, leaf and
++// tree, each weight dequantized on load; a copy, so the gated kernels stay
++// untouched
++__device__ __forceinline__ void warp_dq4xs(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  const u32 ch = 1u << (d - 9);
++  float4 xv[16];
++  if (ch == 1) {
++    warp_x(xv, x, 0, l);
++  }
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const u8* row = W + (u64)r * rb;
++    float s[4];
++    for (u32 k = 0; k < ch; k++) {
++      if (ch > 1) {
++        warp_x(xv, x, k, l);
++      }
++      float4 w[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        u32 g = 512 * k + 32 * i + l;
++        w[i] = g < cg ? iq4xs_w(row, g)
++          : make_float4(0.f, 0.f, 0.f, 0.f);
++      }
++      float v[16];
++      #pragma unroll
++      for (u32 i = 0; i < 16; i++) {
++        float4 a = w[i], b = xv[i];
++        v[i] = __fadd_rn(__fadd_rn(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y)),
++          __fadd_rn(__fmul_rn(a.z, b.z), __fmul_rn(a.w, b.w)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i++) {
++          float o = __shfl_xor_sync(0xffffffffu, v[i], m);
++          v[i] = (l & m) ? __fadd_rn(o, v[i]) : __fadd_rn(v[i], o);
++        }
++      }
++      #pragma unroll
++      for (u32 st = 1; st < 16; st <<= 1) {
++        #pragma unroll
++        for (u32 i = 0; i < 16; i += 2 * st) {
++          v[i] = __fadd_rn(v[i], v[i + st]);
++        }
++      }
++      s[k] = v[0];
++    }
++    for (u32 st = 1; st < ch; st <<= 1) {
++      for (u32 k = 0; k < ch; k += 2 * st) {
++        s[k] = __fadd_rn(s[k], s[k + st]);
++      }
++    }
++    if (l == 0) {
++      y[r] = __float_as_uint(s[0]);
++    }
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(128) llb_warp_iq4xs(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  warp_dq4xs(W, rb, cg, x, y, n, d);
++}
++
+ #endif
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
+@@ -7900,12 +7997,12 @@
+     // An untagged 17 | rb that is also 16 | rb reads as F32 (c = rb / 4) or
+     // Q8_0 (c = rb * 16 / 17): refused, as is a Q8_0 tag without 17 | rb
+     bool     tg = rw >> 30 & 1;
+-    u32      rb = rw & (tg ? 0x0fffffffu : 0x7fffffffu);
+-    u32      fm = tg ? (rw >> 28 & 3) + ((rw >> 31 & 1) << 2) : rw >> 31 ? 2 : rb % 17 == 0;
++    u32      rb = rw & (tg ? 0x07ffffffu : 0x7fffffffu);
++    u32      fm = tg ? (rw >> 28 & 3) + ((rw >> 31 & 1) << 2) + ((rw >> 27 & 1) << 3) : rw >> 31 ? 2 : rb % 17 == 0;
+     if (tg ? (fm == 1 && rb % 17 != 0)
+       || (fm == 3 && rb % 144 != 0) || (fm == 4 && rb % 210 != 0)
+       || (fm == 5 && rb % 110 != 0) || (fm == 6 && rb % 18 != 0)
+-      || (fm == 7 && rb % 34 != 0)
++      || (fm == 7 && rb % 34 != 0) || (fm == 8 && rb % 136 != 0)
+       : fm == 1 && rb % 16 == 0) {
+       bad = bad != 0 ? bad : 4;
+     }
+@@ -7915,6 +8012,7 @@
+       || (fm == 1 ? rb / 17 % 4 != 0 : fm == 3 ? rb % 144 != 0
+         : fm == 4 ? rb % 210 != 0 : fm == 5 ? rb % 110 != 0
+         : fm == 6 ? rb % 18 != 0 : fm == 7 ? rb % 34 != 0
++        : fm == 8 ? rb % 136 != 0
+         : rb % (fm ? 8 : 16) != 0)
+       || ((u64)w & 15) != 0
+       || (u64)bs + (u64)n * rb > p.len || term_tag(x) == TAG_ARR
+@@ -7975,12 +8073,13 @@
+       // down rows'
+       u32  rv = (u32)H[a + 11];
+       bool gt = rv >> 30 & 1;
+-      u32  rg = rv & (gt ? 0x0fffffffu : 0x7fffffffu);
+-      u32  gm = gt ? (rv >> 28 & 3) + ((rv >> 31 & 1) << 2) : rv >> 31 ? 2 : rg % 17 == 0;
++      u32  rg = rv & (gt ? 0x07ffffffu : 0x7fffffffu);
++      u32  gm = gt ? (rv >> 28 & 3) + ((rv >> 31 & 1) << 2) + ((rv >> 27 & 1) << 3) : rv >> 31 ? 2 : rg % 17 == 0;
+       if (gt ? (gm == 1 && rg % 17 != 0)
+         || (gm == 3 && rg % 144 != 0) || (gm == 4 && rg % 210 != 0)
+         || (gm == 5 && rg % 110 != 0) || (gm == 6 && rg % 18 != 0)
+-        || (gm == 7 && rg % 34 != 0) : gm == 1 && rg % 16 == 0) {
++        || (gm == 7 && rg % 34 != 0) || (gm == 8 && rg % 136 != 0)
++        : gm == 1 && rg % 16 == 0) {
+         bad = bad != 0 ? bad : 4;
+       }
+       const u8* wb = (const u8*)(H + term_peek_ro(e, p.data)) + p.off;
+@@ -7988,6 +8087,7 @@
+         || (gm == 1 ? rg / 17 % 4 != 0 : gm == 3 ? rg % 144 != 0
+           : gm == 4 ? rg % 210 != 0 : gm == 5 ? rg % 110 != 0
+           : gm == 6 ? rg % 18 != 0 : gm == 7 ? rg % 34 != 0
++          : gm == 8 ? rg % 136 != 0
+           : rg % (gm ? 8 : 16) != 0)
+         || ((u64)(wb + gb) & 15) != 0
+         || ((u64)(wb + ub) & 15) != 0 || (u64)gb + 6144ull * rg > p.len
+@@ -8555,6 +8655,7 @@
+     || cuModuleGetFunction(&gpu_warp3, gpu_lib, "llb_warp_q3k") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warp2, gpu_lib, "llb_warp_q2_0") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpq2, gpu_lib, "llb_warp_pq2_0") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_warp4, gpu_lib, "llb_warp_iq4xs") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_attn, gpu_lib, "llb_attn") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_rms, gpu_lib, "llb_rms") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_mailk, gpu_lib, "llb_mail") != CUDA_SUCCESS
+@@ -8648,6 +8749,7 @@
+     u32 cg = fm == 1 ? o->rb / 17 * 4 : fm == 3 ? o->rb / 144 * 64
+       : fm == 4 ? o->rb / 210 * 64 : fm == 5 ? o->rb / 110 * 64
+       : fm == 6 ? o->rb / 18 * 16 : fm == 7 ? o->rb / 34 * 32
++      : fm == 8 ? o->rb / 136 * 64
+       : o->rb / (fm ? 8 : 16);
+     CUdeviceptr op = gpu_att + (CUdeviceptr)j * 2048 * 4;
+     // attention (f, +wt, +q, +kc, +vc, +c, y, +wo, +r): its o GEMV reads
+@@ -8684,7 +8786,7 @@
+       u32 gq = gm ? rg : rg / 16, gc = gm == 1 ? rg / 17 * 4
+         : gm == 3 ? rg / 144 * 64 : gm == 4 ? rg / 210 * 64
+         : gm == 5 ? rg / 110 * 64 : gm == 6 ? rg / 18 * 16
+-        : gm == 7 ? rg / 34 * 32 : rg / (gm ? 8 : 16);
++        : gm == 7 ? rg / 34 * 32 : gm == 8 ? rg / 136 * 64 : rg / (gm ? 8 : 16);
+       CUdeviceptr ga = gpu_act + (CUdeviceptr)j * 3 * 6144 * 4;
+       CUdeviceptr ua = ga + 6144 * 4, sa = ua + 6144 * 4;
+       void* ra[] = { &xp, &wn, &op };
+@@ -8692,9 +8794,9 @@
+       void* ua_[] = { &wu, &gq, &gc, &op, &ua, &nf, &df };
+       void* sa_[] = { &ga, &ua, &sa, &nf };
+       if (cuLaunchKernel(gpu_rms, 1, 1, 1, 1024, 1, 1, 0, NULL, ra, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(gm == 8 ? gpu_warp4 : gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ga_, NULL) != CUDA_SUCCESS
+-        || cuLaunchKernel(gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
++        || cuLaunchKernel(gm == 8 ? gpu_warp4 : gm == 7 ? gpu_warpq2 : gm == 6 ? gpu_warp2 : gm == 5 ? gpu_warp3 : gm == 4 ? gpu_warp6 : gm == 3 ? gpu_warpk : gm == 2 ? gpu_warph : gm ? gpu_warpq : gpu_warp, grid, 1, 1, 128,
+           1, 1, 0, NULL, ua_,
+           NULL) != CUDA_SUCCESS
+         || cuLaunchKernel(gpu_silu, 24, 1, 1, 256, 1, 1, 0, NULL, sa_, NULL)
+@@ -8704,7 +8806,7 @@
+       xp = sa;
+     }
+     void* args[] = { &w, &rq, &cg, &xp, &yp, &n, &d };
+-    if (cuLaunchKernel(fm == 7 ? gpu_warpq2 : fm == 6 ? gpu_warp2 : fm == 5 ? gpu_warp3 : fm == 4 ? gpu_warp6 : fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
++    if (cuLaunchKernel(fm == 8 ? gpu_warp4 : fm == 7 ? gpu_warpq2 : fm == 6 ? gpu_warp2 : fm == 5 ? gpu_warp3 : fm == 4 ? gpu_warp6 : fm == 3 ? gpu_warpk : fm == 2 ? gpu_warph : fm ? gpu_warpq : gpu_warp, grid,
+       1, 1, 128, 1, 1, 0,
+       NULL, args, NULL)
+       != CUDA_SUCCESS) {

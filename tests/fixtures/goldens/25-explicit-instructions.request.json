@@ -1,0 +1,1 @@
+{"model":"clef","state":"The server is offline and does not respond.","questions":{"outage":{"type":"noul","instructions":"Is the server offline?"},"urgency":{"type":"score","instructions":"How urgent is this?","criteria":["Low","Medium","High"]}}}

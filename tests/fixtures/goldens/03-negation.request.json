@@ -1,0 +1,1 @@
+{"model":"clef","state":"The report saying checkout was down was incorrect. All services are healthy.","questions":{"outage":{"type":"noul","instructions":"Is checkout currently down?"}}}

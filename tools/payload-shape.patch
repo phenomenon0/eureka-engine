@@ -1,0 +1,154 @@
+--- a/bend2/comp.ts	2026-10-02 17:29:36.055385715 -0500
++++ b/bend2/comp.ts	2026-10-02 18:32:38.354007397 -0500
+@@ -7074,10 +7074,17 @@
+ // (~0.5 ms a serve, payload stage 1). kind: 0 GEMV, 1 attention, 2 rms,
+ // 3 GEMV-add (tools/interiors-add.patch), 4 rms-GEMV-rope
+ // (tools/interiors-rope.patch), 5 FFN (tools/interiors-ffn.patch).
++// The pass bang's shape record (step2a phase 3): the manifest's d_model,
++// d_ff, n_heads, n_kv_heads, head_dim, ssm_group_count, ssm_time_step_rank
++// and ssm_state_size, as task words 56..63; pass_mail copies it to the Mail.
++typedef struct { u32 d, f, nh, nkv, hd, lkh, lvh, sd; } LlbShape;
++
++// brg: the Q8 row bytes of the d_model-column GEMVs; bro: the attn_output /
++// ssm_out rows' (nh * hd = lvh * sd columns, d_model only on the 9B)
+ typedef struct {
+   u64 w, x, y, k, v, wn, r, qk;
+   u32 kind, n, d, rb, c, fm, gm;
+-  u32 bq, bg, bb, ba, bsa, bdt, bcv, bsn, bso, ban, brg;
++  u32 bq, bg, bb, ba, bsa, bdt, bcv, bsn, bso, ban, brg, bro;
+ } WarpOp;
+ 
+ typedef struct Mail {
+@@ -7086,6 +7093,7 @@
+   // (tools/payload-pass.patch)
+   u64    pw[32];
+   u32    po[40];
++  LlbShape sh;
+   WarpOp op[WARP_MAX];
+ } Mail;
+ 
+@@ -8942,7 +8950,7 @@
+     o->bq = wgate; o->bg = wbo; o->bb = wao; o->ba = wsa;
+     o->bsa = wdt; o->bdt = wcv; o->bcv = wsn; o->bsn = wso;
+     o->ban = an; o->c = wqkv;
+-    o->brg = rg;
++    o->brg = rg; o->bro = rg;
+     return true;
+   }
+   // The full-attention output tail bang (tools/payload-aob.patch): wb (1), q
+@@ -9033,7 +9041,7 @@
+     o->v   = (u64)(H + blk_loc(H, vct));
+     o->ban = an; o->bq = wq; o->bg = wk; o->bb = wv;
+     o->ba = wqn; o->bsa = wkn; o->bdt = wo;
+-    o->c = c; o->brg = rg; o->fm = 1;
++    o->c = c; o->brg = rg; o->bro = rg; o->fm = 1;
+     return true;
+   }
+   if (aux == LLB_AOB_FID) {
+@@ -9094,8 +9102,10 @@
+ // The whole-pass bang (tools/payload-pass.patch): ws (1) the layer weight
+ // list, x (2), y (3, output), the lin / full Offs records flattened into the
+ // task (4..23, 24..43), c = dT | pos << 5 (44), the Q8 row words rg (45, 4096
+-// cols) and rd (46, 12288 cols), the first layer s (47) and the count k (48).
+-// Each layer's blob gets the checks of the linb or fulb decode and the fbn's.
++// cols) and rd (46, 12288 cols), the first layer s (47) and the count k (48),
++// the fold words (49..55) and the shape record (56..63, LlbShape). Each
++// layer's blob gets the checks of the linb or fulb decode and the fbn's, sized
++// by the record; a record outside the compiled kernels' envelope is refused.
+ __device__ static void pass_mail(Env e, Corpus H, Loc a, Mail* M, WarpOp* o, u32* bad) {
+   Term wl = H[a + 1], x = H[a + 2], y = H[a + 3];
+   u32  c = (u32)H[a + 44], rgw = (u32)H[a + 45], rdw = (u32)H[a + 46];
+@@ -9113,7 +9123,20 @@
+   u32  eat = (u32)H[a + 50], noff = (u32)H[a + 52], ooff = (u32)H[a + 53];
+   u32  nh = (u32)H[a + 54], rwh = (u32)H[a + 55];
+   bool fold = nh != 0;
+-  bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
++  LlbShape sh = { (u32)H[a + 56], (u32)H[a + 57], (u32)H[a + 58], (u32)H[a + 59],
++    (u32)H[a + 60], (u32)H[a + 61], (u32)H[a + 62], (u32)H[a + 63] };
++  u64  dm = sh.d, df = sh.f, qa = sh.nh * sh.hd, kv = sh.nkv * sh.hd;
++  u64  lk = sh.lkh * sh.sd, lv = sh.lvh * sh.sd, cv = 2 * lk + lv;
++  u32  ro = (u32)(qa / 32 * 34);
++  // the envelope: llb_rmsnorm / rmsnorm_add n 4096; llb_attn4 hd 256, GQA 4,
++  // a 1024 kv stride, 16 heads; l2norm_qk / gdl / grn sd 128 and the 2048 copy
++  // (lvh = 2 lkh); warp_q8_res depth 12 (8192 < f) and gpu_blk (f <= 12288);
++  // the o / ssm_out GEMVs read nh * hd = lvh * sd columns
++  bool env = dm == 4096 && df > 8192 && df <= 12288 && df % 32 == 0
++    && sh.hd == 256 && sh.sd == 128 && sh.nh == 4 * sh.nkv && kv == 1024
++    && lk == 2048 && sh.lvh == 2 * sh.lkh && qa == lv
++    && rg == dm / 32 * 34 && rd == df / 32 * 34;
++  bool ok = env && fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+     && dT >= 1 && dT <= 17 && pos < (1u << dT) && k >= 1 && s + k <= 32
+     && term_tag(x) != TAG_ARR && term_tag(y) != TAG_ARR
+     && (fold || blk_cls(x) == 12) && blk_cls(y) >= (fold ? 2 : 12);
+@@ -9124,10 +9147,10 @@
+     u32      rbh = rwh & (tg ? 0x0fffffffu : 0x7fffffffu);
+     u32      fmh = tg ? rwh >> 28 & 3 : (rwh >> 31 ? 2 : (rbh % 17 == 0));
+     ok = s == 0 && term_tag(eb) == TAG_STR && str_nar(qe) == 2
+-      && (u64)eat + 4096 + 256 <= qe.len
++      && (u64)eat + dm / 32 * 34 <= qe.len
+       && term_tag(hb) == TAG_STR && str_nar(qh) == 2 && fmh == 1
+-      && rbh == 4352 && noff % 4 == 0 && ooff % 16 == 0 && nh <= (1u << 18) - 4 * AMAX_G
+-      && (u64)noff + 4096 * 4 <= qh.len && (u64)ooff + (u64)nh * rbh <= qh.len;
++      && rbh == dm / 32 * 34 && noff % 4 == 0 && ooff % 16 == 0 && nh <= (1u << 18) - 4 * AMAX_G
++      && (u64)noff + dm * 4 <= qh.len && (u64)ooff + (u64)nh * rbh <= qh.len;
+     if (ok) {
+       o->w  = (u64)((const u8*)(H + term_peek_ro(e, qe.data)) + qe.off + eat);
+       o->k  = (u64)((const u8*)(H + term_peek_ro(e, qh.data)) + qh.off + noff);
+@@ -9161,32 +9184,32 @@
+     // fbn: post, fg, fu, fd at Offs words 1..4
+     ok = p[1] % 4 == 0 && ((u64)(base + p[2]) & 15) == 0
+       && ((u64)(base + p[3]) & 15) == 0 && ((u64)(base + p[4]) & 15) == 0
+-      && (u64)p[1] + 4096 * 4 <= q.len
+-      && (u64)p[2] + (u64)12288 * rg <= q.len
+-      && (u64)p[3] + (u64)12288 * rg <= q.len
+-      && (u64)p[4] + (u64)4096 * rd <= q.len;
++      && (u64)p[1] + dm * 4 <= q.len
++      && (u64)p[2] + df * rg <= q.len
++      && (u64)p[3] + df * rg <= q.len
++      && (u64)p[4] + dm * rd <= q.len;
+     if ((i + 1) % 4 == 0) {
+       // fulb: an 0, q 14, k 15, v 16, q-norm 17, k-norm 18, o 19
+       ok = ok && p[0] % 4 == 0 && p[17] % 4 == 0 && p[18] % 4 == 0
+         && ((u64)(base + p[14]) & 15) == 0 && ((u64)(base + p[15]) & 15) == 0
+         && ((u64)(base + p[16]) & 15) == 0 && ((u64)(base + p[19]) & 15) == 0
+-        && (u64)p[0] + 4096 * 4 <= q.len && (u64)p[14] + (u64)8192 * rg <= q.len
+-        && (u64)p[15] + (u64)1024 * rg <= q.len && (u64)p[16] + (u64)1024 * rg <= q.len
+-        && (u64)p[19] + (u64)4096 * rg <= q.len
+-        && (u64)p[17] + 256 * 4 <= q.len && (u64)p[18] + 256 * 4 <= q.len;
++        && (u64)p[0] + dm * 4 <= q.len && (u64)p[14] + 2 * qa * rg <= q.len
++        && (u64)p[15] + kv * rg <= q.len && (u64)p[16] + kv * rg <= q.len
++        && (u64)p[19] + dm * ro <= q.len
++        && (u64)p[17] + sh.hd * 4 <= q.len && (u64)p[18] + sh.hd * 4 <= q.len;
+     } else {
+       // linb: an 0, qkv 5, gate 6, beta 7, alpha 8, ssm_a 9, dt 10, conv 11,
+       // ssm_norm 12, ssm_out 13
+       ok = ok && ((u64)(base + p[6]) & 15) == 0 && ((u64)(base + p[7]) & 15) == 0
+         && ((u64)(base + p[8]) & 15) == 0 && ((u64)(base + p[13]) & 15) == 0
+-        && (u64)p[0] + 4096 * 4 <= q.len
+-        && (u64)p[5] + (u64)8192 * rg <= q.len
+-        && (u64)p[6] + (u64)4096 * rg <= q.len
+-        && (u64)p[7] + (u64)32 * rg <= q.len
+-        && (u64)p[8] + (u64)32 * rg <= q.len
+-        && (u64)p[13] + (u64)4096 * rg <= q.len
+-        && (u64)p[9] + 32 * 4 <= q.len && (u64)p[10] + 32 * 4 <= q.len
+-        && (u64)p[11] + 8192 * 4 * 4 <= q.len && (u64)p[12] + 128 * 4 <= q.len;
++        && (u64)p[0] + dm * 4 <= q.len
++        && (u64)p[5] + cv * rg <= q.len
++        && (u64)p[6] + lv * rg <= q.len
++        && (u64)p[7] + (u64)sh.lvh * rg <= q.len
++        && (u64)p[8] + (u64)sh.lvh * rg <= q.len
++        && (u64)p[13] + dm * ro <= q.len
++        && (u64)p[9] + sh.lvh * 4 <= q.len && (u64)p[10] + sh.lvh * 4 <= q.len
++        && (u64)p[11] + cv * 4 * 4 <= q.len && (u64)p[12] + sh.sd * 4 <= q.len;
+     }
+     M->pw[i - s] = (u64)base;
+   }
+@@ -9198,6 +9221,8 @@
+   o->x = (u64)(H + blk_loc(H, x));
+   o->y = (u64)(H + blk_loc(H, y));
+   o->c = c; o->brg = rg; o->rb = rd; o->n = s; o->d = k; o->fm = 1;
++  o->bro = ro;
++  M->sh = sh;
+ }
+ 
+ // warp_serve's operand reads and checks, on the device (bad: 1 GEMV,

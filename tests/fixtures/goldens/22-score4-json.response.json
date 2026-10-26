@@ -1,0 +1,1 @@
+{"model":"clef","answers":{"satisfaction":{"type":"score","score":2.6335698513359667,"legend":{"0":"Very dissatisfied","1":"Dissatisfied","2":"Satisfied","3":"Very satisfied"},"probabilities":{"0":0.03483922094593719,"1":0.028061672561180563,"2":0.20578914070386106,"3":0.7313099657890213},"confidence":0.6335698513359662}},"usage":{"input_tokens":181,"output_tokens":0}}

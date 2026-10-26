@@ -1,0 +1,105 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -7564,10 +7564,92 @@
+   }
+ }
+ 
++// llb_warp over Q8_0 rows, 128-bit coalesced loads (tools/gemv-q8-rw.patch).
++// The identical leaf and LSB-first balanced reduction tree as warp_dq<false>
++// (bit-exact; gated by the integ9b 12/12+8/8 and 64-step A/A): one uint4 =
++// 16 B = 4 consecutive groups per lane, a 512 B coalesced warp transaction;
++// group bits 0,1 are the in-lane pairs, bits 2..6 the lane butterfly, bits
++// 7.. the carry tree over vblocks of 128 groups. 40 registers vs 155, so the
++// register-bound occupancy rises and the 32-bit load bottleneck goes away.
++INLINE float q8_dot(u32 v, float s, float4 x) {
++  float a = __fmul_rn((float)(signed char)v, s);
++  float b = __fmul_rn((float)(signed char)(v >> 8), s);
++  float c = __fmul_rn((float)(signed char)(v >> 16), s);
++  float e = __fmul_rn((float)(signed char)(v >> 24), s);
++  return __fadd_rn(__fadd_rn(__fmul_rn(a, x.x), __fmul_rn(b, x.y)),
++    __fadd_rn(__fmul_rn(c, x.z), __fmul_rn(e, x.w)));
++}
++
++// x is a whole corpus block (H + blk_loc), so at least 2^(d+2) words and
++// 16-byte aligned; 4g is a multiple of 16. A uint4 load (not four u32s)
++// because nvrtc does not auto-vectorize the scalar form (nvcc does).
++INLINE float4 xg(const u32* __restrict__ x, u32 g) {
++  uint4 v = *(const uint4*)(x + 4 * g);
++  return make_float4(__uint_as_float(v.x), __uint_as_float(v.y),
++    __uint_as_float(v.z), __uint_as_float(v.w));
++}
++
++// group g's leaf; padding past cg is 0*x, the same inf/NaN law as warp_dq
++INLINE float q8_leaf_g(const u8* __restrict__ row, u32 cg, u32 g,
++  const u32* __restrict__ x) {
++  if (g >= cg) {
++    return q8_dot(0u, 0.f, xg(x, g));
++  }
++  float s = llb_f16(*(const unsigned short*)(row + 4 * cg + 2 * (g >> 3)));
++  return q8_dot(*(const u32*)(row + 4 * g), s, xg(x, g));
++}
++
++__device__ __forceinline__ void warp_dq_q8_rw(
++  const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
++  u32* __restrict__ y, u32 n, u32 d) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  const u32 nv = 1u << (d - 7);
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n;
++    r += nw) {
++    const u8* row = W + (u64)r * rb;
++    float slot[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++    u32 occ = 0;
++    for (u32 j = 0; j < nv; j++) {
++      u32 g0 = 128 * j + 4 * l;
++      float v;
++      if (g0 + 3 < cg) {
++        uint4 q = *(const uint4*)(row + 4 * g0);
++        float s = llb_f16(*(const unsigned short*)
++          (row + 4 * cg + 2 * (g0 >> 3)));
++        v = __fadd_rn(__fadd_rn(q8_dot(q.x, s, xg(x, g0)),
++          q8_dot(q.y, s, xg(x, g0 + 1))),
++          __fadd_rn(q8_dot(q.z, s, xg(x, g0 + 2)),
++            q8_dot(q.w, s, xg(x, g0 + 3))));
++      } else {
++        v = __fadd_rn(__fadd_rn(q8_leaf_g(row, cg, g0, x),
++          q8_leaf_g(row, cg, g0 + 1, x)),
++          __fadd_rn(q8_leaf_g(row, cg, g0 + 2, x),
++            q8_leaf_g(row, cg, g0 + 3, x)));
++      }
++      #pragma unroll
++      for (u32 m = 1; m < 32; m <<= 1) {
++        float o = __shfl_xor_sync(0xffffffffu, v, m);
++        v = (l & m) ? __fadd_rn(o, v) : __fadd_rn(v, o);
++      }
++      u32 b = 0;
++      while (occ & (1u << b)) {
++        v = __fadd_rn(slot[b], v);
++        occ &= ~(1u << b);
++        b += 1;
++      }
++      slot[b] = v;
++      occ |= 1u << b;
++    }
++    if (l == 0) {
++      y[r] = __float_as_uint(slot[31 - __clz(occ)]);
++    }
++  }
++}
++
+ extern "C" __global__ void __launch_bounds__(128) llb_warp_q8(
+   const u8* __restrict__ W, u32 rb, u32 cg, const u32* __restrict__ x,
+   u32* __restrict__ y, u32 n, u32 d) {
+-  warp_dq<false>(W, rb, cg, x, y, n, d);
++  warp_dq_q8_rw(W, rb, cg, x, y, n, d);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128) llb_warp_f16(
+@@ -9547,7 +9629,7 @@
+       : "warp GEMV: unsupported operands");
+   }
+   const char* gs   = getenv("LLB_WARP_GRID");
+-  u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 1024;
++  u32         grid = gs != NULL && atoi(gs) > 0 ? (u32)atoi(gs) : 768;
+   for (u32 j = 0; j < m; j += 1) {
+     volatile WarpOp* o = &gpu_mail->op[j];
+     u64 w = o->w, xp = o->x, yp = o->y;

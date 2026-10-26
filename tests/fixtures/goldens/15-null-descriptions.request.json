@@ -1,0 +1,1 @@
+{"model":"clef","state":"The predominant color in the text description is blue.","questions":{"color":{"type":"choice","instructions":"Which color is described?","criteria":{"red":null,"green":null,"blue":null}}}}

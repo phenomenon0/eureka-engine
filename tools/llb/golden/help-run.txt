@@ -1,0 +1,19 @@
+usage: llb run MODEL [PROMPT] [options] [-- engine options]
+
+Generate text after PROMPT (no chat template; use llb chat for that).
+PROMPT comes from the argument, from -f FILE, or from stdin.
+Decoding is greedy only (always the most likely token); there is no --temp.
+Stops at the end-of-text token or after -n tokens.
+
+  -n N        tokens to generate (default 256)
+  -f FILE     read the prompt from FILE
+  --exact     exact prefill, token by token (always used for models other than 27b)
+  --fast      fast prefill, int8 tensor cores (27b only; the 27b default is set in defaults.conf)
+  --spec      speculative decoding, same tokens (27b only; opt-in)
+  --ids       PROMPT is token ids; print ids, not text (no EOS stop)
+  --dry-run   print the commands, run nothing
+  -v          show the engine's own output
+  --          pass the rest to the engine
+
+MODEL is an alias (llb models) or a path to a .gguf file.
+exit 0
