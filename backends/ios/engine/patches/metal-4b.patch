@@ -1,0 +1,211 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -10337,6 +10337,13 @@
+   device u32* y = (device u32*)(Y + A.y);
+   device const float* x = att + A.slot * 2048;
+   const u32 npr = A.cg >> 8, slo = F::slo(l), shi = slo + (1u << F::KIN);
++  // (ENGINE-4B, patches/metal-4b.patch) nsb real superblocks (cols / 256): a
++  // pair p == npr with 4 p < nsb is partial (the 4B's 2560 cols: pair 2 has
++  // superblocks 8, 9 real, 10, 11 pad). Lane l's superblock is 4 p + (l >> 3)
++  // in every format; a pad lane takes the pad pair's 0 * x span leaves, so the
++  // tree is the CPU contract's (pad groups 0 * x). Whole-pair shapes
++  // (cols % 1024 == 0) never take this arm
++  const u32 nsb = A.cg >> 6;
+   for (u32 r0 = gid * R; r0 < A.n; r0 += ng * R) {
+     device const u8* row[R];
+     for (u32 j = 0; j < R; j++) row[j] = W + (u64)min(r0 + j, A.n - 1) * A.rq;
+@@ -10354,6 +10361,18 @@
+           float2 sp = F::fused(B, l, xl, xh);
+           pv[j][k] = kq_pair_tree<F::KIN, 0>(sp.x, sp.y, l);
+         }
++      } else if (4 * p < nsb) {
++        const bool re = 4 * p + (l >> 3) < nsb;
++        float z[16];
++        for (u32 i = 0; i < 16; i++) z[i] = 0.0f;
++        const float2 zs = float2(kq_span16(z, xl), kq_span16(z, xh));
++        for (u32 j = 0; j < R; j++) {
++          float2 sp = zs;
++          if (re) {
++            sp = F::fused(row[j] + (u64)(4 * p + (l >> 3)) * F::SB, l, xl, xh);
++          }
++          pv[j][k] = kq_pair_tree<F::KIN, 0>(sp.x, sp.y, l);
++        }
+       } else {
+         float z[16];
+         for (u32 i = 0; i < 16; i++) z[i] = 0.0f;
+@@ -11247,7 +11266,9 @@
+     const float a0 = xp[0] * xp[0], a1 = xp[1] * xp[1];
+     const float a2 = xp[2] * xp[2], a3 = xp[3] * xp[3];
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 4096) {
++  } else if (n > 2048) {
++    // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
++    // 8-wide tree over 8192
+     // (tools/metal-27b.patch) n 5120 (the 27B), CUDA's: the tree over 8192,
+     // 8 leaves a thread, +0 pad leaves past n
+     float b[8];
+@@ -11306,7 +11327,9 @@
+     const float a0 = v0 * v0, a1 = v1 * v1;
+     const float a2 = v2 * v2, a3 = v3 * v3;
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 4096) {
++  } else if (n > 2048) {
++    // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
++    // 8-wide tree over 8192
+     float b[8];
+     for (u32 k = 0; k < 8; k++) {
+       const u32 i = t * 8 + k;
+@@ -11559,7 +11582,9 @@
+     const float a0 = xp[0] * xp[0], a1 = xp[1] * xp[1];
+     const float a2 = xp[2] * xp[2], a3 = xp[3] * xp[3];
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 4096) {
++  } else if (n > 2048) {
++    // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
++    // 8-wide tree over 8192
+     // (tools/metal-27b.patch) n 5120 (the 27B), CUDA's: the tree over 8192,
+     // 8 leaves a thread, +0 pad leaves past n
+     float b[8];
+@@ -11616,7 +11641,9 @@
+     const float a0 = v0 * v0, a1 = v1 * v1;
+     const float a2 = v2 * v2, a3 = v3 * v3;
+     acc = (a0 + a1) + (a2 + a3);
+-  } else if (n > 4096) {
++  } else if (n > 2048) {
++    // (ENGINE-4B) n 5120 and n 2560 (the 4B; fnw1's CUDA form): the +0-padded
++    // 8-wide tree over 8192
+     float b[8];
+     for (u32 k = 0; k < 8; k++) {
+       const u32 i = t * 8 + k;
+@@ -13128,6 +13155,26 @@
+   const float m1 = dn * (float)mn;
+   const u32 q = a[16 + 32 * b + (rr & 31)];
+   y[i] = d1 * (float)((q >> (4 * hi)) & 15) - m1;
++}
++
++// (ENGINE-4B, patches/metal-4b.patch) the fused step's Q6_K embedding (the 4B
++// Q4_K_M's tied token_embd, 2100 B rows): column i of the 210 B-superblock row
++// at corpus byte A.a[0] as ggml's dequantize_row_q6_K writes it, y = d * sc *
++// (q - 32) (each product exact: f16 x int8 x 6 bits), the bytes read one at a
++// time. One thread a column, i < A.n (d_model)
++kernel void llb_m_embk6(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant HybArgs& A [[buffer(2)]], uint i [[thread_position_in_grid]]) {
++  device float* y = sa_f(C, S, A.a[1]);
++  if (i >= A.n) {
++    return;
++  }
++  device const u8* a = C + A.a[0] + (u64)(i >> 8) * 210;
++  const u32 r = i & 255, h = r >> 7, g = (r & 127) >> 5, l = r & 31;
++  const u32 ql = a[64 * h + l + (g & 1) * 32], qh = a[128 + 32 * h + l];
++  const u32 q = ((g < 2 ? ql : ql >> 4) & 15) | ((qh >> (2 * g)) & 3) << 4;
++  const float d = llb_f16((u32)a[208] | (u32)a[209] << 8);
++  const float sc = (float)(int)(char)a[192 + 8 * h + l / 16 + 2 * g];
++  y[i] = d * sc * (float)((int)q - 32);
+ }
+ 
+ // (tools/metal-m25.patch = M24 lever L10) llb_m_gdl with a simdgroup a row:
+@@ -15199,6 +15246,8 @@
+ // (lever 4b) windows of L >= M27_LS live slots take the split
+ #define M27_LS 128
+ static id<MTLComputePipelineState> gpu_m_embq8, gpu_m_embk4, gpu_m_gdl2;
++// (ENGINE-4B) the 4B Q4_K_M's Q6_K embedding
++static id<MTLComputePipelineState> gpu_m_embk6;
+ static id<MTLComputePipelineState> gpu_m_ropecs, gpu_m_qkr2, gpu_m_l2nr, gpu_m_addrms;
+ static id<MTLBuffer>               gpu_scr;
+ 
+@@ -15231,6 +15280,7 @@
+   gpu_m_a5c = warp_pipe("llb_m_attn5c");
+   gpu_m_embq8 = warp_pipe("llb_m_embq8");
+   gpu_m_embk4 = warp_pipe("llb_m_embk4");
++  gpu_m_embk6 = warp_pipe("llb_m_embk6");
+   gpu_m_gdl2  = warp_pipe("llb_m_gdl2");
+   gpu_m_ropecs = warp_pipe("llb_m_ropecs");
+   gpu_m_qkr2  = warp_pipe("llb_m_qkr2");
+@@ -15248,6 +15298,7 @@
+     || gpu_m_a5c.maxTotalThreadsPerThreadgroup < 256
+     || gpu_m_embq8.maxTotalThreadsPerThreadgroup < 256
+     || gpu_m_embk4.maxTotalThreadsPerThreadgroup < 256
++    || gpu_m_embk6.maxTotalThreadsPerThreadgroup < 256
+     || gpu_m_gdl2.maxTotalThreadsPerThreadgroup < 1024
+     || gpu_m_ropecs.maxTotalThreadsPerThreadgroup < 32
+     || gpu_m_qkr2.maxTotalThreadsPerThreadgroup < 256
+@@ -15352,7 +15403,11 @@
+   u32  sb = LLB_FM_SB(fm), cols = sb != 0 ? rb / sb * 256 : 0;
+   bool q6 = fm == LLB_FM_Q6_K, q4 = fm == LLB_FM_Q4_K;
+   bool d11 = d == 11 && (q4 || q6), d13 = d == 13 && q4 && cols == 17408;
+-  if (sb == 0 || rb % sb != 0 || cols % 1024 != 0 || cols / 4 > 1u << d
++  // (ENGINE-4B) the bd2 bodies (d 10 / 12) also take a partial last pair
++  // (cols % 256 == 0: the 4B's 2560 cols); rd2 / d 11 / d 13 keep whole pairs
++  bool bd2 = d == 10 || d == 12;
++  if (sb == 0 || rb % sb != 0 || cols % (bd2 ? 256 : 1024) != 0
++    || cols / 4 > 1u << d
+     || (d != 10 && d != 12 && !d11 && !d13) || n == 0 || (x & 15) != 0
+     || (q6 ? (w & 1) != 0 : (w & 15) != 0)) {
+     err_fail("warp GEMV: K-quant operands refused (Metal: d 10 / 12, Q4_K /"
+@@ -15531,11 +15586,19 @@
+ } M9Rows;
+ 
+ // the 9B or the 27B (the engine's mf.validate admits exactly these two)
++// (ENGINE-4B, patches/metal-4b.patch) or the 4B: d 2560, f 9216, the 9B's
++// heads / SSM / layers. Its attn_output / ssm_out rows are nh 256 = 4096
++// columns, not d: the Q8 record (one rg for every non-down tensor, right only
++// while d = nh 256) gets q8 rows of 4096 there; a table overwrites rb per layer
+ static bool m9_shape(M9Rows* R, u32 d, u32 f) {
+   bool b27 = d == 5120 && f == 17408;
++  bool b4 = d == 2560 && f == 9216;
+   R->d = d; R->f = f; R->nh = b27 ? 24 : 16; R->lkh = 16;
+   R->lvh = b27 ? 48 : 32; R->nl = b27 ? 64 : 32;
+-  return b27 || (d == 4096 && f == 12288);
++  if (b4) {
++    R->rb[13] = R->rb[19] = LLB_FM_RB(LLB_FM_Q8_0, R->nh * 256);
++  }
++  return b27 || b4 || (d == 4096 && f == 12288);
+ }
+ 
+ static void m9_rows_q8(M9Rows* R, u32 rg, u32 rd) {
+@@ -16463,8 +16526,10 @@
+ // rows (the host has no format word: the length is the check). (tools/metal-
+ // m30.patch, F1) the 9B Q4_K_M's Q4_K embedding (dm 4096, 2304 B rows) too:
+ // at dm 4096 the region length picks Q4_K (248320 x 2304) or Q8_0 (x 4352)
++// (ENGINE-4B) k6: the 4B Q4_K_M's Q6_K embedding (dm 2560, 2100 B rows), told
++// by the region's length (248320 x 2100) as M30's rule tells Q4_K from Q8_0
+ typedef struct {
+-  bool on, k4;
++  bool on, k4, k6;
+   u64  erow, hb;
+   u32  noff, ooff, rb, fm, dm;
+ } M24Fz;
+@@ -16479,11 +16544,14 @@
+   bool     k4 = dm == 5120
+     || (dm == 4096 && term_tag(ep) == TAG_STR && (u64)qe.len == 248320ull * 2304);
+   u32      noff = (u32)H[a + 52], ooff = (u32)H[a + 53], hw = (u32)H[a + 54];
+-  u32      tok = (u32)H[a + 56], erb = k4 ? dm / 256 * 144 : dm / 32 * 34, rb, fm;
++  bool     k6 = dm == 2560 && term_tag(ep) == TAG_STR
++    && (u64)qe.len == 248320ull * 2100;
++  u32      tok = (u32)H[a + 56], rb, fm;
++  u32      erb = k4 ? dm / 256 * 144 : k6 ? dm / 256 * 210 : dm / 32 * 34;
+   bool     rok = m9_rw(hw, &rb, &fm);
+   bool     ok = str_nar(q) == 2 && term_tag(ep) == TAG_STR && str_nar(qe) == 2
+     && rok && tok < 248320 && noff % 4 == 0 && ooff % 16 == 0
+-    && (dm == 4096 || k4 || dm == 2048)
++    && (dm == 4096 || k4 || dm == 2048 || dm == 2560)
+     && (dm == 2048 ? fm == LLB_FM_Q8_0 : fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm))
+     && rb == LLB_FM_RB(fm, dm)
+     && (u64)noff + dm * 4 <= q.len && (u64)ooff + 248320ull * rb <= q.len
+@@ -16498,13 +16566,15 @@
+   F->fm   = fm;
+   F->dm   = dm;
+   F->k4   = k4;
++  F->k6   = k6;
+   return ok && (F->erow & 1) == 0;
+ }
+ 
+ static void m24_fz_embed(id<MTLComputeCommandEncoder> en, const M24Fz* F, u64 y) {
+   HybArgs A;
+   m9_args(&A, F->erow, y, 0, 0, 0, 0, 0, F->dm, 0, 0, 0.0f);
+-  m9_go(en, F->k4 ? gpu_m_embk4 : gpu_m_embq8, &A, F->dm / 256, 256);
++  m9_go(en, F->k4 ? gpu_m_embk4 : F->k6 ? gpu_m_embk6 : gpu_m_embq8, &A,
++    F->dm / 256, 256);
+ }
+ 
+ static void m24_fz_head(id<MTLComputeCommandEncoder> en, const M24Fz* F, u64 x,

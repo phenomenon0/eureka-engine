@@ -1,0 +1,162 @@
+--- a/llb_engine.m	2026-10-07 22:58:42
++++ b/llb_engine.m	2026-10-08 00:09:38
+@@ -1450,4 +1450,122 @@
+   unsetenv("LLB_GGUF");
+   free(llb_errlog);
+   llb_errlog = NULL;
++}
++
++// (PHONECAM) the camera's verdict (llb_engine.h). The emitted C's session image area (llb_img_cap, llb_img_seq) and
++// readout (llb_ro_*) come from patches/metal-camera.patch; the tower from vision/host/llbv.c. Built with LLB_VISION=1
++#if defined(LLB_VISION) && LLB_VISION
++#include "llbv.h"
++static int llb_vis_d;
++int llb_vision_area(int cap) {
++  llb_err[0] = 0;
++  if (cap < 0 || cap > 4096) {
++    return llb_fail("llb_vision_area: cap 0 .. 4096 rows", NULL);
++  }
++  if (llb_resident() && llb_img_cap != (u32)cap) {
++    return llb_fail("llb_vision_area: set it before llb_open (the session's image area is reserved at its first pass)",
++      NULL);
++  }
++  llb_img_cap = (u32)cap;
++  return 0;
++}
++int llb_vision_open(const char* mmproj, int d, int cap) {
++  llb_err[0] = 0;
++  if (cap < 1 || cap > 4096 || d < 256 || d % 256 != 0) {
++    return llb_fail("llb_vision_open: cap 1 .. 4096 rows and a width that is a multiple of 256", NULL);
++  }
++  if (llb_resident() && llb_img_cap != (u32)cap) {
++    return llb_fail("llb_vision_open: call it before llb_open (the session's image area is reserved at its first pass)",
++      NULL);
++  }
++  char err[256] = {0};
++  if (llbv_open(mmproj, (uint32_t)d, err) != 0) {
++    return llb_fail("llb_vision_open: ", err);
++  }
++  llb_img_cap = (u32)cap;
++  llb_vis_d = d;
++  return 0;
++}
++void llb_vision_close(void) {
++  llbv_close();
++}
++int llb_classify_rgb(const uint8_t* rgb, int w, int h, const uint32_t* pre, int n_pre, const uint32_t* post,
++    int n_post, uint32_t id_a, uint32_t id_b, llb_vstats* st) {
++  llb_vstats z = {0};
++  double t0 = llb_ms();
++  llb_err[0] = 0;
++  rs_reap();
++  if (!llbv_is_open() || llb_img_cap == 0) {
++    return llb_fail("llb_classify_rgb before llb_vision_open", NULL);
++  }
++  if (!llb_resident() || strcmp(rs_dir, llb_dir) != 0) {
++    return llb_fail("llb_classify_rgb needs the resident session (llb_open)", NULL);
++  }
++  if (id_a >= 248320 || id_b >= 248320 || n_pre < 1 || n_post < 1) {
++    return llb_fail("llb_classify_rgb: readout ids in the vocab, a prompt before and after the image", NULL);
++  }
++  char err[256] = {0};
++  uint32_t n = 0, nx = 0, ny = 0;
++  double vm[3] = {0};
++  if (llbv_prepare_rgb(rgb, w, h, (uint32_t)llb_vis_d, &n, &nx, &ny, vm, err) != 0) {
++    return llb_fail("llb_classify_rgb: ", err);
++  }
++  z.prep_ms = vm[0], z.tower_ms = vm[1], z.tower_gpu_ms = vm[2];
++  z.n_img = (int)n, z.nx = (int)nx, z.ny = (int)ny;
++  int n_ids = n_pre + (int)n + n_post;
++  if (n > llb_img_cap || (unsigned)(n_ids + 1) > rs_cap) {
++    llbv_forget();
++    return llb_fail("llb_classify_rgb: the image's rows exceed the session's image area or KV capacity", NULL);
++  }
++  uint32_t* ids = malloc((size_t)n_ids * sizeof *ids);
++  memcpy(ids, pre, (size_t)n_pre * sizeof *ids);
++  for (uint32_t i = 0; i < n; i += 1) {
++    ids[n_pre + i] = LLB_IMG_PAD;
++  }
++  memcpy(ids + n_pre + n, post, (size_t)n_post * sizeof *ids);
++  z.n_ids = n_ids;
++  // the readout armed for this job only (set here, read after the job: the job's hand-off orders both)
++  llb_ro_init = true;
++  llb_ro_ids[0] = id_a, llb_ro_ids[1] = id_b, llb_ro_pos = (u32)(n_ids - 1), llb_ro_got = 0, llb_ro_on = true;
++  uint32_t out[2] = {0};
++  llb_stats gs = {0};
++  double t1 = llb_ms();
++  int got = llb_generate_rs(ids, n_ids, 1, out, &gs);
++  z.llm_ms = llb_ms() - t1;
++  llb_ro_on = false;
++  free(ids);
++  llbv_forget();  // a job that never reached its first chunk leaves the rows held
++  if (got < 0) {
++    return -1;  // llb_error set by the job
++  }
++  if (got < 1 || llb_ro_got != 1) {
++    snprintf(llb_err, sizeof llb_err, "llb_classify_rgb: the readout did not fire (ids %d, readouts %u); see llb_log()",
++      got, llb_ro_got);
++    return -1;
++  }
++  z.first_id = out[0];
++  z.logit_a = llb_ro_v[0], z.logit_b = llb_ro_v[1];
++  memcpy(&z.bits_a, &llb_ro_v[0], 4);
++  memcpy(&z.bits_b, &llb_ro_v[1], 4);
++  z.total_ms = llb_ms() - t0;
++  if (st) {
++    *st = z;
++  }
++  return 0;
+ }
++#else
++int llb_vision_area(int cap) {
++  (void)cap;
++  return llb_fail("this engine build has no vision (LLB_VISION)", NULL);
++}
++int llb_vision_open(const char* mmproj, int d, int cap) {
++  (void)mmproj, (void)d, (void)cap;
++  return llb_fail("this engine build has no vision (LLB_VISION)", NULL);
++}
++void llb_vision_close(void) {}
++int llb_classify_rgb(const uint8_t* rgb, int w, int h, const uint32_t* pre, int n_pre, const uint32_t* post,
++    int n_post, uint32_t id_a, uint32_t id_b, llb_vstats* st) {
++  (void)rgb, (void)w, (void)h, (void)pre, (void)n_pre, (void)post, (void)n_post, (void)id_a, (void)id_b, (void)st;
++  return llb_fail("this engine build has no vision (LLB_VISION)", NULL);
++}
++#endif
+--- a/llb_engine.h	2026-10-07 22:52:00
++++ b/llb_engine.h	2026-10-08 00:09:38
+@@ -115,6 +115,34 @@
+ // one line: resident=yes|no model= cap= loads= jobs= load_ms= open_ms= compile_ms= span_mb= footprint_mb=
+ const char* llb_resident_report(void);
+ 
++// (PHONECAM) the camera's verdict, in process, on the resident session (a VISION build: LLB_VISION; elsewhere every
++// call refuses). One frame = the tower on its RGB canvas -> the image rows into the session's image area -> one
++// resident job (the prompt pre + n <|image_pad|> + post, one new id) -> the head's logits[id_a], logits[id_b] at the
++// last prompt position (the readout: verdict = a - b > 0, as vlive1's Yes/No logit readout).
++// llb_vision_open(mmproj, d, cap): BEFORE llb_open: the tower (mmproj, backbone width d) loaded once and kept, and the
++//   session's image area of cap rows (reserved at the session's first pass); 0 or -1 (llb_error).
++// llb_vision_close(): the tower freed (the session keeps its area until it closes).
++// llb_classify_rgb: rgb is w x h x 3 bytes (row stride w*3). Needs llb_open on the model llb_vision_open was given
++//   for. 0, or -1 (llb_error; nothing held afterwards).
++typedef struct {
++  double   prep_ms;      // canvas -> planar (vpre)
++  double   tower_ms;     // the tower's encode (host wall), and its GPU time
++  double   tower_gpu_ms;
++  double   llm_ms;       // the resident job: prefill (fast chunk) + the exact last step + the readout
++  double   total_ms;     // the whole call
++  int      n_img, nx, ny, n_ids;
++  uint32_t first_id;     // the argmax at the last prompt position (the one new id)
++  float    logit_a, logit_b;
++  uint32_t bits_a, bits_b;  // their f32 bits
++} llb_vstats;
++// llb_vision_area(cap): only the session image area (no tower): call once before any llb_open (e.g. at app start), so
++//   every session reserves it; 0 = none. Refused while a session with another cap is resident.
++int         llb_vision_area(int cap);
++int         llb_vision_open(const char* mmproj, int d, int cap);
++void        llb_vision_close(void);
++int         llb_classify_rgb(const uint8_t* rgb, int w, int h, const uint32_t* pre, int n_pre, const uint32_t* post,
++              int n_post, uint32_t id_a, uint32_t id_b, llb_vstats* st);
++
+ #ifdef __cplusplus
+ }
+ #endif

@@ -1,0 +1,345 @@
+--- a/engine/llb_engine.h
++++ b/engine/llb_engine.h
+@@ -50,6 +50,12 @@
+   uint64_t span_bytes;
+   uint64_t gguf_bytes;
+   int      exit_code;
++  // (ENGINE-DECIDECHUNK) the prefill tier: the chunk K each question's prefill asked for (0 = exact)
++  // and the engine's chunkf lines (fast tier: all but the last prompt position)
++  int      fastpf;
++  int      chunks;
++  int      chunk_tokens;
++  double   chunk_ms_sum;
+ } llb_dstats;
+ 
+ int         llb_load(const char* model_dir, const char* cache_dir);
+@@ -59,6 +65,12 @@
+ // answer line (llama-server's /v1/systemone layout) or {"error":"..."}. The model dir's GGUF must
+ // carry the Kev head (qwen35.decision.type = kev). Returns the number answered, -1 on an engine error.
+ int         llb_decide(const char* const* bodies, int n, char** replies, llb_dstats* st);
++// (ENGINE-DECIDECHUNK) decide's prefill tier: LLB_DECIDE_FASTPF=K (default 512, the fast chunk tier;
++// 0 = the exact path). llb_rows: the rows-parity harness, any pack (no head): item i = ids[i] (n_ids[i])
++// with the hook on at pos[i] (npos[i]) through the same srv loop + hook as llb_decide; its rows to
++// <outdir>/rows-<i>.hidden ([pos u32][width u32][width f32] each). Returns the items written, -1 on error.
++int         llb_rows(const uint32_t* const* ids, const int* n_ids, const uint32_t* const* pos,
++              const int* npos, int n, const char* outdir, llb_dstats* st);
+ void        llb_free(void);
+ const char* llb_error(void);         // last error text ("" if none)
+ const char* llb_log(void);           // the engine's stderr from the last llb_generate
+--- a/engine/llb_engine.m
++++ b/engine/llb_engine.m
+@@ -1,5 +1,8 @@
+ // llb_engine.m: the in-process API (llb_engine.h) over the Bend-emitted engine.
+ // (ENGINE-ONE copy of engine-phone's: + llb_decide, the Jev (Kev) decision head on the same engine run.)
++// (ENGINE-DECIDECHUNK: llb_decide's prefills take the FAST chunk tier, "--fastpf K" on each srv command
++//  (patches/{metal,engine}-dchunk.patch: the chunk rms-norms the hook-marked rows itself);
++//  LLB_DECIDE_FASTPF=0 is the exact path as before. + llb_rows, the rows-parity harness.)
+ //
+ // The emitted C is compiled unmodified, as part of this translation unit:
+ //   - its main becomes llb_bend_main, driven with the same argv the Mac CLI takes
+@@ -66,6 +69,10 @@
+ static char          llb_hpath[1200];
+ static double        llb_t_fwd, llb_fwd_ms, llb_head_ms;
+ static const char*   llb_model;
++// (ENGINE-DECIDECHUNK) the fast tier's chunk K for every srv command (0 = the exact path), and
++// llb_rows' output dir (set: dual_done keeps each item's rows there, no head)
++static int           llb_fastpf;
++static const char*   llb_rawdir;
+ static char llb_err[512];
+ static char llb_dir[1024];
+ static char llb_gguf[1024];
+@@ -314,11 +321,14 @@
+     llb_hidden_positions[q->pos[i]] = 1;
+   }
+   unlink(llb_hpath);
+-  size_t cap = (size_t)q->n * 12 + 32, k = 0;
++  size_t cap = (size_t)q->n * 12 + 64, k = 0;
+   char* c = malloc(cap);
+   for (int i = 0; i < q->n; i += 1) {
+     k += (size_t)snprintf(c + k, cap - k, "%d ", q->ids[i]);
+   }
++  if (llb_fastpf > 0) {  // (ENGINE-DECIDECHUNK) the fast tier (the srv loop's run.prompt)
++    k += (size_t)snprintf(c + k, cap - k, "--fastpf %d ", llb_fastpf);
++  }
+   snprintf(c + k, cap - k, "--steps 1");
+   *cmd = c;
+   *hidden = llb_hpath;
+@@ -334,6 +344,17 @@
+   double t1 = llb_ms();
+   llb_fwd_ms += t1 - llb_t_fwd;
+   char err[512] = "";
++  if (llb_rawdir) {  // (ENGINE-DECIDECHUNK) llb_rows: keep the item's rows, no head
++    char keep[1300];
++    snprintf(keep, sizeof keep, "%s/rows-%d.hidden", llb_rawdir, q->r);
++    if (rename(llb_hpath, keep) != 0) {
++      llb_replies[q->r] = llb_jerr("no rows were written");
++    } else {
++      llb_replies[q->r] = strdup("ok");
++    }
++    llb_qi += 1;
++    return;
++  }
+   jvh_job* j = llb_jobs[q->r];
+   if (jvh_job_rows_file(j, (size_t)q->k, llb_hpath, err, sizeof err) != 0) {
+     llb_replies[q->r] = llb_jerr(err);
+@@ -496,6 +517,9 @@
+ static jvh_session*  llb_head;
+ static int           llb_tok_on;
+ 
++static int  llb_srv(int maxT, int n, llb_dstats* zp);
++static void llb_qfree(void);
++
+ int llb_decide(const char* const* bodies, int n, char** replies, llb_dstats* ds) {
+   llb_dstats z = {0};
+   llb_err[0] = 0;
+@@ -578,6 +602,45 @@
+     }
+   }
+ 
++  if (llb_srv(maxT, n, &z) < 0) {
++    for (int r = 0; r < n; r += 1) {
++      free(replies[r]);
++      replies[r] = NULL;
++      jvh_job_free(llb_jobs[r]);
++    }
++    llb_qfree();
++    return -1;
++  }
++  z.forward_ms = llb_fwd_ms;
++  z.head_ms = llb_head_ms;
++  int answered = 0;
++  for (int r = 0; r < n; r += 1) {
++    if (!replies[r]) {
++      replies[r] = llb_jerr("the engine ended before this request was answered");
++    } else if (strncmp(replies[r], "{\"error\"", 8) != 0) {
++      answered += 1;
++    }
++    jvh_job_free(llb_jobs[r]);
++  }
++  llb_qfree();
++  z.total_ms = llb_ms() - t0;
++  if (ds) {
++    *ds = z;
++  }
++  if (z.exit_code != 0) {
++    llb_fail("engine exit code != 0; see llb_log()", NULL);
++    return -1;
++  }
++  return answered;
++}
++
++// (ENGINE-DECIDECHUNK) the decide queue's engine run (one srv loop over llb_q), split out of
++// llb_decide unchanged so llb_rows shares it; the fast tier's K from LLB_DECIDE_FASTPF (default 512)
++static int llb_srv(int maxT, int n, llb_dstats* zp) {
++  llb_dstats z = *zp;
++  const char* fe = getenv("LLB_DECIDE_FASTPF");
++  llb_fastpf = fe ? atoi(fe) : 512;
++  z.fastpf = llb_fastpf;
+   if (llb_qn > 0) {
+     z.gguf_bytes = llb_gguf_bytes;
+     z.compile_ms = llb_gpu_cache();
+@@ -641,29 +704,27 @@
+     llb_errlog = llb_slurp(ep);
+     fputs(llb_errlog, stderr);
+     for (char* l = llb_errlog; l && *l;) {
+-      unsigned long long a = 0, b = 0;
++      unsigned long long a = 0, b = 0, c = 0;
+       if (sscanf(l, "resident %llu bytes in %llu ms", &a, &b) == 2) {
+         z.load_ms = (double)b;
+       } else if (sscanf(l, "step %llu %llu", &a, &b) == 2) {
+         z.step_ms_sum += (double)b;
+         z.steps += 1;
++      } else if (sscanf(l, "chunkf %llu %llu %llu", &a, &b, &c) == 3) {  // (ENGINE-DECIDECHUNK)
++        z.chunk_ms_sum += (double)c;
++        z.chunks += 1;
++        z.chunk_tokens += (int)b;
+       }
+       char* nl = strchr(l, '\n');
+       l = nl ? nl + 1 : NULL;
+     }
+     unlink(llb_hpath);
+   }
+-  z.forward_ms = llb_fwd_ms;
+-  z.head_ms = llb_head_ms;
+-  int answered = 0;
+-  for (int r = 0; r < n; r += 1) {
+-    if (!replies[r]) {
+-      replies[r] = llb_jerr("the engine ended before this request was answered");
+-    } else if (strncmp(replies[r], "{\"error\"", 8) != 0) {
+-      answered += 1;
+-    }
+-    jvh_job_free(llb_jobs[r]);
+-  }
++  *zp = z;
++  return 0;
++}
++
++static void llb_qfree(void) {
+   for (int i = 0; i < llb_qn; i += 1) {
+     free(llb_q[i].ids);
+     free(llb_q[i].pos);
+@@ -674,6 +735,64 @@
+   llb_jobs = NULL;
+   llb_replies = NULL;
+   llb_qn = llb_qi = 0;
++}
++
++// (ENGINE-DECIDECHUNK) the rows-parity harness: n items (ids, the hook positions) through the same
++// srv loop and hook as llb_decide, fast or exact by LLB_DECIDE_FASTPF, no head (any pack); item i's
++// rows (the hook's [pos, width] + row format) to <outdir>/rows-<i>.hidden. Returns items written.
++int llb_rows(const uint32_t* const* ids, const int* n_ids, const uint32_t* const* pos, const int* npos,
++  int n, const char* outdir, llb_dstats* ds) {
++  llb_dstats z = {0};
++  llb_err[0] = 0;
++  double t0 = llb_ms();
++  if (!llb_loaded) {
++    return llb_fail("llb_rows before llb_load", NULL);
++  }
++  if (llb_runs > 0) {
++    return llb_fail("R1: one engine run per process (the model is not resident yet)", NULL);
++  }
++  snprintf(llb_hpath, sizeof llb_hpath, "%s/run/rows.hidden", llb_cache);
++  char** replies = calloc((size_t)n, sizeof *replies);
++  llb_replies = replies;
++  llb_rawdir = outdir;
++  llb_q = calloc((size_t)n, sizeof *llb_q);
++  llb_qn = llb_qi = 0;
++  llb_fwd_ms = llb_head_ms = 0;
++  int maxT = 0;
++  for (int r = 0; r < n; r += 1) {
++    llb_dq* q = &llb_q[llb_qn++];
++    q->r = r;
++    q->k = 0;
++    q->n = n_ids[r];
++    q->ids = malloc(sizeof *q->ids * (size_t)n_ids[r]);
++    for (int i = 0; i < n_ids[r]; i += 1) {
++      q->ids[i] = (int)ids[r][i];
++    }
++    q->npos = npos[r];
++    q->pos = malloc(sizeof *q->pos * (size_t)npos[r]);
++    memcpy(q->pos, pos[r], sizeof *q->pos * (size_t)npos[r]);
++    maxT = n_ids[r] > maxT ? n_ids[r] : maxT;
++    z.questions += 1;
++    z.input_tokens += n_ids[r];
++  }
++  if (llb_srv(maxT, n, &z) < 0) {
++    for (int r = 0; r < n; r += 1) {
++      free(replies[r]);
++    }
++    free(replies);
++    llb_qfree();
++    llb_rawdir = NULL;
++    return -1;
++  }
++  z.forward_ms = llb_fwd_ms;
++  int got = 0;
++  for (int r = 0; r < n; r += 1) {
++    got += replies[r] && !strcmp(replies[r], "ok");
++    free(replies[r]);
++  }
++  free(replies);
++  llb_qfree();
++  llb_rawdir = NULL;
+   z.total_ms = llb_ms() - t0;
+   if (ds) {
+     *ds = z;
+@@ -682,7 +801,7 @@
+     llb_fail("engine exit code != 0; see llb_log()", NULL);
+     return -1;
+   }
+-  return answered;
++  return got;
+ }
+ 
+ void llb_free(void) {
+--- a/engine/llb_host.c
++++ b/engine/llb_host.c
+@@ -3,6 +3,8 @@
+ // checked against the Mac CLI on the same model + ids.
+ //   llb-host <model_dir> <cache_dir> <n_new> id...
+ //   llb-host <model_dir> <cache_dir> decide request.json...   (ENGINE-ONE) one reply line per request on stdout
++//   llb-host <model_dir> <cache_dir> rows <outdir> item...     (ENGINE-DECIDECHUNK) llb_rows; an item file is
++//            two lines: the ids, then the hook positions (LLB_DECIDE_FASTPF picks the tier, as for decide)
+ #include "llb_engine.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -45,18 +47,77 @@
+     free(bodies[i]);
+   }
+   fprintf(stderr, "LLBDECIDE answered=%d/%d questions=%d input_tokens=%d compile_ms=%.0f head_open_ms=%.1f "
+-    "load_ms=%.0f forward_ms=%.1f head_ms=%.3f steps=%d step_ms_sum=%.0f total_ms=%.0f span_mb=%llu\n", got, nreq,
++    "load_ms=%.0f forward_ms=%.1f head_ms=%.3f steps=%d step_ms_sum=%.0f total_ms=%.0f span_mb=%llu "
++    "fastpf=%d chunks=%d chunk_tokens=%d chunk_ms_sum=%.0f\n", got, nreq,
+     st.questions, st.input_tokens, st.compile_ms, st.head_open_ms, st.load_ms, st.forward_ms, st.head_ms, st.steps,
+-    st.step_ms_sum, st.total_ms, (unsigned long long)(st.span_bytes >> 20));
++    st.step_ms_sum, st.total_ms, (unsigned long long)(st.span_bytes >> 20), st.fastpf, st.chunks, st.chunk_tokens,
++    st.chunk_ms_sum);
+   return got == nreq ? 0 : 3;
+ }
+ 
++// (ENGINE-DECIDECHUNK) llb_rows over item files (line 1 ids, line 2 hook positions)
++static int rows(const char* outdir, int n, char** paths) {
++  uint32_t** ids = calloc((size_t)n, sizeof *ids);
++  uint32_t** pos = calloc((size_t)n, sizeof *pos);
++  int* ni = calloc((size_t)n, sizeof *ni);
++  int* np = calloc((size_t)n, sizeof *np);
++  for (int i = 0; i < n; i += 1) {
++    char* s = slurp(paths[i]);
++    char* nl = s ? strchr(s, '\n') : NULL;
++    if (!nl) {
++      fprintf(stderr, "cannot read two lines from %s\n", paths[i]);
++      return 2;
++    }
++    *nl = 0;
++    for (int pass = 0; pass < 2; pass += 1) {
++      char* t = pass ? nl + 1 : s;
++      uint32_t* v = calloc(strlen(t) / 2 + 2, sizeof *v);
++      int k = 0;
++      for (char* e; ; t = e) {
++        unsigned long x = strtoul(t, &e, 10);
++        if (e == t) {
++          break;
++        }
++        v[k++] = (uint32_t)x;
++      }
++      if (pass) {
++        pos[i] = v;
++        np[i] = k;
++      } else {
++        ids[i] = v;
++        ni[i] = k;
++      }
++    }
++    free(s);
++  }
++  llb_dstats st;
++  int got = llb_rows((const uint32_t* const*)ids, ni, (const uint32_t* const*)pos, np, n, outdir, &st);
++  if (got < 0) {
++    fprintf(stderr, "rows: %s\n", llb_error());
++    return 1;
++  }
++  fprintf(stderr, "LLBROWS written=%d/%d input_tokens=%d compile_ms=%.0f load_ms=%.0f forward_ms=%.1f steps=%d "
++    "step_ms_sum=%.0f total_ms=%.0f fastpf=%d chunks=%d chunk_tokens=%d chunk_ms_sum=%.0f\n", got, n, st.input_tokens,
++    st.compile_ms, st.load_ms, st.forward_ms, st.steps, st.step_ms_sum, st.total_ms, st.fastpf, st.chunks,
++    st.chunk_tokens, st.chunk_ms_sum);
++  return got == n ? 0 : 3;
++}
++
+ int main(int argc, char** argv) {
+   if (argc < 5) {
+     fprintf(stderr, "usage: %s <model_dir> <cache_dir> <n_new> id... | <model_dir> <cache_dir> decide req.json...\n",
+       argv[0]);
+     return 2;
+   }
++  if (!strcmp(argv[3], "rows") && argc >= 6) {
++    if (llb_load(argv[1], argv[2]) != 0) {
++      fprintf(stderr, "load: %s\n", llb_error());
++      return 1;
++    }
++    int rc = rows(argv[4], argc - 5, argv + 5);
++    llb_free();
++    return rc;
++  }
+   if (!strcmp(argv[3], "decide")) {
+     fprintf(stderr, "device: %s\n", llb_device_info());
+     if (llb_load(argv[1], argv[2]) != 0) {

@@ -1,0 +1,61 @@
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -350,8 +350,13 @@
+         Bool.and(Bool.and(mf.cv(s, "d_model", "5120"), mf.cv(s, "d_ff", "17408")),
+           Bool.and(mf.cv(s, "ssm_time_step_rank", "48"), mf.cv(s, "ssm_inner_size", "6144"))))),
+       # (lane m32 = tools/engine-moe.patch) or the 35B-A3B (40, 16, 2048, the shared expert's 512)
+-      Bool.and(moe, Bool.and(Bool.and(mf.cv(s, "n_layers", "40"), mf.cv(s, "n_heads", "16")),
+-        Bool.and(mf.cv(s, "d_model", "2048"), mf.cv(s, "d_ff", "512")))))),
++      Bool.or(Bool.and(moe, Bool.and(Bool.and(mf.cv(s, "n_layers", "40"), mf.cv(s, "n_heads", "16")),
++        Bool.and(mf.cv(s, "d_model", "2048"), mf.cv(s, "d_ff", "512")))),
++      # (ENGINE-4B, patches/engine-4b.patch; CUDA: fnw1 b05e7f6d) or the 4B, Q8 or quant pack (32, 16,
++      # 2560, 9216, the 9B's SSM interior; the tied head is token_embd, the manifest's output.weight alias)
++      Bool.and(Bool.not(moe), Bool.and(Bool.and(mf.cv(s, "n_layers", "32"), mf.cv(s, "n_heads", "16")),
++        Bool.and(Bool.and(mf.cv(s, "d_model", "2560"), mf.cv(s, "d_ff", "9216")),
++          Bool.and(mf.cv(s, "ssm_time_step_rank", "32"), mf.cv(s, "ssm_inner_size", "4096")))))))),
+       "n_layers/n_heads/d_model/d_ff/ssm")
+     mf.config(s, "n_kv_heads", Bool.pick(String, moe, "2", "4"))
+     mf.config(s, "head_dim", "256")
+@@ -559,7 +564,9 @@
+         case False{}:
+           ws.grp(n, s, dir, tb)
+     case False{}:
+-      ws.layers(n, dir, 0, 232178432, False{}, 222857216, g)
++      # (ENGINE-4B) the 4B Q8 layer (d 2560, d_ff 9216): linear 120093440 B, full 114219008 B
++      +b4 = mf.cv(s, "d_model", "2560")
++      ws.layers(n, dir, 0, Bool.pick(U32, b4, 120093440, 232178432), False{}, Bool.pick(U32, b4, 114219008, 222857216), g)
+ 
+ # (lane m32) the 35B: M24's ws.layers.t, one blob a layer, then its experts.idx as the list's LAST
+ # element (the host's 35B arm takes it from there). Not a Model field: a 15th field cost the 27B
+@@ -602,8 +609,10 @@
+     +moe : Bool = mf.moe(s)
+     +hf : U32 = Bool.pick(U32, kq, mf.fm(s, "output.weight"), 1)
+     +ef : U32 = Bool.pick(U32, kq, mf.fm(s, "token_embd.weight"), 1)
++    # (ENGINE-4B) the 4B Q4_K_M's tied token_embd is Q6_K (ef 4): the fused step's llb_m_embk6, d_model 2560 only
+     mf.check(Bool.and(Bool.or(U32.is_eq(hf, 1), Bool.or(U32.is_eq(hf, 3), Bool.or(U32.is_eq(hf, 4), U32.is_eq(hf, 9)))),
+-      Bool.or(U32.is_eq(ef, 1), U32.is_eq(ef, 3))), "head/embedding format")
++      Bool.or(Bool.or(U32.is_eq(ef, 1), U32.is_eq(ef, 3)), Bool.and(U32.is_eq(ef, 4), U32.is_eq(dm, 2560)))),
++      "head/embedding format")
+     mf.check(Bool.or(Bool.not(moe), Bool.and(U32.is_eq(hf, 1), U32.is_eq(ef, 1))), "head/embedding format (qwen35moe: Q8_0)")
+     # the Q8 pack's head word is q8rw(4096) = fmt.rw(1, 4352); (tools/engine-27b.patch)
+     # the head's rows are d_model columns (the 27B's Q6_K: 4200 B)
+@@ -1102,6 +1111,9 @@
+   st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, +steps: U32) ->
+   IO(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+   do IO<U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>>:
++    # (ENGINE-4B) the 4B Shape runs the fused step only (as fnw1 on CUDA): this path's embed and
++    # layer bangs are 4096-wide
++    mf.check(Bool.not(U32.is_eq(m.dm(m), 2560)), "the 4B Shape (d_model 2560) runs the fused step only (no --emit, --lpb >= n_layers)")
+     t0 : Nat <- IO.now()
+     x : Array<F32> <- I.io.time(Array<F32>, "embed", _ => embed!(m, tok))
+     tb : Nat <- IO.now()
+@@ -1125,7 +1137,8 @@
+ def step(+m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +pos: U32, +tok: U32,
+   st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, +steps: U32) ->
+   IO(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+-  step.go(Bool.and(Bool.or(U32.is_eq(m.ef(m), 1), U32.is_eq(m.ef(m), 3)),
++  # (ENGINE-4B) or the 4B's Q6_K one (ef 4)
++  step.go(Bool.and(Bool.or(Bool.or(U32.is_eq(m.ef(m), 1), U32.is_eq(m.ef(m), 3)), U32.is_eq(m.ef(m), 4)),
+     Bool.and(Nat.is_le(m.nl(m), b), U32.is_eq(em, 4294967295))),
+     m, b, em, dT, nT, pos, tok, st, steps)
+ 

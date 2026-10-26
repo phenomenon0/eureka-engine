@@ -1,0 +1,71 @@
+<!doctype html><meta charset="utf-8"><title>bcheck7</title><pre id="log"></pre>
+<script type="module">
+// bcheck7 (webprefill3): the NO-SUBGROUP twins (WebKit path) vs NT dispatches of the shipped non-subgroup turbo entry <c>
+// (k_gemv_turbo.wgsl) on the same weights and NT token vectors, at the engine's strides: per-token outputs must be BIT-identical.
+// Twins: every R x T shape in ?mod= (default k_gemv_turbo_nrt.wgsl, gen-nsg.mjs) and the grid-token twin <c>_g (?gr=, default
+// k_gemv_turbo_ngr.wgsl, gen-gridtok.mjs ORD=row); each against its SABOTAGE build (<mod>x.wgsl: 1-ulp carried-accumulator
+// perturbation), which must differ. gu included (gate+up+swiglu). Times (median of 5, REPS each in one submit): NT shipped
+// dispatches in ONE compute pass (the engine's prefill pass) vs one twin dispatch. No subgroup feature is requested.
+// ?mod= per entry: k_gemv_turbo_nrt_<c>.wgsl (R x T) or k_gemv_turbo_nl_<c>.wgsl (LOOP=1 twins <c>_l<T>) (+ ?only=<c>); the all-entries module is too slow for WebKit to compile in one page.
+// Weights: random bytes with bits 2 and 6 cleared (every f16 scale finite); x random in [-1, 1). ?nt=32 &reps=10 &only=gu,q4k2560
+import { pipes } from "./webgpu.js";
+const LG = new URLSearchParams(location.search).get("save"), log = (s) => { document.getElementById("log").textContent += s + "\n"; if (LG) fetch("/save?name=" + LG + "-log", { method: "POST", body: document.getElementById("log").textContent }); }, out = { entries: {} };
+log("start " + navigator.userAgent);
+const q = new URLSearchParams(location.search), NT = Number(q.get("nt") ?? 32), REPS = Number(q.get("reps") ?? 10), ONLY = q.get("only")?.split(",");
+const SHAPES = [["q4k2560", 8192, 2560, 1440], ["q4k4096", 2560, 4096, 2304], ["q4k9216", 2560, 9216, 5184], ["q6k2560", 4096, 2560, 2100],
+  ["q6k9216", 2560, 9216, 7560], ["q5k2560", 4096, 2560, 1760], ["q5k4096", 2560, 4096, 2816], ["q8w2560", 32, 2560, 2720], ["gu", 9216, 2560, 1440]];
+// the engine's token strides (q35_plan.js Q35_PF_WIDTHS): x width by K (2560 -> 4096-word buffers), out width by rows
+const XW = { 2560: 4096, 4096: 4096, 9216: 9216 }, OW = (rows) => rows === 2560 ? 4096 : rows === 32 ? 64 : rows;
+let seed = 12345; const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296);
+try {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  const d = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: 1 << 27, maxBufferSize: 1 << 28 } });
+  const g = { adapter, device: d }, txt = async (n) => (await fetch("../emit/" + n)).text();
+  const GR = q.get("gr") ?? "k_gemv_turbo_ngr.wgsl", MOD = q.get("mod") ?? "k_gemv_turbo_nrt.wgsl", xn = (n) => n.replace(".wgsl", "x.wgsl");
+  const M = { s: await pipes(g, await txt("k_gemv_turbo.wgsl")), r: await pipes(g, await txt(GR)), rx: await pipes(g, await txt(xn(GR))) };
+  const U = GPUBufferUsage, mk = (bytes, data) => { const b = d.createBuffer({ size: Math.max(16, bytes), usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }); if (data) d.queue.writeBuffer(b, 0, data); return b; };
+  const scb = (words) => mk(64, new Uint32Array([...words, ...Array(16).fill(0)].slice(0, 16)));
+  const readback = async (buf, bytes) => { const r = d.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST }); const e = d.createCommandEncoder(); e.copyBufferToBuffer(buf, 0, r, 0, bytes); d.queue.submit([e.finish()]); await r.mapAsync(GPUMapMode.READ); const u = new Uint32Array(r.getMappedRange().slice(0)); r.unmap(); r.destroy(); return u; };
+  const bind = (pe, bufs) => d.createBindGroup({ layout: pe.bgl, entries: bufs.map(([binding, buffer, offset = 0, size]) => ({ binding, resource: { buffer, offset, ...(size ? { size } : {}) } })) });
+  const grid2 = (n) => [Math.min(n, 65535), Math.ceil(n / 65535)];
+  let allOK = true, sabCaught = true; const LOOPS = new Set();
+  log("compiled shipped + grid modules"); const RT = await pipes(g, await txt(MOD)), RX = await pipes(g, await txt(xn(MOD))); log("compiled " + MOD + " + sabotage");
+  
+  for (const [c, rows, K, rb] of SHAPES) {
+    if (c === "q8w2560" || (ONLY && !ONLY.includes(c))) continue;
+    const ps = M.s.by("cube", c), XS = XW[K], OS = OW(rows);
+    const GU = c === "gu", wbytes = ((GU ? 2 : 1) * rows * rb + 15) & ~15, u = new Uint8Array(wbytes); for (let i = 0; i < wbytes; i++) u[i] = (rnd() * 256) & 0xBB; const W = mk(wbytes, u);
+    const X = new Float32Array(NT * XS); for (let t = 0; t < NT; t++) for (let k = 0; k < K; k++) X[t * XS + k] = rnd() * 2 - 1;
+    const xb = mk(X.byteLength, X), oref = mk(NT * OS * 4), ob = mk(NT * OS * 4), BU = rows * rb, scS = scb(GU ? [rows, 0, BU] : [rows, 0, 0, 0]);
+    const wB = GU ? [[0, W], [1, W]] : [[0, W]], B0 = wB.length;   // gu: bg = 0, bu = rows * rb in the one buffer
+    const bgS = Array.from({ length: NT }, (_, t) => bind(ps, [...wB, [B0, xb, t * XS * 4, XS * 4], [B0 + 1, oref, t * OS * 4, OS * 4], [B0 + 2, scS]]));
+    const scV = scb(GU ? [rows, 0, BU, XS / 4, OS, NT] : [rows, 0, XS / 4, OS, NT]), gpe = M.r.by("cube", c + "_g"), gpx = M.rx.by("cube", c + "_g");
+    const run = async (pe, grid, reps) => {
+      const e = d.createCommandEncoder(), p = e.beginComputePass();
+      for (let r = 0; r < reps; r++) {
+        if (!pe) { p.setPipeline(ps.pipe); for (let t = 0; t < NT; t++) { p.setBindGroup(0, bgS[t]); p.dispatchWorkgroups(rows / 4); } }
+        else { p.setPipeline(pe.pipe); p.setBindGroup(0, bind(pe, [...wB, [B0, xb], [B0 + 1, ob], [B0 + 2, pe === gpe || pe === gpx || LOOPS.has(pe) ? scG : scV]])); p.dispatchWorkgroups(...grid); }
+      }
+      p.end(); const t0 = performance.now(); d.queue.submit([e.finish()]); await d.queue.onSubmittedWorkDone(); return performance.now() - t0;
+    };
+    const scG = scb(GU ? [rows, 0, BU, XS / 4, OS, NT] : [rows, 0, 0, 0, XS / 4, OS, NT]);
+    await run(null, null, 1); const ref = await readback(oref, NT * OS * 4);
+    const cmp = async () => { const b = await readback(ob, NT * OS * 4); let diff = 0, nan = 0; for (let t = 0; t < NT; t++) for (let i = 0; i < rows; i++) { const a = t * OS + i; if (ref[a] !== b[a]) diff++; if ((b[a] & 0x7f800000) === 0x7f800000) nan++; } return [diff, nan]; };
+    const med = (v) => [...v].sort((x, y) => x - y)[2];
+    const V = [[c + "_g", gpe, [rows / 4, NT], gpx], ...RT.man.entries.filter((e) => e.gurt && e.name.startsWith(c + "_")).map((e) => { const pe = RT.by("cube", e.name), px = RX.by("cube", e.name); if (e.loop) LOOPS.add(pe).add(px); return [e.name, pe, [rows / e.gurt[0], Math.ceil(NT / e.gurt[1])], px]; })];   // entries the module carries (_l<T> loop twins: the grid sc layout)
+    for (const [name, pe, grid, sab] of V) {
+      d.queue.writeBuffer(ob, 0, new Uint8Array(NT * OS * 4)); await run(pe, grid, 1); const [diff, nan] = await cmp();
+      let sdiff = null; if (sab) { d.queue.writeBuffer(ob, 0, new Uint8Array(NT * OS * 4)); await run(sab, grid, 1); sdiff = (await cmp())[0]; sabCaught &&= sdiff > 0; }
+      const ms = [], ss = []; for (let i = 0; i < 5; i++) { ss.push(await run(null, null, REPS)); ms.push(await run(pe, grid, REPS)); }
+      const r = { diff, nonfinite: nan, sabotage_diff: sdiff, us_shipped: med(ss) * 1000 / REPS, us: med(ms) * 1000 / REPS }; r.speedup = r.us_shipped / r.us;
+      out.entries[name] = r; allOK &&= diff === 0 && nan === 0;
+      log(`${name.padEnd(16)} ${diff ? "DIFF " + diff : "BIT-IDENTICAL"} nonfinite ${nan} sabotage ${sdiff ?? "-"}  ${NT}×shipped ${r.us_shipped.toFixed(0)} µs  twin ${r.us.toFixed(0)} µs  ${r.speedup.toFixed(2)}×`);
+    }
+    [W, xb, oref, ob, scS, scV, scG].forEach((x) => x.destroy());
+  }
+  out.ok = allOK; out.sabotage_caught = sabCaught; out.nt = NT; log("ALL " + (allOK ? "BIT-IDENTICAL" : "NOT IDENTICAL") + "; sabotage " + (sabCaught ? "CAUGHT" : "NOT CAUGHT"));
+} catch (e) { out.error = String(e.stack || e); log(out.error); }
+out.ua = navigator.userAgent;
+if (q.get("save")) await fetch("/save?name=" + q.get("save"), { method: "POST", body: JSON.stringify(out, null, 1) }); log("saved");
+document.title = "DONE";
+</script>

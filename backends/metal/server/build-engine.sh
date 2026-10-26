@@ -101,19 +101,23 @@ if [ -n "$XPF" ]; then
     bash "$top/mac/xpf/chain.sh" "$O/sys1mac.emit.c" "$O/sys1mac.c"
   fi
 fi
-# (E-METAL-LEAD) the fast decode K-quant GEMV tier: ON by default at run time (serve sets LLB_FASTGEMV=1);
-# LLB_FASTGEMV=0 or serve --canon = the bit-exact fixed-tree bodies. Both tiers are linked.
+# (E-METAL-LEAD) the fast decode K-quant GEMV tier, linked beside the bit-exact fixed-tree bodies. OFF at run time unless
+# LLB_FASTGEMV=1: metal-lead 581933da's "fast by default" (serve sets LLB_FASTGEMV=1, --canon) is HELD for the owner (METAL-PORT).
 mv "$O/sys1mac.c" "$O/sys1mac.pre-fg.c"
-python3 -I "$MY/patches/apply_fastgemv.py" "$O/sys1mac.pre-fg.c" "$O/sys1mac.c" "$MY/patches/kern_fastgemv.metal"
-# (MAC-ENGINE-PENALTY) the W1-SAMPLER host pick on the fused step's head (src/llb_sampler{,_impl}.h, byte-identical to
-# CUDA's host/): a request's "sampling" knobs (frequency_penalty, ...) now act. Greedy requests never enter it. NOSMP=1
-# skips it (the emitted C then equals d2b2a581's)
-if [ -z "${NOSMP:-}" ]; then
-  mv "$O/sys1mac.c" "$O/sys1mac.pre-smp.c"
-  python3 -I "$MY/patches/apply_sampler.py" "$O/sys1mac.pre-smp.c" "$O/sys1mac.c"
-fi
+python3 -I "$MY/patches/apply_fastgemv.py" "$O/sys1mac.pre-fg.c" "$O/sys1mac.fg.c" "$MY/patches/kern_fastgemv.metal"
+# (CHUNKF-F32) the fast chunk's GEMM gets an F32 arm (llb_f27_mm32) and the CHUNKF gate takes clef 9B's F32 ssm_beta / ssm_alpha
+# (slots 7, 8), as the exact PASS arm does: clef 9B's default --fastpf tier exited on its first chunk (bang fid 295, "warp hybrid:
+# unsupported operands"). NOF32MM=1 skips it (= metal-decide-chat c665a1ac's emitted C exactly)
+if [ -n "${NOF32MM:-}" ]; then cp "$O/sys1mac.fg.c" "$O/sys1mac.f32.c"
+else python3 -I "$MY/patches/apply_f27mm32.py" "$O/sys1mac.fg.c" "$O/sys1mac.f32.c"; fi
+# (DECIDE-CHAT-FIX) the chunk area reserved whatever the first pass was (an exact first pass, e.g. a decide, then a fast-tier
+# generate exited with "fast chunk: no chunk area"). NOCHUNKAREA=1 skips it (= KEV-HEAD-METAL's emitted C exactly)
+if [ -n "${NOCHUNKAREA:-}" ]; then mv "$O/sys1mac.f32.c" "$O/sys1mac.c"
+else python3 -I "$MY/patches/apply_chunkarea.py" "$O/sys1mac.f32.c" "$O/sys1mac.c"; fi
 ln -sfn /opt/homebrew/opt/openblas/include "$W/inc/openblas"   # head.c's <openblas/cblas.h>
 clang -D_POSIX_C_SOURCE=200809L -std=c11 -O2 -ffp-contract=off -Wall -Wextra -Wno-unused-function -I"$W/inc" -I"$root/tools" -I"$MY/src" -c "$MY/src/dualm.c" -o "$O/obj/dual.o"
+# (KEV-HEAD-METAL) the Kev decide head beside the clef objects (dualm.c serves decide through it for a Kev GGUF)
+clang -D_POSIX_C_SOURCE=200809L -std=c11 -O2 -ffp-contract=off -Wall -Wextra -Wno-unused-function -I"$root/tools" -I"$MY/src" -c "$MY/src/kevhead.c" -o "$O/obj/kevhead.o"
 for f in clef3/head.c clef3/weights.c clef3/spans.c clef3/json.c qwen35_tokenizer.c; do
   clang -D_POSIX_C_SOURCE=200809L -std=c11 -O2 -ffp-contract=off -Wall -Wextra -Wno-unused-function -I"$W/inc" \
     -c "$root/tools/$f" -o "$O/obj/$(basename "$f" .c).o"
@@ -137,6 +141,6 @@ if [ -n "${VISION:-}" ]; then
   VOBJ+=("obj-vis/vitm.o" -framework Metal -framework Foundation)
 fi
 (cd "$O" && clang -DBEND_METAL=1 -x objective-c -fobjc-arc -fmodules -fmodules-cache-path="$CLANG_MODULE_CACHE_PATH" \
-  -std=c11 -O3 -ffp-contract=off -I"$MY/src" sys1mac.c -x none obj/*.o ${VOBJ[@]+"${VOBJ[@]}"} -L/opt/homebrew/opt/openblas/lib -lopenblas -lpthread -lm \
+  -std=c11 -O3 -ffp-contract=off sys1mac.c -x none obj/*.o ${VOBJ[@]+"${VOBJ[@]}"} -L/opt/homebrew/opt/openblas/lib -lopenblas -lpthread -lm \
   -o sys1mac)
 shasum -a 256 "$S/cc/bend2/comp.ts" "$S/engine/engine_qwen35_gpu.bend" $([ -z "$XPF" ] || ls "$O"/sys1mac.emit.c "$O"/sys1mac.chain.c 2>/dev/null) "$O/sys1mac.c" "$O/sys1mac" "$O"/obj/*.o $([ -z "${VISION:-}" ] || ls "$O"/obj-vis/*.o) | sed "s|$W/||"

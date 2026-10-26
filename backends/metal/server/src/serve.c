@@ -52,7 +52,6 @@
 #define MAX_BODY (8 * 1024 * 1024)
 
 static const char *host = "127.0.0.1", *alias, *api_key;
-static int canon = 0;
 static int think_default = 1; // --reasoning off: the template default is non-thinking (llama-server --reasoning off)
 static int port = 8080, chat_default_n = 256, drain_s = 120;
 // M2 /v1/speak: the P3 launcher (a script that pins the venv + Misaki
@@ -160,12 +159,6 @@ static void engine_start(Slot *s, char **argv) {
         close(in[0]), close(in[1]), close(out[0]), close(out[1]), close(err[0]), close(err[1]);
         setenv("LLB_SYS1", "1", 1);
         setenv("LLB_SYS1_STREAM", "1", 1);
-        // Owner directive: FAST is the product default (chunkf prefill, fast GEMV); the exact
-        // per-token / bit-exact tier is explicit opt-in only. --canon forces the CANON tier over
-        // any inherited env; without it an explicit env value (LLB_DUAL_FASTPF=0 / LLB_FASTGEMV=0)
-        // still wins, so the env opt-in keeps working.
-        setenv("LLB_DUAL_FASTPF", canon ? "0" : "512", canon ? 1 : 0);
-        setenv("LLB_FASTGEMV", canon ? "0" : "1", canon ? 1 : 0);
         // dual.c / sys1.c refuse these (exact pass only)
         unsetenv("LLB_PREFILL"), unsetenv("LLB_SPEC"), unsetenv("LLB_MTP"), unsetenv("LLB_DUMP_HIDDEN");
         execv(argv[0], argv);
@@ -1518,12 +1511,11 @@ static void on_signal(int s) {
 static void usage(const char *a0) {
     fprintf(stderr,
         "usage: %s [--host H] [--port P] [--alias NAME] [--chat-max-tokens N] [--drain-seconds S]\n"
-        "          [--canon] [--api-key KEY] [--reasoning on|off] [--parallel N]\n"
+        "          [--api-key KEY] [--reasoning on|off] [--parallel N]\n"
         "          [--speak-cmd PATH] [--speak-gpu] [--speak-timeout MS] --engine PATH [-- ENGINE ARGS...]\n"
         "          [--whisper PATH --whisper-model PATH [--whisper-port P] [--hear-model NAME]]\n"
         "          --engine PATH [-- ENGINE ARGS...]\n"
         "  --parallel N (-np): N slots = N engine children (each loads its own weights + KV), default 1\n"
-        "  --canon: the CANON tier for this launch (exact per-token prefill, bit-exact GEMV); default is fast\n"
         "  --whisper PATH: whisper-server binary for /v1/hear (spawned as a loopback sidecar)\n"
         "  --whisper-model PATH: ggml whisper model (base.en-q5_1 is the pinned one)\n"
         "  --whisper-port P: sidecar port, default 8137\n"
@@ -1543,7 +1535,6 @@ int main(int argc, char **argv) {
             eargs = argv + i + 1, ean = argc - i - 1;
             break;
         }
-        if (!strcmp(a, "--canon")) { canon = 1; continue; }
         if (!strcmp(a, "--speak-gpu")) { speak_cpu = 0; continue; } // M2
         if (i + 1 >= argc) usage(argv[0]);
         if (!strcmp(a, "--host")) host = argv[++i];
@@ -1566,12 +1557,6 @@ int main(int argc, char **argv) {
     if (!engine || port <= 0 || port > 65535 || chat_default_n < 1 || n_slots < 1 || n_slots > 64 ||
         whisper_port <= 0 || whisper_port > 65535) usage(argv[0]);
     if (!getenv("LLB_GGUF")) fprintf(stderr, "serve: LLB_GGUF is unset (the engine will refuse)\n"), exit(2);
-    // print the tier this launch will actually use (the env opt-ins still win without --canon)
-    const char *fpe = getenv("LLB_DUAL_FASTPF"), *fge = getenv("LLB_FASTGEMV");
-    int pfk = canon ? 0 : (fpe && *fpe ? atoi(fpe) : 512);
-    int gemv = canon ? 0 : (fge ? (*fge != 0 && atoi(fge) != 0) : 1);
-    fprintf(stderr, "serve: tier %s (prefill %s, gemv %s)\n", pfk > 0 ? "FAST" : "CANON",
-            pfk > 0 ? "chunkf non-exact" : "exact per-token", gemv ? "fast" : "bit-exact");
     if (!alias) {
         const char *g = getenv("LLB_GGUF"), *s = strrchr(g, '/');
         alias = s ? s + 1 : g;

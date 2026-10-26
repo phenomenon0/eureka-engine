@@ -1,0 +1,115 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -7348,6 +7348,7 @@
+ 
+ // (lane m31, lever E1) the chunk's embedding rows: id[row]'s row (erb bytes
+ // from ep) into y + row ys floats, d columns, k4 Q4_K else Q8_0
++// (ENGINE-PREFILL) k4 2: Q6_K (the 4B Q4_K_M's tied token_embd)
+ typedef struct {
+   u64 ep, y;
+   u32 erb, d, ys, k4;
+@@ -12273,7 +12274,17 @@
+   if (i >= A.d) {
+     return;
+   }
+-  if (A.k4 != 0) {
++  if (A.k4 == 2) {
++    // (ENGINE-PREFILL, patches/metal-4bpf.patch) llb_m_embk6's column i
++    // verbatim: the chunk's rows are the fused step's bits
++    device const u8* a = C + A.ep + (u64)A.id[row] * A.erb + (u64)(i >> 8) * 210;
++    const u32 r = i & 255, h = r >> 7, g = (r & 127) >> 5, l = r & 31;
++    const u32 ql = a[64 * h + l + (g & 1) * 32], qh = a[128 + 32 * h + l];
++    const u32 q = ((g < 2 ? ql : ql >> 4) & 15) | ((qh >> (2 * g)) & 3) << 4;
++    const float d = llb_f16((u32)a[208] | (u32)a[209] << 8);
++    const float sc = (float)(int)(char)a[192 + 8 * h + l / 16 + 2 * g];
++    y[i] = d * sc * (float)((int)q - 32);
++  } else if (A.k4 != 0) {
+     device const u8* a = C + A.ep + (u64)A.id[row] * A.erb + (u64)(i >> 8) * 144;
+     const u32 rr = i & 255, b = rr >> 6, hi = (rr & 63) >> 5, j = 2 * b + hi;
+     const float d  = llb_f16((u32)a[0] | (u32)a[1] << 8);
+@@ -15888,7 +15899,9 @@
+   // lane m26 (tools/metal-f27.patch): the 27B fast chunk's area past the
+   // state (its addresses unchanged); only at the 27B Shape
+   // (lane m31) and at d_model 4096 when the first pass bang is a fast chunk
+-  u64 fch = R->d == 5120 || (R->d == 4096 && f9_want) ? F27_BYTES : 0;
++  // (ENGINE-PREFILL, patches/metal-4bpf.patch) and the 4B's d_model 2560 so
++  u64 fch = R->d == 5120 || ((R->d == 4096 || R->d == 2560) && f9_want)
++    ? F27_BYTES : 0;
+   id<MTLBuffer> g = [gpu_dev newBufferWithLength:M9_SCR + n + fch
+     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+   if (!g) {
+@@ -16378,9 +16391,11 @@
+ // the chunk: nt (1 .. F27_CH) tokens at pos0 .. through all S0->nl layers,
+ // head-less. ids / erow: the tokens and the embedding region (Q4_K rows of
+ // 2880 B); pw / tw / po as m9_pass_run's (the table required)
++// (ENGINE-PREFILL, patches/metal-4bpf.patch) or the 4B (d 2560): ek6 its
++// Q4_K_M's Q6_K embedding (2100 B rows); Kev-4B's Q4_K (1440 B) is ek4
+ static void f27_chunk(id<MTLComputeCommandEncoder> en, const u32* ids, u32 nt,
+-  u64 ep, bool ek4, u32 c, const M9Rows* S0, const u64* pw, const u32* po,
+-  const u32* tw) {
++  u64 ep, bool ek4, bool ek6, u32 c, const M9Rows* S0, const u64* pw,
++  const u32* po, const u32* tw) {
+   u32 dT = c & 31, pos0 = c >> 5;
+   u64 cv = 2 * S0->lkh * 128 + S0->lvh * 128;
+   f9_want = true;
+@@ -16391,19 +16406,21 @@
+   if (dT != pass_dT) {
+     err_fail("warp pass: dT changed");
+   }
+-  if (f27_base == 0 || (S0->d != 5120 && S0->d != 4096) || nt < 1 || nt > F27_CH
+-    || (S0->d == 5120 && (tw == NULL || !ek4))) {
++  if (f27_base == 0 || (S0->d != 5120 && S0->d != 4096 && S0->d != 2560)
++    || nt < 1 || nt > F27_CH || (S0->d == 5120 && (tw == NULL || !ek4))
++    || (ek6 && (ek4 || S0->d != 2560))) {
+     err_fail("fast chunk: no chunk area / not the 27B or 9B / nt out of range");
+   }
+   f27_pipes();
+   // (lane m31) the embedding rows: Q4_K (d / 256 x 144 B) or Q8_0 (d / 32 x 34)
+-  const u64 erb = ek4 ? S0->d / 256 * 144 : S0->d / 32 * 34;
++  const u64 erb = ek4 ? S0->d / 256 * 144 : ek6 ? S0->d / 256 * 210
++    : S0->d / 32 * 34;
+   // (lane m31, lever E1) one dispatch: d / 256 groups x nt rows
+   {
+     FEmbArgs E;
+     memset(&E, 0, sizeof E);
+     E.ep = ep; E.y = f27_base + F27_X * 4; E.erb = (u32)erb; E.d = S0->d;
+-    E.ys = (u32)F27_TB; E.k4 = ek4 ? 1 : 0;
++    E.ys = (u32)F27_TB; E.k4 = ek4 ? 1 : ek6 ? 2 : 0;
+     memcpy(E.id, ids, nt * sizeof(u32));
+     f27_go(en, gpu_f27_embt, &E, (u32)(32 + nt * sizeof(u32)),
+       S0->d / 256, nt, 256);
+@@ -16894,7 +16911,7 @@
+     m9_rows_q8(&S0, rg, rd);
+     bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+       && m9_shape(&S0, rg / 17 * 16, rd / 17 * 16)
+-      && (S0.d == 5120 || S0.d == 4096)
++      && (S0.d == 5120 || S0.d == 4096 || S0.d == 2560)
+       && dT >= 5 && dT <= 17 && nt >= 1 && nt <= F27_CH
+       && (u64)pos + nt <= (1ull << dT) && !M9_ARR(y)
+       && a32_load(a32_at(H, H_WARP_N)) == 1 && term_tag(ept) == TAG_STR;
+@@ -16902,9 +16919,14 @@
+     StrParts eq = str_peek_ro(e, ept);
+     // (lane m31) the embedding: the 27B's Q4_K, the 9B's Q4_K (2304 B rows) or
+     // Q8_0 (4352), told by the region's length (M30 F1's rule)
+-    bool ek4 = S0.d == 5120 || (u64)eq.len == 248320ull * 2304;
++    // (ENGINE-PREFILL, patches/metal-4bpf.patch) the 4B (d 2560): Q8_0 (2720
++    // B rows), the Q4_K_M's Q6_K (2100) or Kev-4B's Q4_K (1440), by length
++    bool ek4 = S0.d == 5120 || (u64)eq.len == 248320ull * 2304
++      || (S0.d == 2560 && (u64)eq.len == 248320ull * 1440);
++    bool ek6 = S0.d == 2560 && (u64)eq.len == 248320ull * 2100;
+     ok = ok && str_nar(eq) == 2
+-      && (u64)eq.len == 248320ull * (ek4 ? S0.d / 256 * 144 : S0.d / 32 * 34);
++      && (u64)eq.len == 248320ull * (ek4 ? S0.d / 256 * 144
++        : ek6 ? S0.d / 256 * 210 : S0.d / 32 * 34);
+     // (tools/metal-kquant.patch) the table (task word 49): a 2-part Bytes,
+     // 4-aligned, >= s + k rows; the Q8 pack passes exactly SNil (the old
+     // path); any other word is refused
+@@ -17058,7 +17080,7 @@
+     if ((ep & 1) != 0) {
+       m9_bad(aux);
+     }
+-    f27_chunk(en, ids, nt, ep, ek4, c, &S0, pw, po, tw);
++    f27_chunk(en, ids, nt, ep, ek4, ek6, c, &S0, pw, po, tw);
+     return true;
+   }
+   if (aux == LLB_PASS_FID) {

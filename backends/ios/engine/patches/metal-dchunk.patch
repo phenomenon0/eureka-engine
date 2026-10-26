@@ -1,0 +1,97 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -16484,23 +16484,77 @@
+ static unsigned char llb_hidden_positions[16384];
+ static u32           llb_hidden_tokens, llb_hidden_pos, llb_hidden_width;
+ static bool          llb_hidden_ready, llb_hidden_written, llb_hidden_pend;
+-static void llb_hidden_flush(void) {
+-  if (!llb_hidden_pend) {
+-    return;
+-  }
+-  llb_hidden_pend = false;
+-  u32 header[2] = { llb_hidden_pos, llb_hidden_width };
++// (ENGINE-DECIDECHUNK, patches/metal-dchunk.patch) a fast chunk's marked rows
++// (f27_rows): their pos and serve address, appended before the fused step's
++static u32 llb_hidden_cn, llb_hidden_cw, llb_hidden_cpos[F27_CH];
++static u64 llb_hidden_crow[F27_CH];
++static void llb_hidden_put1(u32 pos, u32 width, u64 at) {
++  u32 header[2] = { pos, width };
+   const f32* row = (const f32*)((const u8*)[gpu_scr contents]
+-    + (M9_HEADH & ~SA_SCR));
++    + (at & ~SA_SCR));
+   FILE* f = fopen(llb_hidden_path, llb_hidden_written ? "ab" : "wb");
+   if (!f || fwrite(header, 4, 2, f) != 2
+-    || fwrite(row, 4, llb_hidden_width, f) != llb_hidden_width) {
++    || fwrite(row, 4, width, f) != width) {
+     err_fail("LLB_DUMP_HIDDEN: write failed");
+   }
+   if (fclose(f)) {
+     err_fail("LLB_DUMP_HIDDEN: close failed");
+   }
+   llb_hidden_written = true;
++}
++static void llb_hidden_flush(void) {
++  for (u32 i = 0; i < llb_hidden_cn; i += 1) {
++    llb_hidden_put1(llb_hidden_cpos[i], llb_hidden_cw, llb_hidden_crow[i]);
++  }
++  llb_hidden_cn = 0;
++  if (!llb_hidden_pend) {
++    return;
++  }
++  llb_hidden_pend = false;
++  llb_hidden_put1(llb_hidden_pos, llb_hidden_width, M9_HEADH);
++}
++
++// (ENGINE-DECIDECHUNK, patches/metal-dchunk.patch) the hook inside a fast
++// chunk: each hook-marked pos among its nt rows (llb_hidden_positions, the
++// fused step's test) gets the head's rmsnorm (output_norm: the bang's head
++// region, word 50, at offset word 51) by llb_m_rmsnormt, the chunk's *t
++// kernel, from its block's x after the last layer into its block's mixer
++// slot (F27_AO, dead after the last fbn): the fused step's M9_HEADH, a row a
++// marked pos; llb_hidden_flush appends them once the round has completed
++static void f27_rows(Env e, Corpus H, Loc a, id<MTLComputeCommandEncoder> en,
++  u32 nt, u32 pos0, u32 d) {
++  if (!llb_hidden_path) {
++    return;
++  }
++  Term hd = H[a + 50];
++  u32  noff = (u32)H[a + 51];
++  u64  hw = 0;
++  if (term_tag(hd) == TAG_STR) {
++    StrParts q = str_peek_ro(e, hd);
++    const u8* hb = (const u8*)(H + term_peek_ro(e, q.data)) + q.off;
++    if (str_nar(q) == 2 && noff % 4 == 0 && (u64)noff + d * 4 <= q.len) {
++      hw = (u64)(hb - (const u8*)H) + noff;
++    }
++  }
++  for (u32 t = 0; t < nt; t += 1) {
++    u32 pos = pos0 + t;
++    if (pos >= llb_hidden_tokens || !llb_hidden_positions[pos]) {
++      continue;
++    }
++    if (hw == 0 || llb_hidden_cn >= F27_CH) {
++      err_fail("fast chunk: a hook-marked row without the head's norm");
++    }
++    HybTArgs T;
++    f27_targs(&T, d, 0, 0, 0.0f);
++    T.a[0] = f27_base + t * F27_TS + F27_X * 4;
++    T.a[1] = hw;
++    T.a[2] = f27_base + t * F27_TS + F27_AO * 4;
++    f27_go(en, gpu_t27_rnorm, &T, sizeof T, 1, 1, 1024);
++    llb_hidden_cpos[llb_hidden_cn] = pos;
++    llb_hidden_crow[llb_hidden_cn] = T.a[2];
++    llb_hidden_cn += 1;
++    llb_hidden_cw = d;
++  }
+ }
+ 
+ // (lane m32, f35) the 35B fast chunk's area past the 35B layer state, only when the first 35B bang is a fast
+@@ -17081,6 +17135,8 @@
+       m9_bad(aux);
+     }
+     f27_chunk(en, ids, nt, ep, ek4, ek6, c, &S0, pw, po, tw);
++    // (ENGINE-DECIDECHUNK, patches/metal-dchunk.patch) the hook's rows
++    f27_rows(e, H, a, en, nt, pos, S0.d);
+     return true;
+   }
+   if (aux == LLB_PASS_FID) {

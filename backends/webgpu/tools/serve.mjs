@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// serve.mjs [PORT]: static server for the WebGPU battery pages (byte ranges; COOP/COEP on /senses/).
+// serve.mjs [PORT]: static server for the WebGPU engine pages (byte ranges; COOP/COEP headers).
 //   /trunk/   the WGSL trunk engine and its pages (smoke.html = chat, clef.html = decide)
 //   /engine/  engine deps (tok.js, tok.wasm, gguf.js, ggufpack.js, q35_*.js)
 //   /emit/    the WGSL kernels used by the shipped engine

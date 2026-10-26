@@ -287,3 +287,129 @@ export function q35_plan(manifest, table, { ctx, layers = 32, embedChunk = 0, pa
     spec: { lane: "bend-graph/1", buffers: Object.fromEntries(Object.entries(buffers).map(([n, b]) => [n,
       { bytes: b.bytes, external: true, persist: true }])), steps, result: { buffer: resultBuf, bytes: resultWords * 4 } } };
 }
+
+// BATCHPREFILL: the prompt's tokens (all but the last) through the turbo graph's own kernels, layer-major over a chunk of nt tokens,
+// with no head and no readback. Per-token activations live in T-wide scratch buffers (pf.*: token t at word t * width); every
+// per-token op is the turbo plan's op on the same inputs, bound to its token's slice (ranged bindings, no copies), so each token's
+// arithmetic is the decode step's. GEMVs: per token on the shipped turbo entry, or (entry in `batched`) one dispatch of its
+// batched twin <entry>_b<T> (k_gemv_turbo_b.wgsl: per (token,row) the shipped kernel's operation sequence).
+// A step: {module, kind, name, bind: {in: [buffer, wordOffset, words|null]}, out, out2?, count, tile?, sc: {name: number |
+// {pos: t} | {tok: t} | {row0: t}}}; buffer {embed: t} = the head chunk holding token t's embedding row. The step after the chunk
+// (pos0 + nt) reads the state banks of parity (pos0 + nt) % 2, exactly as if each token had been stepped.
+export const Q35_PF_WIDTHS = { R: 4096, H: 4096, QKV: 8192, Z: 4096, N: 4096, A: 4096, RS: 4096, HN: 4096, SW: 9216, DN: 4096,
+  QX: 8192, KX: 1024, VX: 1024, G: 4096, FG: 9216, FU: 9216, CONV: 8192, Q: 4096, K: 4096, RO: 4096, BETA: 64, DEC: 64 };
+// bank (0|1, or null = the decode step's ping-pong kvput): every token's K/V row is written in place (k_fuse_pf kvput1) into that one
+// bank, the one the step after the prefill reads; attention reads it (rows <= pos only). TB: tokens per batched GEMV dispatch.
+// tokb (needs bank): the row-independent ops run as ONE dispatch for the chunk's nt tokens (their k_*_tb / k_fuse_pfb twins, grid
+// [workgroups, nt], token slot = workgroup_id.y); only the recurrent conv history and GDN state steps stay one token at a time.
+// webprefill2: grid (needs tokb): GEMV entries that run as ONE dispatch for the chunk's nt tokens through their grid-token twin
+// <entry>_g (k_gemv_turbo_grf.wgsl: the shipped entry, token slot = workgroup_id.y); gu ("r<R>t<T>", needs tokb): the gate+up
+// GEMV as gu_r<R>t<T> (k_gemv_turbo_guf.wgsl: the shipped gu's 160 lanes for R rows x T tokens), ceil(nt / T) token groups.
+// recur (needs tokb): convh and gdn as ONE dispatch for the chunk (k_fuse_rc.wgsl: the nt tokens walked in order, state in
+// registers): reads bank parity0, leaves the final state in bank (parity0 + nt) % 2 (= the step after the chunk's bank; the other
+// bank is never read before it is overwritten); _ci when the two are the same buffer (nt even), _c otherwise. recur "sg":
+// k_fuse_rcs.wgsl (gdn's last 5 tree steps by subgroup shuffle, the same adds; subgroups only).
+// rt (needs tokb): entry -> "r<R>t<T>": that GEMV as <entry>_r<R>t<T> (k_gemv_turbo_rtf.wgsl: the shipped entry's lanes for R rows x
+// T tokens), ceil(nt / T) token groups; takes precedence over grid / batched. embed (needs tokb, Q6_K head): the embed gathers as
+// one embed_tb dispatch per head chunk (k_embed_tb.wgsl; buffer {head: c}), each token's workgroups run in its row's chunk only.
+// webprefill3: nsg (no subgroups, the WebKit path): grid uses the grid-token twins of the shipped NON-subgroup k_gemv_turbo.wgsl
+// entries (k_gemv_turbo_ngrf.wgsl, gen-gridtok.mjs on k_gemv_turbo.wgsl; same entry names and sc layouts), and gu "g" (nsg only) the
+// gate+up GEMV as its grid-token twin gu_g there. No-subgroup R x T twins are NOT bit-identical on WebKit (receipts bc7-wk-*).
+export function q35_prefill_plan(manifest, table, { ctx, layers = 32, nt, T, parity0, batched = new Set(), bank = null, TB = 4, tokb = false, grid = new Set(), gu = null, recur = false, rt = new Map(), embed = false, nsg = false }) {
+  check(Q35_CAPACITIES.includes(ctx), `unsupported capacity ${ctx}`);
+  check(Number.isInteger(nt) && nt >= 1 && nt <= T && T % TB === 0, "bad prefill chunk");
+  check(bank === null || bank === 0 || bank === 1, "bad prefill bank");
+  check(!tokb || bank !== null, "token-batched prefill needs the one-bank kvput");
+  check(tokb || (!grid.size && !gu && !recur && !rt.size), "grid-token GEMVs / recurrent chunks need the token-batched prefill");
+  const model = q35_tensors(manifest, table), steps = [], W = Q35_PF_WIDTHS;
+  const N = "k_norms_t.wgsl", VT = "k_gemv_turbo.wgsl", VB = "k_gemv_turbo_b.wgsl", TF = "k_fuse_t.wgsl", PF = "k_fuse_pf.wgsl";
+  const groups = [...Array(Math.ceil(nt / TB)).keys()];   // batched GEMVs: TB token slots a dispatch (slots >= nt compute unused values)
+  const pf = (k, t) => [`pf.${k}`, t * W[k], W[k]], whole = (b) => [b, 0, null], all = (k) => [`pf.${k}`, 0, T * W[k]];
+  const VG = nsg ? "k_gemv_turbo_ngrf.wgsl" : "k_gemv_turbo_grf.wgsl", VU = "k_gemv_turbo_guf.wgsl", GU = gu && /^r(\d+)t(\d+)$/.exec(gu);
+  check(!gu || GU || (gu === "g" && nsg), "bad gu shape " + gu);
+  const NB = "k_norms_tb.wgsl", TFB = "k_fuse_tb.wgsl", PFB = "k_fuse_pfb.wgsl";
+  const opT = (module, name, bind, out, count, sc = {}, out2 = null, tile = 1, tokens = nt) => steps.push({ module, kind: "cube", name, bind, out, count, sc, tokens, ...(out2 ? { out2 } : {}), ...(tile > 1 ? { tile } : {}) });
+  const tokens = [...Array(nt).keys()], par = (t) => (parity0 + t) % 2;
+  const op = (module, kind, name, bind, out, count, sc = {}, out2 = null, tile = 1) =>
+    steps.push({ module, kind, name, bind, out, count, sc, ...(out2 ? { out2 } : {}), ...(tile > 1 ? { tile } : {}) });
+  const gemv = (w, x, o) => {   // the turbo plan's mv(): output words = 4096 for 2560 rows (padded), else rows
+    check(W[o] === (w.rows === 2560 ? 4096 : w.rows), "prefill width " + o + " for " + w.name);
+    const rs = rt.get(w.entry), RS = rs && /^r(\d+)t(\d+)$/.exec(rs);
+    if (rs) check(RS, "bad rt shape " + rs);
+    if (RS) opT("k_gemv_turbo_rtf.wgsl", `${w.entry}_${rs}`, { wb: whole(w.buffer), xb: all(x) }, all(o), w.rows, { base: w.offset, xs: W[x] / 4, os: W[o], nt }, null, Number(RS[1]), Math.ceil(nt / Number(RS[2])));
+    else if (grid.has(w.entry)) opT(VG, `${w.entry}_g`, { wb: whole(w.buffer), xb: all(x) }, all(o), w.rows, { base: w.offset, xs: W[x] / 4, os: W[o], nt }, null, 4);
+    else if (batched.has(w.entry)) for (const gi of groups) op(VB, "cube", `${w.entry}_b${TB}`, { wb: whole(w.buffer), xb: [`pf.${x}`, gi * TB * W[x], TB * W[x]] }, [`pf.${o}`, gi * TB * W[o], TB * W[o]], w.rows, { base: w.offset, xs: W[x] * 4, os: W[o] }, null, 4);
+    else for (const t of tokens) op(VT, "cube", w.entry, { wb: whole(w.buffer), xb: pf(x, t) }, pf(o, t), w.rows, { base: w.offset }, null, 4);
+  };
+  const EMB = embed && tokb && nt >= 4 && T <= 32 && model.head.embed[1] === "embed";   // nt < 4: the per-token gathers are cheaper than 4 dispatches
+  if (EMB) for (let c = 0; c < 4; c++) steps.push({ module: "k_embed_tb.wgsl", kind: "map", name: "embed_tb", bind: { wb: [{ head: c }, 0, null] }, out: all("R"), count: 2560,
+    sc: { chunk_row0: c * Q35_HEAD_ROWS, c, nt, ...Object.fromEntries([...Array(32).keys()].map((t) => ["id" + t, t < nt ? { tok: t } : 0])) }, tokens: nt });   // slots >= nt: 0 (tk >= nt returns)
+  for (const t of tokens) {
+    if (!EMB) op(model.head.embed[0], "map", model.head.embed[1], { wb: [{ embed: t }, 0, null] }, pf("R", t), 2560, { id: { tok: t }, chunk_row0: { row0: t } });
+    if (!tokb) op(N, "cube", "rms2560", { x: pf("R", t), w: whole(model.layers[0].tensors.an.buffer) }, pf("H", t), 1);
+  }
+  if (tokb) opT(NB, "rms2560", { x: all("R"), w: whole(model.layers[0].tensors.an.buffer) }, all("H"), 1);
+  for (const l of model.layers.slice(0, layers)) {
+    const P = `L${l.layer}.`, t_ = l.tensors;
+    if (!l.full) {
+      const fuseG = t_.sb.entry === "q8w2560" && t_.sa.entry === "q8w2560" && t_.sb.buffer === t_.sa.buffer;
+      check(fuseG, "prefill: unfused gates are not supported (turbo fuses them on this pack)");
+      gemv(t_.qkv, "H", "QKV"); gemv(t_.gate, "H", "Z");
+      if (tokb) {
+        const hist = [P + "hist0", P + "hist1"], ss = [P + "state0", P + "state1"];
+        opT(TFB, "gatesg", { wb: whole(t_.sb.buffer), xb: all("H"), dt: whole(t_.dt.buffer), sa: whole(t_.ssa.buffer) }, all("BETA"), 1, { bb: t_.sb.offset, ba: t_.sa.offset }, all("DEC"));
+        const pin = par(0), pout = par(nt), RC = recur === "sg" ? "k_fuse_rcs.wgsl" : "k_fuse_rc.wgsl", some = (k, off = 0) => [`pf.${k}`, off, nt * W[k] - off];
+        if (recur && pin === pout) op(RC, "cube", "convh_ci", { xb: some("QKV"), wb: whole(t_.cv.buffer) }, some("CONV"), 32, {}, whole(hist[pin]));
+        else if (recur) op(RC, "cube", "convh_c", { xb: some("QKV"), hb: whole(hist[pin]), wb: whole(t_.cv.buffer) }, some("CONV"), 32, {}, whole(hist[pout]));
+        else for (const t of tokens) op(TF, "cube", "convh", { xb: pf("QKV", t), hb: whole(hist[par(t)]), wb: whole(t_.cv.buffer) }, pf("CONV", t), 32, {}, whole(hist[1 - par(t)]));
+        opT(TFB, "l2qk", { c: all("CONV") }, all("Q"), 32, {}, all("K"));
+        const gin = { kb: some("K"), db: some("DEC"), vb: some("CONV", 4096), bb: some("BETA"), qb: some("Q") };
+        if (recur && pin === pout) op(RC, "cube", "gdn_ci", gin, whole(ss[pin]), 1024, {}, some("RO"));
+        else if (recur) op(RC, "cube", "gdn_c", { sb: whole(ss[pin]), ...gin }, whole(ss[pout]), 1024, {}, some("RO"));
+        else for (const t of tokens) op(TF, "cube", "gdn", { sb: whole(ss[par(t)]), kb: pf("K", t), db: pf("DEC", t), vb: ["pf.CONV", t * W.CONV + 4096, 4096], bb: pf("BETA", t), qb: pf("Q", t) }, whole(ss[1 - par(t)]), 1024, {}, pf("RO", t));
+        opT(NB, "gated", { o: all("RO"), w: whole(t_.sn.buffer), z: all("Z") }, all("N"), 32);
+      } else for (const t of tokens) {
+        const p = par(t), hist = [P + "hist0", P + "hist1"], ss = [P + "state0", P + "state1"];
+        op(TF, "cube", "gatesg", { wb: whole(t_.sb.buffer), xb: pf("H", t), dt: whole(t_.dt.buffer), sa: whole(t_.ssa.buffer) }, whole(P + "beta"), 1, { bb: t_.sb.offset, ba: t_.sa.offset }, whole(P + "dec"));
+        op(TF, "cube", "convh", { xb: pf("QKV", t), hb: whole(hist[p]), wb: whole(t_.cv.buffer) }, whole(P + "conv"), 32, {}, whole(hist[1 - p]));
+        op(TF, "cube", "l2qk", { c: whole(P + "conv") }, whole(P + "q"), 32, {}, whole(P + "k"));
+        op(TF, "cube", "gdn", { sb: whole(ss[p]), kb: whole(P + "k"), db: whole(P + "dec"), vb: [P + "conv", 4096, 4096], bb: whole(P + "beta"), qb: whole(P + "q") }, whole(ss[1 - p]), 1024, {}, whole(P + "readout"));
+        op(N, "cube", "gated", { o: whole(P + "readout"), w: whole(t_.sn.buffer), z: pf("Z", t) }, pf("N", t), 32);
+      }
+      gemv(t_.so, "N", "A");
+    } else {
+      gemv(t_.aq, "H", "QX"); gemv(t_.ak, "H", "KX"); gemv(t_.av, "H", "VX");
+      if (tokb) {   // every token's K/V row lands first (one bank), then each token attends to rows <= its own position
+        const kc = P + "kc" + bank, vc = P + "vc" + bank;
+        opT(TFB, "qprep", { qx: all("QX"), w: whole(t_.aqn.buffer) }, all("Q"), 16, { pos: { pos: 0 } });
+        opT(PFB, "kvput1", { kx: all("KX"), vx: all("VX"), w: whole(t_.akn.buffer) }, whole(kc), 4, { pos: { pos: 0 } }, whole(vc));
+        opT(TFB, "attn", { q: all("Q"), cb: whole(kc), vb: whole(vc), qx: all("QX") }, all("G"), 16, { pos: { pos: 0 } });
+      } else for (const t of tokens) {
+        const p = par(t), kc = [P + "kc0", P + "kc1"], vc = [P + "vc0", P + "vc1"];
+        op(TF, "cube", "qprep", { qx: pf("QX", t), w: whole(t_.aqn.buffer) }, whole(P + "q"), 16, { pos: { pos: t } });
+        const cur = bank === null ? 1 - p : bank;   // the bank holding rows 0..pos after this token's put
+        if (bank === null) op(TF, "cube", "kvput", { cb: whole(kc[p]), vb: whole(vc[p]), kx: pf("KX", t), vx: pf("VX", t), w: whole(t_.akn.buffer) }, whole(kc[1 - p]), ctx * 4, { pos: { pos: t } }, whole(vc[1 - p]));
+        else op(PF, "cube", "kvput1", { kx: pf("KX", t), vx: pf("VX", t), w: whole(t_.akn.buffer) }, whole(kc[bank]), 4, { pos: { pos: t } }, whole(vc[bank]));
+        op(TF, "cube", "attn", { q: whole(P + "q"), cb: whole(kc[cur]), vb: whole(vc[cur]), qx: pf("QX", t) }, pf("G", t), 16, { pos: { pos: t } });
+      }
+      gemv(t_.ao, "G", "A");
+    }
+    if (tokb) opT(TFB, "addrms", { a: all("R"), b: all("A"), w: whole(t_.post.buffer) }, all("RS"), 1, {}, all("HN"));
+    else for (const t of tokens) op(TF, "cube", "addrms", { a: pf("R", t), b: pf("A", t), w: whole(t_.post.buffer) }, pf("RS", t), 1, {}, pf("HN", t));
+    if (t_.fg.entry === "q4k2560" && t_.fu.entry === "q4k2560") {
+      if (gu === "g") opT(VG, "gu_g", { wg: whole(t_.fg.buffer), wu: whole(t_.fu.buffer), xb: all("HN") }, all("SW"), 9216, { bg: t_.fg.offset, bu: t_.fu.offset, xs: W.HN / 4, os: W.SW, nt }, null, 4);   // webprefill3 (nsg)
+      else if (GU) opT(VU, `gu_${gu}`, { wg: whole(t_.fg.buffer), wu: whole(t_.fu.buffer), xb: all("HN") }, all("SW"), 9216, { bg: t_.fg.offset, bu: t_.fu.offset, xs: W.HN / 4, os: W.SW, nt }, null, Number(GU[1]), Math.ceil(nt / Number(GU[2])));
+      else if (batched.has("gu")) for (const gi of groups) op(VB, "cube", `gu_b${TB}`, { wg: whole(t_.fg.buffer), wu: whole(t_.fu.buffer), xb: ["pf.HN", gi * TB * W.HN, TB * W.HN] }, ["pf.SW", gi * TB * W.SW, TB * W.SW], 9216, { bg: t_.fg.offset, bu: t_.fu.offset, xs: W.HN * 4, os: W.SW }, null, 4);
+      else for (const t of tokens) op(VT, "cube", "gu", { wg: whole(t_.fg.buffer), wu: whole(t_.fu.buffer), xb: pf("HN", t) }, pf("SW", t), 9216, { bg: t_.fg.offset, bu: t_.fu.offset }, null, 4);
+    } else {
+      gemv(t_.fg, "HN", "FG"); gemv(t_.fu, "HN", "FU");
+      for (const t of tokens) op(N, "map", "swiglu", { g: pf("FG", t), u: pf("FU", t) }, pf("SW", t), 9216);
+    }
+    gemv(t_.fd, "SW", "DN");
+    const nextW = l.layer + 1 < layers ? model.layers[l.layer + 1].tensors.an.buffer : "head.normw";
+    if (tokb) opT(TFB, "addrms", { a: all("RS"), b: all("DN"), w: whole(nextW) }, all("R"), 1, {}, all("H"));
+    else for (const t of tokens) op(TF, "cube", "addrms", { a: pf("RS", t), b: pf("DN", t), w: whole(nextW) }, pf("R", t), 1, {}, pf("H", t));
+  }
+  const kv = model.layers.slice(0, layers).filter((l) => l.full).map((l) => `L${l.layer}.`);
+  return { schema: "q35-prefill-plan/1", ctx, layers, nt, T, TB, parity0, bank, tokb, kv, steps, buffers: Object.fromEntries(Object.keys(W).map((k) => [`pf.${k}`, T * W[k] * 4])) };
+}

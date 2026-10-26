@@ -1,0 +1,317 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -14336,17 +14336,37 @@
+   sigaction(SIGSEGV, &sa, NULL);
+   sigaction(SIGBUS, &sa, NULL);
+   return (Term*)p;
++}
++
++// (ENGINE-REPEAT) a pool_stack's mapping back to the system: the calling
++// thread's alternate signal stack (inside it) off first
++static void pool_unstack(Term* p) {
++  stack_t ss = { .ss_flags = SS_DISABLE };
++  sigaltstack(&ss, NULL);
++  munmap(p, (1ull << 31) + 16384 + SIGSTKSZ);
+ }
+ 
++// (ENGINE-REPEAT) the workers are joinable: pool_close sets pool_quit, wakes
++// them, and joins every one (pool_open starts them again on the next run)
++static pthread_t pool_tid[CUBE_T];
++static u32       pool_up;
++static bool      pool_quit;
++
+ static void* pool_work(void* arg) {
+   Term* stk  = pool_stack();
+   u64   seen = 0;
+   for (;;) {
+     pthread_mutex_lock(&pool_lock);
+-    while (atomic_load_explicit(&pool_tick, memory_order_acquire) == seen) {
++    while (atomic_load_explicit(&pool_tick, memory_order_acquire) == seen
++      && !pool_quit) {
+       pthread_cond_wait(&pool_wake, &pool_lock);
+     }
++    bool quit = pool_quit;
+     pthread_mutex_unlock(&pool_lock);
++    if (quit) {
++      pool_unstack(stk);
++      return NULL;
++    }
+     seen = atomic_load_explicit(&pool_tick, memory_order_acquire);
+     Env e = { CORPUS, ALC[1 + (u32)(uintptr_t)arg] };
+     for (;;) {
+@@ -14377,17 +14397,28 @@
+ }
+ 
+ OUTLINE void pool_open(void) {
+-  static bool up;
+-  if (up) {
++  if (pool_up != 0) {
+     return;
+   }
+-  up = true;
+   for (u32 w = 0; w < pool_size; w += 1) {
+-    pthread_t tid;
+-    if (pthread_create(&tid, NULL, pool_work, (void*)(uintptr_t)w)) {
++    if (pthread_create(&pool_tid[w], NULL, pool_work, (void*)(uintptr_t)w)) {
+       err_fail("pthread_create");
+     }
++    pool_up = w + 1;
++  }
++}
++
++// (ENGINE-REPEAT) every worker out and joined, its stack unmapped
++static void pool_close(void) {
++  pthread_mutex_lock(&pool_lock);
++  pool_quit = true;
++  pthread_cond_broadcast(&pool_wake);
++  pthread_mutex_unlock(&pool_lock);
++  for (u32 w = 0; w < pool_up; w += 1) {
++    pthread_join(pool_tid[w], NULL);
+   }
++  pool_up   = 0;
++  pool_quit = false;
+ }
+ 
+ // The CPUs this process may use: affinity mask under the cgroup quota
+@@ -17742,6 +17773,9 @@
+ static int  moe_gl = -1;
+ static u32  moe_gn, moe_dfd;
+ static f32* moe_feed;
++// (ENGINE-REPEAT) the experts' GGUF map, for bend_close
++static u8*  moe_map;
++static u64  moe_maplen;
+ static char moe_dir[1024];
+ static u64  moe_fslot, moe_dmb, moe_dout;
+ static int  moe_pend_l = -1, moe_pend_p;
+@@ -17865,6 +17899,8 @@
+   if (F == MAP_FAILED) {
+     err_fail("moe pool: cannot map the GGUF");
+   }
++  moe_map    = F;
++  moe_maplen = flen;
+   struct timespec t0, t1;
+   clock_gettime(CLOCK_MONOTONIC, &t0);
+   volatile u64 sink = 0;
+@@ -19900,6 +19936,9 @@
+ static u32            io_busy;
+ static u32            io_size;
+ static int            io_wake_fd[2];
++// (ENGINE-REPEAT) the helpers are joinable: io_close sets io_quit and joins
++static pthread_t      io_tid[IO_HELP];
++static bool           io_quit;
+ 
+ static void io_take(Env e) {
+   IoAct*  acts[64];
+@@ -19917,9 +19956,13 @@
+ static void* io_help(void* arg) {
+   for (;;) {
+     pthread_mutex_lock(&io_gate);
+-    while (io_jobs.head == NULL) {
++    while (io_jobs.head == NULL && !io_quit) {
+       pthread_cond_wait(&io_bell, &io_gate);
+     }
++    if (io_jobs.head == NULL) {
++      pthread_mutex_unlock(&io_gate);
++      return NULL;
++    }
+     IoAct* a = io_pop(&io_jobs);
+     pthread_mutex_unlock(&io_gate);
+     a->work.call(&a->work);
+@@ -19934,11 +19977,9 @@
+   w->pack  = pack;
+   io_busy += 1;
+   if (io_busy > io_size && io_size < IO_HELP) {
+-    pthread_t tid;
+-    if (pthread_create(&tid, NULL, io_help, NULL)) {
++    if (pthread_create(&io_tid[io_size], NULL, io_help, NULL)) {
+       err_fail("pthread_create");
+     }
+-    pthread_detach(tid);
+     io_size += 1;
+   }
+   pthread_mutex_lock(&io_gate);
+@@ -20147,6 +20188,19 @@
+ } IoWire;
+ 
+ static IoWire* io_wire;
++
++// (ENGINE-REPEAT) every helper out (after the jobs left, if any) and joined
++static void io_close(void) {
++  pthread_mutex_lock(&io_gate);
++  io_quit = true;
++  pthread_cond_broadcast(&io_bell);
++  pthread_mutex_unlock(&io_gate);
++  for (u32 i = 0; i < io_size; i += 1) {
++    pthread_join(io_tid[i], NULL);
++  }
++  io_size = 0;
++  io_quit = false;
++}
+ 
+ static ssize_t io_wire_read(int fd, void* buf, size_t len, short* dir) {
+   *dir = POLLIN;
+@@ -20564,6 +20618,164 @@
+   int code  = io_loop(H);
+   io_sync();
+   return code;
++}
++
++// (ENGINE-REPEAT) bend_close: after main has returned, everything main set up
++// goes back, so the next main in this process starts as the first one did.
++// Each static returns to its initializer: the lazy inits test them (nil, 0),
++// so every pipeline, buffer, layer state and table is built again from the
++// next run's own span and model. Order: the pool and the io helpers joined
++// (nothing touches the corpus), the GPU drained, every Metal object dropped
++// (the span's no-copy buffer last), then the span and the loop's stack
++// unmapped. Returns 0, or -1 (nothing torn down) where it cannot: a CUDA
++// build, or --workers children.
++static int bend_close(void) {
++#if BEND_CUDA
++  return -1;
++#endif
++  if (cli_kids_n != 0) {
++    return -1;
++  }
++  pool_close();
++  io_close();
++#if BEND_METAL
++  @autoreleasepool {
++    if (gpu_que != nil) {
++      id<MTLCommandBuffer> cb = [gpu_que commandBuffer];
++      [cb commit];
++      [cb waitUntilCompleted];
++    }
++  }
++#if defined(LLB_WARP_FID)
++  m30_cb = nil; m30_cb0 = nil; m30_en = nil; m30_fence = nil;
++  m30_split_at = 2;
++  m24_cs_en = NULL; m24_cs_pos = 0;
++  gpu_attn = nil; gpu_warp = nil; gpu_warpq = nil; gpu_add = nil; gpu_rms = nil;
++  gpu_warpqs = nil; gpu_warpqv = nil; gpu_warpq11 = nil; gpu_rope = nil; gpu_silu = nil;
++  for (u32 f = 0; f < 3; f += 1) {
++    for (u32 k = 0; k < 3; k += 1) {
++      gpu_kq[f][k] = nil;
++    }
++  }
++  for (u32 k = 0; k < 4; k += 1) {
++    gpu_kx[k] = nil;
++    gpu_f27_mm[k] = nil;
++  }
++  // the engine's own Metal buffers (the layer state: KV, the fast chunk's
++  // area) are emptied now: Metal can drop its last reference to them later,
++  // on its completion thread, and the memory would linger until it does
++  for (u32 k = 0; k < 3; k += 1) {
++    id<MTLBuffer> b = k == 0 ? gpu_scr : k == 1 ? gpu_att : gpu_act;
++    if (b != nil) {
++      [b setPurgeableState:MTLPurgeableStateEmpty];
++    }
++  }
++  gpu_att = nil; gpu_act = nil; gpu_scr = nil;
++  gpu_m_rnorm = nil; gpu_m_elem = nil; gpu_m_l2n = nil; gpu_m_conv = nil;
++  gpu_m_grn = nil; gpu_m_gdl = nil; gpu_m_mida = nil; gpu_m_midb = nil; gpu_m_amax = nil;
++  gpu_m_slot = nil; gpu_m_qkr = nil; gpu_m_attn4 = nil; gpu_m_attn5 = nil;
++  gpu_m_a5s = nil; gpu_m_a5p = nil; gpu_m_a5v = nil; gpu_m_a5c = nil;
++  gpu_m_embq8 = nil; gpu_m_embk4 = nil; gpu_m_gdl2 = nil; gpu_m_embk6 = nil;
++  gpu_m_ropecs = nil; gpu_m_qkr2 = nil; gpu_m_l2nr = nil; gpu_m_addrms = nil;
++  m28_nb = false;
++  memset(pass_b, 0, sizeof pass_b); memset(pass_S, 0, sizeof pass_S);
++  memset(pass_kc, 0, sizeof pass_kc); memset(pass_vc, 0, sizeof pass_vc);
++  memset(pass_x, 0, sizeof pass_x); memset(pass_r, 0, sizeof pass_r);
++  memset(pass_pos, 0, sizeof pass_pos); memset(pass_on, 0, sizeof pass_on);
++  f27_base = 0; f9_want = false; pass_top = 0; pass_end = 0; pass_dT = 0; m24_fin = 0;
++  gpu_f27_gdl = nil; gpu_f27_attn = nil; gpu_f9_attn = nil;
++  gpu_f27_conv = nil; gpu_f27_copy = nil; gpu_f27_embt = nil;
++  gpu_t27_rnorm = nil; gpu_t27_addrms = nil; gpu_t27_elem = nil;
++  gpu_t27_grn = nil; gpu_t27_mida = nil; gpu_t27_midb = nil;
++  gpu_t27_slot = nil; gpu_t27_qkr = nil; gpu_t27_l2nr = nil;
++  llb_hidden_path = NULL;
++  memset(llb_hidden_positions, 0, sizeof llb_hidden_positions);
++  llb_hidden_tokens = 0; llb_hidden_pos = 0; llb_hidden_width = 0;
++  llb_hidden_ready = false; llb_hidden_written = false; llb_hidden_pend = false;
++  llb_hidden_cn = 0; llb_hidden_cw = 0;
++  memset(llb_hidden_cpos, 0, sizeof llb_hidden_cpos);
++  memset(llb_hidden_crow, 0, sizeof llb_hidden_crow);
++  f35_base = 0; f35_want = false; f35_r1l = -1; f35_dbg_nt = 0; f35_ids_nt = 0;
++  gpu_moe_rdot = nil; gpu_moe_tail = nil; gpu_m_attn8 = nil; gpu_m_f32ab = nil;
++  gpu_x_attn5 = nil; gpu_x_a5s = nil; gpu_x_a5v = nil; gpu_m_l2n4 = nil;
++  for (u32 k = 0; k < 2; k += 1) {
++    gpu_moe_gu[k] = nil; gpu_moe_dn[k] = nil;
++    gpu_f35_xgu[k] = nil; gpu_f35_xdn[k] = nil;
++  }
++  for (u32 i = 0; i < 40; i += 1) {
++    for (u32 r = 0; r < 3; r += 1) {
++      moe_b[i][r] = nil;
++    }
++  }
++  if (moe_map != NULL) {
++    munmap(moe_map, moe_maplen);
++  }
++  moe_map = NULL; moe_maplen = 0;
++  moe_on = false;
++  memset(moe_o, 0, sizeof moe_o); memset(moe_eg, 0, sizeof moe_eg);
++  memset(moe_ed, 0, sizeof moe_ed); memset(moe_fg, 0, sizeof moe_fg);
++  memset(moe_fd, 0, sizeof moe_fd);
++  moe_gl = -1; moe_gn = 0; moe_dfd = 0;
++  free(moe_feed);
++  moe_feed = NULL;
++  memset(moe_dir, 0, sizeof moe_dir);
++  moe_fslot = 0; moe_dmb = 0; moe_dout = 0; moe_pend_l = -1; moe_pend_p = 0;
++  for (u32 k = 0; k < 3; k += 1) {
++    gpu_f35_mm[k] = nil;
++  }
++  gpu_f35_rdot = nil; gpu_f35_tail = nil; gpu_f35_group = nil;
++  gpu_f35_silu = nil; gpu_f35_comb = nil; gpu_f35_f32ab = nil; gpu_f35_attn = nil;
++  gpu_f35_dcmp = nil; gpu_f35_xsgu = nil; gpu_f35_xsdn = nil; gpu_f35_idcp = nil;
++#endif
++  gpu_enc = nil;
++  gpu_pso = nil;
++  gpu_que = nil;
++  gpu_mlib = nil;
++  gpu_buf = nil;
++  gpu_dev = nil;
++#endif
++  if (CORPUS != NULL) {
++    munmap(CORPUS, corpus_size);
++  }
++  CORPUS      = NULL;
++  corpus_size = 0;
++  if (io_stk != NULL) {
++    pool_unstack(io_stk);
++  }
++  io_stk = NULL;
++  if (io_wake_fd[0] > 0) {
++    close(io_wake_fd[0]);
++    close(io_wake_fd[1]);
++  }
++  io_wake_fd[0] = io_wake_fd[1] = 0;
++#ifdef __linux__
++  if (io_ep >= 0) {
++    close(io_ep);
++  }
++  io_ep = -1; io_fds = 0;
++  free(io_time);
++  io_time = NULL; io_time_n = 0; io_time_cap = 0;
++  free(io_fdt);
++  io_fdt = NULL; io_fdt_cap = 0;
++#endif
++  memset(ALC, 0, sizeof ALC);
++  KEEP_WORDS = 0;
++  CUBE_LOG   = 7;
++  bank_lock  = 0;
++  pool_size  = 0;
++  pool_grow  = false;
++  atomic_store(&pool_row, 0);
++  atomic_store(&pool_tick, 0);
++  atomic_store(&pool_done, 0);
++  io_gpu  = false;
++  io_argc = 0;
++  io_argv = NULL;
++  io_runs = (IoQue){ 0 };
++  io_park = (IoQue){ 0 };
++  io_jobs = (IoQue){ 0 };
++  io_live = 0;
++  io_busy = 0;
++  return 0;
+ }
+ 
+ #endif

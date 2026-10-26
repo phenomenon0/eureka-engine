@@ -1,0 +1,81 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -15571,8 +15571,9 @@
+ }
+ 
+ // tensor f's bytes in its layer blob
++// (SYS1-MAC) an F32 GEMV slot (7, 8) is rows of rb = 4 cols bytes
+ static u64 m9_tsz(const M9Rows* R, u32 f) {
+-  return m9_n(R, f) * (R->fm[f] == LLB_FM_F32 ? 4 : R->rb[f]);
++  return m9_n(R, f) * (R->fm[f] == LLB_FM_F32 && f != 7 && f != 8 ? 4 : R->rb[f]);
+ }
+ 
+ static void m9_fbn_run(id<MTLComputeCommandEncoder> en, u64 b, u32 post,
+@@ -16394,6 +16395,33 @@
+ static void m24_pass_arm(Env e, Corpus H, id<MTLComputeCommandEncoder> en,
+   Loc a, u32 aux, u32 grid);
+ static void m24_flush(void);
++
++// (SYS1-MAC) CLEF-3's hidden-row hook on Metal: the names tools/sys1dual/sys1.c
++// sets per request (CUDA: host/llb_host.c). The fused step's final RMS-normed
++// row (M9_HEADH, CUDA's gpu_headh) for its pos, appended as [pos, width] + row
++// (llb_hidden_put's format) once the round's command buffer has completed
++static const char*   llb_hidden_path;
++static unsigned char llb_hidden_positions[16384];
++static u32           llb_hidden_tokens, llb_hidden_pos, llb_hidden_width;
++static bool          llb_hidden_ready, llb_hidden_written, llb_hidden_pend;
++static void llb_hidden_flush(void) {
++  if (!llb_hidden_pend) {
++    return;
++  }
++  llb_hidden_pend = false;
++  u32 header[2] = { llb_hidden_pos, llb_hidden_width };
++  const f32* row = (const f32*)((const u8*)[gpu_scr contents]
++    + (M9_HEADH & ~SA_SCR));
++  FILE* f = fopen(llb_hidden_path, llb_hidden_written ? "ab" : "wb");
++  if (!f || fwrite(header, 4, 2, f) != 2
++    || fwrite(row, 4, llb_hidden_width, f) != llb_hidden_width) {
++    err_fail("LLB_DUMP_HIDDEN: write failed");
++  }
++  if (fclose(f)) {
++    err_fail("LLB_DUMP_HIDDEN: close failed");
++  }
++  llb_hidden_written = true;
++}
+ 
+ // (lane m32, f35) the 35B fast chunk's area past the 35B layer state, only when the first 35B bang is a fast
+ // chunk (f35_want): F35_CH token blocks of F35_TB floats (x 2048, the mixer's output 2048, then the larger of the
+@@ -17069,8 +17097,12 @@
+           tp[f] = w & 0x0fffffffu;
+           R.fm[f] = fm;
+           R.rb[f] = LLB_FM_RB(fm, m9_cols(&R, f));
++          // (SYS1-MAC) Clef's F32 ssm_beta / ssm_alpha (linear slots 7, 8):
++          // m9_gemv's F32 arm (llb_warp, float4 stride rb / 16) serves them
+           ok = ok && (!(has >> f & 1) || (gv >> f & 1
+-            ? fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm) : fm == LLB_FM_F32));
++            ? fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm)
++              || (!full && (f == 7 || f == 8) && fm == LLB_FM_F32)
++            : fm == LLB_FM_F32));
+           sz += has >> f & 1 ? m9_tsz(&R, f) : 0;
+         }
+         // (tools/metal-27b.patch) the blob is exactly its tensors at this
+@@ -17142,6 +17174,11 @@
+         en = m30_en;
+       }
+       m24_fz_head(en, &F, m24_fin, M9_A(y), grid, true);
++      if (llb_hidden_path && pos < llb_hidden_tokens && llb_hidden_positions[pos]) {
++        llb_hidden_pend = true;
++        llb_hidden_pos = pos;
++        llb_hidden_width = F.dm;
++      }
+       return true;
+     }
+     m9_pass_run(en, M9_A(x), M9_A(y), c, &S0, s, k, pw, po, tw, grid, 0);
+@@ -17509,6 +17546,7 @@
+     }
+     // (tools/metal-moe.patch) the Stage 1 gate's dump, if one is pending
+     m24_flush();
++    llb_hidden_flush();
+     // (lever E) the early buffer completed before the last one began (fence)
+     if (m30_cb0 != nil && [m30_cb0 error]) {
+       gpu_fail([m30_cb0 error]);

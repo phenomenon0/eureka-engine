@@ -1,0 +1,79 @@
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -26,6 +26,7 @@
+ import ./kernels/io.bend as I
+ import ./kernels/flat.bend as F
+ import ./gguf.bend as G
++import ./tools/sys1dual/sys1.bend as S
+ 
+ # Array.map's callback is a closure fid the device program does not hold, so
+ # the scalar activations run as direct structural recursion (same order).
+@@ -1348,8 +1349,57 @@
+         r => run.fgen(n, m, b, em, dT, nT, steps, r))
+     case False{}:
+       prompt(ts, n, m, b, em, dT, nT, 0, 0, states(m.nl(m), dT), steps)
++
++# SYS1-MAC (LLB_SYS1 set, docs/sys1mac-registration.md): SYS1-DUAL's srv loop
++# on the Mac engine. One load, then requests from S.sys1.next until EOF; each
++# from pos 0 on fresh states through the exact prompt path (the host's
++# m26_reset zeroes its layer state at pos 0), one dT for the run (argv
++# "0 --steps C" sizes it)
++@unsafe
++def srv.one(ok: Bool, ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
++  match ok:
++    case True{}:
++      do IO<Unit>:
++        prompt(ts, U32.to_nat((st - 1 : U32)), m, b, em, dT, (1 << dT : U32), 0, 0, states(m.nl(m), dT), st)
++        S.sys1.done()
++        k(Unit{})
++    case False{}:
++      IO.die(Unit, 2, "sys1: bad request command")
++
++@unsafe
++def srv.chk(+ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
++  srv.one(Bool.and(ok_ids(ts), (st >= 1 : U32)), ts, st, m, b, em, dT, k)
++
++@unsafe
++def srv.run(c: List<&2, U32> & U32 & U32 & U32 & U32 & U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
++  (ts, sl) = c
++  (st, rest) = sl
++  srv.chk(ts, st, m, b, em, dT, k)
++
++@unsafe
++def srv.go(q: List<String>, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
++  match q:
++    case Nil{}:
++      IO.pure(Unit, Unit{})
++    case Con{w, ws}:
++      srv.run(cfg(w <> ws, Nil{}, 0, 0, 4294967295, 64, 0, 0, True{}), m, b, em, dT, k)
+ 
+ @unsafe
++def srv(+dir: String, +m: Model, +b: Nat, +em: U32, +dT: Nat) -> IO(Unit):
++  do IO<Unit>:
++    q : List<String> <- S.sys1.next(dir, (1 << dT : U32))
++    srv.go(q, m, b, em, dT, u => srv(dir, m, b, em, dT))
++
++@unsafe
++def srv.or(on: Bool, +dir: String, ts: List<&2, U32>, +m: Model, +b: Nat, +em: U32, +dT: Nat, +st: U32, +fd: U32) -> IO(Unit):
++  match on:
++    case True{}:
++      srv(dir, m, b, em, dT)
++    case False{}:
++      run.prompt(Bool.and((fd >= 1 : U32), m.fast(m, b, em)), fd, ts, U32.to_nat((st - 1 : U32)), m, b, em, dT,
++        (1 << dT : U32), st)
++
++@unsafe
+ def run.go(ok: Bool, +dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb: U32, +fk: U32) -> IO(Unit):
+   match ok:
+     case True{}:
+@@ -1360,8 +1410,8 @@
+         +dT : Nat = lg(17n, 0n, (nt + st - 1 : U32))
+         # (lane m36) fk 4294967295 = neither --fastpf nor --exactpf: the default tier
+         +fd : U32 = Bool.pick(U32, U32.is_eq(fk, 4294967295), m.dfk(m, nt, dT), fk)
+-        run.prompt(Bool.and((fd >= 1 : U32), m.fast(m, U32.to_nat(lb), em)), fd, ts, U32.to_nat((st - 1 : U32)), m,
+-          U32.to_nat(lb), em, dT, (1 << dT : U32), st)
++        se : Result<&1, &1, U32 & String, String> <- IO.get_env("LLB_SYS1")
++        srv.or(G.gguf.on(se), dir, ts, m, U32.to_nat(lb), em, dT, st, fd)
+         t1 : Nat <- IO.now()
+         IO.print("wall_ms " ++ Nat.show(Nat.sub(t1, t0)))
+     case False{}:

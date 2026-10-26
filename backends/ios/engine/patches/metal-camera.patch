@@ -1,0 +1,162 @@
+--- a/bend2/comp.ts	2026-10-08 00:01:44
++++ b/bend2/comp.ts	2026-10-08 00:02:00
+@@ -15462,6 +15462,12 @@
+ static u64 llb_img_at, llb_img_dump;
+ static float* llb_img_rows;
+ static id<MTLBuffer> llb_img_buf;
++// (PHONECAM, patches/metal-camera.patch) the session image area: llb_img_cap != 0 (set by the in-process wrapper
++// before a resident session opens; the CLI never sets it) reserves cap rows at the pass reserve instead of loading an
++// image there, and every new sequence (pos 0: a resident job) takes the rows llbv holds for it, if any, into that
++// area (llb_img_seq): one image per job, any number of jobs per load. 0 = engine-iphonevis's path exactly
++static u32 llb_img_cap;
++static void llb_img_seq(u32 d);
+ 
+ static void llb_img_atexit(void) {
+   const char* f = getenv("LLB_VIS_DUMPX");
+@@ -15476,6 +15482,10 @@
+ 
+ // the bytes the reserve adds (0: no image asked); loads the rows the first time
+ static u64 llb_img_bytes(u32 d) {
++  if (llb_img_cap != 0) {  // (PHONECAM) the session area; its rows come per sequence
++    llb_img_d = d;
++    return d % 256 == 0 ? (u64)llb_img_cap * d * 4 : 0;
++  }
+   if (!llbv_requested()) {
+     return 0;
+   }
+@@ -15494,6 +15504,9 @@
+ // the region's place once the reserve allocated g (off = its byte offset in g)
+ static void llb_img_place(id<MTLBuffer> g, u64 off) {
+   llb_img_at = SA_SCR + off;
++  if (llb_img_cap != 0) {  // (PHONECAM) the session area: filled per sequence
++    return;
++  }
+   memcpy((u8*)[g contents] + off, llb_img_rows, (size_t)llb_img_n * llb_img_d * 4);
+   if (llb_img_dcap != 0) {
+     llb_img_dump = llb_img_at + (u64)llb_img_n * llb_img_d * 4;
+@@ -16026,6 +16039,9 @@
+     ? F27_BYTES : 0;
+   // (ENGINE-VISION2 V5) + the image rows (and the dump rows) past the chunk area
+   u64 vis = llb_img_bytes(R->d);
++  if (llb_img_cap != 0 && fch == 0) {  // (PHONECAM) no chunk area, no session image area (text only)
++    vis = 0;
++  }
+   if (vis != 0 && fch == 0) {
+     err_fail("vision: image rows need the fast chunk (the first pass bang must be a fast chunk)");
+   }
+@@ -16121,6 +16137,9 @@
+   u32 dT = c & 31, pos = c >> 5;
+   if (pass_x[0] != 0 && s == 0 && pos == 0 && pass_on[0]) {
+     m26_reset(dT, S0);
++  }
++  if (s == 0 && pos == 0) {
++    llb_img_seq(S0->d);  // (PHONECAM)
+   }
+   u64 cv = 2 * S0->lkh * 128 + S0->lvh * 128;
+   m9_pass_init(dT, S0);
+@@ -16517,8 +16536,71 @@
+   T.a[0] = B + x1 * 4; T.s[0] = F27_TS; T.a[1] = B + dd * 4; T.s[1] = F27_TS;
+   T.a[2] = B + F27_X * 4; T.s[2] = F27_TS;
+   f27_go(en, gpu_t27_elem, &T, sizeof T, (d + 255) / 256, nt, 256);
++}
++
++// (PHONECAM) a new sequence (pos 0) in a session: the image map and rows back to "no image", then the rows llbv
++// holds for this job (llbv_prepare*), if any, into the session area. The wrapper checks n <= cap before the job
++static void llb_img_seq(u32 d) {
++  if (llb_img_cap == 0 || llb_img_at == 0) {
++    return;
++  }
++  memset(llb_mr, 0, sizeof llb_mr);
++  llb_img_n = 0; llb_img_nx = 0; llb_img_ny = 0; llb_img_seen = 0; llb_img_s0 = 0;
++  if (!llbv_requested()) {
++    return;
++  }
++  float* r = NULL;
++  u32 n = 0, nx = 0, ny = 0;
++  char err[256] = {0};
++  if (d != llb_img_d || llbv_rows(d, &r, &n, &nx, &ny, err) != 0) {
++    fprintf(stderr, "vision: %s\n", d != llb_img_d ? "the session area's width differs" : err);
++    err_fail("vision: no image rows");
++  }
++  if (n > llb_img_cap) {
++    free(r);
++    err_fail("vision: more image rows than the session area holds");
++  }
++  memcpy((u8*)[gpu_scr contents] + (llb_img_at - SA_SCR), r, (size_t)n * d * 4);
++  free(r);
++  llb_img_n = n; llb_img_nx = nx; llb_img_ny = ny;
++  fprintf(stderr, "vision: session rows %u (%u x %u), d %u\n", n, nx, ny, d);
+ }
+ 
++// (PHONECAM) the readout: the head's logits[ids[0]], logits[ids[1]] at prompt pos llb_ro_pos (the last prompt id:
++// the logits the first new id is the argmax of), read from the head's logits row (M9_LOGIT) once the round's command
++// buffer has completed (the point ENGINE-PREFILL's gate-logits instrument read the same row); printed as
++// "ro <pos> <bits0> <bits1>" and kept in llb_ro_v for the in-process wrapper. Armed by the wrapper
++// (llb_ro_on = true) or, in the CLI, LLB_READOUT=<id0>,<id1>,<pos>. Off: nothing is read
++static bool llb_ro_on, llb_ro_init, llb_ro_pend;
++static u32  llb_ro_ids[2], llb_ro_pos, llb_ro_got;
++static f32  llb_ro_v[2];
++static void llb_ro_mark(u32 pos) {
++  if (!llb_ro_init) {
++    llb_ro_init = true;
++    const char* r = getenv("LLB_READOUT");
++    unsigned a = 0, b = 0, p = 0;
++    if (r != NULL && sscanf(r, "%u,%u,%u", &a, &b, &p) == 3 && a < 248320 && b < 248320) {
++      llb_ro_ids[0] = a; llb_ro_ids[1] = b; llb_ro_pos = p; llb_ro_on = true;
++    }
++  }
++  if (llb_ro_on && pos == llb_ro_pos) {
++    llb_ro_pend = true;
++  }
++}
++static void llb_ro_flush(void) {
++  if (!llb_ro_pend) {
++    return;
++  }
++  llb_ro_pend = false;
++  const f32* row = (const f32*)((const u8*)[gpu_scr contents] + (M9_LOGIT & ~SA_SCR));
++  llb_ro_v[0] = row[llb_ro_ids[0]];
++  llb_ro_v[1] = row[llb_ro_ids[1]];
++  llb_ro_got += 1;
++  u32 b0, b1;
++  memcpy(&b0, &llb_ro_v[0], 4); memcpy(&b1, &llb_ro_v[1], 4);
++  fprintf(stderr, "ro %u %08x %08x\n", llb_ro_pos, b0, b1);
++}
++
+ // (ENGINE-VISION2 V5) the batch's pad rows := the image rows (llb_m_slott, <= 1024
+ // columns a launch: d 4096 = 4 x 1024, d 2560 = 1024 + 1024 + 512), then (LLB_VIS_DUMPX)
+ // every batch row of the chunk to the dump rows at its slot
+@@ -16581,6 +16663,9 @@
+   m9_pass_init(dT, S0);
+   if (pos0 == 0 && pass_on[0]) {
+     m26_reset(dT, S0);
++  }
++  if (pos0 == 0) {
++    llb_img_seq(S0->d);  // (PHONECAM)
+   }
+   if (dT != pass_dT) {
+     err_fail("warp pass: dT changed");
+@@ -17512,6 +17597,7 @@
+         en = m30_en;
+       }
+       m24_fz_head(en, &F, m24_fin, M9_A(y), grid, true);
++      llb_ro_mark(pos);  // (PHONECAM)
+       if (llb_hidden_path && pos < llb_hidden_tokens && llb_hidden_positions[pos]) {
+         llb_hidden_pend = true;
+         llb_hidden_pos = pos;
+@@ -17885,6 +17971,7 @@
+     // (tools/metal-moe.patch) the Stage 1 gate's dump, if one is pending
+     m24_flush();
+     llb_hidden_flush();
++    llb_ro_flush();  // (PHONECAM)
+     // (lever E) the early buffer completed before the last one began (fence)
+     if (m30_cb0 != nil && [m30_cb0 error]) {
+       gpu_fail([m30_cb0 error]);
+@@ -20844,6 +20931,7 @@
+   free(llb_img_rows); llb_img_rows = NULL; llb_img_buf = nil;
+   llb_img_n = 0; llb_img_nx = 0; llb_img_ny = 0; llb_img_seen = 0; llb_img_s0 = 0;
+   llb_img_dn = 0; llb_img_dcap = 0; llb_img_d = 0; llb_img_at = 0; llb_img_dump = 0;
++  llb_ro_init = false; llb_ro_on = false; llb_ro_pend = false; llb_ro_got = 0; llb_ro_pos = 0;  // (PHONECAM)
+   gpu_f27_gdl = nil; gpu_f27_attn = nil; gpu_f9_attn = nil;
+   gpu_f27_conv = nil; gpu_f27_copy = nil; gpu_f27_embt = nil;
+   gpu_t27_rnorm = nil; gpu_t27_addrms = nil; gpu_t27_elem = nil;

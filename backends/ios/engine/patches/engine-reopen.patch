@@ -1,0 +1,76 @@
+--- a/host/llb_gguf.c
++++ b/host/llb_gguf.c
+@@ -36,6 +36,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
+@@ -512,6 +513,25 @@
+ static int gg_state;  // 0 unopened, 1 open, -1 failed
+ static char gg_err0[256];
+ static pthread_mutex_t gg_mu = PTHREAD_MUTEX_INITIALIZER;
++static char* gg_man;  // LLB_GGUF_VERIFY's manifest, read once a run
++
++// (ENGINE-REPEAT) after a run: the GGUF closed, its tables freed, gg_state
++// back to unopened, so the next run opens LLB_GGUF again (another model, too)
++static int gguf_close(void) {
++  pthread_mutex_lock(&gg_mu);
++  if (gg_file.fd > 0) close(gg_file.fd);
++  for (size_t i = 0; gg_file.t && i < gg_file.nt; i++) free(gg_file.t[i].name);
++  free(gg_file.t);
++  free(gg_file.lo);
++  free(gg_file.hi);
++  memset(&gg_file, 0, sizeof gg_file);
++  gg_state = 0;
++  gg_err0[0] = 0;
++  free(gg_man);
++  gg_man = NULL;
++  pthread_mutex_unlock(&gg_mu);
++  return 0;
++}
+ 
+ static void gguf_read_call(IoWork* w) {
+   char err[256] = "";
+@@ -540,8 +560,7 @@
+ // LLB_GGUF_VERIFY: the block read back, every whole tensor in [lo, lo + n)
+ // hashed and compared with the manifest's sha256. 0 ok, else mismatches.
+ static int gguf_verify(Env e, Term blk, uint64_t lo, uint64_t n, const char* man) {
+-  static char* m;
+-  if (!m && !(m = gg_slurp(man))) {
++  if (!gg_man && !(gg_man = gg_slurp(man))) {
+     fprintf(stderr, "gguf verify: cannot read %s\n", man);
+     return 1;
+   }
+@@ -561,7 +580,7 @@
+     }
+     char got[65], want[65];
+     gg_sha_hex(&s, got);
+-    int have = gg_manifest_sha(m, t->name, want), same = have && !strcmp(got, want);
++    int have = gg_manifest_sha(gg_man, t->name, want), same = have && !strcmp(got, want);
+     fprintf(stderr, "g1 %s %s %s\n", t->name, got, !have ? "NO-SHA" : same ? "ok" : "MISMATCH");
+     bad += !same, seen++;
+   }
+@@ -585,7 +604,7 @@
+     }
+     r = io_done(e, str_view_owned(e, out));
+   }
+-  free(w->data);
++  munmap(w->data, w->size ? w->size : 1);
+   free(w->text);
+   w->text = NULL;
+   return r;
+@@ -601,7 +620,10 @@
+   if (w->size > (1ull << 31)) {
+     return io_fail(e, EINVAL, "Gguf.read: region over 2^31 bytes");
+   }
+-  w->data = io_mem(malloc(w->size ? w->size : 1));
++  // (ENGINE-REPEAT) the region's buffer is its own anonymous map, not malloc: freed, malloc's large cache kept the
++  // regions (GBs) dirty in the footprint after a run; munmap (gguf_read_pack) gives them back
++  void* buf = mmap(NULL, w->size ? w->size : 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++  w->data = io_mem(buf == MAP_FAILED ? NULL : buf);
+   return io_work(w, gguf_read_call, gguf_read_pack);
+ }
+ 

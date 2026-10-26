@@ -1,0 +1,268 @@
+--- a/llb_engine.m
++++ b/llb_engine.m
+@@ -17,6 +17,10 @@
+ //     the head (head/jevsession.h, jev-head 8736c62) in this process.
+ // The engine prints ids to stdout and diagnostics to stderr; llb_generate and
+ // llb_decide point fds 1/2 at files in <cache>/run/ for the call, then parse them.
++// (ENGINE-REPEAT) N runs per process: each run is load -> run -> release. After main returns, bend_close
++// (patches/metal-reopen.patch) joins the pool and io helpers, drops every Metal object, unmaps the span and the
++// loop's stack and puts every engine static back to its initializer; gguf_close (engine-reopen.patch) closes the
++// GGUF. llb_load / llb_free then admit the next run; only a run whose release failed leaves the engine spent.
+ 
+ #include <mach-o/dyld.h>
+ #include <stdint.h>
+@@ -44,6 +48,8 @@
+ #include "llb_engine.h"
+ #include <dirent.h>
+ #include <fcntl.h>
++#include <mach/mach.h>
++#include <signal.h>
+ #include <sys/stat.h>
+ #include <TargetConditionals.h>
+ #if TARGET_OS_IPHONE
+@@ -80,8 +86,78 @@
+ static char* llb_errlog;
+ static u64   llb_gguf_bytes;
+ static int   llb_loaded;
+-static int   llb_runs;
++static int   llb_runs;    // runs since the last llb_load / llb_free (the R1 guards: at most one)
++static int   llb_spent;   // (ENGINE-REPEAT) a run's release failed: no more runs in this process
++static char  llb_rel[256];
+ 
++static double llb_ms(void) {
++  struct timespec t;
++  clock_gettime(CLOCK_MONOTONIC, &t);
++  return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
++}
++
++// (ENGINE-REPEAT) the process's phys_footprint (what jetsam counts), in MB
++static long llb_footprint_mb(void) {
++  task_vm_info_data_t v;
++  mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
++  if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &n) != KERN_SUCCESS) {
++    return -1;
++  }
++  return (long)(v.phys_footprint >> 20);
++}
++
++const char* llb_release_report(void) { return llb_rel; }
++
++// the R1 guards' refusal: a used-up engine (its release failed), or a second run without llb_load / llb_free
++static int llb_refuse(const char* what) {
++  if (llb_spent) {
++    snprintf(llb_err, sizeof llb_err, "R1: %s: the previous run could not be released (%s); no more runs in this "
++      "process", what, llb_rel);
++  } else {
++    snprintf(llb_err, sizeof llb_err, "R1: %s: one run per llb_load (llb_load or llb_free before the next run)",
++      what);
++  }
++  return -1;
++}
++
++// (ENGINE-REPEAT) one engine run: main inside an autorelease pool (its command buffers and encoders, which hold the
++// span's buffer, are gone when it returns), then the release: bend_close + gguf_close, the argv copy freed, and the
++// calling thread's signal stack and the SIGSEGV / SIGBUS actions as they were before the run (pool_stack set them)
++static int llb_run_main(int argc, char** argv) {
++  stack_t oss;
++  struct sigaction osegv, obus;
++  sigaltstack(NULL, &oss);
++  sigaction(SIGSEGV, NULL, &osegv);
++  sigaction(SIGBUS, NULL, &obus);
++  // main keeps argv + 1 as its io_argv and shifts the words in place: give it a copy
++  char** av = calloc((size_t)argc + 1, sizeof(char*));
++  memcpy(av, argv, (size_t)argc * sizeof(char*));
++  int code;
++  @autoreleasepool {
++    code = llb_bend_main(argc, av);
++  }
++  long fp0 = llb_footprint_mb();
++  double t0 = llb_ms();
++  int rc = bend_close();
++#ifdef CID_GGUF_READ
++  if (rc == 0) {
++    rc = gguf_close();
++  }
++#endif
++  if (rc == 0) {
++    free(av);  // io_argv pointed into it; bend_close set it back to NULL
++    if (!(oss.ss_flags & SS_DISABLE)) {
++      sigaltstack(&oss, NULL);
++    }
++    sigaction(SIGSEGV, &osegv, NULL);
++    sigaction(SIGBUS, &obus, NULL);
++  }
++  llb_spent = rc != 0;
++  snprintf(llb_rel, sizeof llb_rel, "released=%s release_ms=%.1f footprint_mb_before=%ld footprint_mb_after=%ld",
++    rc == 0 ? "yes" : "NO (bend_close refused: CUDA build or --workers)", llb_ms() - t0, fp0, llb_footprint_mb());
++  return code;
++}
++
+ const char* llb_error(void) { return llb_err; }
+ const char* llb_log(void) { return llb_errlog ? llb_errlog : ""; }
+ 
+@@ -90,12 +166,6 @@
+   return -1;
+ }
+ 
+-static double llb_ms(void) {
+-  struct timespec t;
+-  clock_gettime(CLOCK_MONOTONIC, &t);
+-  return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+-}
+-
+ // The span the engine runs in: weights + the engine's tables, KV and scratch.
+ // Measured on the Mac for the 9B Q4_K_M (5.67 GB GGUF): 8 GiB fails, 9 GiB runs;
+ // the default is GGUF + 3 GiB rounded up to 256 MiB (9B: 8.5 GiB, see engine-ios).
+@@ -192,8 +262,31 @@
+   return rep;
+ }
+ 
++static Q35Tokenizer  llb_tok;
++static jvh_session*  llb_head;
++static int           llb_tok_on;
++
++// the decision head and the tokenizer of the model in llb_dir (llb_decide opens them on first use)
++static void llb_head_close(void) {
++  if (llb_head) {
++    jvh_session_close(llb_head);
++    llb_head = NULL;
++  }
++  if (llb_tok_on) {
++    q35_tok_free(&llb_tok);
++    llb_tok_on = 0;
++  }
++}
++
+ int llb_load(const char* model_dir, const char* cache_dir) {
+   llb_err[0] = 0;
++  if (llb_spent) {
++    return llb_refuse("llb_load");
++  }
++  llb_runs = 0;  // (ENGINE-REPEAT) the last run was released: this load admits the next one
++  if (strcmp(llb_dir, model_dir) != 0) {
++    llb_head_close();  // another model: its own head and tokenizer
++  }
+   snprintf(llb_dir, sizeof llb_dir, "%s", model_dir);
+   snprintf(llb_cache, sizeof llb_cache, "%s", cache_dir);
+   char p[1200];
+@@ -378,9 +471,9 @@
+   if (!llb_loaded) {
+     return llb_fail("llb_generate before llb_load", NULL);
+   }
+-  if (llb_runs > 0) {
+-    // the engine's statics (heap, pool threads, GPU span) are set up once per process
+-    return llb_fail("R1: one llb_generate per process (the model is not resident yet)", NULL);
++  if (llb_runs > 0 || llb_spent) {
++    // (ENGINE-REPEAT) each run sets up and releases the engine's statics (heap, pool threads, GPU span)
++    return llb_refuse("llb_generate");
+   }
+   if (n_ids < 1 || n_new < 1) {
+     return llb_fail("need at least one prompt id and one new id", NULL);
+@@ -450,10 +543,7 @@
+   fprintf(stderr, "llb: span %llu MB, threads %ld, %d ids, %d new\n",
+     (unsigned long long)(z.span_bytes >> 20), thr, n_ids, n_new);
+   llb_runs += 1;
+-  // main keeps argv + 1 as its io_argv and shifts the words in place: give it a copy
+-  char** av = calloc((size_t)argc + 1, sizeof(char*));
+-  memcpy(av, argv, (size_t)argc * sizeof(char*));
+-  z.exit_code = llb_bend_main(argc, av);
++  z.exit_code = llb_run_main(argc, argv);
+   fflush(stdout);
+   fflush(stderr);
+   dup2(o1, 1);
+@@ -463,7 +553,7 @@
+   for (int i = 7; i < 7 + n_ids; i += 1) {
+     free(argv[i]);
+   }
+-  free(argv);  // av stays: the engine's io_argv points into it
++  free(argv);
+ 
+   free(llb_errlog);
+   llb_errlog = llb_slurp(ep);
+@@ -513,10 +603,6 @@
+ // run. Each question is rendered by the head, tokenized by the engine's tokenizer (the sidecar's
+ // tokenizer.bin, parse_special), prefilled from pos 0 on fresh states (the srv loop, --steps 1), and
+ // its rows at the option markers + the pointer go to the head as they are produced.
+-static Q35Tokenizer  llb_tok;
+-static jvh_session*  llb_head;
+-static int           llb_tok_on;
+-
+ static int  llb_srv(int maxT, int n, llb_dstats* zp);
+ static void llb_qfree(void);
+ 
+@@ -527,8 +613,8 @@
+   if (!llb_loaded) {
+     return llb_fail("llb_decide before llb_load", NULL);
+   }
+-  if (llb_runs > 0) {
+-    return llb_fail("R1: one engine run per process (the model is not resident yet)", NULL);
++  if (llb_runs > 0 || llb_spent) {
++    return llb_refuse("llb_decide");
+   }
+   if (n < 1) {
+     return llb_fail("need at least one request", NULL);
+@@ -690,9 +776,7 @@
+       (unsigned long long)(z.span_bytes >> 20), thr, n, llb_qn, ctx);
+     llb_runs += 1;
+     setenv("LLB_SYS1", "1", 1);
+-    char** av = calloc((size_t)argc + 1, sizeof(char*));
+-    memcpy(av, argv, (size_t)argc * sizeof(char*));
+-    z.exit_code = llb_bend_main(argc, av);
++    z.exit_code = llb_run_main(argc, argv);
+     unsetenv("LLB_SYS1");
+     fflush(stdout);
+     fflush(stderr);
+@@ -748,8 +832,8 @@
+   if (!llb_loaded) {
+     return llb_fail("llb_rows before llb_load", NULL);
+   }
+-  if (llb_runs > 0) {
+-    return llb_fail("R1: one engine run per process (the model is not resident yet)", NULL);
++  if (llb_runs > 0 || llb_spent) {
++    return llb_refuse("llb_rows");
+   }
+   snprintf(llb_hpath, sizeof llb_hpath, "%s/run/rows.hidden", llb_cache);
+   char** replies = calloc((size_t)n, sizeof *replies);
+@@ -806,14 +890,11 @@
+ 
+ void llb_free(void) {
+   llb_loaded = 0;
+-  if (llb_head) {
+-    jvh_session_close(llb_head);
+-    llb_head = NULL;
++  if (!llb_spent) {
++    llb_runs = 0;  // (ENGINE-REPEAT) the engine was released after its run: the next llb_load is admitted
+   }
+-  if (llb_tok_on) {
+-    q35_tok_free(&llb_tok);
+-    llb_tok_on = 0;
+-  }
++  llb_head_close();
++  llb_dir[0] = 0;
+   unsetenv("LLB_GGUF");
+   free(llb_errlog);
+   llb_errlog = NULL;
+--- a/llb_engine.h
++++ b/llb_engine.h
+@@ -14,6 +14,11 @@
+ // R1 limits (see REPORT.md): llb_generate (or llb_decide) runs the engine's whole program
+ // (weights into the GPU span, prefill, decode), so the model is not resident
+ // between calls; a fatal engine error ends the process (the engine's _exit).
++// (ENGINE-REPEAT) Any number of runs per process: each run releases everything it set up when it
++// returns (the span unmapped, the engine's threads joined, its statics reset), so a request is
++// llb_load -> llb_generate | llb_decide, and the next request (same or another model) loads again.
++// One run per llb_load; llb_free also re-arms. Only a run whose release failed leaves the engine
++// spent (every later call refuses with "R1: ... could not be released").
+ #ifndef LLB_ENGINE_H
+ #define LLB_ENGINE_H
+ 
+@@ -83,6 +88,9 @@
+ // warp rms checks), "fits" or the list that does not. A compile error is the
+ // engine's _exit (its stderr). Call before llb_generate.
+ const char* llb_kernel_report(void);
++// (ENGINE-REPEAT) the last run's release, one line: released=yes|NO release_ms=
++// footprint_mb_before= (main returned) footprint_mb_after= (after the release)
++const char* llb_release_report(void);
+ 
+ #ifdef __cplusplus
+ }

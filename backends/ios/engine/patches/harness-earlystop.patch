@@ -1,0 +1,106 @@
+--- a/llb_host.c	2026-10-07 14:51:09
++++ b/llb_host.c	2026-10-07 17:32:42
+@@ -160,6 +160,20 @@
+     st.load_ms, st.prefill_ms, st.steps, st.steps ? st.step_ms_sum / st.steps : 0.0,
+     st.total_ms, (unsigned long long)(st.span_bytes >> 20),
+     (unsigned long long)(st.gguf_bytes >> 20));
++  // (ENGINE-EARLYSTOP) the engine's own "stop <pos> <id>" line (the run ended at a stop id), else ran to n_new
++  const char* lg = llb_log();
++  const char* sl = NULL;
++  for (const char* l = lg; l && *l;) {
++    if (!strncmp(l, "stop ", 5)) {
++      sl = l;
++    }
++    const char* nl = strchr(l, '\n');
++    l = nl ? nl + 1 : NULL;
++  }
++  printf("LLBSTOP %s", sl ? "stopped_at=" : "ran_to_n_new\n");
++  if (sl) {
++    printf("%.*s\n", (int)strcspn(sl + 5, "\n"), sl + 5);
++  }
+   int again = llb_generate(ids, n_ids, n_new, out, &st);
+   printf("second llb_generate: %d (%s)\n", again, llb_error());
+   llb_free();
+--- a/llb_repeat.c	2026-10-07 16:32:23
++++ b/llb_repeat.c	2026-10-07 17:34:46
+@@ -88,13 +88,15 @@
+ static const char *chat_dir, *decide_dir, *cache;
+ static int fails;
+ 
+-static void chat(int cyc, int step, const char* name, const uint32_t* ids, int n, const uint32_t* want, int nw) {
+-  uint32_t out[256];
++// (ENGINE-EARLYSTOP) ask: the n_new requested (a maximum); the reply must be want's nw ids exactly
++static void chat(int cyc, int step, const char* name, const uint32_t* ids, int n, const uint32_t* want, int nw,
++  int ask) {
++  uint32_t out[1024];
+   llb_stats st;
+   double t0 = now_ms();
+   int got = -1;
+   if (llb_load(chat_dir, cache) == 0) {
+-    got = llb_generate(ids, n, nw, out, &st);
++    got = llb_generate(ids, n, ask, out, &st);
+   }
+   double wall = now_ms() - t0;
+   int same = got == nw && memcmp(out, want, sizeof *out * (size_t)nw) == 0;
+@@ -105,9 +107,9 @@
+   if (got < 0) {
+     printf("REPEAT cycle %d step %d chat %s FAILED: %s\n", cyc, step, name, llb_error());
+   } else {
+-    printf("REPEAT cycle %d step %d chat %s answered %d ids, PARITY %s (%d/%d identical) wall_ms=%.0f "
++    printf("REPEAT cycle %d step %d chat %s asked %d answered %d ids, PARITY %s (%d/%d identical) wall_ms=%.0f "
+       "compile_ms=%.0f load_ms=%.0f prefill_ms=%.0f decode_ms_per_tok=%.2f engine_total_ms=%.0f span_mb=%llu | %s\n",
+-      cyc, step, name, got, same ? "OK" : "DIFF", k, nw, wall, st.compile_ms, st.load_ms, st.prefill_ms,
++      cyc, step, name, ask, got, same ? "OK" : "DIFF", k, nw, wall, st.compile_ms, st.load_ms, st.prefill_ms,
+       st.steps ? st.step_ms_sum / st.steps : 0.0, st.total_ms, (unsigned long long)(st.span_bytes >> 20),
+       llb_release_report());
+   }
+@@ -144,9 +146,9 @@
+ }
+ 
+ int main(int argc, char** argv) {
+-  if (argc != 11) {
++  if (argc != 11 && argc != 13) {
+     fprintf(stderr, "usage: %s chat_dir decide_dir cache cycles p2.ids p2.expect p0.ids p0.expect travel.json "
+-      "travel.mac.json\n", argv[0]);
++      "travel.mac.json [ps.ids ps.expect]\n", argv[0]);
+     return 2;
+   }
+   chat_dir = argv[1];
+@@ -158,24 +160,32 @@
+   int n0 = ids_of(argv[7], p0, 64), m0 = ids_of(argv[8], e0, 64);
+   char* body = slurp(argv[9]);
+   char* mac = trim(slurp(argv[10]));
++  // (ENGINE-EARLYSTOP) optional step 5: a short reply (ps, ending at its stop id) with 768 requested
++  uint32_t ps[64], es[64];
++  int ns = argc == 13 ? ids_of(argv[11], ps, 64) : 0, ms = argc == 13 ? ids_of(argv[12], es, 64) : 0;
+   printf("REPEAT device %s\n", llb_device_info());
+   mem("start");
+   for (int c = 1; c <= cycles; c += 1) {
+-    chat(c, 1, "p2", p2, n2, e2, m2);
++    chat(c, 1, "p2", p2, n2, e2, m2, m2);
+     mem("after-step-1");
+-    chat(c, 2, "p0", p0, n0, e0, m0);
++    chat(c, 2, "p0", p0, n0, e0, m0, m0);
+     mem("after-step-2");
+     decide(c, 3, body, mac);
+     mem("after-step-3");
+-    chat(c, 4, "p2", p2, n2, e2, m2);
++    chat(c, 4, "p2", p2, n2, e2, m2, m2);
+     mem("after-step-4");
++    if (ns) {
++      chat(c, 5, "ps", ps, ns, es, ms, 768);
++      mem("after-step-5");
++    }
+   }
+   if (getenv("LLB_REPEAT_PAUSE")) {  // hold the process for footprint / vmmap
+     printf("PAUSE pid %d\n", getpid());
+     fflush(stdout);
+     sleep((unsigned)atoi(getenv("LLB_REPEAT_PAUSE")));
+   }
+-  printf("RESULT %d cycles x 4 requests in one process: %d/%d answered and matched -> %s\n", cycles,
+-    4 * cycles - fails, 4 * cycles, fails ? "FAIL" : "PASS");
++  int per = ns ? 5 : 4;
++  printf("RESULT %d cycles x %d requests in one process: %d/%d answered and matched -> %s\n", cycles, per,
++    per * cycles - fails, per * cycles, fails ? "FAIL" : "PASS");
+   return fails ? 1 : 0;
+ }

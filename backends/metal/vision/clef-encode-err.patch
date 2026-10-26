@@ -1,0 +1,197 @@
+diff --git a/S1D/tools/clef3/decide.c b/S1D/tools/clef3/decide.c
+index 39a613c..f8af3ab 100644
+--- a/S1D/tools/clef3/decide.c
++++ b/S1D/tools/clef3/decide.c
+@@ -174,7 +174,7 @@ int main(int argc,char **argv) {
+     } Q35Tokenizer tok;
+     if (q35_tok_load(&tok,side)) clef_fail("sidecar requires tokenizer.bin (llb-tok extract)");
+     Record *r=calloc(1,sizeof *r);
+-    clef_encode(&tok,req,r,CLEF_MAX_T);
++    clef_encode(&tok,req,r,CLEF_MAX_T,NULL);
+     q35_tok_free(&tok);
+     double encoded=now();
+     backbone(gguf,side,r);
+diff --git a/S1D/tools/clef3/head-test.c b/S1D/tools/clef3/head-test.c
+index a0e46c2..666d164 100644
+--- a/S1D/tools/clef3/head-test.c
++++ b/S1D/tools/clef3/head-test.c
+@@ -8,7 +8,7 @@ int main(int argc,char **argv) {
+     if (argc!=5) clef_fail("usage: head-test GGUF TOKENIZER_DIR REQUEST HIDDEN|synthetic");
+     Q35Tokenizer tok; if (q35_tok_load(&tok,argv[2])) clef_fail("tokenizer load");
+     char *raw=json_read_file(argv[3]); const char *err=NULL; if (!raw) clef_fail("request read");
+-    jv *req=json_parse(raw,&err); if (!req) clef_fail(err); Record *r=calloc(1,sizeof *r); clef_encode(&tok,req,r,CLEF_MAX_T);
++    jv *req=json_parse(raw,&err); if (!req) clef_fail(err); Record *r=calloc(1,sizeof *r); clef_encode(&tok,req,r,CLEF_MAX_T,NULL);
+     float *hidden;
+     if (!strcmp(argv[4],"synthetic")) {
+         hidden=malloc((size_t)r->n*4096*4);
+diff --git a/S1D/tools/clef3/spans.c b/S1D/tools/clef3/spans.c
+index f852560..7592fe0 100644
+--- a/S1D/tools/clef3/spans.c
++++ b/S1D/tools/clef3/spans.c
+@@ -29,57 +29,62 @@ static char *render(const jv *v) {
+     if (v->type == J_STR) return strdup(v->str);
+     sb s = {0}; sorted_json(&s, v); return s.p;
+ }
+-static void piece(Q35Tokenizer *tok, Record *r, const char *s) {
++// piece/option/clef_encode return NULL, or the rejection message (clef_encode hands it to clef_fail or its caller)
++static const char *piece(Q35Tokenizer *tok, Record *r, const char *s) {
+     int n = q35_tok_encode(tok, s, 1, NULL, 0);
+-    if (n < 0 || r->n + n > CLEF_MAX_T * 8) clef_fail("piece token budget exceeded");
++    if (n < 0 || r->n + n > CLEF_MAX_T * 8) return "piece token budget exceeded";
+     r->ids = realloc(r->ids, (r->n + n + 1) * sizeof(int));
+-    if (q35_tok_encode(tok, s, 1, r->ids + r->n, n) != n) clef_fail("tokenize failed");
++    if (q35_tok_encode(tok, s, 1, r->ids + r->n, n) != n) return "tokenize failed";
+     int cap = (int)strlen(s) + 1; char *decoded = calloc(cap, 1);
+     int dn = q35_tok_decode(tok, r->ids + r->n, n, decoded, cap);
+     if (dn != cap-1 || memcmp(decoded, s, dn)) r->roundtrip = 0;
+     free(decoded);
+     if (r->pieces.n) sb_addc(&r->pieces, ',');
+-    json_quote(&r->pieces, s); sb_add(&r->text, s); r->n += n;
++    json_quote(&r->pieces, s); sb_add(&r->text, s); r->n += n; return NULL;
+ }
+-static void option(Q35Tokenizer *tok, Record *r, Question *q, const char *id, const jv *desc) {
+-    if (r->no == CLEF_MAX_O) clef_fail("too many options");
+-    sb b = {0}; sb_fmt(&b, "OPTION %d: ", q->count + 1); piece(tok, r, b.p); free(b.p);
++static const char *option(Q35Tokenizer *tok, Record *r, Question *q, const char *id, const jv *desc) {
++    if (r->no == CLEF_MAX_O) return "too many options";
++    const char *e;
++    sb b = {0}; sb_fmt(&b, "OPTION %d: ", q->count + 1); e = piece(tok, r, b.p); free(b.p); if (e) return e;
+     Option *o = &r->o[r->no++]; o->id = strdup(id); o->parent = r->nq-1; o->span.start = r->n;
+     b = (sb){0}; sb_addc(&b, '{');
+     if (desc && desc->type != J_NULL) { sb_add(&b, "\"description\":"); sorted_json(&b, desc); sb_addc(&b, ','); }
+     sb_add(&b, "\"option_id\":"); json_quote(&b, id); sb_addc(&b, '}');
+-    piece(tok, r, b.p); free(b.p); o->span.end = r->n;
+-    piece(tok, r, "\n"); q->count++;
++    e = piece(tok, r, b.p); free(b.p); if (e) return e; o->span.end = r->n;
++    if ((e = piece(tok, r, "\n"))) return e; q->count++; return NULL;
+ }
+-void clef_encode(Q35Tokenizer *tok, const jv *req, Record *r, int max_length) {
++#define TRY(x) do { if ((e = (x))) goto fail; } while (0)
++#define REJECT(m) do { e = (m); goto fail; } while (0)
++int clef_encode(Q35Tokenizer *tok, const jv *req, Record *r, int max_length, const char **err) {
+     memset(r, 0, sizeof *r); r->roundtrip = 1;
++    const char *e = NULL; Record *prefix = NULL, *st = NULL, *suffix = NULL; size_t *ix = NULL;
+     const jv *qs = json_get(req, "questions"), *state = json_get(req, "state");
+-    if (!state || !qs || qs->type != J_OBJ || !qs->n || qs->n > CLEF_MAX_Q) clef_fail("invalid state/questions");
+-    if (json_get(req, "images") || json_get(req, "videos")) clef_fail("multimodal is out of scope");
+-    piece(tok, r, "\n\nSCHEMA FIELDS:\n");
++    if (!state || !qs || qs->type != J_OBJ || !qs->n || qs->n > CLEF_MAX_Q) REJECT("invalid state/questions");
++    if (json_get(req, "images") || json_get(req, "videos")) REJECT("multimodal is out of scope");
++    TRY(piece(tok, r, "\n\nSCHEMA FIELDS:\n"));
+     for (size_t i = 0; i < qs->n; i++) {
+         const jv *jq = qs->items[i], *ty = json_get(jq, "type"), *ins = json_get(jq, "instructions"), *cr = json_get(jq, "criteria");
+-        if (!ty || ty->type != J_STR) clef_fail("missing question type");
++        if (!ty || ty->type != J_STR) REJECT("missing question type");
+         Question *q = &r->q[r->nq++]; q->id = strdup(qs->keys[i]); q->first = r->no;
+         q->type = !strcmp(ty->str, "noul") ? 0 : !strcmp(ty->str, "choice") ? 1 : !strcmp(ty->str, "score") ? 2 : -1;
+-        if (q->type < 0) clef_fail("unknown question type");
++        if (q->type < 0) REJECT("unknown question type");
+         sb b = {0}; sb_fmt(&b, "\nFIELD %zu\nID: ", i+1); sb_add(&b, q->id);
+-        sb_add(&b, "\nTYPE: "); sb_add(&b, ty->str); sb_add(&b, "\nINSTRUCTION: "); piece(tok, r, b.p); free(b.p);
++        sb_add(&b, "\nTYPE: "); sb_add(&b, ty->str); sb_add(&b, "\nINSTRUCTION: "); e = piece(tok, r, b.p); free(b.p); if (e) goto fail;
+         q->span.start = r->n;
+         char *text = (!ins || ins->type == J_NULL || (ins->type == J_STR && !*ins->str)) ? strdup(q->id) : render(ins);
+-        piece(tok, r, text); free(text); q->span.end = r->n;
+-        if (q->span.start == q->span.end) clef_fail("empty question span");
+-        piece(tok, r, "\nALLOWED OPTIONS:\n");
++        e = piece(tok, r, text); free(text); if (e) goto fail; q->span.end = r->n;
++        if (q->span.start == q->span.end) REJECT("empty question span");
++        TRY(piece(tok, r, "\nALLOWED OPTIONS:\n"));
+         if (!q->type) {
+             const char *ids[] = {"true", "false"};
+             char *defaults[] = {"The proposition is true or the answer is yes.", "The proposition is false or the answer is no."};
+-            if (cr && cr->type != J_NULL && cr->type != J_OBJ) clef_fail("invalid noul criteria");
++            if (cr && cr->type != J_NULL && cr->type != J_OBJ) REJECT("invalid noul criteria");
+             for (int j = 0; j < 2; j++) {
+-                jv d = {.type=J_STR, .str=defaults[j]}; const jv *v = json_get(cr, ids[j]); option(tok, r, q, ids[j], v ? v : &d);
++                jv d = {.type=J_STR, .str=defaults[j]}; const jv *v = json_get(cr, ids[j]); TRY(option(tok, r, q, ids[j], v ? v : &d));
+             }
+         } else {
+-            if (!cr || cr->type != (q->type == 1 ? J_OBJ : J_ARR) || !cr->n) clef_fail("invalid criteria");
+-            size_t *ix = calloc(cr->n, sizeof *ix);
++            if (!cr || cr->type != (q->type == 1 ? J_OBJ : J_ARR) || !cr->n) REJECT("invalid criteria");
++            ix = calloc(cr->n, sizeof *ix);
+             for (size_t j = 0; j < cr->n; j++) {
+                 size_t k = j;
+                 while (q->type == 1 && k && strcmp(cr->keys[ix[k-1]], cr->keys[j]) > 0) { ix[k] = ix[k-1]; k--; }
+@@ -87,20 +92,20 @@ void clef_encode(Q35Tokenizer *tok, const jv *req, Record *r, int max_length) {
+             }
+             for (size_t j = 0; j < cr->n; j++) {
+                 char id[24]; snprintf(id, sizeof id, "%zu", j);
+-                option(tok, r, q, q->type == 1 ? cr->keys[ix[j]] : id, cr->items[ix[j]]);
++                TRY(option(tok, r, q, q->type == 1 ? cr->keys[ix[j]] : id, cr->items[ix[j]]));
+             }
+-            free(ix);
++            free(ix); ix = NULL;
+         }
+-        piece(tok, r, "END FIELD\n");
++        TRY(piece(tok, r, "END FIELD\n"));
+     }
+-    Record *prefix = calloc(1, sizeof *prefix), *st = calloc(1, sizeof *st), *suffix = calloc(1, sizeof *suffix);
++    prefix = calloc(1, sizeof *prefix); st = calloc(1, sizeof *st); suffix = calloc(1, sizeof *suffix);
+     prefix->roundtrip = st->roundtrip = suffix->roundtrip = 1;
+-    piece(tok, prefix, "<|im_start|>system\nRead the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.<|im_end|>\n<|im_start|>user\nSTATE:\n");
+-    piece(tok, suffix, "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:");
+-    char *text = render(state); piece(tok, st, text); free(text);
++    TRY(piece(tok, prefix, "<|im_start|>system\nRead the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.<|im_end|>\n<|im_start|>user\nSTATE:\n"));
++    TRY(piece(tok, suffix, "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:"));
++    char *text = render(state); e = piece(tok, st, text); free(text); if (e) goto fail;
+     int fixed = prefix->n + r->n + suffix->n;
+-    if (max_length < fixed || max_length > CLEF_MAX_T) clef_fail("schema exceeds token budget");
+-    if (st->n > max_length - fixed) clef_fail("state truncation not enabled in CLI; input exceeds budget");
++    if (max_length < fixed || max_length > CLEF_MAX_T) REJECT("schema exceeds token budget");
++    if (st->n > max_length - fixed) REJECT("state truncation not enabled in CLI; input exceeds budget");
+     int shift = prefix->n + st->n, total = fixed + st->n;
+     int *ids = calloc(total, sizeof *ids);
+     memcpy(ids, prefix->ids, prefix->n*4); memcpy(ids+prefix->n, st->ids, st->n*4);
+@@ -115,6 +120,13 @@ void clef_encode(Q35Tokenizer *tok, const jv *req, Record *r, int max_length) {
+     }
+     free(r->text.p); free(r->pieces.p); r->text = joined; r->pieces = pieces;
+     clef_record_free(prefix); clef_record_free(st); clef_record_free(suffix); free(prefix); free(st); free(suffix);
++    return 0;
++fail:  // a rejected request: the temporaries and the partial record freed (r is left empty); unarmed = clef_fail's exit
++    free(ix); Record *tmp[] = {prefix, st, suffix};
++    for (int i = 0; i < 3; i++) if (tmp[i]) { clef_record_free(tmp[i]); free(tmp[i]); }
++    clef_record_free(r); memset(r, 0, sizeof *r);
++    if (!err) clef_fail(e);
++    *err = e; return -1;
+ }
+ void clef_record_json(const Record *r, sb *b) {
+     sb_fmt(b, "{\"input_tokens\":%d,\"roundtrip\":%s,\"input_ids\":[", r->n, r->roundtrip ? "true" : "false");
+@@ -141,7 +153,7 @@ int main(int argc, char **argv) {
+     Q35Tokenizer tok; if (q35_tok_load(&tok, argv[1])) clef_fail("tokenizer load failed");
+     char *text = json_read_file(argv[2]); const char *err = NULL;
+     if (!text) clef_fail("request read failed"); jv *req = json_parse(text, &err); if (!req) clef_fail(err);
+-    Record *r = calloc(1, sizeof *r); clef_encode(&tok, req, r, CLEF_MAX_T); sb b = {0}; clef_record_json(r, &b); puts(b.p);
++    Record *r = calloc(1, sizeof *r); clef_encode(&tok, req, r, CLEF_MAX_T, NULL); sb b = {0}; clef_record_json(r, &b); puts(b.p);
+     clef_record_free(r); free(r); free(b.p); json_free(req); free(text); q35_tok_free(&tok); return 0;
+ }
+ #endif
+diff --git a/S1D/tools/clef3/spans.h b/S1D/tools/clef3/spans.h
+index ea3284e..089324f 100644
+--- a/S1D/tools/clef3/spans.h
++++ b/S1D/tools/clef3/spans.h
+@@ -12,7 +12,9 @@ typedef struct {
+     Question q[CLEF_MAX_Q]; Option o[CLEF_MAX_O];
+     sb text, pieces; int roundtrip;
+ } Record;
+-void clef_encode(Q35Tokenizer *tok, const jv *req, Record *r, int max_length);
++// 0 = r encoded. A rejected request (unknown question type, invalid criteria, multimodal, over budget, ...): err NULL
++// (every CLI) = clef_fail (stderr "clef: MSG", exit 1) as before; err set (a serving caller) = *err = MSG, r left empty, -1
++int clef_encode(Q35Tokenizer *tok, const jv *req, Record *r, int max_length, const char **err);
+ void clef_record_json(const Record *r, sb *out);
+ void clef_record_free(Record *r);
+ void clef_fail(const char *message);
+diff --git a/S1D/tools/sys1dual/dual.c b/S1D/tools/sys1dual/dual.c
+index 18ad4cd..9471cb7 100644
+--- a/S1D/tools/sys1dual/dual.c
++++ b/S1D/tools/sys1dual/dual.c
+@@ -177,7 +177,7 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
+     }
+     // ponytail: clef_encode still exits the process on the inputs it rejects (spans.c clef_fail); error lines need a non-exiting encode
+     rec=calloc(1,sizeof *rec);
+-    clef_encode(&tok,req,rec,CLEF_MAX_T);
++    clef_encode(&tok,req,rec,CLEF_MAX_T,NULL);
+     if ((unsigned)rec->n>ctx) return refuse("request exceeds the KV capacity fixed at launch"),0;
+     mode=1;
+     steps=1;

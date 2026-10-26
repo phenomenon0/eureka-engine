@@ -1,0 +1,60 @@
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -1151,15 +1151,17 @@
+ # is the same (the next exact step reads it). y is not written. Fields: ws 1,
+ # ids 2, y 3, lin / full Offs 4..43, c 44, rg 45, rd 46, the table 47, the
+ # embedding region 48, nt 49.
++# (ENGINE-DECIDECHUNK, patches/engine-dchunk.patch) + the head region 50 and its
++# output_norm offset 51: the host rms-norms the chunk's hook-marked rows
+ @unsafe
+ def llb.chunkf_warp(+f: Nat, +ws: List<&2, Bytes()>, +ids: List<&2, U32>, y: Array<F32>, +lo: Offs, +fo: Offs,
+-  +c: U32, +rg: U32, +rd: U32, +tb: Bytes(), +ep: Bytes(), +nt: U32) -> Array<F32>:
++  +c: U32, +rg: U32, +rd: U32, +tb: Bytes(), +ep: Bytes(), +nt: U32, +hd: Bytes(), +noff: U32) -> Array<F32>:
+   Array.new(F32, 12n, K.f32_from_bits(2143289344))
+ 
+ @unsafe
+ def fwd.chunkf(+m: Model, +pos: U32, +dT: Nat, +ids: List<&2, U32>, +nt: U32) -> Array<F32>:
+   llb.chunkf_warp!(14n, m.ws(m), ids, Array.new(F32, 12n, 0.0), m.lino(m), m.fulo(m),
+-    (U32.from_nat(dT) .|. (pos << 5n) : U32), q8rw(m.dm(m)), q8rw(m.df(m)), m.tb(m), m.ep(m), nt)
++    (U32.from_nat(dT) .|. (pos << 5n) : U32), q8rw(m.dm(m)), q8rw(m.df(m)), m.tb(m), m.ep(m), nt, m.pk(m), m.nb(m))
+ 
+ @unsafe
+ def step.chunkf.after(r: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)> & Array<F32>,
+@@ -1370,26 +1372,32 @@
+ # from pos 0 on fresh states through the exact prompt path (the host's
+ # m26_reset zeroes its layer state at pos 0), one dT for the run (argv
+ # "0 --steps C" sizes it)
++# (ENGINE-DECIDECHUNK, patches/engine-dchunk.patch) a command's --fastpf K: the
++# fast tier (run.prompt, as the CLI's); none or --exactpf (fk 0): the exact path
+ @unsafe
+-def srv.one(ok: Bool, ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
++def srv.one(ok: Bool, ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, +fk: U32, k: Unit -> IO(Unit)) -> IO(Unit):
+   match ok:
+     case True{}:
+       do IO<Unit>:
+-        prompt(ts, U32.to_nat((st - 1 : U32)), m, b, em, dT, (1 << dT : U32), 0, 0, states(m.nl(m), dT), st)
++        run.prompt(Bool.and((fk >= 1 : U32), m.fast(m, b, em)), fk, ts, U32.to_nat((st - 1 : U32)), m, b, em, dT,
++          (1 << dT : U32), st)
+         S.sys1.done()
+         k(Unit{})
+     case False{}:
+       IO.die(Unit, 2, "sys1: bad request command")
+ 
+ @unsafe
+-def srv.chk(+ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
+-  srv.one(Bool.and(ok_ids(ts), (st >= 1 : U32)), ts, st, m, b, em, dT, k)
++def srv.chk(+ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, +fk: U32, k: Unit -> IO(Unit)) -> IO(Unit):
++  srv.one(Bool.and(ok_ids(ts), (st >= 1 : U32)), ts, st, m, b, em, dT, fk, k)
+ 
+ @unsafe
+ def srv.run(c: List<&2, U32> & U32 & U32 & U32 & U32 & U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
+   (ts, sl) = c
+   (st, rest) = sl
+-  srv.chk(ts, st, m, b, em, dT, k)
++  (ly, r2) = rest
++  (em2, r3) = r2
++  (lb, fk) = r3
++  srv.chk(ts, st, m, b, em, dT, fk, k)
+ 
+ @unsafe
+ def srv.go(q: List<String>, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):

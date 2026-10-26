@@ -1,0 +1,22 @@
+base/ (ISILDUR, 2026-10-09): the Bend compiler (cc/bend2, comp.ts) and the Qwen3.5 engine sources (engine/*.bend,
+engine/host, engine/kernels, engine/tools) that every emitted C in this repo is generated from, BEFORE patches/.
+
+It is the tree mac/base_tree-fresh41.sh used to make, frozen:
+  emitted-unlock/integrate (build/m9d/cc + engine/)  ->  m36 release patches  ->  m38 pair  ->  m41 pair
+  ->  mac/metal-sys1mac.patch + mac/engine-sys1mac.patch
+That recipe read the lane trees emitted-unlock, m36, m38 and m41. m38 no longer exists, so it cannot run.
+
+How it was recovered: PHONECAM's patched VISION tree (phonecam/engine/work/mac/tree, the one that emitted
+b0ffd9af), minus engine/tools/sys1dual (copied in from S1D at build time), with the 16 patches of mac/build.sh's
+VISION stack reverse-applied in reverse order (patch -R --fuzz=0: every one applied cleanly).
+
+How it was checked:
+  1. file-for-file: 442/442 sha256 equal to the sys1mac lane's tree inventory
+     (sys1mac lane: receipts/sys1mac/scratch-inventory.txt, "./tree/" rows; its only extra
+     rows are the 3 engine/tools/sys1dual files, which build.sh copies in).
+  2. forward: base/ + patches/ through mac/build.sh re-emits, byte for byte,
+       VISION=1          b0ffd9afe033cdb1...  (PHONECAM, the camera engine)
+       (default)         bccd7cea5b7d110b...  (KEVPHONE, resident)
+       NORESIDENT=1      c13b9e28d36ca618...  (ENGINE-EARLYSTOP)
+     receipts/isildur/emit-*.txt.
+  comp.ts 70473751... engine_qwen35_gpu.bend e0eaf6df... host/llb_gguf.c ec6ba09c...  (all files: SHA256SUMS)

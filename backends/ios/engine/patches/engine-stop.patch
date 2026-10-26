@@ -1,0 +1,217 @@
+--- a/engine_qwen35_gpu.bend	2026-10-07 17:29:54
++++ b/engine_qwen35_gpu.bend	2026-10-07 17:31:40
+@@ -1242,27 +1242,46 @@
+   (t, cs) = r
+   k(t, cs)
+ 
++# (ENGINE-EARLYSTOP, patches/engine-stop.patch) --stop ID (any number of them): the ids that end the reply
++def stop.has(sp: List<&2, U32>, +t: U32) -> Bool:
++  match sp:
++    case Con{h, rest}:
++      Bool.or(U32.is_eq(h, t), stop.has(rest, t))
++    case Nil{}:
++      False{}
++
++# (ENGINE-EARLYSTOP) n is a maximum: a stop id is printed and ends the run (no step after it). go: tok is not
++# a stop id (the caller's stop.go)
++def stop.go(sp: List<&2, U32>, +t: U32) -> Bool:
++  Bool.not(stop.has(sp, t))
++
+ @unsafe
+ def gen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +pos: U32, +tok: U32, st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>,
+-  +steps: U32) -> IO(Unit):
++  +steps: U32, +sp: List<&2, U32>, go: Bool) -> IO(Unit):
+   match n:
+     case 0n:
+       IO.print(U32.show(tok))
+     case 1n+p:
+-      do IO<Unit>:
+-        IO.print(U32.show(tok))
+-        IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, tok, st, steps),
+-          run.with(t => st2 => gen(p, m, b, em, dT, nT, (pos + 1 : U32), t, st2, steps)))
++      match go:
++        case True{}:
++          do IO<Unit>:
++            IO.print(U32.show(tok))
++            IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, tok, st, steps),
++              run.with(+t => st2 => gen(p, m, b, em, dT, nT, (pos + 1 : U32), t, st2, steps, sp, stop.go(sp, t))))
++        case False{}:
++          do IO<Unit>:
++            IO.print(U32.show(tok))
++            IO.print_err("stop " ++ U32.show(pos) ++ " " ++ U32.show(tok))
+ 
+ @unsafe
+ def prompt(ts: List<&2, U32>, n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +pos: U32, +prev: U32,
+-  st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, +steps: U32) -> IO(Unit):
++  st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, +steps: U32, +sp: List<&2, U32>) -> IO(Unit):
+   match ts:
+     case Con{t, rest}:
+       IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, t, st, steps),
+-        run.with(nt => st2 => prompt(rest, n, m, b, em, dT, nT, (pos + 1 : U32), nt, st2, steps)))
++        run.with(nt => st2 => prompt(rest, n, m, b, em, dT, nT, (pos + 1 : U32), nt, st2, steps, sp)))
+     case Nil{}:
+-      gen(n, m, b, em, dT, nT, pos, prev, st, steps)
++      gen(n, m, b, em, dT, nT, pos, prev, st, steps, sp, stop.go(sp, prev))
+ 
+ # Setup
+ # -----
+@@ -1274,6 +1293,16 @@
+     case None{}:
+       4294967295
+ 
++# (ENGINE-EARLYSTOP) the --stop values in the argument list (a value is the word after a --stop)
++def stops(xs: List<String>, after: Bool, +sp: List<&2, U32>) -> List<&2, U32>:
++  match xs:
++    case Con{a0, t}:
++      +a = a0
++      +v = num.of(U32.read(a))
++      stops(t, String.eq(a, "--stop"), Bool.pick(List<&2, U32>, after, v <> sp, sp))
++    case Nil{}:
++      sp
++
+ # (tools/engine-m31.patch) --fastpf K: fk, mode 5
+ def cfg(xs: List<String>, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb: U32, +fk: U32, +mode: U32, +ok: Bool) ->
+   List<&2, U32> & U32 & U32 & U32 & U32 & U32:
+@@ -1287,7 +1316,9 @@
+       +ff = String.eq(a, "--fastpf")
+       # (lane m36) --exactpf: the exact tier (fk 0), no value
+       +fx = String.eq(a, "--exactpf")
+-      +flag = Bool.or(fs, Bool.or(fl, Bool.or(fe, Bool.or(fb, ff))))
++      # (ENGINE-EARLYSTOP) --stop ID: mode 6, read by stops()
++      +fp = String.eq(a, "--stop")
++      +flag = Bool.or(Bool.or(fs, Bool.or(fl, Bool.or(fe, Bool.or(fb, ff)))), fp)
+       +fz = Bool.or(flag, fx)
+       +v = num.of(U32.read(a))
+       cfg(t,
+@@ -1295,7 +1326,7 @@
+         Bool.pick(U32, U32.is_eq(mode, 1), v, st), Bool.pick(U32, U32.is_eq(mode, 2), v, ly),
+         Bool.pick(U32, U32.is_eq(mode, 3), v, em), Bool.pick(U32, U32.is_eq(mode, 4), v, lb),
+         Bool.pick(U32, U32.is_eq(mode, 5), v, Bool.pick(U32, fx, 0, fk)),
+-        Bool.pick(U32, fs, 1, Bool.pick(U32, fl, 2, Bool.pick(U32, fe, 3, Bool.pick(U32, fb, 4, Bool.pick(U32, ff, 5, 0))))),
++        Bool.pick(U32, fs, 1, Bool.pick(U32, fl, 2, Bool.pick(U32, fe, 3, Bool.pick(U32, fb, 4, Bool.pick(U32, ff, 5, Bool.pick(U32, fp, 6, 0)))))),
+         Bool.and(ok, Bool.pick(Bool, fz, U32.is_eq(mode, 0), Bool.not(U32.is_eq(v, 4294967295)))))
+     case Nil{}:
+       (List.reverse(&2, U32, ts),
+@@ -1319,7 +1350,7 @@
+       n
+ 
+ def usage() -> String:
+-  "usage: engine_qwen35 <packdir> <tok>... [--steps N] [--layers L] [--emit L] [--lpb K] [--fastpf K] [--exactpf]  (N>=1, ids<248320, K<=4096; the 27B / 9B use <= 512)"
++  "usage: engine_qwen35 <packdir> <tok>... [--steps N] [--layers L] [--emit L] [--lpb K] [--fastpf K] [--exactpf] [--stop ID]...  (N>=1, ids<248320, K<=4096; the 27B / 9B use <= 512)"
+ 
+ # (tools/engine-m31.patch) the fast prefill tier exists for this model: the
+ # fused step (no --layers / --emit, --lpb >= the layer count) and a fast chain
+@@ -1353,23 +1384,23 @@
+     Bool.pick(U32, U32.is_eq(m.dm(m), 2560), k4, 0)))
+   Bool.pick(U32, Nat.is_le(5n, dT), k, 0)
+ 
+-def run.fgen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +steps: U32,
++def run.fgen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +steps: U32, +sp: List<&2, U32>,
+   r: U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) -> IO(Unit):
+   (+pos, pt) = r
+   (+tok, st) = pt
+-  gen(n, m, b, em, dT, nT, pos, tok, st, steps)
++  gen(n, m, b, em, dT, nT, pos, tok, st, steps, sp, stop.go(sp, tok))
+ 
+ # OFF (fk 0, or no fast chain): M30's exact prompt path, its arguments unchanged
+ @unsafe
+ def run.prompt(fast: Bool, +fk: U32, ts: List<&2, U32>, n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32,
+-  +steps: U32) -> IO(Unit):
++  +steps: U32, +sp: List<&2, U32>) -> IO(Unit):
+   match fast:
+     case True{}:
+       IO.bind(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit,
+         prefill.f27(m.fastk(m, fk), ts, m, b, em, dT, nT, 0, states(m.nl(m), 1n), steps),
+-        r => run.fgen(n, m, b, em, dT, nT, steps, r))
++        r => run.fgen(n, m, b, em, dT, nT, steps, sp, r))
+     case False{}:
+-      prompt(ts, n, m, b, em, dT, nT, 0, 0, states(m.nl(m), dT), steps)
++      prompt(ts, n, m, b, em, dT, nT, 0, 0, states(m.nl(m), dT), steps, sp)
+ 
+ # SYS1-MAC (LLB_SYS1 set, docs/sys1mac-registration.md): SYS1-DUAL's srv loop
+ # on the Mac engine. One load, then requests from S.sys1.next until EOF; each
+@@ -1384,7 +1415,7 @@
+     case True{}:
+       do IO<Unit>:
+         run.prompt(Bool.and((fk >= 1 : U32), m.fast(m, b, em)), fk, ts, U32.to_nat((st - 1 : U32)), m, b, em, dT,
+-          (1 << dT : U32), st)
++          (1 << dT : U32), st, Nil{})
+         S.sys1.done()
+         k(Unit{})
+     case False{}:
+@@ -1418,16 +1449,18 @@
+     srv.go(q, m, b, em, dT, u => srv(dir, m, b, em, dT))
+ 
+ @unsafe
+-def srv.or(on: Bool, +dir: String, ts: List<&2, U32>, +m: Model, +b: Nat, +em: U32, +dT: Nat, +st: U32, +fd: U32) -> IO(Unit):
++def srv.or(on: Bool, +dir: String, ts: List<&2, U32>, +m: Model, +b: Nat, +em: U32, +dT: Nat, +st: U32, +fd: U32,
++  +sp: List<&2, U32>) -> IO(Unit):
+   match on:
+     case True{}:
+       srv(dir, m, b, em, dT)
+     case False{}:
+       run.prompt(Bool.and((fd >= 1 : U32), m.fast(m, b, em)), fd, ts, U32.to_nat((st - 1 : U32)), m, b, em, dT,
+-        (1 << dT : U32), st)
++        (1 << dT : U32), st, sp)
+ 
+ @unsafe
+-def run.go(ok: Bool, +dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb: U32, +fk: U32) -> IO(Unit):
++def run.go(ok: Bool, +dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb: U32, +fk: U32,
++  +sp: List<&2, U32>) -> IO(Unit):
+   match ok:
+     case True{}:
+       do IO<Unit>:
+@@ -1438,14 +1471,14 @@
+         # (lane m36) fk 4294967295 = neither --fastpf nor --exactpf: the default tier
+         +fd : U32 = Bool.pick(U32, U32.is_eq(fk, 4294967295), m.dfk(m, nt, dT), fk)
+         se : Result<&1, &1, U32 & String, String> <- IO.get_env("LLB_SYS1")
+-        srv.or(G.gguf.on(se), dir, ts, m, U32.to_nat(lb), em, dT, st, fd)
++        srv.or(G.gguf.on(se), dir, ts, m, U32.to_nat(lb), em, dT, st, fd, sp)
+         t1 : Nat <- IO.now()
+         IO.print("wall_ms " ++ Nat.show(Nat.sub(t1, t0)))
+     case False{}:
+       IO.die(Unit, 2, usage())
+ 
+ @unsafe
+-def run.chk(dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb: U32, +fk: U32) -> IO(Unit):
++def run.chk(dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb: U32, +fk: U32, +sp: List<&2, U32>) -> IO(Unit):
+   +nt = U32.from_nat(count_ids(ts, 0n))
+   +ok = Bool.and(ok_ids(ts), (nt >= 1 : U32))
+   +ok1 = Bool.and(ok, (st >= 1 : U32))
+@@ -1457,27 +1490,29 @@
+   +ok6 = Bool.and(ok5, (lb <= 64 : U32))
+   # (tools/engine-m31.patch) --fastpf K: 0 (off) or 1 .. 512 (the chunk area)
+   +ok7 = Bool.and(ok6, Bool.or((fk <= 4096 : U32), U32.is_eq(fk, 4294967295)))
+-  run.go(Bool.and(ok7, (nt <= (131073 - st : U32) : U32)), dir, ts, st, ly, em, lb, fk)
++  run.go(Bool.and(ok7, (nt <= (131073 - st : U32) : U32)), dir, ts, st, ly, em, lb, fk, sp)
+ 
+ @unsafe
+-def run.sl(dir: String, ts: List<&2, U32>, sl: U32 & U32 & U32 & U32 & U32) -> IO(Unit):
++def run.sl(dir: String, ts: List<&2, U32>, sl: U32 & U32 & U32 & U32 & U32, +sp: List<&2, U32>) -> IO(Unit):
+   (st, lf) = sl
+   (ly, ef) = lf
+   (em, lk) = ef
+   (lb, fk) = lk
+-  run.chk(dir, ts, st, ly, em, lb, fk)
++  run.chk(dir, ts, st, ly, em, lb, fk, sp)
+ 
+ @unsafe
+-def run(dir: String, c: List<&2, U32> & U32 & U32 & U32 & U32 & U32) -> IO(Unit):
++def run(dir: String, c: List<&2, U32> & U32 & U32 & U32 & U32 & U32, +sp: List<&2, U32>) -> IO(Unit):
+   (ts, sl) = c
+-  run.sl(dir, ts, sl)
++  run.sl(dir, ts, sl, sp)
+ 
+ @unsafe
+ def main.go(args: List<String>) -> IO(Unit):
+   match args:
+-    case Con{dir, rest}:
++    case Con{dir, rest0}:
++      +rest = rest0
+       # (lane m36) fk starts at 4294967295: no prefill flag (the default tier)
+-      run(dir, cfg(rest, Nil{}, 8, 0, 4294967295, 64, 4294967295, 0, True{}))
++      # (ENGINE-EARLYSTOP) + the --stop ids (none: n new ids exactly, as before)
++      run(dir, cfg(rest, Nil{}, 8, 0, 4294967295, 64, 4294967295, 0, True{}), stops(rest, False{}, Nil{}))
+     case Nil{}:
+       IO.die(Unit, 2, usage())
+ 

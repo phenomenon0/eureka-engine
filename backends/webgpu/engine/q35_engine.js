@@ -1,7 +1,7 @@
 // Device and pack lifetime for q35_plan. Publicly re-exported by q35_step.js.
 import { pipes, entry_run, wgsl_manifest } from "./webgpu.js";
 import { graph_open } from "./webgpu_graph.js";
-import { q35_plan, Q35_HEAD_ROWS } from "./q35_plan.js";
+import { q35_plan, Q35_HEAD_ROWS, q35_prefill_plan, Q35_PF_WIDTHS } from "./q35_plan.js";
 import { XCHK_LIMIT, FAST_FORMATS, SPLIT_MODES, scale_scan, audit_chain } from "./q35_split.js";
 
 const u8 = value => value instanceof ArrayBuffer ? new Uint8Array(value) :
@@ -296,9 +296,130 @@ export async function q35_open(g, packSrc, manifest, options = {}) {
       return { bits, ms: performance.now() - at, submits, dispatches, copies: p.steps.length - dispatches };
     } finally { rb.destroy(); }
   }
+  // BATCHPREFILL: prompt tokens (all but the last) layer-major in chunks of T through the turbo kernels (q35_prefill_plan): no head,
+  // no readback, one compute pass a chunk, chunks pipelined (encode the next while the GPU runs this one), one wait at the end.
+  // Turbo only. prefillBatched: GEMV entries that run as one batched dispatch a chunk (k_gemv_turbo_b.wgsl, subgroups only).
+  // prefillKV: "inplace" (default: k_fuse_pf kvput1, one bank) or "pingpong" (the decode step's whole-cache kvput every token).
+  // prefillTokens: the row-independent ops as one dispatch a chunk (k_*_tb twins; default on with the in-place kvput).
+  const pfT = options.prefillChunk ?? 32, pfTB = options.prefillBatchWidth ?? 4, pfKV = options.prefillKV ?? "inplace", pfPlans = new Map();
+  const pfTok = pfKV === "inplace" && options.prefillTokens !== false;
+  // webprefill2: prefillGrid: GEMV entries through their grid-token twins (k_gemv_turbo_grf.wgsl); prefillGu: "r<R>t<T>" gate+up shape
+  // (k_gemv_turbo_guf.wgsl) or "" for the per-token gu. Both subgroups only and need prefillTokens; WebKit keeps the per-token GEMVs.
+  const pfRecur = !pfTok || options.prefillRecur === false ? false : (options.prefillRecur ?? "sg") === "sg" && sgOK ? "sg" : true;   // webprefill2: convh/gdn one dispatch a chunk ("sg": k_fuse_rcs.wgsl, else / no subgroups: k_fuse_rc.wgsl)
+  const pfEmbed = pfTok && options.prefillEmbed !== false;   // webprefill2: embed_tb (k_embed_tb.wgsl), one dispatch per head chunk
+  // webprefill2 defaults (bitwise vs the shipped entries: receipts bc5-rtf / bc3-guf / bc2-grf; q6k R x T is NOT bit-identical -> grid)
+  const Q35_PF_RT = { q4k2560: "r2t4", q4k4096: "r2t4", q4k9216: "r4t2", q5k2560: "r2t8", q5k4096: "r2t4" };
+  // webprefill3: no subgroups (WebKit): the grid-token twins of the shipped NON-subgroup k_gemv_turbo.wgsl entries, gu included
+  // (k_gemv_turbo_ngrf.wgsl, bitwise receipts bc7-wk-*; the no-subgroup R x T twins are not bit-identical there). prefillGrid /
+  // prefillGu ("g" = gu_g) apply; prefillNsg: false = the per-token GEMVs (as webprefill2). prefillRt stays subgroups only.
+  const Q35_PF_NGRID = ["q4k2560", "q4k4096", "q4k9216", "q6k2560", "q6k9216", "q5k2560", "q5k4096"];
+  const pfN = !sgOK && pfTok && options.prefillNsg !== false;
+  const pfRt = new Map(sgOK && pfTok ? Object.entries(options.prefillRt ?? Q35_PF_RT) : []);   // webprefill2: entry -> "r<R>t<T>"
+  const pfGrid = new Set(sgOK && pfTok ? (options.prefillGrid ?? ["q6k2560", "q6k9216"]) : pfN ? (options.prefillGrid ?? Q35_PF_NGRID) : []);
+  const pfGu = sgOK && pfTok ? (options.prefillGu ?? "r1t8") : pfN ? (options.prefillGu ?? "g") : "";
+  if (pfGu === "g" && !pfN) throw new Error("q35 prefillGu \"g\" is the no-subgroup path only");
+  const pfBatched = new Set(sgOK ? (options.prefillBatched ?? ["q5k4096", "q4k9216", "q4k4096"]).filter((x) => !pfGrid.has(x) && !pfRt.has(x)) : []);
+  if (pfT % pfTB || !Number.isInteger(pfT) || pfT < 1) throw new Error("q35 prefillChunk must be a multiple of prefillBatchWidth");
+  if (!["inplace", "pingpong"].includes(pfKV)) throw new Error("q35 prefillKV must be inplace or pingpong");
+  let pfReady = null;
+  const pfInit = () => pfReady ??= (async () => {
+    const want = [...(pfBatched.size ? ["k_gemv_turbo_b.wgsl"] : []), ...(pfGrid.size ? [pfN ? "k_gemv_turbo_ngrf.wgsl" : "k_gemv_turbo_grf.wgsl"] : []), ...(pfGu ? [pfGu === "g" ? "k_gemv_turbo_ngrf.wgsl" : "k_gemv_turbo_guf.wgsl"] : []), ...(pfRecur ? [pfRecur === "sg" ? "k_fuse_rcs.wgsl" : "k_fuse_rc.wgsl"] : []), ...(pfRt.size ? ["k_gemv_turbo_rtf.wgsl"] : []), ...(pfEmbed ? ["k_embed_tb.wgsl"] : []), ...(pfKV === "inplace" && !pfTok ? ["k_fuse_pf.wgsl"] : []), ...(pfTok ? ["k_fuse_tb.wgsl", "k_norms_tb.wgsl", "k_fuse_pfb.wgsl"] : [])].filter((n, i, a) => !compiled.mods[n] && a.indexOf(n) === i);
+    if (want.length) {
+      const t = {}; for (const n of want) t[n] = await loadText(n);
+      const more = await compile(g, t, progress);
+      Object.assign(compiled.mods, more.mods); compiled.compile_ms.push(...more.compile_ms); compiled.modules.push(...more.modules);
+    }
+    for (const [k, w] of Object.entries(Q35_PF_WIDTHS)) buffers[`pf.${k}`] ??= d.createBuffer({ label: "q35:pf." + k, size: pfT * w * 4, usage });
+  })();
+  const align = d.limits.minStorageBufferOffsetAlignment;
+  function pfPlan(nt, parity0, bank) {   // the chunk plan, its pipelines, grids and static bindings, cached by (nt, parity, bank)
+    const key = nt + ":" + parity0 + ":" + bank;
+    if (pfPlans.has(key)) return pfPlans.get(key);
+    const p = q35_prefill_plan(manifest, table, { ctx, layers, nt, T: pfT, TB: pfTB, parity0, batched: pfBatched, bank, tokb: pfTok, grid: pfGrid, gu: pfGu || null, recur: pfRecur, rt: pfRt, embed: pfEmbed, nsg: pfN });
+    const res = ([name, off, words]) => typeof name === "object" ? ("head" in name ? { head: name.head } : { embed: name.embed }) : { buffer: buffers[name], offset: off * 4, size: words === null ? undefined : words * 4 };
+    let slots = 0, stride = 0;
+    const prep = p.steps.map((s) => {
+      const pe = compiled.mods[s.module]?.by(s.kind, s.name);
+      if (!pe?.pipe) throw new Error(`q35 prefill: missing entry ${s.module}:${s.kind}.${s.name}`);
+      const e = pe.man, tile = s.tile ?? 1;
+      if (s.kind === "cube" && s.count % tile) throw new Error("q35 prefill: rows not a multiple of the tile");
+      const ins = e.ins.map((i) => { if (!s.bind[i.name]) throw new Error(`q35 prefill: unbound ${s.name}.${i.name}`); return [i.binding, res(s.bind[i.name])]; });
+      const outs = [[e.out.binding, res(s.out)], ...(e.out2 ? [[e.out2.binding, res(s.out2)]] : [])];
+      if (!!e.out2 !== !!s.out2) throw new Error("q35 prefill: second output disagrees " + s.name);
+      const bytes = e.sc ? Math.max(16, (1 + e.sc.scalars.length + e.sc.lens.length + 1) * 4) : 0;
+      stride = Math.max(stride, bytes);
+      let grid = s.kind === "cube" ? [Math.min(s.count / tile, 65535), Math.ceil(s.count / tile / 65535)] : [Math.min(Math.ceil(s.count / e.lanes), 65535), Math.ceil(Math.ceil(s.count / e.lanes) / 65535)];
+      if (s.tokens) { if (grid[1] !== 1 || !(e.tokens || e.gridtok === "row" || e.gurt)) throw new Error("q35 prefill: not a token-batched entry " + s.name); grid = [grid[0], s.tokens]; }   // y = token slot
+      return { s, pe, e, ins, outs, slot: e.sc ? slots++ : -1, bytes, grid };
+    });
+    const v = { plan: p, prep, slots, stride: Math.ceil(Math.max(16, stride) / align) * align };
+    pfPlans.set(key, v); return v;
+  }
+  function pfEncode(v, toks, pos0, pre = null) {
+    const sc = new Uint8Array(v.slots * v.stride), scb = d.createBuffer({ size: Math.max(16, sc.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const chunkOf = (t) => Math.floor(toks[t] / Q35_HEAD_ROWS);
+    const val = (x) => typeof x === "number" ? x : "pos" in x ? pos0 + x.pos : "tok" in x ? toks[x.tok] : chunkOf(x.row0) * Q35_HEAD_ROWS;
+    const enc = d.createCommandEncoder();
+    pre?.(enc);
+    const pass = enc.beginComputePass();
+    for (const q of v.prep) {
+      const ent = (b, r) => ({ binding: b, resource: r.head !== undefined ? { buffer: buffers[`head${r.head}`] } : r.embed !== undefined ? { buffer: buffers[`head${chunkOf(r.embed)}`] } : { buffer: r.buffer, offset: r.offset, ...(r.size ? { size: r.size } : {}) } });
+      const entries = [...q.ins.map(([b, r]) => ent(b, r)), ...q.outs.map(([b, r]) => ent(b, r))];
+      if (q.e.sc) {
+        const words = new Uint32Array(sc.buffer, q.slot * v.stride, q.bytes / 4);
+        words[0] = q.s.count;
+        for (const x of q.e.sc.scalars) words[x.at] = val(q.s.sc[x.name]) >>> 0;
+        for (const x of q.e.sc.lens) { const r = q.ins.find(([b]) => b === q.e.ins.find((i) => i.name === x.name).binding)[1]; words[x.at] = r.head !== undefined ? buffers[`head${r.head}`].size : r.embed !== undefined ? buffers[`head${chunkOf(r.embed)}`].size : (r.size ?? r.buffer.size - r.offset); }
+        entries.push({ binding: q.e.sc.binding, resource: { buffer: scb, offset: q.slot * v.stride, size: q.bytes } });
+      }
+      pass.setPipeline(q.pe.pipe);
+      pass.setBindGroup(0, d.createBindGroup({ layout: q.pe.bgl, entries }));
+      pass.dispatchWorkgroups(...q.grid);
+    }
+    pass.end();
+    d.queue.writeBuffer(scb, 0, sc);
+    return { cmd: enc.finish(), scb };
+  }
+  // the prefill's extra modules and scratch compile with the model (not on the first prompt) when the session opens on turbo
+  if (numerics === "turbo" && options.prefill !== false) { await pfInit(); facts.prefill = { chunk: pfT, batch_width: pfTB, kv: pfKV, tokens: pfTok, batched: [...pfBatched], grid: [...pfGrid], gu: pfGu, recur: pfRecur, rt: Object.fromEntries(pfRt), embed: pfEmbed, nsg: pfN }; }
   const api = {
     facts,
     plan,
+    // BATCHPREFILL: step tokens[i] at pos0 + i for every i, without logits (no head, nothing read back). Leaves the session exactly
+    // where stepping them one by one would (state banks, nextPos); the caller steps the prompt's last token for its logits.
+    async prefill(tokens, pos0) {
+      if (closed || poisoned) throw new Error("q35 prefill is closed or invalidated; reopen after device loss/error");
+      if (busy) throw new Error("q35 step already running");
+      if (numerics !== "turbo") throw new Error("q35 prefill runs the turbo graph only");
+      if (!Array.isArray(tokens) || !tokens.length || tokens.some((x) => !Number.isInteger(x) || x < 0 || x >= 248320)) throw new Error("q35 prefill: token outside vocabulary");
+      if (pos0 !== nextPos || pos0 + tokens.length >= ctx) throw new Error(`q35 prefill expected position ${nextPos}, got ${pos0} (+${tokens.length}, capacity ${ctx})`);
+      busy = true;
+      const run = async () => {
+        const fresh = [];
+        try {
+          const start = performance.now(); let submitted = 0, dispatches = 0, encode_ms = 0;
+          await gpuErrors(d, async () => {
+            await pfInit();
+            // in place: the whole history goes to the bank the step after the prefill reads; a follow-up turn's earlier rows move there first
+            const bank = pfKV === "inplace" ? (pos0 + tokens.length) % 2 : null, from = pos0 % 2;
+            const pre = bank !== null && pos0 > 0 && bank !== from ? (enc) => { for (const L of pfPlan(Math.min(tokens.length, pfT), pos0 % 2, bank).plan.kv) for (const c of ["kc", "vc"]) enc.copyBufferToBuffer(buffers[L + c + from], 0, buffers[L + c + bank], 0, pos0 * 4096); } : null;
+            for (let i = 0; i < tokens.length; i += pfT) {
+              const toks = tokens.slice(i, i + pfT), at = performance.now();
+              const v = pfPlan(toks.length, (pos0 + i) % 2, bank), { cmd, scb } = pfEncode(v, toks, pos0 + i, i === 0 ? pre : null);
+              encode_ms += performance.now() - at;
+              fresh.push(scb); d.queue.submit([cmd]); submitted++; dispatches += v.prep.length;
+              if (closed) throw new Error("q35 prefill invalidated while running");
+            }
+            await d.queue.onSubmittedWorkDone();
+          });
+          if (closed) throw new Error("q35 prefill invalidated while running");
+          nextPos += tokens.length;
+          return { tokens: tokens.length, ms: performance.now() - start, encode_ms, submits: submitted, dispatches, chunk: pfT, batch_width: pfTB, kv: pfKV, tokb: pfTok, batched: [...pfBatched], grid: [...pfGrid], gu: pfGu, recur: pfRecur, rt: Object.fromEntries(pfRt), embed: pfEmbed };
+        } catch (error) { poisoned = true; throw error; }
+        finally { for (const b of fresh) b.destroy(); busy = false; }
+      };
+      active = run(); return active;
+    },
     async step(token_id, pos) {
       if (closed || poisoned) throw new Error("q35 step is closed or invalidated; reopen after device loss/error");
       if (busy) throw new Error("q35 step already running");

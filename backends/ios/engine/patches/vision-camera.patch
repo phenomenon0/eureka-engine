@@ -1,0 +1,97 @@
+--- a/llbv.c	2026-10-07 21:01:22
++++ b/llbv.c	2026-10-08 00:02:59
+@@ -230,3 +230,78 @@
+   *nx = (uint32_t)tw / 32, *ny = (uint32_t)th / 32;
+   return 0;
+ }
++
++// (PHONECAM) the resident tower (the camera path, llbv.h)
++static Tower llbv_res;
++static int llbv_res_on;
++static uint32_t llbv_res_d;
++
++int llbv_open(const char *mmproj, uint32_t d, char *err) {
++  if (llbv_res_on && llbv_res_d == d) return 0;
++  llbv_close();
++  if (mmproj == NULL || d == 0) {
++    snprintf(err, 256, "llbv_open wants an mmproj and the backbone width");
++    return 1;
++  }
++  Tower t = {0, NULL, NULL};
++  if (tower_load(&t, mmproj, d, err)) return 1;
++  if (tower_proj_dim(&t) != (int)d) {
++    snprintf(err, 256, "tower projection %d != d %u", tower_proj_dim(&t), d);
++    tower_free(&t);
++    return 1;
++  }
++  llbv_res = t, llbv_res_on = 1, llbv_res_d = d;
++  return 0;
++}
++
++void llbv_close(void) {
++  if (llbv_res_on) tower_free(&llbv_res);
++  llbv_res = (Tower){0, NULL, NULL}, llbv_res_on = 0, llbv_res_d = 0;
++}
++
++int llbv_is_open(void) { return llbv_res_on; }
++
++int llbv_prepare_rgb(const uint8_t *rgb, int w, int h, uint32_t d, uint32_t *n, uint32_t *nx, uint32_t *ny, double *ms,
++                     char *err) {
++  llbv_forget();
++  if (rgb == NULL || w < 1 || h < 1 || d == 0) {
++    snprintf(err, 256, "llbv_prepare_rgb wants RGB bytes, a size and the backbone width");
++    return 1;
++  }
++  if (!llbv_res_on || llbv_res_d != d) {
++    snprintf(err, 256, "llbv_prepare_rgb: no resident tower for width %u (llbv_open)", d);
++    return 1;
++  }
++  double t0 = llbv_ms();
++  VPreCfg pc;
++  vpre_cfg_default(&pc);
++  VImg src = {w, h, (uint8_t *)rgb}, rs;
++  int px = 0, py = 0;
++  vpre_target(&pc, w, h, &px, &py);
++  if (vpre_resize(&src, px, py, &rs, err)) return 1;
++  float *planar = malloc(sizeof(float) * 3 * (size_t)px * py);
++  if (planar == NULL) {
++    vpre_free(&rs);
++    snprintf(err, 256, "out of memory (planar)");
++    return 1;
++  }
++  vpre_normalize(&pc, &rs, planar);
++  vpre_free(&rs);
++  double t1 = llbv_ms();
++  int nt = tower_tokens(&llbv_res, px, py);
++  float *r = malloc((size_t)nt * d * sizeof *r);
++  VitOpt o = {1, 1, NULL, NULL, NULL};
++  if (r == NULL || tower_encode(&llbv_res, planar, px, py, &o, r, err)) {
++    free(r), free(planar);
++    return 1;
++  }
++  double t2 = llbv_ms();
++  free(planar);
++  llbv_held = r, llbv_held_d = d, llbv_held_n = (uint32_t)nt, llbv_held_nx = (uint32_t)px / 32,
++  llbv_held_ny = (uint32_t)py / 32;
++  if (n != NULL) *n = llbv_held_n;
++  if (nx != NULL) *nx = llbv_held_nx;
++  if (ny != NULL) *ny = llbv_held_ny;
++  if (ms != NULL) ms[0] = t1 - t0, ms[1] = t2 - t1, ms[2] = vitm_gpu_ms(llbv_res.m);
++  return 0;
++}
+--- a/llbv.h	2026-10-07 21:01:35
++++ b/llbv.h	2026-10-08 00:02:59
+@@ -14,3 +14,13 @@
+ void llbv_forget(void);
+ // the merged grid an image will produce (vpre's target size / 32), without the tower: the prompt carries nx * ny pads
+ int llbv_grid(const char *image, uint32_t *nx, uint32_t *ny, char *err);
++// (PHONECAM) the camera path: the tower stays loaded (weights + pipelines resident) between frames, and a frame comes
++// in memory. llbv_open loads it once for backbone width d (0 ok, else err set); llbv_close frees it. llbv_prepare_rgb:
++// RGB bytes (w x h, row stride w*3) -> vpre's target/resize/normalize (the same functions vpre_image runs after its
++// decode) -> the tower (the resident one if open, else loaded and freed as llbv_prepare) -> rows held for the next run,
++// as llbv_prepare. ms (may be NULL): [0] preprocess, [1] encode (host wall), [2] the tower's GPU time
++int llbv_open(const char *mmproj, uint32_t d, char *err);
++void llbv_close(void);
++int llbv_is_open(void);
++int llbv_prepare_rgb(const uint8_t *rgb, int w, int h, uint32_t d, uint32_t *n, uint32_t *nx, uint32_t *ny, double *ms,
++                     char *err);

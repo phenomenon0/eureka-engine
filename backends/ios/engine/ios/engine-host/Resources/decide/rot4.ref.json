@@ -1,0 +1,1 @@
+{"model": "models/Kev-4B-Q4_K_M.gguf", "answers": {"destination": {"type": "choice", "choice": "Amsterdam", "probabilities": {"Seville": 0.054365284051764995, "Lisbon": 0.2710131159949708, "Edinburgh": 0.08341626692128408, "Amsterdam": 0.5470265831318625, "Reykjavik": 0.044178749900117595}, "confidence": 0.43378322891482807}}, "usage": {"input_tokens": 149, "output_tokens": 0}}

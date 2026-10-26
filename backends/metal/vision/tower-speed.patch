@@ -1,0 +1,542 @@
+diff --git a/vision/host/llbv.c b/vision/host/llbv.c
+index c2ef9bf..93ad6f7 100644
+--- a/vision/host/llbv.c
++++ b/vision/host/llbv.c
+@@ -75,9 +75,27 @@ int llbv_requested(void) {
+   return getenv("LLB_VIS_IMAGE") != NULL || getenv("LLB_VIS_EMBD") != NULL;
+ }
+ 
++// (TOWER-SPEED, V7-PLAN G-E) LLB_VIS_MAXTOK=<n>: the serve-mode cap on tokens per image. An image (or LLB_VIS_EMBD rows)
++// over it is refused before the tower encodes, with the count and the cap in the reason. Unset = no cap (today's build)
++static int vis_cap(long *cap, char *err) {
++  const char *s = getenv("LLB_VIS_MAXTOK");
++  char *e = NULL;
++  *cap = 0;
++  if (s == NULL) return 0;
++  const long v = strtol(s, &e, 10);
++  if (*s == 0 || *e != 0 || v < 1) {
++    snprintf(err, 256, "LLB_VIS_MAXTOK=%s: want a token count >= 1", s);
++    return 1;
++  }
++  *cap = v;
++  return 0;
++}
++
+ int llbv_rows(uint32_t d, float **rows, uint32_t *n, uint32_t *nx, uint32_t *ny, char *err) {
+   const char *img = getenv("LLB_VIS_IMAGE"), *mm = getenv("LLB_VIS_MMPROJ"), *ef = getenv("LLB_VIS_EMBD");
+   *rows = NULL, *n = *nx = *ny = 0;
++  long cap = 0;
++  if (vis_cap(&cap, err)) return 1;
+   if (img != NULL && ef != NULL) {
+     snprintf(err, 256, "LLB_VIS_IMAGE and LLB_VIS_EMBD are exclusive");
+     return 1;
+@@ -95,6 +113,10 @@ int llbv_rows(uint32_t d, float **rows, uint32_t *n, uint32_t *nx, uint32_t *ny,
+     }
+     memcpy(path, ef, (size_t)(c1 - ef));
+     path[c1 - ef] = 0;
++    if (cap && (long)ax * ay > cap) {
++      snprintf(err, 256, "LLB_VIS_EMBD %s: %u tokens > LLB_VIS_MAXTOK %ld (the serve cap): refused", path, ax * ay, cap);
++      return 1;
++    }
+     size_t want = (size_t)ax * ay * d;
+     float *r = malloc(want * sizeof *r);
+     FILE *f = fopen(path, "rb");
+@@ -133,6 +155,11 @@ int llbv_rows(uint32_t d, float **rows, uint32_t *n, uint32_t *nx, uint32_t *ny,
+     }
+     double t2 = llbv_ms();
+     int nt = tower_tokens(&t, px, py);
++    if (cap && nt > cap) {
++      snprintf(err, 256, "image %s: %d tokens > LLB_VIS_MAXTOK %ld (the serve cap): refused before the tower", img, nt, cap);
++      free(planar), tower_free(&t);
++      return 1;
++    }
+     float *r = malloc((size_t)nt * d * sizeof *r);
+     if (r == NULL || tower_proj_dim(&t) != (int)d || tower_encode(&t, planar, px, py, &o, r, err)) {
+       if (r != NULL && tower_proj_dim(&t) != (int)d) snprintf(err, 256, "tower projection %d != d %u", tower_proj_dim(&t), d);
+diff --git a/vision/host/vitm.m b/vision/host/vitm.m
+index 25ac23b..8959f3c 100644
+--- a/vision/host/vitm.m
++++ b/vision/host/vitm.m
+@@ -33,11 +33,13 @@ @interface VitmCtx : NSObject {
+   id<MTLBuffer> wb;  // all weights, 256-aligned offsets
+   size_t o_pe0, o_pe1, o_peb, o_postw, o_postb, o_mm0w, o_mm0b, o_mm2w, o_mm2b, *o_l;  // o_l[il * T_NL + t]
+   float *pos;        // v.position_embd [G*G][E] (F32 in the file), host side
++  id<MTLComputePipelineState> p_fa2[3], p_fa3, p_mm32kl;  // (TOWER-SPEED) vt_fa2_q1/q2/q4
+   id<MTLComputePipelineState> p_mm32, p_mm16, p_fa, p_ln, p_rope, p_gelu, p_add, p_embed, p_i2c;
+   size_t ncap, pixcap;  // activation capacity (patches), planar capacity (pixels)
+   id<MTLBuffer> b_planar, b_rows, b_x, b_cur, b_ao, b_qr, b_qkv, b_up, b_kh, b_vh, b_kd, b_pos, b_ppos, b_embd;
+   int pos_px, pos_py;  // the image size b_pos / b_ppos were built for
+-  double gpu_ms;
++  double gpu_ms, last_ms;
++  double prof_ms[16];  // (TOWER-SPEED) VITM_PROF=1: GPU ms per kernel class (one command buffer per dispatch)
+ }
+ @end
+ @implementation VitmCtx
+@@ -153,6 +155,10 @@ size_t vitm_act_bytes(const VitmW *w) {
+         !(c->p_add = vt_pipe(c->dev, lib, "vt_add", err)) || !(c->p_embed = vt_pipe(c->dev, lib, "vt_embed", err)) ||
+         !(c->p_i2c = vt_pipe(c->dev, lib, "vt_im2col", err)))
+       return NULL;
++    if (!(c->p_fa2[0] = vt_pipe(c->dev, lib, "vt_fa2_q1", err)) || !(c->p_fa2[1] = vt_pipe(c->dev, lib, "vt_fa2_q2", err)) ||
++        !(c->p_fa2[2] = vt_pipe(c->dev, lib, "vt_fa2_q4", err)) || !(c->p_fa3 = vt_pipe(c->dev, lib, "vt_fa3", err)) ||
++        !(c->p_mm32kl = vt_pipe(c->dev, lib, "vt_mm_f32_kl", err)))
++      return NULL;
+     if (c->p_ln.maxTotalThreadsPerThreadgroup < (NSUInteger)c->E / 4 || c->p_mm32.maxTotalThreadsPerThreadgroup < 128 ||
+         c->p_fa.maxTotalThreadsPerThreadgroup < 128) {
+       snprintf(err, 256, "vitm: threadgroup limits too small (ln %lu, mm %lu, fa %lu)", (unsigned long)c->p_ln.maxTotalThreadsPerThreadgroup,
+@@ -230,8 +236,12 @@ static int ensure(VitmCtx *c, size_t N, size_t pix, char *err) {
+ 
+ static void d_mm(VitmCtx *c, id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p, size_t woff, id<MTLBuffer> B,
+                  id<MTLBuffer> Dst, size_t boff, int k, int o, int n, int flags) {
++  // (TOWER-SPEED, adopted) an F32-activation GEMM with k % 32 != 0 (ffn_down) runs the vt_mm_f32_kl twin (bitwise =
++  // vt_mm_f32). VITM_MMLAST=0 = vt_mm_f32 everywhere (the pre-adoption build, the control)
++  static int mmlast = -1;
++  if (mmlast < 0) mmlast = !(getenv("VITM_MMLAST") != NULL && strcmp(getenv("VITM_MMLAST"), "0") == 0);
+   const VtMmArgs a = {k, o, n, k, o, flags};
+-  [enc setComputePipelineState:p];
++  [enc setComputePipelineState:mmlast && k % 32 && p == c->p_mm32 ? c->p_mm32kl : p];
+   [enc setBytes:&a length:sizeof a atIndex:0];
+   [enc setBuffer:c->wb offset:woff atIndex:1];
+   [enc setBuffer:B offset:0 atIndex:2];
+@@ -293,6 +303,29 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+     const size_t N = (size_t)px * py, T = N / 4, npad = (N + 63) / 64 * 64, K = 3 * (size_t)P * P;
+     if (ensure(c, N, (size_t)nx * ny, err)) return -1;
+     const int unfused_all = getenv("VITM_UNFUSED") != NULL;  // test hook: the fused epilogues vs separate kernels
++    // (TOWER-SPEED) VITM_FA2=<qt>,<nsg>: attention through vt_fa2 (qt 1/2/4 query tiles of 8 per simdgroup, nsg
++    // simdgroups per threadgroup). Unset = vt_fa (today's build)
++    int fa2_qt = 0, fa2_ns = 0, fa2_k = -1;
++    if (getenv("VITM_FA2")) {
++      if (sscanf(getenv("VITM_FA2"), "%d,%d", &fa2_qt, &fa2_ns) != 2 || (fa2_k = fa2_qt == 1 ? 0 : fa2_qt == 2 ? 1 : fa2_qt == 4 ? 2 : -1) < 0 ||
++          fa2_ns < 1 || (NSUInteger)(32 * fa2_ns) > c->p_fa2[fa2_k].maxTotalThreadsPerThreadgroup || fa2_ns * 8 * fa2_qt * 544 > 32768) {
++        snprintf(err, 256, "vitm: VITM_FA2=%s: want <qt 1|2|4>,<nsg> within the threadgroup limits", getenv("VITM_FA2"));
++        return -1;
++      }
++    }
++    // (TOWER-SPEED, adopted) attention through vt_fa3 (vt_fa2 qt 1 with O in registers; bitwise = vt_fa) with 2
++    // simdgroups per threadgroup, by default at N >= 512 patches; below that the vt_fa path is untouched.
++    // VITM_FA3=0 = vt_fa at every N (the pre-adoption build, the control); VITM_FA3=<nsg> = vt_fa3 at every N.
++    // VITM_FA2 (the dev variants) turns the default off
++    int fa3_ns = N >= 512 && fa2_k < 0 ? 2 : 0;
++    if (getenv("VITM_FA3")) {
++      char *e3 = NULL;
++      fa3_ns = (int)strtol(getenv("VITM_FA3"), &e3, 10);
++      if (*getenv("VITM_FA3") == 0 || *e3 != 0 || fa3_ns < 0 || (NSUInteger)(32 * fa3_ns) > c->p_fa3.maxTotalThreadsPerThreadgroup || fa3_ns * 2048 > 32768) {
++        snprintf(err, 256, "vitm: VITM_FA3=%s: want <nsg> within the threadgroup limits", getenv("VITM_FA3"));
++        return -1;
++      }
++    }
+     memcpy(c->b_planar.contents, planar, sizeof(float) * 3 * (size_t)nx * ny);
+     // the position rows (merge order) and the rope positions: once per image size
+     if (c->pos_px != px || c->pos_py != py) {
+@@ -331,7 +364,8 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+         failed = 1;
+         return -1;
+       }
+-      c->gpu_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
++      c->last_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
++      c->gpu_ms += c->last_ms;
+       cb = [c->q commandBuffer];
+       enc = [cb computeCommandEncoder];
+       return 0;
+@@ -345,6 +379,14 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+     }                                                                                                  \
+   } while (0)
+ #define LDUMP(base, il, buf, ne0, rows) do { snprintf(nm, sizeof nm, "%s-%d", base, il); DUMP(nm, buf, ne0, rows); } while (0)
++    // (TOWER-SPEED) VITM_PROF=1: every dispatch in its own command buffer, its GPU time added to its class (timing only;
++    // the numerics are the same kernels on the same buffers). Unset = today's single command buffer.
++    enum { P_I2C, P_MMPE, P_ELT, P_LN, P_QKV, P_ROPE, P_FA, P_MMO, P_UP, P_DOWN, P_MRG0, P_MRG2, P_NP };
++    static const char *const pname[P_NP] = {"im2col", "mm_patch", "elementwise", "ln", "mm_qkv", "rope", "fa", "mm_o",
++                                            "mm_up", "mm_down", "mm_merge0", "mm_merge2"};
++    const int prof = getenv("VITM_PROF") != NULL;
++    memset(c->prof_ms, 0, sizeof c->prof_ms);
++#define PROF(k) do { if (prof) { if (flush()) return -1; c->prof_ms[k] += c->last_ms; } } while (0)
+ 
+     // patch embed: im2col (F16, merge order) -> conv(W0), conv(W1) -> sum + bias -> + pos
+     {
+@@ -354,8 +396,11 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+       [enc setBuffer:c->b_planar offset:0 atIndex:1];
+       [enc setBuffer:c->b_rows offset:0 atIndex:2];
+       d_elt(enc, N * K);
++      PROF(P_I2C);
+       d_mm(c, enc, c->p_mm16, c->o_pe0, c->b_rows, c->b_cur, 0, (int)K, E, (int)N, 0);
++      PROF(P_MMPE);
+       d_mm(c, enc, c->p_mm16, c->o_pe1, c->b_rows, c->b_ao, 0, (int)K, E, (int)N, 0);
++      PROF(P_MMPE);
+       const uint32_t ne[2] = {(uint32_t)(N * E / 4), (uint32_t)(E / 4)};
+       [enc setComputePipelineState:c->p_embed];
+       [enc setBuffer:c->b_x offset:0 atIndex:0];
+@@ -364,8 +409,10 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+       [enc setBuffer:c->wb offset:c->o_peb atIndex:3];
+       [enc setBytes:ne length:sizeof ne atIndex:4];
+       d_elt(enc, ne[0]);
++      PROF(P_ELT);
+       DUMP("patch_bias", c->b_x, E, N);
+       d_add(c, enc, c->b_x, c->b_pos, N * E);
++      PROF(P_ELT);
+       DUMP("inp_pos_emb", c->b_x, E, N);
+     }
+ 
+@@ -379,8 +426,10 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+       const int kdbg = wants(o, nm);
+ 
+       d_ln(c, enc, c->b_x, lo[T_LN1W], lo[T_LN1B], c->b_cur, (int)N);
++      PROF(P_LN);
+       LDUMP("ln1", il, c->b_cur, E, N);
+       d_mm(c, enc, c->p_mm32, lo[T_QKVW], c->b_cur, c->b_qkv, lo[T_QKVB], E, 3 * E, (int)N, MM_BIAS);
++      PROF(P_QKV);
+       {
+         const VtRopeArgs a = {(int)N, E, H, (int)npad, kdbg};
+         [enc setComputePipelineState:c->p_rope];
+@@ -393,29 +442,45 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+         [enc setBuffer:c->b_kd offset:0 atIndex:6];
+         d_elt(enc, N * H * 36);
+       }
++      PROF(P_ROPE);
+       LDUMP("Qcur_rope", il, c->b_qr, E, N);
+       LDUMP("Kcur_rope", il, c->b_kd, E, N);
+       {
+         const VtFaArgs a = {(int)N, (int)npad, E, E, scale};
+-        [enc setComputePipelineState:c->p_fa];
++        [enc setComputePipelineState:fa3_ns ? c->p_fa3 : fa2_k < 0 ? c->p_fa : c->p_fa2[fa2_k]];
+         [enc setBytes:&a length:sizeof a atIndex:0];
+         [enc setBuffer:c->b_qr offset:0 atIndex:1];
+         [enc setBuffer:c->b_kh offset:0 atIndex:2];
+         [enc setBuffer:c->b_vh offset:0 atIndex:3];
+         [enc setBuffer:c->b_ao offset:0 atIndex:4];
+-        [enc setThreadgroupMemoryLength:8 * (72 + 2 * 128 + 4 * 64) * 2 atIndex:0];
+-        [enc dispatchThreadgroups:MTLSizeMake((N + 7) / 8, (NSUInteger)H, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
++        if (fa3_ns) {
++          const NSUInteger rows = (NSUInteger)8 * fa3_ns;
++          [enc setThreadgroupMemoryLength:(NSUInteger)fa3_ns * 2048 atIndex:0];
++          [enc dispatchThreadgroups:MTLSizeMake((N + rows - 1) / rows, (NSUInteger)H, 1) threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)fa3_ns, 1)];
++        } else if (fa2_k < 0) {
++          [enc setThreadgroupMemoryLength:8 * (72 + 2 * 128 + 4 * 64) * 2 atIndex:0];
++          [enc dispatchThreadgroups:MTLSizeMake((N + 7) / 8, (NSUInteger)H, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
++        } else {
++          const NSUInteger rows = (NSUInteger)8 * fa2_qt * fa2_ns;
++          [enc setThreadgroupMemoryLength:(NSUInteger)fa2_ns * 8 * fa2_qt * 544 atIndex:0];
++          [enc dispatchThreadgroups:MTLSizeMake((N + rows - 1) / rows, (NSUInteger)H, 1) threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)fa2_ns, 1)];
++        }
+       }
++      PROF(P_FA);
+       LDUMP("kqv_out", il, c->b_ao, E, N);
+       if (unf) {
+         d_mm(c, enc, c->p_mm32, lo[T_OW], c->b_ao, c->b_cur, lo[T_OB], E, E, (int)N, MM_BIAS);
++        PROF(P_MMO);
+         LDUMP("attn_out", il, c->b_cur, E, N);
+         d_add(c, enc, c->b_x, c->b_cur, N * E);
++        PROF(P_ELT);
+       } else {
+         d_mm(c, enc, c->p_mm32, lo[T_OW], c->b_ao, c->b_x, lo[T_OB], E, E, (int)N, MM_BIAS | MM_RES);
++        PROF(P_MMO);
+       }
+       LDUMP("ffn_inp", il, c->b_x, E, N);
+       d_ln(c, enc, c->b_x, lo[T_LN2W], lo[T_LN2B], c->b_cur, (int)N);
++      PROF(P_LN);
+       LDUMP("ffn_inp_normed", il, c->b_cur, E, N);
+       if (unf) {
+         d_mm(c, enc, c->p_mm32, lo[T_UPW], c->b_cur, c->b_up, lo[T_UPB], E, F, (int)N, MM_BIAS);
+@@ -427,11 +492,14 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+         d_add(c, enc, c->b_x, c->b_cur, N * E);
+       } else {
+         d_mm(c, enc, c->p_mm32, lo[T_UPW], c->b_cur, c->b_up, lo[T_UPB], E, F, (int)N, MM_BIAS | MM_GELU);
++        PROF(P_UP);
+         d_mm(c, enc, c->p_mm32, lo[T_DOWNW], c->b_up, c->b_x, lo[T_DOWNB], F, E, (int)N, MM_BIAS | MM_RES);
++        PROF(P_DOWN);
+       }
+       LDUMP("layer_out", il, c->b_x, E, N);
+     }
+     d_ln(c, enc, c->b_x, c->o_postw, c->o_postb, c->b_cur, (int)N);
++    PROF(P_LN);
+     LDUMP("norm_b", c->L, c->b_cur, E, N);
+     // merger: 4 consecutive (merge-ordered) patches = one 4E row -> mm.0 + b -> GELU -> mm.2 + b
+     if (unfused_all || wants(o, "ffn_up_b") || wants(o, "ffn_gelu")) {
+@@ -441,12 +509,21 @@ int vitm_encode(VitmW *w, const float *planar, int nx, int ny, const VitOpt *o,
+       DUMP("ffn_gelu", c->b_up, 4 * E, T);
+     } else {
+       d_mm(c, enc, c->p_mm32, c->o_mm0w, c->b_cur, c->b_up, c->o_mm0b, 4 * E, 4 * E, (int)T, MM_BIAS | MM_GELU);
++      PROF(P_MRG0);
+     }
+     d_mm(c, enc, c->p_mm32, c->o_mm2w, c->b_up, c->b_embd, c->o_mm2b, 4 * E, PD, (int)T, MM_BIAS);
++    PROF(P_MRG2);
+     if (flush() || failed) return -1;
+     [enc endEncoding];  // the empty buffer flush() opened, never committed
+     memcpy(embd, c->b_embd.contents, sizeof(float) * T * PD);
+     if (wants(o, "embd")) o->dump(o->dump_ud, "embd", embd, PD, (int)T);
++    if (prof) {
++      double s = 0;
++      fprintf(stderr, "VITMPROF N %zu T %zu", N, T);
++      for (int k = 0; k < P_NP; k++) fprintf(stderr, " %s=%.3f", pname[k], c->prof_ms[k]), s += c->prof_ms[k];
++      fprintf(stderr, " sum=%.3f\n", s);
++    }
++#undef PROF
+ #undef DUMP
+ #undef LDUMP
+     return 0;
+diff --git a/vision/host/vitm.metal b/vision/host/vitm.metal
+index 39070f2..1ce499b 100644
+--- a/vision/host/vitm.metal
++++ b/vision/host/vitm.metal
+@@ -25,7 +25,9 @@ static inline float vt_gelu1(float x) {
+ // ---------------------------------------------------------------- GEMM: D[n][o] (=|+=) epi(B[n][k] . A[o][k]^T)
+ struct VtMmArgs { int k, o, n, ldb, ldd, flags; };  // flags: 1 = + bias[o], 2 = GELU, 4 = + D (residual)
+ 
+-template <typename T1, typename T1_2x4>
++// (TOWER-SPEED) KL: the twin for k % 32 != 0 (ffn_down, k 4304) that bounds-checks only the last k block; the full
++// blocks load the same values unchecked. KL = false is the original kernel
++template <typename T1, typename T1_2x4, bool KL>
+ kernel void vt_mm(constant VtMmArgs & a [[buffer(0)]],
+                   device const half * A [[buffer(1)]],
+                   device const T1 * B [[buffer(2)]],
+@@ -45,7 +47,7 @@ kernel void vt_mm(constant VtMmArgs & a [[buffer(0)]],
+   const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+   const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+   const short il0 = tiitg % NL0;
+-  const bool bc = (a.k % NK) != 0;
++  const bool bc0 = (a.k % NK) != 0;
+   device const half * x = A + (ulong)(r0 + lr0)*a.k + 16*il0;
+   const short iy = 8*(tiitg % NL1);
+   device const T1 * y = B + (ulong)(r1 + lr1)*a.ldb + iy;
+@@ -56,6 +58,7 @@ kernel void vt_mm(constant VtMmArgs & a [[buffer(0)]],
+   for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+ 
+   for (int loop_k = 0; loop_k < a.k; loop_k += NK) {
++    const bool bc = KL ? bc0 && loop_k + NK > a.k : bc0;
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+     // A: 16 halves of weight row lr0 (k 16*il0..), stored as transposed 8x8 blocks
+     for (short i = 0; i < 16; i++) {
+@@ -71,6 +74,9 @@ kernel void vt_mm(constant VtMmArgs & a [[buffer(0)]],
+         for (short i = 0; i < 8; i++) *(sb + 64*ib + 8*ly + i) = loop_k + iy + i < a.k ? (half)y[i] : (half)0;
+       } else {
+         *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = (half2x4)(*((device const T1_2x4 *)y));
++#ifdef VT_SAB2
++        if (KL && bc0 && tiitg == 0 && loop_k == 0) sb[64*ib + 8*ly] = as_type<half>((ushort)(as_type<ushort>(sb[64*ib + 8*ly]) ^ 1));  // sabotage: the unchecked full block of a k % 32 != 0 GEMM
++#endif
+       }
+     }
+     x += NK;
+@@ -109,8 +115,9 @@ kernel void vt_mm(constant VtMmArgs & a [[buffer(0)]],
+   }
+ }
+ 
+-template [[host_name("vt_mm_f32")]] kernel decltype(vt_mm<float, float2x4>) vt_mm<float, float2x4>;
+-template [[host_name("vt_mm_f16")]] kernel decltype(vt_mm<half, half2x4>) vt_mm<half, half2x4>;
++template [[host_name("vt_mm_f32")]] kernel decltype(vt_mm<float, float2x4, false>) vt_mm<float, float2x4, false>;
++template [[host_name("vt_mm_f16")]] kernel decltype(vt_mm<half, half2x4, false>) vt_mm<half, half2x4, false>;
++template [[host_name("vt_mm_f32_kl")]] kernel decltype(vt_mm<float, float2x4, true>) vt_mm<float, float2x4, true>;
+ 
+ // ---------------------------------------------------------------- bidirectional attention (flash, one head per tg.y)
+ struct VtFaArgs { int n, npad, ldq, ldo; float scale; };
+@@ -236,6 +243,213 @@ kernel void vt_fa(constant VtFaArgs & a [[buffer(0)]],
+   }
+ }
+ 
++// ---------------------------------------------------------------- (TOWER-SPEED) vt_fa2: a twin of vt_fa, opt-in VITM_FA2
++// The same per-row arithmetic as vt_fa, op for op (Q/K/V half, the 8x8 QK MMAs over the 9 DK chunks in order, the F32
++// online softmax with 2 keys per lane, O += P V over the 8 key chunks in key order, O rescaled in threadgroup memory),
++// but each simdgroup owns R = 8*QT whole query rows end to end (no threadgroup barriers), and P V computes only the 72
++// real output columns (vt_fa, as ggml, computes 128 = PV and drops 56). Threadgroup memory per simdgroup: O [R][72] F32,
++// S [R][64] F32 = R*544 bytes (the Q staging, [R][72] half, aliases S: Q lives in registers before S is written).
++template <short QT>
++kernel void vt_fa2(constant VtFaArgs & a [[buffer(0)]],
++                   device const float * q [[buffer(1)]],
++                   device const half * k [[buffer(2)]],
++                   device const half * v [[buffer(3)]],
++                   device float * dst [[buffer(4)]],
++                   threadgroup char * shmem [[threadgroup(0)]],
++                   uint3 tgpig [[threadgroup_position_in_grid]],
++                   ushort tiisg [[thread_index_in_simdgroup]],
++                   ushort sgitg [[simdgroup_index_in_threadgroup]],
++                   ushort nsg [[simdgroups_per_threadgroup]]) {
++  constexpr short DK = 72, DV = 72, C = 64, NW = 32, DK4 = DK/4, DK8 = DK/8, DV4 = DV/4, DV8 = DV/8, R = 8*QT;
++  const int h = tgpig.y;
++  const int iq1 = ((int)tgpig.x*nsg + sgitg)*R;
++  threadgroup float  * so  = (threadgroup float *)(shmem + (int)sgitg*R*544);
++  threadgroup float4 * so4 = (threadgroup float4 *)so;
++  threadgroup float  * ss  = so + R*DV;
++  threadgroup float2 * ss2 = (threadgroup float2 *)ss;
++  threadgroup half   * sq  = (threadgroup half *)ss;
++  threadgroup half4  * sq4 = (threadgroup half4 *)sq;
++
++  for (short j = 0; j < R; ++j) {
++    device const float4 * q4 = (device const float4 *)(q + (ulong)(iq1 + j)*a.ldq + h*DK);
++    for (short i = tiisg; i < DK4; i += NW) sq4[j*DK4 + i] = (iq1 + j < a.n) ? (half4)q4[i] : (half4)0;
++    for (short i = tiisg; i < DV4; i += NW) so4[j*DV4 + i] = 0;
++  }
++  simdgroup_barrier(mem_flags::mem_threadgroup);
++  simdgroup_half8x8 mq[QT][DK8];
++  for (short t = 0; t < QT; ++t)
++    for (short i = 0; i < DK8; ++i) simdgroup_load(mq[t][i], sq + t*8*DK + 8*i, DK);
++  simdgroup_barrier(mem_flags::mem_threadgroup);  // Q is in registers; S may now overwrite the staging
++
++  float S[R], M[R];
++  for (short j = 0; j < R; ++j) S[j] = 0.0f, M[j] = -FLT_MAX/2;
++  device const half * kh = k + (ulong)h*a.npad*DK;
++  device const half * vh = v + (ulong)h*a.npad*DV;
++
++  for (int ic = 0; ic < a.n; ic += C) {
++    // S = Q K^T: key tile cc = keys ic+8cc..
++    for (short cc = 0; cc < C/8; ++cc) {
++      device const half * pk = kh + (ulong)(ic + 8*cc)*DK;
++      simdgroup_float8x8 mqk[QT];
++      for (short t = 0; t < QT; ++t) mqk[t] = make_filled_simdgroup_matrix<float, 8>(0.0f);
++      for (short i = 0; i < DK8; ++i) {
++        simdgroup_half8x8 mk;
++        simdgroup_load(mk, pk + 8*i, DK, 0, true);
++        for (short t = 0; t < QT; ++t) simdgroup_multiply_accumulate(mqk[t], mq[t][i], mk, mqk[t]);
++      }
++      for (short t = 0; t < QT; ++t) simdgroup_store(mqk[t], ss + t*8*C + 8*cc, C, 0, false);
++    }
++    simdgroup_barrier(mem_flags::mem_threadgroup);
++
++    // online softmax, F32, 2 keys per lane (vt_fa's expressions)
++    for (short j = 0; j < R; ++j) {
++      const float m = M[j];
++      float2 s2 = ss2[j*C/2 + tiisg]*a.scale;
++      if (ic + C > a.n) {
++        const int c0 = ic + 2*tiisg;
++        s2 += float2(c0 < a.n ? 0.0f : -VT_MAXHALF, c0 + 1 < a.n ? 0.0f : -VT_MAXHALF);
++      }
++      M[j] = simd_max(max(M[j], max(s2[0], s2[1])));
++      const float  ms  = exp(m  - M[j]);
++      const float2 vs2 = exp(s2 - M[j]);
++      S[j] = S[j]*ms + simd_sum(vs2[0] + vs2[1]);
++      ss2[j*C/2 + tiisg] = vs2;
++      for (short i = tiisg; i < DV4; i += NW) so4[j*DV4 + i] *= ms;
++    }
++    simdgroup_barrier(mem_flags::mem_threadgroup);
++
++    // O += P V over the 72 real columns; per output tile the 8 key chunks in key order (= vt_fa's order)
++    {
++      simdgroup_float8x8 vs[QT][C/8];
++      for (short t = 0; t < QT; ++t)
++        for (short cc = 0; cc < C/8; ++cc) simdgroup_load(vs[t][cc], ss + t*8*C + 8*cc, C, 0, false);
++      for (short t2 = 0; t2 < DV8; ++t2) {
++        simdgroup_float8x8 lo[QT];
++        for (short t = 0; t < QT; ++t) simdgroup_load(lo[t], so + t*8*DV + 8*t2, DV, 0, false);
++        device const half * pv = vh + (ulong)ic*DV + 8*t2;
++        for (short cc = 0; cc < C/8; ++cc) {
++          simdgroup_half8x8 mv;
++          simdgroup_load(mv, pv + cc*8*DV, DV, 0, false);
++          for (short t = 0; t < QT; ++t) simdgroup_multiply_accumulate(lo[t], vs[t][cc], mv, lo[t]);
++        }
++        for (short t = 0; t < QT; ++t) simdgroup_store(lo[t], so + t*8*DV + 8*t2, DV, 0, false);
++      }
++    }
++    simdgroup_barrier(mem_flags::mem_threadgroup);
++  }
++
++  for (short j = 0; j < R; ++j) {
++    if (iq1 + j >= a.n) break;
++    device float4 * dst4 = (device float4 *)(dst + (ulong)(iq1 + j)*a.ldo + h*DV);
++    const float scale = S[j] == 0.0 ? 0.0f : 1.0f/S[j];
++    for (short i = tiisg; i < DV4; i += NW) dst4[i] = (float4)so4[j*DV4 + i]*scale;
++#ifdef VT_SAB
++    if (j == 0 && tiisg == 0) dst4[0].x = as_type<float>(as_type<uint>(dst4[0].x) ^ 1u);  // sabotage: one ulp
++#endif
++  }
++}
++
++template [[host_name("vt_fa2_q1")]] kernel decltype(vt_fa2<1>) vt_fa2<1>;
++template [[host_name("vt_fa2_q2")]] kernel decltype(vt_fa2<2>) vt_fa2<2>;
++template [[host_name("vt_fa2_q4")]] kernel decltype(vt_fa2<4>) vt_fa2<4>;
++
++// (TOWER-SPEED) vt_fa3, opt-in VITM_FA3=<nsg>: vt_fa2 (QT 1) with O kept in registers (9 F32 8x8 tiles) instead of
++// threadgroup memory. The row rescale O *= ms and the final O * (1/S) are the same single F32 multiplies, applied to each
++// lane's 2 elements via thread_elements() as a float2, as MLX does (lane -> (row, col) of an 8x8 tile as MLX's BaseMMAFrag). Threadgroup memory
++// per simdgroup: S [8][64] F32 = 2048 bytes (Q's staging aliases it).
++kernel void vt_fa3(constant VtFaArgs & a [[buffer(0)]],
++                   device const float * q [[buffer(1)]],
++                   device const half * k [[buffer(2)]],
++                   device const half * v [[buffer(3)]],
++                   device float * dst [[buffer(4)]],
++                   threadgroup char * shmem [[threadgroup(0)]],
++                   uint3 tgpig [[threadgroup_position_in_grid]],
++                   ushort tiisg [[thread_index_in_simdgroup]],
++                   ushort sgitg [[simdgroup_index_in_threadgroup]],
++                   ushort nsg [[simdgroups_per_threadgroup]]) {
++  constexpr short DK = 72, DV = 72, C = 64, NW = 32, DK4 = DK/4, DK8 = DK/8, DV8 = DV/8, R = 8;
++  const int h = tgpig.y;
++  const int iq1 = ((int)tgpig.x*nsg + sgitg)*R;
++  threadgroup float  * ss  = (threadgroup float *)(shmem + (int)sgitg*R*C*4);
++  threadgroup float2 * ss2 = (threadgroup float2 *)ss;
++  threadgroup half4  * sq4 = (threadgroup half4 *)ss;
++  const short qid = tiisg/4, fm = (qid & 4) + ((tiisg/2) % 4), fn = (qid & 2)*2 + (tiisg % 2)*2;  // this lane's (row, col)
++
++  for (short j = 0; j < R; ++j) {
++    device const float4 * q4 = (device const float4 *)(q + (ulong)(iq1 + j)*a.ldq + h*DK);
++    for (short i = tiisg; i < DK4; i += NW) sq4[j*DK4 + i] = (iq1 + j < a.n) ? (half4)q4[i] : (half4)0;
++  }
++  simdgroup_barrier(mem_flags::mem_threadgroup);
++  simdgroup_half8x8 mq[DK8];
++  for (short i = 0; i < DK8; ++i) simdgroup_load(mq[i], (threadgroup half *)ss + 8*i, DK);
++  simdgroup_barrier(mem_flags::mem_threadgroup);
++
++  simdgroup_float8x8 lo[DV8];
++  for (short t2 = 0; t2 < DV8; ++t2) lo[t2] = make_filled_simdgroup_matrix<float, 8>(0.0f);
++  float S[R], M[R];
++  for (short j = 0; j < R; ++j) S[j] = 0.0f, M[j] = -FLT_MAX/2;
++  device const half * kh = k + (ulong)h*a.npad*DK;
++  device const half * vh = v + (ulong)h*a.npad*DV;
++
++  for (int ic = 0; ic < a.n; ic += C) {
++    for (short cc = 0; cc < C/8; ++cc) {
++      device const half * pk = kh + (ulong)(ic + 8*cc)*DK;
++      simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
++      for (short i = 0; i < DK8; ++i) {
++        simdgroup_half8x8 mk;
++        simdgroup_load(mk, pk + 8*i, DK, 0, true);
++        simdgroup_multiply_accumulate(mqk, mq[i], mk, mqk);
++      }
++      simdgroup_store(mqk, ss + 8*cc, C, 0, false);
++    }
++    simdgroup_barrier(mem_flags::mem_threadgroup);
++
++    float msl = 0.0f;  // ms of this lane's row fm
++    for (short j = 0; j < R; ++j) {
++      const float m = M[j];
++      float2 s2 = ss2[j*C/2 + tiisg]*a.scale;
++      if (ic + C > a.n) {
++        const int c0 = ic + 2*tiisg;
++        s2 += float2(c0 < a.n ? 0.0f : -VT_MAXHALF, c0 + 1 < a.n ? 0.0f : -VT_MAXHALF);
++      }
++      M[j] = simd_max(max(M[j], max(s2[0], s2[1])));
++      const float  ms  = exp(m  - M[j]);
++      const float2 vs2 = exp(s2 - M[j]);
++      S[j] = S[j]*ms + simd_sum(vs2[0] + vs2[1]);
++      ss2[j*C/2 + tiisg] = vs2;
++      if (j == fm) msl = ms;
++    }
++    simdgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (short t2 = 0; t2 < DV8; ++t2) reinterpret_cast<thread float2 &>(lo[t2].thread_elements()) *= msl;
++    // key chunk outer, output tile inner: 9 independent accumulators; each tile still sums the chunks in key order
++    for (short cc = 0; cc < C/8; ++cc) {
++      simdgroup_float8x8 vs;
++      simdgroup_load(vs, ss + 8*cc, C, 0, false);
++      device const half * pv = vh + (ulong)(ic + 8*cc)*DV;
++      for (short t2 = 0; t2 < DV8; ++t2) {
++        simdgroup_half8x8 mv;
++        simdgroup_load(mv, pv + 8*t2, DV, 0, false);
++        simdgroup_multiply_accumulate(lo[t2], vs, mv, lo[t2]);
++      }
++    }
++    simdgroup_barrier(mem_flags::mem_threadgroup);
++  }
++
++  float sl = 0.0f;
++  for (short j = 0; j < R; ++j) if (j == fm) sl = S[j] == 0.0 ? 0.0f : 1.0f/S[j];
++  if (iq1 + fm < a.n) {
++    device float * d = dst + (ulong)(iq1 + fm)*a.ldo + h*DV + fn;
++    for (short t2 = 0; t2 < DV8; ++t2) {
++      float2 e = reinterpret_cast<thread float2 &>(lo[t2].thread_elements())*sl;
++#ifdef VT_SAB
++      if (fm == 0 && fn == 0 && t2 == 0) e.x = as_type<float>(as_type<uint>(e.x) ^ 1u);  // sabotage: one ulp
++#endif
++      *(device float2 *)(d + 8*t2) = e;
++    }
++  }
++}
++
+ // ---------------------------------------------------------------- LayerNorm with weight and bias (one row per tg)
+ struct VtLnArgs { int ne00, ne00_t; float eps; };
+ 

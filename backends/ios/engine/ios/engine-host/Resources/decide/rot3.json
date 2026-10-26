@@ -1,0 +1,16 @@
+{
+ "state": "I live in London, have a 3-day weekend in mid-April, a mid-range budget, and I like food, walking and a bit of culture. I do not want to spend more than 3 hours travelling each way.",
+ "questions": {
+  "destination": {
+   "type": "choice",
+   "instructions": "Where should I go for a long weekend in spring?",
+   "criteria": {
+    "Reykjavik": "nature, expensive, 3h flight",
+    "Seville": "warm, flamenco, orange blossom, 2.5h flight",
+    "Lisbon": "sunny, great food, hilly walks, 2.5h flight",
+    "Edinburgh": "historic, cool weather, 4.5h train",
+    "Amsterdam": "canals, museums, cycling, 1h flight"
+   }
+  }
+ }
+}

@@ -1,0 +1,21 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -16528,6 +16528,8 @@
+ // at dm 4096 the region length picks Q4_K (248320 x 2304) or Q8_0 (x 4352)
+ // (ENGINE-4B) k6: the 4B Q4_K_M's Q6_K embedding (dm 2560, 2100 B rows), told
+ // by the region's length (248320 x 2100) as M30's rule tells Q4_K from Q8_0
++// (ENGINE-ONE, patches/metal-kev.patch) and Kev-4B Q4_K_M's Q4_K embedding (dm
++// 2560, 1440 B rows), by the same length rule; llb_m_embk4 is width-general
+ typedef struct {
+   bool on, k4, k6;
+   u64  erow, hb;
+@@ -16542,7 +16544,8 @@
+   }
+   StrParts q = str_peek_ro(e, hd), qe = str_peek_ro(e, ep);
+   bool     k4 = dm == 5120
+-    || (dm == 4096 && term_tag(ep) == TAG_STR && (u64)qe.len == 248320ull * 2304);
++    || (dm == 4096 && term_tag(ep) == TAG_STR && (u64)qe.len == 248320ull * 2304)
++    || (dm == 2560 && term_tag(ep) == TAG_STR && (u64)qe.len == 248320ull * 1440);
+   u32      noff = (u32)H[a + 52], ooff = (u32)H[a + 53], hw = (u32)H[a + 54];
+   bool     k6 = dm == 2560 && term_tag(ep) == TAG_STR
+     && (u64)qe.len == 248320ull * 2100;

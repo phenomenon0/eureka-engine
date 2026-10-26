@@ -1,7 +1,7 @@
 // bend-worker.js (BENDWEB-SHOWCASE): the in-tab engine, a dedicated (classic) Worker. It hosts TURBODEFAULT's WebGPU engine
 // (q35_step.js: q35_open / step / reset / free, Turbo numerics by default) and the app's C tokenizer (tok.wasm), and runs the
 // chat loop the native shell runs: prompt token by token through the same step, then greedy (the engine's own top-1) until
-// <|im_end|>. Its only state besides the GPU session: the token ids already in the session's KV/state, so a follow-up turn
+// <|im_end|> (BATCHPREFILL: the prompt but its last token goes through session.prefill in chunks). Its only state besides the GPU session: the token ids already in the session's KV/state, so a follow-up turn
 // whose prompt extends them only steps the new tokens.
 //
 //   in:  open {source, ctx, numerics, tokenizer, vocabSha}   chat {id, system, messages, maxNew}   cancel {id}
@@ -18,7 +18,7 @@ const post = (m) => postMessage(m);
 const IM_END = 248046, END_OF_TEXT = 248044;
 
 let engine = null, ggufpack = null, device = null, session = null, Tok = null;
-let ctx = 4096, cached = [], current = null, tail = Promise.resolve(), gen = 0, label = "", kev = null;
+let ctx = 4096, cached = [], current = null, tail = Promise.resolve(), gen = 0, label = "", kev = null, pfOn = true;
 
 const toU8 = (b) => b instanceof Uint8Array ? b : new Uint8Array(b);
 const fileReader = (file) => async (offset, length) => toU8(await file.slice(offset, offset + length).arrayBuffer());
@@ -61,7 +61,7 @@ async function open(m) {
   const t0 = performance.now(), mine = ++gen;
   await free(true);
   kev = null;
-  ctx = m.ctx ?? 4096; label = m.label ?? "";
+  ctx = m.ctx ?? 4096; label = m.label ?? ""; pfOn = m.prefill !== false;   // BATCHPREFILL: on by default; {prefill:false} = the token-by-token prompt
   engine ??= await import(here + "q35_step.js");
   if (!self.navigator?.gpu) throw Object.assign(new Error("This browser has no WebGPU in workers."), { code: "no-gpu" });
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
@@ -104,6 +104,7 @@ async function open(m) {
   const total = blocks + headChunks;
   const s = await engine.q35_open({ adapter, device }, packSrc, manifest, {
     ctx, numerics: m.numerics ?? "turbo", canon: kev ? false : m.canon !== false, verify, subgroups: sg, trace: kev ? ["head.h"] : m.trace ?? [],
+    prefill: !kev && m.prefill !== false, prefillChunk: m.prefillChunk, prefillBatched: m.prefillBatched, prefillBatchWidth: m.prefillBatchWidth, prefillKV: m.prefillKV, prefillTokens: m.prefillTokens, prefillGrid: m.prefillGrid, prefillGu: m.prefillGu, prefillRecur: m.prefillRecur, prefillRt: m.prefillRt, prefillEmbed: m.prefillEmbed, prefillNsg: m.prefillNsg,   // BATCHPREFILL (Kev's decide steps token by token); webprefill2: the options were behind this comment (never passed)
     // Kev's Q8_0 4096-column projections: the turbo GEMV module + that one shape (tools/turbo-build.py), every other entry identical
     modules: kev ? { "k_gemv_turbo.wgsl": await (await fetch(here + `../emit/k_gemv_turbo${sg ? "_sg" : ""}_kev.wgsl`)).text() } : undefined,
     progress: (e) => {
@@ -135,18 +136,25 @@ async function loop(r, ids, maxNew) {
   let reuse = cached.length && cached.length <= ids.length && cached.every((x, i) => ids[i] === x) ? cached.length : 0;
   if (reuse === ids.length) reuse = 0;   // nothing new to feed: the last prompt token must be stepped for its logits
   post({ t: "prompt", id: r.id, ids: ids.length, reused: reuse });
-  let prefill = 0, decode = 0, steps = 0, n = 0, firstAt = null;
+  let prefill = 0, decode = 0, steps = 0, n = 0, firstAt = null, batch = null;
   const finish = (reason, extra = {}) => {
     if (r.finished) return; r.finished = true; if (current === r) current = null;
     post({ t: "done", id: r.id, reason, ...extra, stats: { numerics: session?.numerics, prompt_tokens: ids.length, reused_tokens: reuse,
       prefill_tokens: ids.length - reuse, prefill_ms: Math.round(prefill), decode_tokens: n, decode_ms: Math.round(decode),
-      decode_steps: steps, tokens_per_second: steps ? steps * 1000 / decode : null, first_token_ms: firstAt, wall_ms: Math.round(performance.now() - t0) } });
+      decode_steps: steps, tokens_per_second: steps ? steps * 1000 / decode : null, first_token_ms: firstAt, prefill_batch: batch, wall_ms: Math.round(performance.now() - t0) } });
   };
   r.finish = finish;
   try {
     if (r.finished) return;
     if (!reuse) { session.reset(); cached = []; }
     let pos = reuse, tok = ids[pos];
+    // BATCHPREFILL: every prompt token but the last in chunks (no logits); the last one is stepped below for the first token's logits
+    if (pfOn && session.prefill && session.numerics === "turbo" && ids.length - 1 > pos) {
+      const part = ids.slice(pos, ids.length - 1), pr = await session.prefill(part, pos);
+      cached.push(...part); prefill += pr.ms; batch = { tokens: pr.tokens, ms: Math.round(pr.ms), encode_ms: Math.round(pr.encode_ms), submits: pr.submits, chunk: pr.chunk, batch_width: pr.batch_width, kv: pr.kv, tokb: pr.tokb, dispatches: pr.dispatches, batched: pr.batched };
+      if (r.finished) return;
+      pos = ids.length - 1; tok = ids[pos];
+    }
     for (;;) {
       const out = await session.step(tok, pos);
       cached.push(tok);

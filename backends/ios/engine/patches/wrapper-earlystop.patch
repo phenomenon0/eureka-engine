@@ -1,0 +1,110 @@
+--- a/llb_engine.h	2026-10-07 16:30:38
++++ b/llb_engine.h	2026-10-07 17:46:20
+@@ -6,7 +6,10 @@
+ //                          (manifest.json, table.bin, tokenizer.bin, chat.flags).
+ //                          cache is a writable directory (the app's Caches/) for
+ //                          the compiled Metal program (<cache>/sys1mac.gpu).
+-//   llb_generate(ids, n)   greedy: prefill ids, then n new ids into out.
++//   llb_generate(ids, n)   greedy: prefill ids, then up to n new ids into out. (ENGINE-EARLYSTOP) n is a
++//                          maximum: the run ends at the model's first stop id (tokenizer.bin's eos =
++//                          <|im_end|>, and <|endoftext|>), which is the last id returned (the return value
++//                          counts it). LLB_EARLYSTOP=0 in the environment: exactly n ids, as before.
+ //   llb_decide(bodies, n)  (ENGINE-ONE) /v1/systemone requests -> reply lines, the decision head
+ //                          on the engine's final-normed rows, in process (no server, no HTTP).
+ //   llb_free()             forget the model.
+--- a/llb_engine.m	2026-10-07 16:46:02
++++ b/llb_engine.m	2026-10-07 17:32:33
+@@ -277,7 +277,57 @@
+     llb_tok_on = 0;
+   }
+ }
++
++// (ENGINE-EARLYSTOP) the ids that end a chat reply: the tokenizer's eos (<|im_end|>) and <|endoftext|>, the pair
++// Bend cuts its reply at. Read from <dir>/tokenizer.bin (its header, then the vocab records until the
++// <|endoftext|> text), once per model dir. n = 0: no stop ids (no tokenizer.bin): llb_generate runs n_new ids.
++static char     llb_stop_dir[1024];
++static uint32_t llb_stop[2];
++static int      llb_nstop;
+ 
++static void llb_stop_read(const char* dir) {
++  if (strcmp(llb_stop_dir, dir) == 0) {
++    return;
++  }
++  snprintf(llb_stop_dir, sizeof llb_stop_dir, "%s", dir);
++  llb_nstop = 0;
++  char p[1200];
++  snprintf(p, sizeof p, "%s/tokenizer.bin", dir);
++  FILE* f = fopen(p, "rb");
++  if (!f) {
++    return;
++  }
++  char magic[8];
++  uint32_t h[8];  // n_vocab n_merges max_len bos eos pad add_bos n_special
++  if (fread(magic, 1, 8, f) == 8 && memcmp(magic, "Q35TOK01", 8) == 0 && fread(h, 4, 8, f) == 8 &&
++      fseek(f, 4L * (long)h[7], SEEK_CUR) == 0) {
++    llb_stop[llb_nstop++] = h[4];
++    static const char eot[] = "<|endoftext|>";
++    char buf[sizeof eot];
++    for (uint32_t i = 0; i < h[0]; i += 1) {
++      uint16_t l;
++      uint8_t ty;
++      if (fread(&l, 2, 1, f) != 1 || fread(&ty, 1, 1, f) != 1) {
++        break;
++      }
++      if (l == sizeof eot - 1) {
++        if (fread(buf, 1, l, f) != l) {
++          break;
++        }
++        if (memcmp(buf, eot, l) == 0) {
++          if (i != h[4]) {
++            llb_stop[llb_nstop++] = i;
++          }
++          break;
++        }
++      } else if (fseek(f, l, SEEK_CUR) != 0) {
++        break;
++      }
++    }
++  }
++  fclose(f);
++}
++
+ int llb_load(const char* model_dir, const char* cache_dir) {
+   llb_err[0] = 0;
+   if (llb_spent) {
+@@ -323,6 +373,7 @@
+   mkdir(p, 0755);
+   snprintf(llb_exe, sizeof llb_exe, "%s/sys1mac", cache_dir);
+   setenv("LLB_GGUF", llb_gguf, 1);
++  llb_stop_read(model_dir);
+   llb_loaded = 1;
+   return 0;
+ }
+@@ -524,6 +575,16 @@
+   }
+   argv[argc++] = "--steps";
+   argv[argc++] = ns;
++  // (ENGINE-EARLYSTOP) n_new is a maximum: the run ends at the first stop id (it is the last id returned).
++  // LLB_EARLYSTOP=0: exactly n_new ids, as before.
++  const char* es = getenv("LLB_EARLYSTOP");
++  int nstop = es && strcmp(es, "0") == 0 ? 0 : llb_nstop;
++  char stops[2][16];
++  for (int i = 0; i < nstop; i += 1) {
++    snprintf(stops[i], sizeof stops[i], "%u", llb_stop[i]);
++    argv[argc++] = "--stop";
++    argv[argc++] = stops[i];
++  }
+ 
+   char op[1200], ep[1200];
+   snprintf(op, sizeof op, "%s/run/out.txt", llb_cache);
+@@ -540,8 +601,8 @@
+   dup2(f2, 2);
+   close(f1);
+   close(f2);
+-  fprintf(stderr, "llb: span %llu MB, threads %ld, %d ids, %d new\n",
+-    (unsigned long long)(z.span_bytes >> 20), thr, n_ids, n_new);
++  fprintf(stderr, "llb: span %llu MB, threads %ld, %d ids, %d new, stop ids %s %s\n",
++    (unsigned long long)(z.span_bytes >> 20), thr, n_ids, n_new, nstop ? stops[0] : "none", nstop > 1 ? stops[1] : "");
+   llb_runs += 1;
+   z.exit_code = llb_run_main(argc, argv);
+   fflush(stdout);

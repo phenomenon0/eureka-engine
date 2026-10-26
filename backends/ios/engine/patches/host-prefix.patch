@@ -1,0 +1,287 @@
+--- sys1mac.orig.c	2026-10-08 19:14:03
++++ sys1mac.c	2026-10-08 19:20:23
+@@ -70226,9 +70226,245 @@
+       f27_go(en, gpu_t27_slot, &T, sizeof T, 1, m, d - c < 1024 ? d - c : 1024);
+     }
+     llb_img_dn = pos0 + m > llb_img_dn ? pos0 + m : llb_img_dn;
++  }
++}
++
++// (IMGFAST) prefix snapshots on the resident session: the layer state at the end of a prompt prefix (the camera's
++// 33-id system prefix, the look's, or the look's prefix + an image's rows), kept, and restored when a later job's
++// first chunk starts with the same ids (and the same image: the wrapper's key, llb_px_img), so that job's chunk runs
++// only the rest. The state at P: every GDN layer's conv ring (pass_b, 4 rows) + pass_r + S (pass_S), every full
++// layer's kc / vc rows 0 .. P-1 (4096 B a slot), and the image's rope map / slot bookkeeping. Rows are position-major,
++// each row a function of the rows before it only, so the rest's rows are those of one chunk over the whole prompt
++// (gated: receipts/r2). A wanted prefix end inside a first chunk splits it there: the part before runs, its command
++// buffer completes, the state is copied out, the rest runs on a new buffer. Only on the 4B (d 2560), only for jobs
++// the wrapper arms (llb_px_job), never with the hidden-row hook. LLB_PREFIX=0: off.
++#define LLB_PX_SLOTS 3
++#define LLB_PX_MAXP 1024u
++typedef struct {
++  u32  p, dT, nl;
++  u64  img;
++  u32  ids[LLB_PX_MAXP];
++  u8*  st;
++  u64  nb;
++  u32  r[64];
++  u32  mr[4], s0, seen;
++  u64  used;
++} LlbPx;
++static LlbPx  llb_px[LLB_PX_SLOTS];
++static u64    llb_px_clock;
++static const char* llb_hidden_path;  // (the SYS1 hook's, below: a tentative definition)
++static bool   llb_px_job;      // the wrapper armed this job (vision jobs only)
++static u32    llb_px_want[2];  // its wanted prefix ends (0: none)
++static u64    llb_px_img;      // its image key (0: unkeyed: no snapshot past a pad)
++static int    llb_px_mode = -1;
++static u32    llb_px_hit, llb_px_saved;  // this job's restored prefix / last saved prefix end
++static double llb_px_ms;                 // host ms this job spent restoring / waiting + saving
++
++static bool llb_px_enabled(void) {
++  if (llb_px_mode < 0) {
++    const char* e = getenv("LLB_PREFIX");
++    llb_px_mode = !(e != NULL && strcmp(e, "0") == 0);
++  }
++  return llb_px_mode == 1 && llb_px_job;
++}
++
++static double llb_px_now(void) {
++  struct timespec t;
++  clock_gettime(CLOCK_MONOTONIC, &t);
++  return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
++}
++
++static bool llb_px_haspad(const u32* ids, u32 p) {
++  for (u32 i = 0; i < p; i += 1) {
++    if (ids[i] == LLB_IMG_PAD) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// slot x matches the first x->p ids of this job (and its image)
++static bool llb_px_match(const LlbPx* x, const u32* ids, u32 nt, u32 dT) {
++  return x->st != NULL && x->p < nt && x->dT == dT && (x->img == 0 || x->img == llb_px_img)
++    && memcmp(x->ids, ids, (size_t)x->p * sizeof(u32)) == 0;
++}
++
++static bool llb_px_have(const u32* ids, u32 p, u32 dT) {
++  for (u32 k = 0; k < LLB_PX_SLOTS; k += 1) {
++    const LlbPx* x = &llb_px[k];
++    if (x->st != NULL && x->p == p && x->dT == dT && (x->img == 0 || x->img == llb_px_img)
++      && memcmp(x->ids, ids, (size_t)p * sizeof(u32)) == 0) {
++      return true;
++    }
+   }
++  return false;
+ }
+ 
++static u8* llb_px_host(u64 sa) { return (u8*)[gpu_scr contents] + (sa - SA_SCR); }
++
++// copy the state at x->p between the layer slots and x->st (save: out of the slots)
++static void llb_px_copy(LlbPx* x, const M9Rows* S0, bool save) {
++  u64 cv = 2 * S0->lkh * 128 + S0->lvh * 128, o = 0;
++  u64 kb = (u64)x->p * 1024 * 4, bb = 4 * cv * 4, sb = ((u64)S0->lvh << 14) * 4;
++  for (u32 i = 0; i < S0->nl; i += 1) {
++    bool full = (i + 1) % 4 == 0;
++    u64 a = full ? pass_kc[i] : pass_b[i], b = full ? pass_vc[i] : pass_S[i];
++    u64 na = full ? kb : bb, nb = full ? kb : sb;
++    if (save) {
++      memcpy(x->st + o, llb_px_host(a), na);
++      memcpy(x->st + o + na, llb_px_host(b), nb);
++    } else {
++      memcpy(llb_px_host(a), x->st + o, na);
++      memcpy(llb_px_host(b), x->st + o + na, nb);
++    }
++    o += na + nb;
++  }
++}
++
++static u64 llb_px_bytes(u32 p, const M9Rows* S0) {
++  u64 cv = 2 * S0->lkh * 128 + S0->lvh * 128, n = 0;
++  for (u32 i = 0; i < S0->nl; i += 1) {
++    n += (i + 1) % 4 == 0 ? 2 * (u64)p * 1024 * 4 : (4 * cv + ((u64)S0->lvh << 14)) * 4;
++  }
++  return n;
++}
++
++// the first chunk of a job (after m26_reset): the longest kept prefix of its ids restored; returns its length (0: none)
++static u32 llb_px_restore(const u32* ids, u32 nt, u32 dT, const M9Rows* S0) {
++  llb_px_hit = 0;
++  if (S0->d != 2560 || S0->nl > 64) {
++    return 0;
++  }
++  LlbPx* best = NULL;
++  for (u32 k = 0; k < LLB_PX_SLOTS; k += 1) {
++    if (llb_px_match(&llb_px[k], ids, nt, dT) && (best == NULL || llb_px[k].p > best->p)) {
++      best = &llb_px[k];
++    }
++  }
++  if (best == NULL) {
++    return 0;
++  }
++  double t0 = llb_px_now();
++  u64 cv = 2 * S0->lkh * 128 + S0->lvh * 128;
++  for (u32 i = 0; i < S0->nl; i += 1) {  // the slots taken in the body's order (as at pos 0)
++    if (!pass_on[i]) {
++      if ((i + 1) % 4 == 0) {
++        pass_kc[i] = pass_zero(1ull << (dT + 10));
++        pass_vc[i] = pass_zero(1ull << (dT + 10));
++      } else {
++        pass_b[i] = pass_zero(4 * cv);
++        pass_S[i] = pass_zero((u64)S0->lvh << 14);
++      }
++      pass_on[i] = true;
++    }
++    pass_pos[i] = best->p - 1;
++    pass_r[i] = best->r[i];
++  }
++  llb_px_copy(best, S0, false);
++  if (best->img != 0) {  // the image is inside the prefix: its rope map and slots as the prefix left them
++    if (llb_img_n == 0 || best->seen != llb_img_n) {
++      err_fail("prefix: the kept prefix's image is not this job's");
++    }
++    memcpy(llb_mr, best->mr, sizeof llb_mr);
++    llb_img_s0 = best->s0;
++    llb_img_seen = best->seen;
++  }
++  best->used = ++llb_px_clock;
++  llb_px_hit = best->p;
++  llb_px_ms += llb_px_now() - t0;
++  fprintf(stderr, "prefix: restored %u ids (%s) in %.2f ms\n", best->p, best->img ? "with the image" : "text",
++    llb_px_now() - t0);
++  return best->p;
++}
++
++// the state at p (the GPU idle: llb_px_sync) kept in the least recently used slot
++static void llb_px_save(const u32* ids, u32 p, u32 dT, const M9Rows* S0) {
++  if (S0->d != 2560 || S0->nl > 64 || p > LLB_PX_MAXP) {
++    return;
++  }
++  bool pad = llb_px_haspad(ids, p);
++  if (pad && (llb_px_img == 0 || llb_img_seen != llb_img_n)) {
++    return;  // an unkeyed image, or a prefix that ends inside the image
++  }
++  double t0 = llb_px_now();
++  // a free slot, else (an image prefix) the oldest image prefix, so the text prefixes every job starts with stay;
++  // else the least recently used
++  LlbPx* x = NULL;
++  for (u32 k = 0; k < LLB_PX_SLOTS && x == NULL; k += 1) {
++    if (llb_px[k].st == NULL) {
++      x = &llb_px[k];
++    }
++  }
++  for (u32 k = 0; k < LLB_PX_SLOTS && x == NULL; k += 1) {
++    if (pad && llb_px[k].img != 0) {
++      x = &llb_px[k];
++    }
++  }
++  for (u32 k = 0; x != NULL && x->st != NULL && x->img != 0 && k < LLB_PX_SLOTS; k += 1) {
++    if (llb_px[k].img != 0 && llb_px[k].used < x->used) {
++      x = &llb_px[k];
++    }
++  }
++  if (x == NULL) {
++    x = &llb_px[0];
++    for (u32 k = 1; k < LLB_PX_SLOTS; k += 1) {
++      if (llb_px[k].used < x->used) {
++        x = &llb_px[k];
++      }
++    }
++  }
++  u64 nb = llb_px_bytes(p, S0);
++  if (x->st == NULL || x->nb < nb) {
++    free(x->st);
++    x->st = malloc(nb);
++    x->nb = x->st != NULL ? nb : 0;
++    if (x->st == NULL) {
++      return;
++    }
++  }
++  x->p = p; x->dT = dT; x->nl = S0->nl; x->img = pad ? llb_px_img : 0;
++  memcpy(x->ids, ids, (size_t)p * sizeof(u32));
++  memcpy(x->r, pass_r, sizeof x->r);
++  memcpy(x->mr, llb_mr, sizeof x->mr);
++  x->s0 = llb_img_s0; x->seen = llb_img_seen;
++  llb_px_copy(x, S0, true);
++  x->used = ++llb_px_clock;
++  llb_px_saved = p;
++  llb_px_ms += llb_px_now() - t0;
++  fprintf(stderr, "prefix: kept %u ids (%s, %.1f MB) in %.2f ms\n", p, x->img ? "with the image" : "text",
++    (double)nb / 1048576.0, llb_px_now() - t0);
++}
++
++// the round's work so far committed and completed (the split point); a new buffer + encoder for the rest
++static id<MTLComputeCommandEncoder> llb_px_sync(void) {
++  double t0 = llb_px_now();
++  [m30_en endEncoding];
++  [m30_cb commit];
++  [m30_cb waitUntilCompleted];
++  if ([m30_cb error]) {
++    gpu_fail([m30_cb error]);
++  }
++  m30_cb = [gpu_que commandBuffer];
++  m30_en = [m30_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:0];
++  [m30_en setBuffer:gpu_att offset:0 atIndex:1];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:3];
++  llb_px_ms += llb_px_now() - t0;
++  return m30_en;
++}
++
++// every snapshot dropped (the session's release; the wrapper's llb_vision_forget)
++static void llb_px_drop(void) {
++  for (u32 k = 0; k < LLB_PX_SLOTS; k += 1) {
++    free(llb_px[k].st);
++    memset(&llb_px[k], 0, sizeof llb_px[k]);
++  }
++}
++
++static void f27_body(id<MTLComputeCommandEncoder> en, const u32* ids, u32 nt,
++  u64 ep, bool ek4, bool ek6, u32 dT, u32 pos0, const M9Rows* S0, const u64* pw,
++  const u32* po, const u32* tw);
++
+ // the chunk: nt (1 .. F27_CH) tokens at pos0 .. through all S0->nl layers,
+ // head-less. ids / erow: the tokens and the embedding region (Q4_K rows of
+ // 2880 B); pw / tw / po as m9_pass_run's (the table required)
+@@ -70256,6 +70492,30 @@
+     err_fail("fast chunk: no chunk area / not the 27B or 9B / nt out of range");
+   }
+   f27_pipes();
++  // (IMGFAST) the session's prefix snapshots (llb_px_*, below): a first chunk whose leading ids (and image) match a
++  // kept prefix restores that prefix's layer state and runs only the rest; a first chunk that passes a wanted prefix
++  // end (the wrapper's llb_px_want) is split there and the state at that point is kept
++  if (pos0 == 0 && llb_px_enabled() && llb_hidden_path == NULL) {
++    u32 p = llb_px_restore(ids, nt, dT, S0);
++    for (u32 k = 0; k < 2; k += 1) {
++      u32 w = llb_px_want[k];
++      if (w > p && w < nt && !llb_px_have(ids, w, dT)) {
++        f27_body(en, ids + p, w - p, ep, ek4, ek6, dT, p, S0, pw, po, tw);
++        en = llb_px_sync();
++        llb_px_save(ids, w, dT, S0);
++        p = w;
++      }
++    }
++    ids += p; nt -= p; pos0 = p;
++  }
++  f27_body(en, ids, nt, ep, ek4, ek6, dT, pos0, S0, pw, po, tw);
++}
++
++// (IMGFAST) the chunk's work on nt tokens at pos0 (embedding, image splice, every layer); f27_chunk's own body, moved
++static void f27_body(id<MTLComputeCommandEncoder> en, const u32* ids, u32 nt,
++  u64 ep, bool ek4, bool ek6, u32 dT, u32 pos0, const M9Rows* S0, const u64* pw,
++  const u32* po, const u32* tw) {
++  u64 cv = 2 * S0->lkh * 128 + S0->lvh * 128;
+   // (lane m31) the embedding rows: Q4_K (d / 256 x 144 B) or Q8_0 (d / 32 x 34)
+   const u64 erb = ek4 ? S0->d / 256 * 144 : ek6 ? S0->d / 256 * 210
+     : S0->d / 32 * 34;
+@@ -75920,6 +76180,7 @@
+   llb_img_n = 0; llb_img_nx = 0; llb_img_ny = 0; llb_img_seen = 0; llb_img_s0 = 0;
+   llb_img_dn = 0; llb_img_dcap = 0; llb_img_d = 0; llb_img_at = 0; llb_img_dump = 0;
+   llb_ro_init = false; llb_ro_on = false; llb_ro_pend = false; llb_ro_got = 0; llb_ro_pos = 0;  // (PHONECAM)
++  llb_px_drop(); llb_px_job = false; llb_px_want[0] = llb_px_want[1] = 0; llb_px_img = 0;  // (IMGFAST)
+   gpu_f27_gdl = nil; gpu_f27_attn = nil; gpu_f9_attn = nil;
+   gpu_f27_conv = nil; gpu_f27_copy = nil; gpu_f27_embt = nil;
+   gpu_t27_rnorm = nil; gpu_t27_addrms = nil; gpu_t27_elem = nil;

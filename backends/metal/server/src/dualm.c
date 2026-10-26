@@ -12,12 +12,14 @@
 //    the id's bytes, an incomplete UTF-8 tail held back for the next event); the final line is the usual response.
 //  - stop ids (<|im_end|>, <|endoftext|>) end a generate request; the stop id is not part of "ids"/"text" and
 //    the final line carries "finish":"stop" (else "length").
-// MAC-ENGINE-PENALTY: the server's "sampling" object -> the W1-SAMPLER spec (CUDA's dual.c sample_word map, base
-//    LLB_SAMPLE or preset=greedy), set per request with llb_sampler_configure; the engine's fused-step head
-//    then picks on the host (patches/apply_sampler.py). Every generated id must be a host pick (llb_sampler_picks).
+// KEV-HEAD-METAL: a GGUF without the clef head but with the Kev head (<arch>.decision.type "kev", cls.output.{weight,bias})
+// serves decide through kevhead.c: one exact pass per question (the hook on), queued here like tools/kevserve/kev.c
+// (dual_next hands out the next question without reading stdin), one response line when the last is answered.
+// The clef probe and path are checked first and are unchanged; neither head = headless as before.
 #define _DARWIN_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "clef3/head.h"
+#include "kevhead.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +29,9 @@
 
 static Q35Tokenizer tok;
 static Head head;
-static int headless,stream_on;
+static int headless,stream_on,kev,kev_qi;
+static char kev_why[256];
+static sb kev_ans;
 #define STOP_A 248046
 #define STOP_B 248044
 static FILE *out,*cap;
@@ -37,13 +41,6 @@ static jv *req;
 static Record *rec;
 static int mode,steps,seq,prompt_n,prompt_ids[CLEF_MAX_T];
 static double t_req;
-// the engine's W1-SAMPLER (patches/apply_sampler.py): the spec, the prompt length (heads before it are prefill
-// rows), the host pick count; the penalty window is the engine's own (each fused step's input token)
-int llb_sampler_configure(const char *spec);
-void llb_sampler_prompt(int n_prompt);
-int llb_sampler_picks(void);
-static int smp_req,smp_picks0;
-static char smp_spec[1024];
 
 static double now(void) {
     struct timespec t;
@@ -68,6 +65,12 @@ static void refuse(const char *msg) {
 }
 
 static void drop(void) {
+    if (kev) {
+        kev_drop();
+        free(kev_ans.p);
+        kev_ans=(sb){0};
+        kev_qi=0;
+    }
     if (rec) {
         clef_record_free(rec);
         free(rec);
@@ -166,9 +169,13 @@ static void init(const char *dir) {
     if (q35_tok_load(&tok,dir)) clef_fail("sidecar requires tokenizer.bin (llb-tok extract)");
     headless=!gguf_has_head(gguf);
     if (!headless) clef_head_open(&head,gguf);
+    else if ((kev=kev_head_probe(gguf,kev_why,sizeof kev_why))) {
+        headless=0;
+        kev_head_open(gguf,&tok);
+    } else if (*kev_why) fprintf(stderr,"sys1: partial kev head ignored: %s\n",kev_why);
     stream_on=getenv("LLB_SYS1_STREAM")&&*getenv("LLB_SYS1_STREAM")=='1';
     out=stdout;
-    fprintf(stderr,"sys1: %s + tokenizer ready %.3f ms\n",headless?"headless (generate only)":"FP32 clef head",(now()-t0)*1000);
+    fprintf(stderr,"sys1: %s + tokenizer ready %.3f ms\n",headless?"headless (generate only)":kev?"kev head":"FP32 clef head",(now()-t0)*1000);
 }
 
 // argv words for the request's ids + steps
@@ -183,32 +190,6 @@ static char *command(const int *ids,int n,int st) {
         if (k>0) sb_fmt(&c," --fastpf %d",k);
     }
     return c.p;
-}
-
-// CUDA's dual.c G15 map: OpenAI/llama.cpp sampling knobs -> host/llb_sampler.h spec keys; 0 = refused
-static const char *smp_map[][2]={{"temperature","temp"},{"top_p","top_p"},{"top_k","top_k"},
-    {"min_p","min_p"},{"seed","seed"},{"presence_penalty","presence"},{"frequency_penalty","frequency"},
-    {"repeat_penalty","repeat_penalty"},{"repetition_penalty","repeat_penalty"},{NULL,NULL}};
-static int sample_spec(void) {
-    jv *smp=json_get(req,"sampling");
-    const char *d=getenv("LLB_SAMPLE");
-    sb c={0};
-    sb_add(&c,d&&*d?d:"preset=greedy");
-    int any=0;
-    for (int i=0; smp&&smp->type==J_OBJ&&smp_map[i][0]; i++) {
-        jv *v=json_get(smp,smp_map[i][0]);
-        if (!v || v->type==J_NULL) continue;
-        if (v->type!=J_NUM) return free(c.p),refuse("sampling values must be numbers"),0;
-        if (!strcmp(smp_map[i][1],"seed") || !strcmp(smp_map[i][1],"top_k")) sb_fmt(&c,",%s=%lld",smp_map[i][1],(long long)v->num);
-        else sb_fmt(&c,",%s=%.9g",smp_map[i][1],v->num);
-        any=1;
-    }
-    snprintf(smp_spec,sizeof smp_spec,"%s",any||(d&&*d)?c.p:"");
-    free(c.p);
-    int live=llb_sampler_configure(smp_spec);  // -1 bad, 0 argmax-equivalent, 1 the host picks
-    if (live<0) return refuse("bad sampling values"),0;
-    smp_req=live;
-    return 1;
 }
 
 // one request line -> 1 (cmd set) or 0 (refused, answered already)
@@ -227,7 +208,6 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
             }
             prompt_n=(int)pi->n;
             if ((unsigned)prompt_n+(unsigned)k->num-1>ctx) return refuse("prompt + n exceeds the KV capacity fixed at launch"),0;
-            if (!sample_spec()) return 0;
             mode=2;
             steps=(int)k->num;
             *n=(unsigned)prompt_n;
@@ -242,7 +222,6 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         int c=q35_tok_encode(&tok,p->str,sp&&sp->type==J_BOOL&&sp->b,ids,cap_ids);
         if (c<1) return free(ids),refuse("prompt must tokenize to 1..16384 tokens"),0;
         if ((unsigned)c+(unsigned)k->num-1>ctx) return free(ids),refuse("prompt + n exceeds the KV capacity fixed at launch"),0;
-        if (!sample_spec()) return free(ids),0;
         mode=2;
         steps=(int)k->num;
         prompt_n=c;
@@ -253,7 +232,25 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         free(ids);
         return 1;
     }
+    if (headless&&*kev_why) { // a Kev key/tensor without a usable Kev head: say what is missing
+        char m[400];
+        snprintf(m,sizeof m,"decide needs the clef or Kev head; this model's Kev head is unusable (%s), launched headless (generate only)",kev_why);
+        return refuse(m),0;
+    }
     if (headless) return refuse("decide needs the clef head; this model was launched headless (generate only)"),0;
+    if (kev) {
+        const char *e=kev_request(req,ctx);
+        if (e) return refuse(e),0;
+        mode=3;
+        steps=1;
+        kev_qi=0;
+        int kn;
+        const int *ids=kev_ids(0,&kn);
+        *n=(unsigned)kn;
+        *hidden=hidden_path;
+        *cmd=command(ids,kn,1);
+        return 1;
+    }
     // the clef-decide request checks (tools/clef3/decide.c main), as error lines
     jv *model=json_get(req,"model"),*qs=json_get(req,"questions");
     if (!model || model->type!=J_STR || !qs || qs->type!=J_OBJ) return refuse("model/questions required"),0;
@@ -262,12 +259,16 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         if (!ins || ins->type==J_NULL) return refuse("instructions must be provided"),0;
         if (type && type->type==J_STR && !strcmp(type->str,"score") && (!criteria || criteria->type!=J_ARR || criteria->n<2 || criteria->n>10)) return refuse("score requires 2..10 criteria"),0;
     }
-    // ponytail: clef_encode still exits the process on the inputs it rejects (spans.c clef_fail); error lines need a non-exiting encode
+    // (CLEF-PICK) clef_encode's rejections (e.g. "unknown question type") are error lines (400), not an engine exit: with
+    // err set it returns the message instead of clef_fail's exit, rec left empty (drop() frees it)
     rec=calloc(1,sizeof *rec);
-    clef_encode(&tok,req,rec,CLEF_MAX_T);
+    const char *fail;
+    if (clef_encode(&tok,req,rec,CLEF_MAX_T,&fail)) {
+        char m[400];
+        snprintf(m,sizeof m,"clef: %s",fail);
+        return refuse(m),0;
+    }
     if ((unsigned)rec->n>ctx) return refuse("request exceeds the KV capacity fixed at launch"),0;
-    llb_sampler_configure(NULL);
-    smp_req=0;
     mode=1;
     steps=1;
     *n=(unsigned)rec->n;
@@ -328,7 +329,13 @@ static int gwrite(void *ck,const char *p,int n) {
 
 int dual_next(const char *dir,unsigned ctx,char **cmd,const char **hidden,unsigned *n) {
     if (!out) init(dir);
-    for (;;) {
+    if (mode==3&&kev_qi<kev_count()) { // the next question of the queued Kev decide: no stdin read
+        int kn;
+        const int *ids=kev_ids(kev_qi,&kn);
+        *n=(unsigned)kn;
+        *hidden=hidden_path;
+        *cmd=command(ids,kn,1);
+    } else for (;;) {
         char *line=NULL;
         size_t len=0;
         if (getline(&line,&len,stdin)<0) {
@@ -342,10 +349,6 @@ int dual_next(const char *dir,unsigned ctx,char **cmd,const char **hidden,unsign
         drop();
     }
     gk=gl=gpn=0;
-    if (mode==2) {
-        llb_sampler_prompt(prompt_n);
-        smp_picks0=llb_sampler_picks();
-    }
     cap=funopen(NULL,NULL,gwrite,NULL,NULL);
     if (!cap) clef_fail("funopen failed");
     setvbuf(cap,NULL,_IOLBF,0);
@@ -364,10 +367,6 @@ void dual_done(void) {
     sb o={0};
     if (mode==2) {
         if (k>steps||(!stopped&&k!=steps)) clef_fail("generate: id count differs from n");
-        if (smp_req&&llb_sampler_picks()-smp_picks0!=gk) {
-            fprintf(stderr,"sampler: %d host picks for %d ids\n",llb_sampler_picks()-smp_picks0,gk);
-            clef_fail("generate: an id was not a host pick (sampler hook missed a head path)");
-        }
         sb_add(&o,"{\"prompt_ids\":[");
         for (int i=0; i<prompt_n; i++) sb_fmt(&o,i?",%d":"%d",prompt_ids[i]);
         sb_add(&o,"],\"ids\":[");
@@ -381,8 +380,21 @@ void dual_done(void) {
         sb_fmt(&o,",\"finish\":\"%s\"}",stopped?"stop":"length");
         free(t);
         reply(o.p);
-        fprintf(stderr,"{\"seq\":%d,\"mode\":\"generate\",\"prompt_tokens\":%d,\"n\":%d,\"sampler\":\"%s\",\"picks\":%d,\"forward_ms\":%.3f,\"total_ms\":%.3f}\n",
-            seq,prompt_n,k,smp_req?smp_spec:"argmax",llb_sampler_picks()-smp_picks0,(t_ran-t_req)*1000,(now()-t_req)*1000);
+        fprintf(stderr,"{\"seq\":%d,\"mode\":\"generate\",\"prompt_tokens\":%d,\"n\":%d,\"forward_ms\":%.3f,\"total_ms\":%.3f}\n",
+            seq,prompt_n,k,(t_ran-t_req)*1000,(now()-t_req)*1000);
+    } else if (mode==3) {
+        kev_answer(kev_qi,hidden_path,&kev_ans);
+        if (++kev_qi<kev_count()) return; // the next question's pass comes from dual_next
+        const jv *model=json_get(req,"model");
+        sb_add(&o,"{\"model\":");
+        if (model) json_dump(&o,model); else sb_add(&o,"null");
+        sb_add(&o,",\"answers\":{");
+        sb_add(&o,kev_ans.p);
+        sb_fmt(&o,"},\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}",kev_tokens());
+        reply(o.p);
+        fprintf(stderr,"{\"seq\":%d,\"mode\":\"decide\",\"head\":\"kev\",\"questions\":%d,\"input_tokens\":%d,\"total_ms\":%.3f,\"raw\":%s}\n",
+            seq,kev_count(),kev_tokens(),(now()-t_req)*1000,kev_raw());
+        mode=0;
     } else {
         float *hidden=clef_hidden_read(hidden_path,rec->n);
         float *logits=calloc(rec->no,4);

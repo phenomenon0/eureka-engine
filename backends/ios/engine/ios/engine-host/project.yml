@@ -1,0 +1,47 @@
+name: EngineHost
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "27.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: ${BEND_TEAM_ID}
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+targets:
+  EngineHost:
+    type: application
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - Sources
+      # (ENGINE-PHONE2) the decide fixtures (travel request + rotations, R1 references, the Mac's fast replies),
+      # copied into the bundle as the folder "decide"
+      - path: Resources/decide
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.bendenginep
+        PRODUCT_NAME: EngineHost
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/EngineHost-Bridging.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../../engine
+        CODE_SIGN_ENTITLEMENTS: EngineHost.entitlements
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_STRICT_CONCURRENCY: minimal
+    dependencies:
+      - framework: ../../build/LLBEngine.xcframework
+        embed: false
+      - sdk: Metal.framework
+      - sdk: Foundation.framework
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Engine Phone
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

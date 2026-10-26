@@ -1,0 +1,15 @@
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -1344,7 +1344,11 @@
+   +k9q = Bool.pick(U32, (nt >= 13 : U32), 512, 0)
+   +k9k = Bool.pick(U32, (nt >= 13 : U32), 512, 0)
+   +k9 = Bool.pick(U32, U32.is_eq(m.ef(m), 1), k9q, Bool.pick(U32, U32.is_eq(m.ef(m), 3), k9k, 0))
+-  +k = Bool.pick(U32, U32.is_eq(m.dm(m), 2048), k35, Bool.pick(U32, U32.is_eq(m.dm(m), 4096), k9, 0))
++  # (ENGINE-PREFILL, patches/engine-4bdef.patch, optional) the 4B (d_model 2560): 512 at nt >= 13 (its break-even,
++  # runs/breakeven.txt: fast <= exact from nt 8), any of its embeddings (m.fast admits Q8_0 / Q4_K / Q6_K)
++  +k4 = Bool.pick(U32, (nt >= 13 : U32), 512, 0)
++  +k = Bool.pick(U32, U32.is_eq(m.dm(m), 2048), k35, Bool.pick(U32, U32.is_eq(m.dm(m), 4096), k9,
++    Bool.pick(U32, U32.is_eq(m.dm(m), 2560), k4, 0)))
+   Bool.pick(U32, Nat.is_le(5n, dT), k, 0)
+ 
+ def run.fgen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +steps: U32,

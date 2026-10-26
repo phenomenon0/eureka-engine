@@ -1,0 +1,6 @@
+88fd9bc8cf8ba4d2813adfeec964758f9f7c2691587390de56bb5f8315b908dc  cam-gen/src/sys1mac.c
+13a402b1447f297d05342d0bb024620c79ad9b0d86fb98c9d61d80a9ff74a4f3  cam-macos/libllbengine.a
+26ebb4437b2ddef84406bf1246ff0482bfa4c588f50e59c1735139604d29d2d4  cam-ios/libllbengine.a
+5a89d29e4c7bb37fa8c828ae81d112522791c322479823480e8fc2aac0964c1d  cam-sim/libllbengine.a
+314c26547817c711062ba4a480ba8b2e257e7a8428aea0d17ae63bfc8e3b19f2  cam/include/llb_engine.h
+base_emitted_c b0ffd9afe033cdb1a9a15a5012551301717f528062b8ab49c7e89f08ee3b32b5 (phonecam engine 53aaa61, read only) + patches/host-prefix.patch 109b94e38369d90f

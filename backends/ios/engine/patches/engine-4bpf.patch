@@ -1,0 +1,16 @@
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -1324,10 +1324,12 @@
+ # (lane m26's f27: the 27B Shape, d_model 5120, Q4_K embedding; lane m31's
+ # f9: the 9B Shape, d_model 4096, Q4_K or Q8_0 embedding)
+ # (lane m32, f35) or the 35B Shape (d_model 2048, Q8_0 embedding)
++# (ENGINE-PREFILL, patches/engine-4bpf.patch) or the 4B Shape (d_model 2560: Q8_0, Q4_K or Q6_K embedding)
+ def m.fast(+m: Model, +b: Nat, +em: U32) -> Bool:
+-  Bool.and(Bool.or(Bool.or(Bool.and(U32.is_eq(m.dm(m), 5120), U32.is_eq(m.ef(m), 3)),
++  Bool.and(Bool.or(Bool.or(Bool.or(Bool.and(U32.is_eq(m.dm(m), 5120), U32.is_eq(m.ef(m), 3)),
+       Bool.and(U32.is_eq(m.dm(m), 4096), Bool.or(U32.is_eq(m.ef(m), 3), U32.is_eq(m.ef(m), 1)))),
+       Bool.and(U32.is_eq(m.dm(m), 2048), U32.is_eq(m.ef(m), 1))),
++      Bool.and(U32.is_eq(m.dm(m), 2560), Bool.or(Bool.or(U32.is_eq(m.ef(m), 1), U32.is_eq(m.ef(m), 3)), U32.is_eq(m.ef(m), 4)))),
+     Bool.and(Nat.is_le(m.nl(m), b), U32.is_eq(em, 4294967295)))
+ 
+ # (lane m32, f35) the chunk size: the 35B's K (<= 4096); the 27B / 9B at most 512 (their chunk area)

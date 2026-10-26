@@ -42,3 +42,29 @@ adffd22f8dd842b530c03a4aa7c9d8e959802e3c63f9115a2e4c985d0fcd21a9  emit/k_top_t.w
 4f9524ee3d7293381bcd5991450c3b37d4ac4b0bf3b92d0db425fcbc0c7e298d  trunk/trunk_kernels.js
 bb2c4b86f4f16567e4827cb03237977b385d812bcbffcb9d4675ef132ca68cdf  trunk/trunk_session.js
 ```
+
+## Batched prefill + WebKit twins (webprefill3 `3a66615`, adopted tree `race/n3`)
+
+The three engine files above were replaced, and 12 runtime modules, one check module and one check page were added (see README.md, "Batched prefill and the Safari/WebKit twins"). The before hashes are the ones in the table above; they were byte-equal to the lane's `race/shipped-src`. Current hashes:
+
+```
+967c807e5695986191145905049dd0c67293854f80d5ccda3ecda65c6d836611  engine/bend-worker.js
+cb854877bc807b5ca6b57de4c922b2baccf7f7079e94e9085773cb9552e542fe  engine/q35_engine.js
+b3b6aa53a946507fe6cec25c8ae297d5f7032889b56e0c20a2230e4dd632fe8a  engine/q35_plan.js
+fc7d56d68cb0428962c28931e003eabde6b54facdaa70fa206ab14fff78aa639  engine/bcheck7.html
+e1b227a3211884e2e25509733aaf4b597f2b9c46e44ec2a9fdcd1db440be6728  emit/k_embed_tb.wgsl
+c0b35e42b6c18c67eb5680cc7974aceb1328d6c37a2c18dce5fb800bba92fc96  emit/k_fuse_pf.wgsl
+36441aa9a2d60ac5628bfef8152a4fe102a8453581354a1708519e53b3c93bc6  emit/k_fuse_pfb.wgsl
+929a73fbeffcb48064bf729b4380e1fc7da5cf88b40d15fffc06c85edf05c66a  emit/k_fuse_rc.wgsl
+a9038af91321a9feaad17e26bf42fcb231b0595bf64f8d3b2cb4dfa90df87db3  emit/k_fuse_rcs.wgsl
+1010ffd44759a430ba2667825c4fcaee9c64f0fce0566dcebb58ca234a01fde1  emit/k_fuse_tb.wgsl
+7dda2007b7e991da2d53fdb4ef3de8a39e78f959707486aca28da792ac3e56cf  emit/k_gemv_turbo_b.wgsl
+cf8af843dc185598740b1bc3c8aa1ca34b3c93914a2ba07d1f3138afef5895fb  emit/k_gemv_turbo_grf.wgsl
+ca0c09f6dbcfc189e9feb5b0b0315034f3fd294fff1a13e8679f6d9fdc17142e  emit/k_gemv_turbo_guf.wgsl
+79f9a3da3c00d56cf1847da32910b910b0e6a3f600d91730c1acbf7e60831576  emit/k_gemv_turbo_ngrf.wgsl
+c46b4e5822163e097fdc118d39a2bce5066accc84b625fd2b8753f9d5566bfa1  emit/k_gemv_turbo_ngrfx.wgsl
+77ef70d1a63c699534659efd7223b56688158dfdb885b5ff68578094a58d5e98  emit/k_gemv_turbo_rtf.wgsl
+96c14abe18c5bf9b036d242b6930561c3639e92f03f402ef93659a36bb8279b2  emit/k_norms_tb.wgsl
+```
+
+`engine/bcheck7.html` and `emit/k_gemv_turbo_ngrfx.wgsl` are check-only: the page compares the twins against the shipped entry in the browser, and `ngrfx` is its sabotage build. The app never loads them.
