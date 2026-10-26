@@ -3,7 +3,7 @@
 The Android engine: the Bend CPU engine built as a static aarch64 executable,
 `libbendengine.so`. The Android app runs it as a child process and talks to it
 in JSON lines. The app itself (Kotlin, WebView, and the `see`, `hear`, and
-`speak` glue) is not in this repository; see [The app](#the-app).
+`speak` glue) is in the app repository; see [The app](#the-app).
 
 ## Measured result
 
@@ -69,10 +69,10 @@ Any drift between `vendor/` and the patches fails the build.
 
 ## The app
 
-The Android app that hosts this engine is not yet in the app repository,
-`github.com/phenomenon0/bend-app`. Its measured build is
-`dev.bend.app.gpu` 0.8 (versionCode 8), from the private llama-bend branch
-`ship/android/voice/ship-wip/app`, commit `87d32614`.
+The Android app that hosts this engine is in `github.com/phenomenon0/bend-app`,
+directory `android/`. Its `build-and-install.sh` builds this engine from a
+checkout of this repository (`EUREKA_ENGINE`). The measured build is
+`dev.bend.app.gpu` 0.8 (versionCode 8).
 
 ## Source
 
