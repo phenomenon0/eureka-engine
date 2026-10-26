@@ -1,0 +1,18 @@
+{
+  "schema": "webgpu-battery-lines/v1",
+  "fixture": "Kokoro-82M af_bella (web)",
+  "voice": "af_bella",
+  "voice_sha256": "f69d836209b78eb8c66e75e3cda491e26ea838a3674257e9d4e5703cbaf55c8b",
+  "lines": [
+    { "id": "long-108", "text": "Hi, I'm Bella. Everything you hear right now was synthesized inside this browser tab, with no server at all." },
+    { "id": "short-38", "text": "A second sentence, to time a warm run." },
+    { "id": "pangram", "text": "The quick brown fox jumps over the lazy dog." },
+    { "id": "route", "text": "Every sense runs inside the tab: no model server and no network round trip." },
+    { "id": "model", "text": "Kokoro is an eighty two million parameter text to speech model." },
+    { "id": "battery", "text": "Ten synthesis runs, one page session, measured end to end." },
+    { "id": "weather", "text": "Chicago weather is best in October, when the lake is still warm." },
+    { "id": "receipt", "text": "Read the receipt before you trust the claim." },
+    { "id": "tiny", "text": "Short line." },
+    { "id": "closing", "text": "A longer closing line, to check that the same voice holds its rhythm across a full paragraph of speech and not only across a single short sentence." }
+  ]
+}

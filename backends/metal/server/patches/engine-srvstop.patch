@@ -1,0 +1,49 @@
+--- a/engine_qwen35_gpu.bend	2026-10-18 16:59:19
++++ b/engine_qwen35_gpu.bend	2026-10-18 16:59:58
+@@ -1418,30 +1418,30 @@
+ # (ENGINE-DECIDECHUNK, patches/engine-dchunk.patch) a command's --fastpf K: the
+ # fast tier (run.prompt, as the CLI's); none or --exactpf (fk 0): the exact path
+ @unsafe
+-def srv.one(ok: Bool, ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, +fk: U32, k: Unit -> IO(Unit)) -> IO(Unit):
++def srv.one(ok: Bool, ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, +fk: U32, +sp: List<&2, U32>, k: Unit -> IO(Unit)) -> IO(Unit):
+   match ok:
+     case True{}:
+       do IO<Unit>:
+         run.prompt(Bool.and((fk >= 1 : U32), m.fast(m, b, em)), fk, ts, U32.to_nat((st - 1 : U32)), m, b, em, dT,
+-          (1 << dT : U32), st, Nil{})
++          (1 << dT : U32), st, sp)
+         S.sys1.done()
+         k(Unit{})
+     case False{}:
+       IO.die(Unit, 2, "sys1: bad request command")
+ 
+ @unsafe
+-def srv.chk(+ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, +fk: U32, k: Unit -> IO(Unit)) -> IO(Unit):
++def srv.chk(+ts: List<&2, U32>, +st: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, +fk: U32, +sp: List<&2, U32>, k: Unit -> IO(Unit)) -> IO(Unit):
+   # (ENGFOLD) a command's --exactpf (fk 4294967294): fk 0, the exact path as before
+-  srv.one(Bool.and(ok_ids(ts), (st >= 1 : U32)), ts, st, m, b, em, dT, Bool.pick(U32, U32.is_eq(fk, 4294967294), 0, fk), k)
++  srv.one(Bool.and(ok_ids(ts), (st >= 1 : U32)), ts, st, m, b, em, dT, Bool.pick(U32, U32.is_eq(fk, 4294967294), 0, fk), sp, k)
+ 
+ @unsafe
+-def srv.run(c: List<&2, U32> & U32 & U32 & U32 & U32 & U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
++def srv.run(c: List<&2, U32> & U32 & U32 & U32 & U32 & U32, +sp: List<&2, U32>, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
+   (ts, sl) = c
+   (st, rest) = sl
+   (ly, r2) = rest
+   (em2, r3) = r2
+   (lb, fk) = r3
+-  srv.chk(ts, st, m, b, em, dT, fk, k)
++  srv.chk(ts, st, m, b, em, dT, fk, sp, k)
+ 
+ @unsafe
+ def srv.go(q: List<String>, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
+@@ -1449,7 +1449,8 @@
+     case Nil{}:
+       IO.pure(Unit, Unit{})
+     case Con{w, ws}:
+-      srv.run(cfg(w <> ws, Nil{}, 0, 0, 4294967295, 64, 0, 0, True{}), m, b, em, dT, k)
++      +qq : List<String> = w <> ws
++      srv.run(cfg(qq, Nil{}, 0, 0, 4294967295, 64, 0, 0, True{}), stops(qq, False{}, Nil{}), m, b, em, dT, k)
+ 
+ @unsafe
+ def srv(+dir: String, +m: Model, +b: Nat, +em: U32, +dT: Nat) -> IO(Unit):

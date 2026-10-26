@@ -10,3 +10,9 @@
 # docs/, tests/, reports/, receipts/ and tasks/ are already skipped by the scanner;
 # listing them here is redundant. The allowlist is for exceptions inside shipping
 # roots (e.g. a vendored third-party dev tool under tools/).
+
+backends/webgpu/senses/speak.html   # browser preview: kokoro-js (espeak-ng WASM phonemizer) is fetched by scripts/senses/vendor.sh at setup, not vendored here; licence gap disclosed in backends/webgpu/README.md
+backends/android/app/src/main/java/dev/bend/app/Voice.kt          # optional fallback: runs a user-built espeak-ng binary as a separate process (ProcessBuilder, arm's length); the binary and data are not in this repo or the default APK; default TTS is Kokoro
+backends/android/app/src/main/java/dev/bend/app/MainActivity.kt   # names the optional "fast" (espeak-ng CLI) mode; default is "kokoro"
+backends/android/app/src/main/java/dev/bend/app/Kokoro.kt         # comment only: misaki G2P port "without its espeak fallback"
+backends/metal/server/speak/serve.py   # names espeak only in a guard tuple that refuses to import espeak/phonemizer modules

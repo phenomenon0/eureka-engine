@@ -1,0 +1,202 @@
+--- a/tools/qwen35_engine.c	2026-10-08 03:45:00.914596856 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 03:45:58.411558599 -0500
+@@ -1112,7 +1112,7 @@
+ 
+ // Quantizes X[T] (per token, as gemv's quant_x8), pads to GNT with zero tokens,
+ // then Yo[t][r] as gemm.
+-static void gemm8(int fmt, const uint8_t *W, const float *X, int rows, int cols, int rb, int T, float *Yo) {
++static void gemm8_quant(const float *X, int cols, int T) {
+   int Tp = (T + GNT - 1) / GNT * GNT, nb = cols / 256, ns = cols / 32;
+   quant_need((size_t)Tp * cols);
+   if ((size_t)Tp * ns > gBScap) {
+@@ -1131,20 +1131,31 @@
+       gBS[(size_t)t * ns + i] = (int16_t)s;
+     }
+   }
++}
++
++// output row r of a quantized-X gemm: Yo[t][r] for all T tokens
++static void gemm8_row(int fmt, const uint8_t *row, int cols, int rows, int r, int T, float *Yo) {
++  int nb = cols / 256, ns = cols / 32;
++  for (int t0 = 0; t0 < T; t0 += GNT) {
++    float o[GNT];
++    if (fmt == 3) gemm8_q4k(row, cols, gQX + (size_t)t0 * cols, gXD + (size_t)t0 * nb, gBS + (size_t)t0 * ns, o);
++    else gemm8_q6k(row, cols, gQX + (size_t)t0 * cols, gXD + (size_t)t0 * nb, o);
++    for (int t = 0; t < GNT && t0 + t < T; t++) Yo[(size_t)(t0 + t) * rows + r] = o[t];
++  }
++}
++
++static void gemm8(int fmt, const uint8_t *W, const float *X, int rows, int cols, int rb, int T, float *Yo) {
++  gemm8_quant(X, cols, T);
+   #pragma omp parallel for schedule(LLB_SCHED)
+-  for (int r = 0; r < rows; r++)
+-    for (int t0 = 0; t0 < T; t0 += GNT) {
+-      float o[GNT];
+-      const uint8_t *row = W + (size_t)r * rb;
+-      if (fmt == 3) gemm8_q4k(row, cols, gQX + (size_t)t0 * cols, gXD + (size_t)t0 * nb, gBS + (size_t)t0 * ns, o);
+-      else gemm8_q6k(row, cols, gQX + (size_t)t0 * cols, gXD + (size_t)t0 * nb, o);
+-      for (int t = 0; t < GNT && t0 + t < T; t++) Yo[(size_t)(t0 + t) * rows + r] = o[t];
+-    }
++  for (int r = 0; r < rows; r++) gemm8_row(fmt, W + (size_t)r * rb, cols, rows, r, T, Yo);
+ }
+ #else
+ #define DOT8G_KIND ""
+ #endif
+ 
++static void gemm_xt(const float *X, int cols, int T);
++static void gemm_row(int fmt, const uint8_t *row, int cols, int rows, int r, int T, float *w, float *Yo);
++
+ static void gemm(int id, const float *X, float *Yo, int T) {
+   if (T == 1) { gemv(id, tptr(id), X, Yo); return; }
+   int rows = trows(id), cols = tcols(id), fmt = tfmt(id);
+@@ -1168,6 +1179,18 @@
+     return;
+   }
+ #endif
++  gemm_xt(X, cols, T);
++  const uint8_t *W = tptr(id);
++  #pragma omp parallel
++  {
++    float *w = (float *)malloc((size_t)cols * 4);
++    #pragma omp for schedule(LLB_SCHED)
++    for (int r = 0; r < rows; r++) gemm_row(fmt, W + (size_t)r * rb, cols, rows, r, T, w, Yo);
++    free(w);
++  }
++}
++
++static void gemm_xt(const float *X, int cols, int T) {
+   int nb = (T + TBL - 1) / TBL;
+   size_t need = (size_t)nb * cols * TBL;
+   if (need > gXTcap) {
+@@ -1183,25 +1206,67 @@
+         int t = b * TBL + j;
+         gXT[((size_t)b * cols + c) * TBL + j] = t < T ? X[(size_t)t * cols + c] : 0.0f;
+       }
+-  const uint8_t *W = tptr(id);
++}
++
++// output row r of the f32 batched gemm: dequantize the row once into w, then all T tokens
++static void gemm_row(int fmt, const uint8_t *row, int cols, int rows, int r, int T, float *w, float *Yo) {
++  int nb = (T + TBL - 1) / TBL;
++  deq_row(fmt, row, cols, w);
++  for (int b = 0; b < nb; b++) {
++    const v8f *xt = (const v8f *)(gXT + (size_t)b * cols * TBL);
++    v8f a0 = {0}, a1 = {0}, a2 = {0}, a3 = {0};
++    for (int c = 0; c < cols; c++) {
++      v8f wc = (v8f){0} + w[c];
++      a0 += xt[4 * c + 0] * wc; a1 += xt[4 * c + 1] * wc;
++      a2 += xt[4 * c + 2] * wc; a3 += xt[4 * c + 3] * wc;
++    }
++    float acc[TBL];
++    memcpy(acc, &a0, 32); memcpy(acc + 8, &a1, 32); memcpy(acc + 16, &a2, 32); memcpy(acc + 24, &a3, 32);
++    for (int j = 0; j < TBL && b * TBL + j < T; j++) Yo[(size_t)(b * TBL + j) * rows + r] = acc[j];
++  }
++}
++
++// Projections of one X (prefill, T > 1) in one parallel region: X is transposed or quantized
++// once and the rows of all n tensors share one row loop. Every row is gemm's own serial
++// computation, so no bits change; only fork/joins and the repeated X preparation go away.
++static void gemm_n(int n, const int *ids, const float *X, float *const *Yo, int T) {
++  int cols = tcols(ids[0]), R = 0, r0[9], q8 = 1;
++  if (T == 1 || n > 8) { for (int k = 0; k < n; k++) gemm(ids[k], X, Yo[k], T); return; }
++  for (int k = 0; k < n; k++) {
++    r0[k] = R; R += trows(ids[k]);
++    q8 &= tfmt(ids[k]) == 3 || tfmt(ids[k]) == 4;
++    if (tcols(ids[k]) != cols) { for (int j = 0; j < n; j++) gemm(ids[j], X, Yo[j], T); return; }
++  }
++  r0[n] = R;
++#ifdef LLB_DOT8
++#ifdef LLB_DOT8_GEMM
++  if (q8) {
++    gemm8_quant(X, cols, T);
++    #pragma omp parallel for schedule(LLB_SCHED)
++    for (int r = 0; r < R; r++) {
++      int k = 0;
++      while (r >= r0[k + 1]) k++;
++      int id = ids[k], rl = r - r0[k];
++      gemm8_row(tfmt(id), tptr(id) + (size_t)rl * trb(id), cols, trows(id), rl, T, Yo[k]);
++    }
++    return;
++  }
++#endif
++  // other dot8 kinds keep their own per-tensor path
++  for (int k = 0; k < n; k++) gemm(ids[k], X, Yo[k], T);
++  return;
++#endif
++  (void)q8;
++  gemm_xt(X, cols, T);
+   #pragma omp parallel
+   {
+     float *w = (float *)malloc((size_t)cols * 4);
+     #pragma omp for schedule(LLB_SCHED)
+-    for (int r = 0; r < rows; r++) {
+-      deq_row(fmt, W + (size_t)r * rb, cols, w);
+-      for (int b = 0; b < nb; b++) {
+-        const v8f *xt = (const v8f *)(gXT + (size_t)b * cols * TBL);
+-        v8f a0 = {0}, a1 = {0}, a2 = {0}, a3 = {0};
+-        for (int c = 0; c < cols; c++) {
+-          v8f wc = (v8f){0} + w[c];
+-          a0 += xt[4 * c + 0] * wc; a1 += xt[4 * c + 1] * wc;
+-          a2 += xt[4 * c + 2] * wc; a3 += xt[4 * c + 3] * wc;
+-        }
+-        float acc[TBL];
+-        memcpy(acc, &a0, 32); memcpy(acc + 8, &a1, 32); memcpy(acc + 16, &a2, 32); memcpy(acc + 24, &a3, 32);
+-        for (int j = 0; j < TBL && b * TBL + j < T; j++) Yo[(size_t)(b * TBL + j) * rows + r] = acc[j];
+-      }
++    for (int r = 0; r < R; r++) {
++      int k = 0;
++      while (r >= r0[k + 1]) k++;
++      int id = ids[k], rl = r - r0[k], fmt = tfmt(id);
++      gemm_row(fmt, tptr(id) + (size_t)rl * (fmt == 0 ? (size_t)cols * 4 : (size_t)trb(id)), cols, trows(id), rl, T, w, Yo[k]);
+     }
+     free(w);
+   }
+@@ -1237,19 +1302,19 @@
+     for (int t = 0; t < T; t++) rms_norm(PH + (size_t)t * D, PX + (size_t)t * D, fvec(id), D);
+     if (gFull[il]) {
+       int nq = 2 * HDIM * H, nk = KV * HDIM;
+-      N("attn_q.weight"); gemm(id, PH, PA, T);
+-      N("attn_k.weight"); gemm(id, PH, PC, T);
+-      N("attn_v.weight"); gemm(id, PH, PD, T);
++      int ig[3]; float *og[3] = {PA, PC, PD};
++      N("attn_q.weight"); ig[0] = id; N("attn_k.weight"); ig[1] = id; N("attn_v.weight"); ig[2] = id;
++      gemm_n(3, ig, PH, og, T);
+       for (int t = 0; t < T; t++) {
+         full_core(il, p, PA + (size_t)t * nq, PC + (size_t)t * nk, PD + (size_t)t * nk, pos0 + t);
+         memcpy(PB + (size_t)t * H * HDIM, ATTN, (size_t)H * HDIM * 4);
+       }
+       N("attn_output.weight"); gemm(id, PB, PO, T);
+     } else {
+-      N("attn_qkv.weight"); gemm(id, PH, PA, T);
+-      N("attn_gate.weight"); gemm(id, PH, PB, T);
+-      N("ssm_beta.weight"); gemm(id, PH, PC, T);
+-      N("ssm_alpha.weight"); gemm(id, PH, PD, T);
++      int ig[4]; float *og[4] = {PA, PB, PC, PD};
++      N("attn_qkv.weight"); ig[0] = id; N("attn_gate.weight"); ig[1] = id;
++      N("ssm_beta.weight"); ig[2] = id; N("ssm_alpha.weight"); ig[3] = id;
++      gemm_n(4, ig, PH, og, T);
+       for (int t = 0; t < T; t++) {
+         linear_core(il, p, PA + (size_t)t * CONVD, PB + (size_t)t * VDC, PC + (size_t)t * TR, PD + (size_t)t * TR);
+         memcpy(PE + (size_t)t * VDC, OUT0, (size_t)VDC * 4);
+@@ -1262,8 +1327,11 @@
+       for (int i = 0; i < D; i++) x[i] += o[i];
+       rms_norm(PH + (size_t)t * D, x, fvec(id), D);
+     }
+-    N("ffn_gate.weight"); gemm(id, PH, PB, T);
+-    N("ffn_up.weight"); gemm(id, PH, PE, T);
++    {
++      int ig[2]; float *og[2] = {PB, PE};
++      N("ffn_gate.weight"); ig[0] = id; N("ffn_up.weight"); ig[1] = id;
++      gemm_n(2, ig, PH, og, T);
++    }
+     for (size_t i = 0; i < (size_t)T * dff; i++) PB[i] = hf_silu(PB[i]) * PE[i];
+     N("ffn_down.weight"); gemm(id, PB, PO, T);
+     for (size_t i = 0; i < (size_t)T * D; i++) PX[i] += PO[i];
+@@ -1426,6 +1494,7 @@
+           gNT, psz, L, D, H, KV, HDIM, dff, V);
+ #ifdef _OPENMP
+   fprintf(stderr, "cpu: omp threads %d (rows split, per-row order serial)\n", omp_get_max_threads());
++  fprintf(stderr, "cpu: prefill projections fused per input (qkv/gate/beta/alpha, q/k/v, gate/up; per-row order serial)\n");
+   {
+     omp_sched_t k; int ch; omp_get_schedule(&k, &ch);
+ #ifdef LLB_PAR_CORE

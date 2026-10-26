@@ -1,0 +1,52 @@
+diff -ru a/tools/kevserve/kev.c
+--- a/tools/kevserve/kev.c	2026-10-08 05:50:10.136902054 -0500
++++ b/tools/kevserve/kev.c	2026-10-08 05:50:10.138055187 -0500
+@@ -331,7 +331,7 @@
+     jv *p = json_get(req, "prompt"), *k = json_get(req, "n");
+     if (!p || p->type != J_STR || !k || k->type != J_NUM || k->num < 1 || k->num > 65536 || k->num != floor(k->num))
+       return refuse("generate needs prompt (string) and n (integer 1..65536)"), 0;
+-    int c = q35_tok_encode(&tok, p->str, 0, prompt_ids, TMAX);
++    int c = q35_tok_encode(&tok, p->str, getenv("KEV_EOS") != NULL, prompt_ids, TMAX);  // KEV_EOS: the app sends ChatML
+     if (c < 1 || c > TMAX) return refuse("prompt must tokenize to 1..16384 tokens"), 0;
+     if ((unsigned)c + (unsigned)k->num - 1 > ctx) return refuse("prompt + n exceeds the KV capacity fixed at launch"), 0;
+     mode = 2, steps = (int)k->num, prompt_n = c;
+@@ -413,7 +413,7 @@
+   free(capp);
+   sb o = {0};
+   if (mode == 2) {
+-    if (k != steps) die("generate: id count differs from n");
++    if (k > steps || (k < steps && !getenv("KEV_EOS"))) die("generate: id count differs from n");  // KEV_EOS: may stop early
+     sb_add(&o, "{\"prompt_ids\":[");
+     for (int i = 0; i < prompt_n; i++) sb_fmt(&o, i ? ",%d" : "%d", prompt_ids[i]);
+     sb_add(&o, "],\"ids\":[");
+diff -ru a/tools/qwen35_engine.c
+--- a/tools/qwen35_engine.c	2026-10-08 05:50:10.137087736 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 05:50:10.138266777 -0500
+@@ -1639,7 +1639,11 @@
+   Q35Tokenizer tk;
+   int mid = -1;
+   if (q35_tok_load(&tk, dir) || q35_tok_encode(&tk, "<|fim_middle|>", 1, &mid, 1) != 1) { fprintf(stderr, "decide: no <|fim_middle|>\n"); return 1; }
+-  q35_tok_free(&tk);
++  // KEV_EOS=1 (the Android app): generate stops at <|im_end|>/<|endoftext|> and streams each id's bytes to
++  // stderr as {"piece":"<hex>"}. Unset: kevserve's contract (exactly n ids, no stop) and the tokenizer is freed.
++  int eos = getenv("KEV_EOS") != NULL, stop[2] = {-1, -1};
++  if (eos) { q35_tok_encode(&tk, "<|im_end|>", 1, &stop[0], 1); q35_tok_encode(&tk, "<|endoftext|>", 1, &stop[1], 1); }
++  else q35_tok_free(&tk);
+   size_t ns = (size_t)L * TR * SZ * SZ, nc = (size_t)L * (KC - 1) * CONVD;
+   float *sS = malloc(ns * 4), *sC = malloc(nc * 4), *h = malloc((size_t)D * 4);
+   int *ids = malloc((size_t)ctx * 4), *pre = malloc((size_t)ctx * 4), npre = 0, fork = !getenv("KEV_NOFORK");
+@@ -1682,7 +1686,14 @@
+       for (int st = 0; st < steps; st++) {
+         final_logits();
+         int cur = argmax_first(LOGITS, V);
++        if (eos && (cur == stop[0] || cur == stop[1])) break;
+         printf("%d\n", cur);
++        if (eos) {
++          char pc[256]; int np = q35_tok_decode(&tk, &cur, 1, pc, sizeof pc);
++          fputs("{\"piece\":\"", stderr);
++          for (int i = 0; i < np && i < (int)sizeof pc; i++) fprintf(stderr, "%02x", (unsigned char)pc[i]);
++          fputs("\"}\n", stderr);
++        }
+         if (st + 1 < steps) forward_token(cur, (int)n + st);
+       }
+     }

@@ -1,0 +1,16 @@
+{
+  "model": "kev-4b",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are terse."
+    },
+    {
+      "role": "user",
+      "content": "Name the capital of France."
+    }
+  ],
+  "max_tokens": 64,
+  "temperature": 0,
+  "stream": false
+}

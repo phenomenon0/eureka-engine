@@ -1,0 +1,16 @@
+# vendored verbatim: sha256  path  <- source worktree@commit
+69b66d8f923a1ed764e7dac7db9c62d3c940afac3d90e936fec0d016c7363d9b  ./host/llb_formats.h  <- llama-bend-cpuspeed@cb4547dc
+29ce4040ee046509937b7c10b18cdb304b2e2c46112c10d82bb8c9ab458b52ed  ./host/llb_gguf.c  <- llama-bend-kevserve@2ef7e19d
+4342d1795c3e94307aa565e17de02ad81bb1470a273b670e8856f634cb1a3e22  ./tools/clef3/json.c  <- llama-bend-kevserve@2ef7e19d
+1a15c0f7eb3d097fa03421e24bbf456cb98e2cd9f10eac6e98e549fdbbbd1180  ./tools/clef3/json.h  <- llama-bend-kevserve@2ef7e19d
+d7553bdc421699a591dacd06b1e6f1801bd40e4fa51e42d660a61571b795d2b2  ./tools/cpuspeed/01-omp-rows.patch  <- llama-bend-cpuspeed@cb4547dc
+b7952a0ea596c9922663477a1254a90e2303557511a79744463f7b9ccde4b331  ./tools/cpuspeed/02-batched-prefill.patch  <- llama-bend-cpuspeed@cb4547dc
+a5f05c23960e646f365207cda845fa9f3e8a5fb0a07b40189aa5935ef1216c09  ./tools/kevserve/kev.c  <- llama-bend-kevserve@2ef7e19d
+38d88c912891142b919839c5e6a2d8c44623f5012f337c03b1c52ce1def3feeb  ./tools/qwen35_engine.c  <- llama-bend-cpuspeed@cb4547dc
+af1e2be7198d22a0f3290c73603782f44c179685e25b5276fe8b32a0c64cefec  ./tools/qwen35_sampler.c  <- llama-bend-cpuspeed@cb4547dc
+4f3f65f0e02821d1ce1f50a717bdb61d649fc59defd3a6f4ac69165d22412015  ./tools/qwen35_sampler.h  <- llama-bend-cpuspeed@cb4547dc
+76db578eec9b4b0959a45a95f8fe4d717b8c2931b7f384a51eb59830d3fbee77  ./tools/qwen35_template.c  <- llama-bend-cpuspeed@cb4547dc
+bfd9bb1e6a124c637c751d0d5c9b8f85d1790da56e125df071b9891ffb97ff71  ./tools/qwen35_template.h  <- llama-bend-cpuspeed@cb4547dc
+d9e5e51da0e809074481cea26e660af3d0d519de7c134c40e78aa7a33e6db65f  ./tools/qwen35_tokenizer.c  <- llama-bend-cpuspeed@cb4547dc
+8df88e095bb9df24cb8ce58b424f766c609230c5fd40363038023874c3f3f62a  ./tools/qwen35_tokenizer.h  <- llama-bend-cpuspeed@cb4547dc
+d2402201dcc7cdbe9981ba3a0819c6b4f55eb37896fc6ee97e380b5b92ec8f3b  ./tools/qwen35_unicode_data.inc  <- llama-bend-cpuspeed@cb4547dc

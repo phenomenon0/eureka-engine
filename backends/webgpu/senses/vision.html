@@ -1,0 +1,43 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Look · Eureka senses</title><link rel="icon" href="data:,"><link rel="stylesheet" href="common.css">
+<style>#img{display:block;max-width:100%;max-height:52vh;border-radius:8px}</style>
+<body data-page="vision">
+<main><section class="card">
+  <div class="row"><button data-img="assets/bus.jpg">bus.jpg</button><button data-img="assets/zidane.jpg">zidane.jpg</button>
+    <label><input type="file" id="file" accept="image/*" hidden><span class="chip" style="cursor:pointer" onclick="file.click()">Your image…</span></label></div>
+  <img id="img" alt="the image being looked at">
+  <div class="row"><input type="text" id="prompt" style="flex:1" value="Describe this image in two sentences."><button class="pri" id="ask" disabled>Look</button></div>
+  <p class="status" id="status"></p><div class="out" id="out"></div></section>
+<aside class="card"><h2>Measured</h2><div class="stats" id="stats"></div><h2 style="margin-top:14px">Log</h2><div class="log" id="log"></div>
+<p class="note">SmolVLM-256M-Instruct through transformers.js: SigLIP vision tower → pixel-shuffle projector → SmolLM2 decoder, all three ONNX graphs in this tab. WebGPU = fp32 tower/embeddings + q4 decoder; WASM = int8 on CPU. This is <b>not</b> bend's Qwen3.5 vision tower: that one runs in the native app only (see WEB-MODES.md).</p></aside></main>
+<script type="module">
+import T from "./tjs.js";
+import { q, S, pickEP, shell, ran, log, status, stats, fail, now, ms } from "./common.js";
+shell("Look", "image → words, in this tab");
+const $ = (i) => document.getElementById(i), M = "HuggingFaceTB/SmolVLM-256M-Instruct"; let proc, model, ep, busy = false;
+async function look(url, prompt) {
+  if (busy) return; busy = true; $("ask").disabled = true; $("img").src = url; $("out").textContent = ""; status("looking…");
+  const t0 = now(), image = await T.load_image(url);
+  const text = proc.apply_chat_template([{ role: "user", content: [{ type: "image" }, { type: "text", text: prompt }] }], { add_generation_prompt: true });
+  const inputs = await proc(text, [image], { do_image_splitting: false }); const t1 = now(); let first = null, n = 0;
+  const streamer = new T.TextStreamer(proc.tokenizer, { skip_prompt: true, skip_special_tokens: true, callback_function: (s) => { first ??= now(); $("out").textContent += s; }, token_callback_function: () => n++ });
+  const out = await model.generate({ ...inputs, max_new_tokens: +(q.get("n") ?? 80), do_sample: false, repetition_penalty: 1.1, streamer }); const t2 = now();
+  const toks = out.dims.at(-1) - inputs.input_ids.dims.at(-1), dec = toks > 1 ? (toks - 1) / ((t2 - first) / 1000) : null;
+  const r = { image: url.split("/").pop(), prompt_tokens: inputs.input_ids.dims.at(-1), new_tokens: toks, preprocess_ms: Math.round(t1 - t0), first_token_ms: Math.round(first - t1), total_ms: Math.round(t2 - t0), decode_tok_s: dec && +dec.toFixed(1), text: $("out").textContent.trim() };
+  (S.runs ??= []).push(r);
+  stats({ path: ep === "webgpu" ? "WebGPU (tower fp32 · dec q4)" : "WASM (CPU, int8)", model: "SmolVLM-256M", load: ms(S.t.load_ms), "image prep": ms(r.preprocess_ms), "tower+prefill → 1st token": ms(r.first_token_ms), decode: dec ? dec.toFixed(1) + " tok/s" : "–", tokens: `${r.prompt_tokens} in · ${toks} out`, total: ms(r.total_ms) });
+  log(`${r.image}: 1st token ${ms(r.first_token_ms)} · ${toks} tok · ${r.decode_tok_s} tok/s`); status(`looked in ${ms(r.total_ms)}`, "ok"); busy = false; $("ask").disabled = false; return r;
+}
+try {
+  ep = await pickEP(); status("loading SmolVLM-256M (tower + projector + decoder)…"); const t0 = now();
+  proc = await T.AutoProcessor.from_pretrained(M);
+  model = await T.AutoModelForVision2Seq.from_pretrained(M, { device: ep, dtype: ep === "webgpu" ? { vision_encoder: "fp32", embed_tokens: "fp32", decoder_model_merged: "q4" } : { vision_encoder: "q8", embed_tokens: "q8", decoder_model_merged: "q8" } });
+  S.t.load_ms = now() - t0; ran(ep); log(`SmolVLM-256M on ${ep}: load ${ms(S.t.load_ms)}`); $("ask").disabled = false;
+  let cur = q.get("img") ?? "assets/bus.jpg";
+  document.querySelectorAll("[data-img]").forEach((b) => (b.onclick = () => look((cur = b.dataset.img), $("prompt").value).catch((e) => fail("look", e))));
+  $("file").onchange = (e) => e.target.files[0] && look((cur = URL.createObjectURL(e.target.files[0])), $("prompt").value).catch((x) => fail("look", x));
+  $("ask").onclick = () => look(cur, $("prompt").value).catch((e) => fail("look", e));
+  await look(cur, $("prompt").value); if (q.has("warm")) await look("assets/zidane.jpg", $("prompt").value);
+  S.status = "ok";
+} catch (e) { fail("look", e); status(`In-page vision could not start (${e?.message ?? e}). Looking at images needs the native app on this device.`, "err"); }
+</script></body></html>

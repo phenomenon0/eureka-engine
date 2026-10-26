@@ -1,0 +1,72 @@
+--- a/tools/qwen35_engine.c	2026-10-08 03:17:18.980750000 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 03:17:18.998967605 -0500
+@@ -499,6 +499,28 @@
+ static const uint8_t *gPack = NULL;
+ static size_t gMapSz = 0;  // nonzero: gPack is an mmap; drop its pages per layer (RSS <= one layer)
+ static const char *gDumpLayers = NULL;
++// LLB_RESIDENT=1: keep the mapped pack resident across layers/tokens instead of dropping it per layer.
++// Clean file pages stay reclaimable; each layer end re-checks MemAvailable and drops below the floor.
++static int gResident = 0, gDrops = 0;
++static long gFloorKB = 0, gMinAvailKB = -1;
++static long mem_avail_kb(void) {
++  FILE *f = fopen("/proc/meminfo", "r");
++  char ln[128]; long v = -1;
++  if (!f) return -1;
++  while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &v) == 1) break;
++  fclose(f);
++  return v;
++}
++static void pack_release(void) {
++  if (!gMapSz) return;
++  if (gResident) {
++    long a = mem_avail_kb();
++    if (a >= 0 && (gMinAvailKB < 0 || a < gMinAvailKB)) gMinAvailKB = a;
++    if (a >= gFloorKB) return;
++    gDrops++;
++  }
++  madvise((void *)gPack, gMapSz, MADV_DONTNEED);
++}
+ 
+ static int L, D, H, KV, HDIM, dff, V, INTERVAL, KC, SZ, GK, TR, VHD, KDC, VDC, CONVD, ROPEDIM;
+ static float EPS, ROPE_BASE;
+@@ -942,7 +964,7 @@
+       FILE *f = fopen(fn, "wb"); fwrite(X, 4, D, f); fclose(f);
+     }
+ #undef N
+-    if (gMapSz) madvise((void *)gPack, gMapSz, MADV_DONTNEED);
++    pack_release();
+   }
+ }
+ 
+@@ -1246,7 +1268,7 @@
+     N("ffn_down.weight"); gemm(id, PB, PO, T);
+     for (size_t i = 0; i < (size_t)T * D; i++) PX[i] += PO[i];
+ #undef N
+-    if (gMapSz) madvise((void *)gPack, gMapSz, MADV_DONTNEED);
++    pack_release();
+   }
+   memcpy(X, PX + (size_t)(T - 1) * D, (size_t)D * 4);
+ }
+@@ -1391,6 +1413,14 @@
+     gPack = (const uint8_t *)mmap(NULL, psz, PROT_READ, MAP_PRIVATE, fd, 0);
+     if (gPack == MAP_FAILED) { perror("mmap"); return 1; }
+     gMapSz = psz;
++    const char *r = getenv("LLB_RESIDENT"), *fl = getenv("LLB_RESIDENT_FLOOR_MB");
++    gResident = r && atoi(r) > 0;
++    gFloorKB = (fl ? atol(fl) : 1024) * 1024;
++    if (gResident)
++      fprintf(stderr, "cpu: pack resident (LLB_RESIDENT=1; drop per layer below MemAvailable %ld MB, now %ld MB)\n",
++              gFloorKB >> 10, mem_avail_kb() >> 10);
++    else
++      fprintf(stderr, "cpu: pack dropped per layer (MADV_DONTNEED)\n");
+   }
+   fprintf(stderr, "loaded %d tensors, pack %zu bytes; L=%d D=%d H=%d KV=%d hd=%d dff=%d V=%d\n",
+           gNT, psz, L, D, H, KV, HDIM, dff, V);
+@@ -1531,6 +1561,7 @@
+     fprintf(stderr, "\nwall_ms %llu tok_s %.4f gen %d\n",
+             (unsigned long long)(t1 - t0), gen > 0 ? (double)gen * 1000.0 / (double)(t1 - t0) : 0.0, gen);
+   }
++  if (gResident) fprintf(stderr, "pack: resident floor_drops %d memavail_min_kb %ld\n", gDrops, gMinAvailKB);
+   if (have_tok) q35_tok_free(&tok);
+   (void)tmpl_raw;
+   return 0;

@@ -21,6 +21,12 @@
 //   POST /v1/audio/transcriptions     {input_audio:{data,format:"wav"}, response_format?: json|text|verbose_json} -> text
 //   chat: an input_audio part is transcribed by the ear and its transcript replaces the audio tag in the user turn
 //         (mm_replace_audio), so the trunk gets a text prompt; requests without audio are untouched.
+// Senses (env-configured, always routed; 503 until configured, docs in docs/reference/http-api.md#senses):
+//   POST /v1/see                      {image, threshold?, max_detections?} -> D-FINE-N COCO-80 boxes
+//                                     (see_route.c: a tools/see/see_worker.py child, onnxruntime; LLB_SEE_*)
+//   POST /v1/hear                     {audio: base64 WAV} -> transcript (hear_route.c: proxy to a resident
+//                                     whisper.cpp whisper-server on loopback; LLB_HEAR_*)
+//   POST /v1/speak                    {text, voice?} -> WAV: the --tts speech route under the senses name
 // One request runs on the engine at a time (single slot, FIFO by the engine
 // lock); the others wait. Streaming = dual.c's LLB_SYS1_STREAM token events.
 // G6 (--parallel N, default 1): N slots = N engine children, each its own
@@ -2227,6 +2233,31 @@ static void handle_voice(Conn *c, const char *req) {
     json_free(h);
 }
 
+// /v1/speak {text, voice?, speed?} = /v1/audio/speech {input, voice?, speed?} with a WAV reply (style is ignored)
+static void handle_speak(Conn *c, const char *body_s) {
+    const char *err = NULL;
+    jv *body = json_parse(body_s, &err);
+    const jv *t = body && body->type == J_OBJ ? json_get(body, "text") : NULL;
+    if (!t || t->type != J_STR) {
+        err_reply(c, 400, "invalid_request_error", err ? err : "text must be a string");
+        json_free(body);
+        return;
+    }
+    const jv *v = json_get(body, "voice"), *sp = json_get(body, "speed");
+    sb r = {0};
+    sb_add(&r, "{\"input\":");
+    json_quote(&r, t->str);
+    if (v) sb_add(&r, ",\"voice\":"), json_dump(&r, v);
+    if (sp) sb_add(&r, ",\"speed\":"), json_dump(&r, sp);
+    sb_add(&r, ",\"response_format\":\"wav\"}");
+    json_free(body);
+    handle_speech(c, r.p);
+    free(r.p);
+}
+
+#include "see_route.c"  // POST /v1/see (D-FINE-N detector child)
+#include "hear_route.c" // POST /v1/hear (whisper-server proxy)
+
 static void route(Conn *c, const char *body) {
     char *q = strchr(c->path, '?');
     if (q) *q = 0;
@@ -2336,6 +2367,19 @@ static void route(Conn *c, const char *body) {
         handle_voice(c, r.p);
         free(r.p);
         return;
+    }
+    if (!strcmp(p, "/v1/speak")) {
+        if (!post) return err_reply(c, 405, "invalid_request_error", "use POST");
+        if (!tts_dir) return err_reply(c, 503, "unavailable_error", "speech is not enabled on this backend");
+        return handle_speak(c, body);
+    }
+    if (!strcmp(p, "/v1/see")) {
+        if (!post) return err_reply(c, 405, "invalid_request_error", "use POST");
+        return handle_see(c, body);
+    }
+    if (!strcmp(p, "/v1/hear")) {
+        if (!post) return err_reply(c, 405, "invalid_request_error", "use POST");
+        return handle_hear(c, body);
     }
     int comp = !strcmp(p, "/v1/completions") || !strcmp(p, "/completions");
     int chat = !strcmp(p, "/v1/chat/completions") || !strcmp(p, "/chat/completions");
@@ -2609,7 +2653,12 @@ static void usage(const char *a0) {
         "      still busy; a second signal skips the drain\n"
         "  --tts DIR: speech (POST /v1/audio/speech, GET /v1/audio/voices, POST /voice/select) from a Kokoro pack\n"
         "             (tools/tts/kokoro_tts.py fetch DIR); env LLB_TTS_PYTHON (python3), LLB_TTS_SCRIPT (kokoro_tts.py\n"
-        "             beside llb-serve), BEND_KOKORO_THREADS (4), BEND_VOICE (default voice)\n"
+        "             beside llb-serve), BEND_KOKORO_THREADS (4), BEND_VOICE (default voice); POST /v1/speak {text}\n"
+        "             is the same speech under the senses name\n"
+        "  POST /v1/see (503 until set): env LLB_SEE_SCRIPT (see_worker.py), LLB_SEE_MODEL (dfine_n_coco.onnx),\n"
+        "             LLB_SEE_PYTHON (python3), LLB_SEE_LABELS, LLB_SEE_EP auto|cuda|cpu, LLB_SEE_THREADS (4)\n"
+        "  POST /v1/hear (503 until set): env LLB_HEAR_URL=http://127.0.0.1:PORT/inference (a running whisper.cpp\n"
+        "             whisper-server), LLB_HEAR_MODEL_ID, LLB_HEAR_MODEL_PATH, LLB_HEAR_MODEL_SHA256, LLB_HEAR_ENGINE\n"
         "  ENGINE ARGS default: --threads 16 -- $SYS1_SIDECAR 0 --steps 4096  (the SYS1-DUAL launch)\n"
         "  --exact (default): exact prefill, no prefix cache (the golden oracle, W1-SERVER launch)\n"
         "  --decide-path: LLB_PREFILL=fast + LLB_PREFIX_CACHE=1 + greedy LLB_SAMPLE (DECIDE-PATH.md);\n"
@@ -2803,6 +2852,8 @@ int main(int argc, char **argv) {
     if (tts_dir) tts_start(ls); // G41: before the glue worker (its pipes are not CLOEXEC)
     if (ear_dir) ear_start(ls); // EARS-CANON: same rule
     if (glue_pack) glue_start(); // G24: one glue worker shared by every slot (glue_lock)
+    see_cfg_init();  // senses: read LLB_SEE_* / LLB_HEAR_* once, before any connection thread
+    hear_cfg_init();
     if (n_slots == 1)
         logf_("listening on http://%s:%d model=%s engine=%s pid=%d (loading)%s", host, port, alias, engine, (int)slots[0].pid,
             structured_on ? " structured=on" : "");
@@ -2943,6 +2994,11 @@ int main(int argc, char **argv) {
         if (rc != ear_pid) kill(ear_pid, SIGTERM), waitpid(ear_pid, &st, 0);
         logf_("ear exit %s %d", WIFEXITED(st) ? "rc" : "signal", WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
         pthread_mutex_unlock(&ear_lock);
+    }
+    if (see_w.pid > 0) { // the /v1/see detector child, if one was started
+        pthread_mutex_lock(&see_lock);
+        see_worker_stop();
+        pthread_mutex_unlock(&see_lock);
     }
     return 0;
 }

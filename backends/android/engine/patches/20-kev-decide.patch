@@ -1,0 +1,133 @@
+--- a/tools/qwen35_engine.c	2026-10-08 05:47:03.976261081 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 05:47:03.977160222 -0500
+@@ -1484,6 +1484,7 @@
+ // Batch buffers for up to PFB prompt tokens per chunk.
+ #define PFB 64
+ static float *PX, *PH, *PA, *PB, *PC, *PD, *PE, *PO;
++static float *gHid;  // --decide: every prefilled token's last-layer residual, by position
+ 
+ static void prefill_alloc(void) {
+   size_t wa = (size_t)(CONVD > 2 * HDIM * H ? CONVD : 2 * HDIM * H);
+@@ -1556,6 +1557,7 @@
+ #undef N
+     pack_release();
+   }
++  if (gHid) memcpy(gHid + (size_t)pos0 * D, PX, (size_t)T * D * 4);
+   memcpy(X, PX + (size_t)(T - 1) * D, (size_t)D * 4);
+ }
+ 
+@@ -1563,6 +1565,11 @@
+   for (int t0 = 0; t0 < n; t0 += PFB) prefill_chunk(tok + t0, n - t0 < PFB ? n - t0 : PFB, t0);
+ }
+ 
++// prefill positions [a, n) of tok (the state holds [0, a)); chunked as prefill(), so the same bits
++static void prefill_range(const int *tok, int a, int n) {
++  for (int t0 = a; t0 < n; t0 += PFB) prefill_chunk(tok + t0, n - t0 < PFB ? n - t0 : PFB, t0);
++}
++
+ static void final_logits(void) {
+   int onorm = find("output_norm.weight");
+   rms_norm(HH, X, fvec(onorm), D);
+@@ -1613,7 +1620,76 @@
+     "    --seed S             RNG seed\n"
+     "    --ids | --text       emit ids / streamed text (default by mode)\n"
+     "    --stop ID            extra stop token (repeatable)\n"
+-    "    --layers L --preload --dump-layers DIR --selftest --tokenwise-prefill\n", p);
++    "    --layers L --preload --dump-layers DIR --selftest --tokenwise-prefill\n"
++    "    --decide CTX         serve kevserve JSON lines on stdin (KV capacity CTX; env LLB_GGUF, TMPDIR)\n", p);
++}
++
++// ---- --decide CTX: kevserve's kev.c request loop (JSON lines, stdin/stdout) on this CPU engine.
++// kev.c hands out one prompt per question (or generate); we prefill it, write every prompt row's
++// final-norm output (the LM head's input) to its hidden file, and print generate's greedy ids.
++// Fork: a question's prefix through the first <|fim_middle|> (fim_prefix STATE fim_middle) is
++// prefilled once and its recurrent state saved; the next prompt with the same prefix restores it
++// and prefills only its own suffix. Per-token arithmetic is independent of the chunking (G2), so
++// the bits equal a full re-prefill. KEV_NOFORK=1 turns it off (the A/B check).
++int dual_next(const char *dir, unsigned ctx, char **cmd, const char **hidden, unsigned *n);
++void dual_done(void);
++
++static int serve_decide(const char *dir, int ctx) {
++  state_alloc(ctx); buf_alloc(); prefill_alloc();
++  Q35Tokenizer tk;
++  int mid = -1;
++  if (q35_tok_load(&tk, dir) || q35_tok_encode(&tk, "<|fim_middle|>", 1, &mid, 1) != 1) { fprintf(stderr, "decide: no <|fim_middle|>\n"); return 1; }
++  q35_tok_free(&tk);
++  size_t ns = (size_t)L * TR * SZ * SZ, nc = (size_t)L * (KC - 1) * CONVD;
++  float *sS = malloc(ns * 4), *sC = malloc(nc * 4), *h = malloc((size_t)D * 4);
++  int *ids = malloc((size_t)ctx * 4), *pre = malloc((size_t)ctx * 4), npre = 0, fork = !getenv("KEV_NOFORK");
++  gHid = malloc((size_t)ctx * D * 4);
++  if (!sS || !sC || !h || !ids || !pre || !gHid) { fprintf(stderr, "decide alloc failed\n"); return 1; }
++  int onorm = find("output_norm.weight");
++  char *cmd; const char *hid; unsigned n;
++  while (dual_next(dir, (unsigned)ctx, &cmd, &hid, &n)) {
++    char *s = cmd;
++    for (unsigned i = 0; i < n; i++) ids[i] = (int)strtol(s, &s, 10);
++    int steps = atoi(strstr(s, "--steps") + 7);
++    free(cmd);
++    u64 t0 = now_ms();
++    int m = 0;
++    while (m < (int)n && ids[m] != mid) m++;
++    m = fork && m < (int)n ? m + 1 : 0;
++    int a = 0;
++    if (m && npre == m && !memcmp(pre, ids, (size_t)m * 4)) {
++      memcpy(gS, sS, ns * 4); memcpy(gConv, sC, nc * 4); a = m;  // KV + gHid rows [0, m) are still this prefix's
++    } else {
++      memset(gS, 0, ns * 4); memset(gConv, 0, nc * 4); npre = 0;
++      if (m) {
++        prefill_range(ids, 0, m);
++        memcpy(sS, gS, ns * 4); memcpy(sC, gConv, nc * 4); memcpy(pre, ids, (size_t)m * 4); npre = m; a = m;
++      }
++    }
++    prefill_range(ids, a, (int)n);
++    if (hid) {
++      FILE *f = fopen(hid, "wb");
++      if (!f) { fprintf(stderr, "decide: cannot write %s\n", hid); return 1; }
++      for (unsigned i = 0; i < n; i++) {
++        u32 hd[2] = {i, (u32)D};
++        rms_norm(h, gHid + (size_t)i * D, fvec(onorm), D);
++        if (fwrite(hd, 4, 2, f) != 2 || fwrite(h, 4, D, f) != (size_t)D) { fprintf(stderr, "decide: write failed\n"); return 1; }
++      }
++      if (fclose(f)) { fprintf(stderr, "decide: close failed\n"); return 1; }
++    } else {
++      npre = 0;  // generate writes KV past the prompt; positions [0, n) are this prompt's now
++      memcpy(X, gHid + (size_t)(n - 1) * D, (size_t)D * 4);  // X = the last prompt row even when nothing was prefilled
++      for (int st = 0; st < steps; st++) {
++        final_logits();
++        int cur = argmax_first(LOGITS, V);
++        printf("%d\n", cur);
++        if (st + 1 < steps) forward_token(cur, (int)n + st);
++      }
++    }
++    fprintf(stderr, "{\"kevcpu\":{\"tokens\":%u,\"reused\":%d,\"run_ms\":%llu}}\n", n, a, (unsigned long long)(now_ms() - t0));
++    dual_done();
++  }
++  return 0;
+ }
+ 
+ static int is_stop(Q35Tokenizer *t, int id, const int *stops, int nstops) {
+@@ -1634,7 +1710,7 @@
+   int tmpl_raw = -1;         // -1 auto, 0 chat, 1 raw
+   float temp = 0.0f, top_p = 1.0f;
+   unsigned long seed = 0;
+-  int stops[64], nstops = 0;
++  int stops[64], nstops = 0, decide = 0;
+ 
+   for (int a = 2; a < argc; a++) {
+     if (!strcmp(argv[a], "--steps") && a + 1 < argc) steps = atoi(argv[++a]);
+@@ -1643,6 +1719,7 @@
+     else if (!strcmp(argv[a], "--gpu") || !strcmp(argv[a], "--metal")) gUseGpu = 1;
+     else if (!strcmp(argv[a], "--cpu")) gUseGpu = 0;
+     else if (!strcmp(argv[a], "--selftest")) selftest = 1;
++    else if (!strcmp(argv[a], "--decide") && a + 1 < argc) decide = atoi(argv[++a]);
+     else if (!strcmp(argv[a], "--tokenwise-prefill")) tokenwise = 1;
+     else if (!strcmp(argv[a], "--dump-layers") && a + 1 < argc) gDumpLayers = argv[++a];
+     else if (!strcmp(argv[a], "--pack") && a + 1 < argc) pack = argv[++a];
+@@ -1766,6 +1843,7 @@
+   }
+ #endif
+ 
++  if (decide > 0) return serve_decide(dir, decide);
+   int text_mode = (prompt != NULL || chat != NULL);
+   Q35Tokenizer tok;
+   int have_tok = 0;

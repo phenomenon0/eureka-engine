@@ -1,0 +1,31 @@
+{
+  "schema": "webgpu-battery-clips/v1",
+  "fixture": "onnx-community/whisper-base.en",
+  "model_sha_bundle": "9f281aab0e99a7bb1e279888d01be2cc162796648f83585b56049086bc9942b4",
+  "refs_source": "MEGA-M4W/receipts/wer-ort-base.json rows[].ref (turbo transcripts)",
+  "selection_rule": "3 known-good requests from senses/assets + the 7 shortest MEGA-LAB/corpus memos, excluding the 118.1 s memo",
+  "clips": [
+    {
+      "id": "sample",
+      "file": "assets/speech-sample.wav",
+      "sha256": "6cbbf1096252f3c8171377b5bdc15f4019aff4de70ff03d411a9771efd8639d6",
+      "ref": "The quick brown fox jumps over the lazy dog. Bend runs every sense inside the browser tab.",
+      "note": "known-good #1, cold, same as receipt run 0"
+    },
+    {
+      "id": "sample (warm)",
+      "file": "assets/speech-sample.wav",
+      "sha256": "6cbbf1096252f3c8171377b5bdc15f4019aff4de70ff03d411a9771efd8639d6",
+      "ref": "The quick brown fox jumps over the lazy dog. Bend runs every sense inside the browser tab.",
+      "note": "known-good #2, warm, same file requested again"
+    },
+    {
+      "id": "kokoro af_bella",
+      "file": "assets/kokoro-bella.wav",
+      "sha256": "14fde04b646abc2807e5f879b5f5e835c50cd45ce9ba9b91cf0deb735ecd7950",
+      "ref": "Hi, I'm Bella. Everything you hear right now was synthesized inside this browser tab, with no server at all.",
+      "note": "known-good #3, Kokoro TTS round trip"
+    }
+  ],
+  "note_import": "The 7 private corpus memo clips of the graded battery are not included; only the 3 public clips remain."
+}

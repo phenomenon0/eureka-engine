@@ -1,0 +1,125 @@
+{
+  "version": "IOS-FOLD-F0",
+  "contract": "runs/backend-parity/metal-5of5/SCHEMAS.md (M2, 2026-10-19), iOS subset",
+  "ios_subset": {
+    "decide": [
+      "noul",
+      "score",
+      "choice"
+    ],
+    "see": {
+      "image": "data: URL only; http(s) refused",
+      "tasks": [
+        "text",
+        "detect"
+      ],
+      "detect": "501 unless -visionPocket and Documents/ml packages are staged"
+    },
+    "hear": {
+      "audio": "WAV data: URL",
+      "timestamps": false,
+      "native_rate": 16000
+    },
+    "speak": {
+      "rate": 24000,
+      "format": "PCM16 mono WAV",
+      "styles": [
+        "neutral",
+        "slow",
+        "fast"
+      ],
+      "voices": "the bundled Kokoro packs"
+    }
+  },
+  "deferred": [
+    "decide int (needs the clef head, over the 6 GB law)",
+    "hear timestamps:true",
+    "speak pitch_up/pitch_down",
+    "see http(s) images",
+    "see detection boxes without -visionPocket"
+  ],
+  "canonical_error": {
+    "example": {
+      "error": {
+        "message": "text must be a string",
+        "type": "invalid_request_error",
+        "param": null,
+        "code": 400
+      }
+    },
+    "field_order": [
+      "message",
+      "type",
+      "param",
+      "code"
+    ],
+    "statuses": [
+      400,
+      401,
+      404,
+      405,
+      413,
+      500,
+      501,
+      503
+    ]
+  },
+  "responses": {
+    "chat": {
+      "required": [
+        "id",
+        "object",
+        "created",
+        "model",
+        "choices",
+        "usage"
+      ],
+      "extras": [
+        "llb"
+      ]
+    },
+    "decide": {
+      "required": [
+        "model",
+        "answers",
+        "usage"
+      ]
+    },
+    "see": {
+      "required": [
+        "model",
+        "text",
+        "usage",
+        "llb"
+      ]
+    },
+    "see_detect": {
+      "required": [
+        "model",
+        "task",
+        "boxes"
+      ]
+    },
+    "hear": {
+      "required": [
+        "model",
+        "text",
+        "duration_s",
+        "usage",
+        "llb"
+      ]
+    },
+    "speak": {
+      "content_type": "audio/wav",
+      "headers": [
+        "Content-Type",
+        "Content-Length",
+        "X-LLB-Sample-Rate",
+        "X-LLB-Voice",
+        "X-LLB-Style",
+        "X-LLB-G2P",
+        "X-LLB-Speak-Ms"
+      ]
+    }
+  }
+}

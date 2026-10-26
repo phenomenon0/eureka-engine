@@ -1,0 +1,177 @@
+diff -ru a/tools/kevserve/kev.c src/tools/kevserve/kev.c
+--- a/tools/kevserve/kev.c
++++ b/tools/kevserve/kev.c
+@@ -258,6 +258,7 @@
+ static jv *req;
+ static Q qs[QMAX];
+ static int mode, steps, seq, prompt_n, prompt_ids[TMAX], nq, qi, total;
++static char image_path[4096];  // 30-vision: generate's optional "image" (a file the engine's tower reads)
+ static double t_req, t_fwd, fwd_ms[QMAX], head_ms;
+ static sb ans, raws;
+ 
+@@ -303,6 +304,7 @@
+   sb c = {0};
+   for (int i = 0; i < n; i++) sb_fmt(&c, "%d ", ids[i]);
+   sb_fmt(&c, "--steps %d", st);
++  if (mode == 2 && image_path[0]) sb_fmt(&c, " --image %s", image_path);
+   return c.p;
+ }
+ 
+@@ -334,6 +336,19 @@
+     int c = q35_tok_encode(&tok, p->str, getenv("KEV_EOS") != NULL, prompt_ids, TMAX);  // KEV_EOS: the app sends ChatML
+     if (c < 1 || c > TMAX) return refuse("prompt must tokenize to 1..16384 tokens"), 0;
+     if ((unsigned)c + (unsigned)k->num - 1 > ctx) return refuse("prompt + n exceeds the KV capacity fixed at launch"), 0;
++    image_path[0] = 0;
++    jv *im = json_get(req, "image");
++    if (im) {  // the prompt holds one <|image_pad|>; the engine expands it to the tower's rows
++      int pad = -1, np = 0;
++      q35_tok_encode(&tok, "<|image_pad|>", 1, &pad, 1);
++      for (int i = 0; i < c; i++) np += prompt_ids[i] == pad;
++      int vmax = getenv("LLB_VIS_TOKENS") ? atoi(getenv("LLB_VIS_TOKENS")) : 256;
++      if (im->type != J_STR || strlen(im->str) >= sizeof image_path || strpbrk(im->str, " \t\r\n"))
++        return refuse("image must be a file path without whitespace"), 0;
++      if (np != 1) return refuse("no-vision: an image request needs exactly one <|image_pad|> in the prompt"), 0;
++      if ((unsigned)c + (unsigned)vmax + (unsigned)k->num - 2 > ctx) return refuse("no-vision: the photo plus the prompt and reply do not fit the context"), 0;
++      snprintf(image_path, sizeof image_path, "%s", im->str);
++    }
+     mode = 2, steps = (int)k->num, prompt_n = c;
+     return 1;
+   }
+@@ -398,6 +413,15 @@
+   return h;
+ }
+ 
++void dual_fail(const char *msg) {  // the engine could not serve the request (the image): answer {"error":..} instead
++  fflush(cap);
++  stdout = out;
++  fclose(cap);
++  free(capp);
++  refuse(msg);
++  drop();
++}
++
+ void dual_done(void) {
+   double t_ran = now();
+   fflush(cap);
+diff -ru a/tools/qwen35_engine.c src/tools/qwen35_engine.c
+--- a/tools/qwen35_engine.c
++++ b/tools/qwen35_engine.c
+@@ -40,6 +40,7 @@
+ #include "qwen35_tokenizer.c"
+ #include "qwen35_template.c"
+ #include "qwen35_sampler.c"
++#include "vision.h"  // 30-vision: the phone vision tower (android/engine/vision)
+ 
+ typedef uint32_t u32;
+ typedef uint64_t u64;
+@@ -706,6 +707,28 @@
+   }
+ }
+ 
++// ---- vision (30-vision.patch): one image per request. gImgN == 0 (no image) leaves every path bit-identical.
++// The image's gImgN rows replace the embeddings of KV slots [gImgS0, gImgS0+gImgN); slots and the causal mask are
++// unchanged, only the rope angle moves (IMRoPE, Qwen3-VL): pair i takes t/h/w by i%3; image row r = (S0, S0+r/nx,
++// S0+r%nx); text after the image resumes at slot - (n - max(nx,ny)).
++static int gImgS0, gImgN, gImgNx, gImgSh;
++static float *gImgE;
++static void rope_im(float *x, int slot, int nd, int hd, float base) {
++  if (!gImgN) { rope_neox(x, slot, nd, hd, base); return; }
++  int pt = slot, ph = slot, pw = slot;
++  if (slot >= gImgS0 + gImgN) pt = ph = pw = slot - gImgSh;
++  else if (slot >= gImgS0) { int r = slot - gImgS0; pt = gImgS0; ph = gImgS0 + r / gImgNx; pw = gImgS0 + r % gImgNx; }
++  int half = nd / 2;
++  for (int i = 0; i < half; i++) {
++    int pos = i % 3 == 0 ? pt : i % 3 == 1 ? ph : pw;
++    float theta = (float)((double)pos * pow((double)base, -2.0 * i / nd));
++    float c = hf_cos(theta), s = hf_sin(theta);
++    float a = x[i], b = x[i + half];
++    x[i] = a * c - b * s;
++    x[i + half] = a * s + b * c;
++  }
++}
++
+ // ---- model state ---------------------------------------------------------
+ static float *gS, *gConv, *gK, *gV;
+ static int gCap = 0;
+@@ -868,7 +891,7 @@
+     for (int i = 0; i < HDIM; i++) ss += q[i] * q[i];
+     float s = 1.0f / hf_sqrt(ss / (float)HDIM + EPS);
+     for (int i = 0; i < HDIM; i++) qn[hh * HDIM + i] = q[i] * s * qnw[i];
+-    rope_neox(qn + hh * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
++    rope_im(qn + hh * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
+   }
+   size_t base = ((size_t)il * gCap + tpos) * KV * HDIM;
+   float *kc = gK + base;
+@@ -878,7 +901,7 @@
+     for (int i = 0; i < HDIM; i++) ss += k[i] * k[i];
+     float s = 1.0f / hf_sqrt(ss / (float)HDIM + EPS);
+     for (int i = 0; i < HDIM; i++) kc[g * HDIM + i] = k[i] * s * knw[i];
+-    rope_neox(kc + g * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
++    rope_im(kc + g * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
+   }
+   memcpy(gV + base, VB, KV * HDIM * 4);
+ }
+@@ -1509,6 +1532,10 @@
+   int id; char p[32], nm[80];
+   int emb = find("token_embd.weight");
+   for (int t = 0; t < T; t++) row_f32(emb, tok[t], PX + (size_t)t * D);
++  for (int t = 0; t < T; t++) {  // vision: image rows replace the pad tokens' embeddings
++    int r = pos0 + t - gImgS0;
++    if (gImgN && r >= 0 && r < gImgN) memcpy(PX + (size_t)t * D, gImgE + (size_t)r * D, (size_t)D * 4);
++  }
+   for (int il = 0; il < L; il++) {
+     snprintf(p, sizeof p, "blk.%d.", il);
+ #define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
+@@ -1633,6 +1660,7 @@
+ // the bits equal a full re-prefill. KEV_NOFORK=1 turns it off (the A/B check).
+ int dual_next(const char *dir, unsigned ctx, char **cmd, const char **hidden, unsigned *n);
+ void dual_done(void);
++void dual_fail(const char *msg);
+ 
+ static int serve_decide(const char *dir, int ctx) {
+   state_alloc(ctx); buf_alloc(); prefill_alloc();
+@@ -1650,13 +1678,35 @@
+   gHid = malloc((size_t)ctx * D * 4);
+   if (!sS || !sC || !h || !ids || !pre || !gHid) { fprintf(stderr, "decide alloc failed\n"); return 1; }
+   int onorm = find("output_norm.weight");
++  // vision: LLB_MMPROJ = the F16 mmproj (mmap'd at the first image), LLB_VIS_TOKENS = cap on image tokens (default 256)
++  int pad = -1, vmax = getenv("LLB_VIS_TOKENS") ? atoi(getenv("LLB_VIS_TOKENS")) : 256;
++  if (eos) q35_tok_encode(&tk, "<|image_pad|>", 1, &pad, 1);
+   char *cmd; const char *hid; unsigned n;
+   while (dual_next(dir, (unsigned)ctx, &cmd, &hid, &n)) {
+-    char *s = cmd;
++    char *s = cmd, imgp[4096] = "";
+     for (unsigned i = 0; i < n; i++) ids[i] = (int)strtol(s, &s, 10);
+     int steps = atoi(strstr(s, "--steps") + 7);
++    const char *ip = strstr(s, "--image ");
++    if (ip) snprintf(imgp, sizeof imgp, "%s", ip + 8);
+     free(cmd);
+     u64 t0 = now_ms();
++    gImgN = 0;
++    if (imgp[0]) {
++      char err[256] = "";
++      float *emb = NULL; int nt = 0, gx = 0, gy = 0, p = 0; double vms = 0;
++      while (p < (int)n && ids[p] != pad) p++;
++      const char *mm = getenv("LLB_MMPROJ");
++      if (p == (int)n || pad < 0) snprintf(err, sizeof err, "no-vision: the prompt carries no image slot");
++      else if (!mm || !*mm) snprintf(err, sizeof err, "no-vision: LLB_MMPROJ is not set");
++      else if (vis_open(mm, D, err) || vis_encode(imgp, vmax, &emb, &nt, &gx, &gy, &vms, err)) { char e2[300]; snprintf(e2, sizeof e2, "no-vision: %s", err); snprintf(err, sizeof err, "%s", e2); }
++      else if ((long)n + nt - 1 + steps > ctx) { free(emb); snprintf(err, sizeof err, "no-vision: the photo (%d tokens) plus the prompt and reply do not fit the %d-token context", nt, ctx); }
++      if (err[0]) { dual_fail(err); continue; }
++      memmove(ids + p + nt, ids + p + 1, (size_t)(n - p - 1) * 4);
++      for (int k = 0; k < nt; k++) ids[p + k] = pad;
++      n += (unsigned)(nt - 1);
++      gImgS0 = p; gImgN = nt; gImgNx = gx; gImgSh = nt - (gx > gy ? gx : gy); gImgE = emb;
++      fprintf(stderr, "{\"vision\":{\"tokens\":%d,\"grid\":[%d,%d],\"tower_ms\":%.0f}}\n", nt, gx, gy, vms);
++    }
+     int m = 0;
+     while (m < (int)n && ids[m] != mid) m++;
+     m = fork && m < (int)n ? m + 1 : 0;
+@@ -1697,6 +1747,7 @@
+         if (st + 1 < steps) forward_token(cur, (int)n + st);
+       }
+     }
++    if (gImgN) { free(gImgE); gImgE = NULL; gImgN = 0; }
+     fprintf(stderr, "{\"kevcpu\":{\"tokens\":%u,\"reused\":%d,\"run_ms\":%llu}}\n", n, a, (unsigned long long)(now_ms() - t0));
+     dual_done();
+   }

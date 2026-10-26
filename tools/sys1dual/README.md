@@ -145,7 +145,7 @@ This table lists the options that this page uses. For all flags, see
 
 | Topic | Behavior |
 |---|---|
-| Endpoints | `GET /health`, `GET /v1/models`, `GET /version`, `POST /v1/completions`, `POST /v1/chat/completions`, `POST /v1/decide`, and unversioned aliases. `GET /slots` with `--parallel` > 1. |
+| Endpoints | `GET /health`, `GET /v1/models`, `GET /version`, `POST /v1/completions`, `POST /v1/chat/completions`, `POST /v1/decide`, and unversioned aliases. `GET /slots` with `--parallel` > 1. The senses `POST /v1/see`, `POST /v1/hear`, and `POST /v1/speak` answer 503 until configured. See [§7](#7-senses-see-hear-speak). |
 | Batch requests | N items, one pass where supported. The questions of one decide task are answered from one engine pass. A `{"batch":[...]}` of N tasks or prompts runs N passes back to back on one slot: one HTTP request, one queue ticket, no reload. It is not fused into one pass. See [§6](#6-batch-requests-and-v1decide). |
 | Keep-alive | HTTP/1.1 connections are reused for non-streamed responses, up to `--keepalive-seconds` idle (default 30; 0 = one request per connection). An SSE stream always ends with the connection closed. HTTP/1.0 or `Connection: close` closes the connection after the response. Pipelined requests are answered in order. `Expect: 100-continue` is honored. |
 | Errors | Every error is `{"error":{"message":…,"type":…,"param":null,"code":<HTTP status>}}`. An error event inside an SSE stream has the same shape, followed by `data: [DONE]`. Types: `invalid_request_error` (400/405/408/411/413), `permission_error` (403), `not_found_error` (404), `unavailable_error` (503: loading, engine gone, shutting down). |
@@ -217,6 +217,42 @@ curl -s localhost:8080/v1/completions -H 'Content-Type: application/json' -d '{
 Decide errors: a decide task that the engine cannot encode returns 400
 `invalid_request_error`, and the engine stays up. Examples: an unknown question
 type, empty `questions`, or a schema or state over the 16,384-token budget.
+
+## 7. Senses: see, hear, speak
+
+Three routes run beside the engine and do not take an engine slot. Each one is
+always routed and answers `503` with the error shape until you configure it.
+
+| Route | Does | Turn it on |
+|---|---|---|
+| `POST /v1/see` | Image in, COCO-80 boxes out (D-FINE-N, ONNX Runtime child `see_worker.py`). | `LLB_SEE_SCRIPT=$OUT/see_worker.py`, `LLB_SEE_MODEL=…/dfine_n_coco.onnx`, `LLB_SEE_PYTHON=` an interpreter with `onnxruntime`. Model and setup: [`tools/see/README.md`](../see/README.md). |
+| `POST /v1/hear` | WAV in, transcript out, proxied to a whisper.cpp `whisper-server` that you start on loopback. | `LLB_HEAR_URL=http://127.0.0.1:PORT/inference`. Model: `ggml-base.en-q5_1.bin`. |
+| `POST /v1/speak` | `{text, voice?}` in, 24 kHz WAV out: the `--tts` voice under the senses name. | `--tts DIR`. |
+
+1. Start the whisper sidecar and the server:
+
+   ```sh
+   whisper-server --host 127.0.0.1 --port 8137 -m MODEL_DIR/ggml-base.en-q5_1.bin -t 8 --no-timestamps &
+   export LLB_HEAR_URL=http://127.0.0.1:8137/inference
+   export LLB_SEE_SCRIPT=$OUT/see_worker.py LLB_SEE_MODEL=MODEL_DIR/dfine_n_coco.onnx LLB_SEE_PYTHON=PYTHON
+   $OUT/llb-serve --port 8080 --alias clef-flash --engine $OUT/llb-engine -- --threads 16 -- SIDECAR 0 --steps 4096
+   ```
+
+   Replace `MODEL_DIR` with the directory that holds the models, `PYTHON` with an
+   interpreter that has `onnxruntime`, and `SIDECAR` with the SYS1 sidecar.
+
+2. Send an image and a clip:
+
+   ```sh
+   printf '{"image":"data:image/jpeg;base64,%s"}' "$(base64 -w0 photo.jpg)" > see.json
+   curl -s localhost:8080/v1/see -H 'Content-Type: application/json' --data-binary @see.json
+   printf '{"audio":"data:audio/wav;base64,%s"}' "$(base64 -w0 clip.wav)" > hear.json
+   curl -s localhost:8080/v1/hear -H 'Content-Type: application/json' --data-binary @hear.json
+   ```
+
+The server logs one `see:` and one `hear:` line at start when a sense is
+configured. For the full request and response shapes, model checksums, and
+error codes, see [HTTP API: Senses](../../docs/reference/http-api.md#senses).
 
 ## Related pages
 

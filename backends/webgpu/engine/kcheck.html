@@ -1,0 +1,39 @@
+<!doctype html><meta charset="utf-8"><title>kcheck</title><pre id="log"></pre>
+<script type="module">
+// kcheck: the showcase's two new kernels vs a CPU reference on Kev-4B's real weights: embed4 (Q4_K gather) and q8w4096 (turbo GEMV)
+import { pipes, entry_run } from "./webgpu.js";
+import { gguf_read } from "./gguf.js";
+const log = (s) => (document.getElementById("log").textContent += s + "\n"), out = {}; window.__smoke = out;
+const url = new URL("../models/Kev-4B-Q4_K_M.gguf", location.href).href;
+const read = async (o, n) => new Uint8Array(await (await fetch(url, { headers: { Range: `bytes=${o}-${o + n - 1}` } })).arrayBuffer());
+const f16 = (h) => { const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 31, f = h & 1023; return e === 0 ? s * f * 2 ** -24 : s * (1 + f / 1024) * 2 ** (e - 15); };
+try {
+  const g0 = await gguf_read(read), T = Object.fromEntries(g0.tensors.map(t => [t.name, t]));
+  const adapter = await navigator.gpu.requestAdapter(), sg = adapter.features.has("subgroups");
+  const device = await adapter.requestDevice({ requiredFeatures: sg ? ["subgroups"] : [], requiredLimits: { maxStorageBufferBindingSize: 1 << 27, maxBufferSize: 1 << 28 } });
+  const g = { adapter, device };
+  // embed4: rows 1000..1003 of token_embd, id 1002
+  const emb = T["token_embd.weight"], r0 = 1000, wb = await read(emb.abs + r0 * 1440, 4 * 1440);
+  const em = await pipes(g, await (await fetch("../emit/k_embed_q4k.wgsl")).text());
+  const ge = new Float32Array((await entry_run(g, em.by("map", "embed4"), { in: { wb }, sc: { id: 1002, chunk_row0: r0 }, len: 2560 })).bits.buffer);
+  const ref = new Float32Array(2560), base = 2 * 1440, b8 = wb;
+  for (let blk = 0; blk < 10; blk++) {
+    const o = base + blk * 144, d = f16(b8[o] | b8[o + 1] << 8), dm = f16(b8[o + 2] | b8[o + 3] << 8), sc = b8.subarray(o + 4, o + 16), qs = b8.subarray(o + 16, o + 144);
+    const sm = (j) => j < 4 ? [sc[j] & 63, sc[j + 4] & 63] : [(sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4), (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)];
+    for (let c = 0; c < 4; c++) for (let h = 0; h < 2; h++) { const [s, m] = sm(2 * c + h); for (let l = 0; l < 32; l++) { const q = h ? qs[32 * c + l] >> 4 : qs[32 * c + l] & 15; ref[blk * 256 + c * 64 + h * 32 + l] = Math.fround(d * s) * q - Math.fround(dm * m); } }
+  }
+  let e1 = 0; for (let i = 0; i < 2560; i++) e1 = Math.max(e1, Math.abs(ge[i] - ref[i]));
+  out.embed4 = { max_abs_err: e1, sample: [...ge.slice(0, 4)], ref: [...ref.slice(0, 4)], finite: ge.every(Number.isFinite) };
+  log("embed4 " + JSON.stringify(out.embed4));
+  // q8w4096: blk.0.ssm_out rows 0..7, the pack's row split ([4096 int8][128 f16] a row)
+  const t = T["blk.0.ssm_out.weight"], rows = 8, raw = await read(t.abs, rows * 128 * 34), split = new Uint8Array(rows * 4352);
+  for (let r = 0; r < rows; r++) for (let b = 0; b < 128; b++) { const s = r * 128 * 34 + b * 34; split.set(raw.subarray(s + 2, s + 34), r * 4352 + b * 32); split[r * 4352 + 4096 + b * 2] = raw[s]; split[r * 4352 + 4096 + b * 2 + 1] = raw[s + 1]; }
+  const x = new Float32Array(4096).map((_, i) => Math.sin(i * 0.37) * 0.5);
+  const gm = await pipes(g, await (await fetch(`../emit/k_gemv_turbo${sg ? "_sg" : ""}_kev.wgsl`)).text());
+  const gy = new Float32Array((await entry_run(g, gm.by("cube", "q8w4096"), { in: { wb: split, xb: x }, sc: { base: 0 }, rows })).bits.buffer);
+  const want = []; for (let r = 0; r < rows; r++) { let a = 0; for (let b = 0; b < 128; b++) { const s = r * 128 * 34 + b * 34, d = f16(raw[s] | raw[s + 1] << 8); for (let k = 0; k < 32; k++) a += d * ((raw[s + 2 + k] << 24) >> 24) * x[b * 32 + k]; } want.push(a); }
+  out.q8w4096 = { got: [...gy.slice(0, rows)], want, max_rel: Math.max(...want.map((w, i) => Math.abs(gy[i] - w) / Math.max(1e-6, Math.abs(w)))) };
+  log("q8w4096 " + JSON.stringify(out.q8w4096));
+} catch (e) { out.error = String(e.stack || e); log(out.error); }
+document.title = "DONE";
+</script>

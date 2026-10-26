@@ -61,6 +61,9 @@ SYS1 hook refuses all four (exact pass only).
 | POST | `/v1/completions` | `/completions` | Text completion. |
 | POST | `/v1/chat/completions` | `/chat/completions` | Chat completion. |
 | POST | `/v1/decide` | `/decide` | One clef decide task. Every question of the task is answered from one engine pass (SERVE-BATCH). |
+| POST | `/v1/see` | – | Object detection (D-FINE-N, COCO-80). Returns `503` until configured. See [Senses](#senses). |
+| POST | `/v1/hear` | – | Speech to text through a resident whisper.cpp `whisper-server`. Returns `503` until configured. See [Senses](#senses). |
+| POST | `/v1/speak` | – | Text to WAV with the `--tts` voice. Returns `503` without `--tts`. See [Senses](#senses). |
 
 Any other path returns `404`. A wrong method returns `405`. Every connection is
 HTTP/1.1 with `Connection: close` (no keep-alive). Request bodies must carry
@@ -623,6 +626,132 @@ Usage:
 - `llb-ear encb MMPROJ [...] WAV...` is the gate.
 - The feature is off by default. Without these flags, nothing changes.
 
+## Senses
+
+Three routes serve the senses next to the engine: `/v1/see`, `/v1/hear`, and
+`/v1/speak`. They do not use the engine or its slots. Each one is always routed.
+A sense that is not configured returns `503` with the error shape, never `404`.
+Each sense runs one request at a time (FIFO). Errors use the [error shape](#errors).
+
+### `POST /v1/see`
+
+Detects objects in one image with D-FINE-N (COCO-80 classes). The detector is a
+child process, `tools/see/see_worker.py` (ONNX Runtime), forked on the first
+request. To get the model and set up Python, see
+[`tools/see/README.md`](../../tools/see/README.md).
+
+To turn it on, set these environment variables before you start `llb-serve`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLB_SEE_SCRIPT` | Unset | Path to `see_worker.py`. `build-serve.sh` copies it to `OUT_DIR`. Unset means `503 vision is not enabled on this backend`. |
+| `LLB_SEE_MODEL` | Unset | Path to `dfine_n_coco.onnx` (sha256 `4daf426f09e5e1496dd879f2818a65e8706137bd1d9d9f785173df86cee38604`). |
+| `LLB_SEE_PYTHON` | `python3` | An interpreter with `onnxruntime` (or `onnxruntime-gpu`), `numpy`, and `Pillow`. |
+| `LLB_SEE_EP` | `auto` | `auto`, `cuda` (fails instead of falling back to CPU), or `cpu`. |
+| `LLB_SEE_LABELS`, `LLB_SEE_THREADS`, `LLB_SEE_TIMEOUT_MS`, `LLB_SEE_MAX_IMAGE_BYTES` | `coco80.json` beside the script, `4`, `30000`, `4194304` | Label table, ORT threads, per-request budget, decoded image cap. |
+
+Request:
+
+| Field | Type | Description |
+|---|---|---|
+| `image` (or `image_b64`) | string | Required. A `data:image/...;base64,` URL or bare base64 (no whitespace). JPEG, PNG, or any format Pillow reads. |
+| `task` | string | `detect` (default). `describe` returns `503`: this build is detect-only. |
+| `threshold` | number | Score cutoff in [0, 1]. Default `0.4`. |
+| `max_detections` | integer | 1..300. Default `100`. |
+
+Response (`200`):
+
+```json
+{"model":"dfine-n","task":"detect","image_wh":[810,1080],
+ "detections":[{"box":[48.5,396.0,242.9,906.1],"label":"person","class_id":0,"score":0.9397}],
+ "usage":{"images":1},
+ "llb":{"images":1,"encode_ms":39.0,"preprocess_ms":9.27,"infer_ms":29.73,
+        "ep":"CPUExecutionProvider","runtime":"onnxruntime","model_sha256":"4daf426f..."}}
+```
+
+`box` is `[x0, y0, x1, y1]` in original-image pixels. Detections are sorted by
+score, highest first. `image_wh` is `[width, height]`. `llb.ep` names the
+execution provider that actually ran.
+
+Errors: `400` for a bad field, bad base64, or an image that does not decode;
+`413` for an image over `LLB_SEE_MAX_IMAGE_BYTES`; `503` when the route is not
+configured, the worker does not start, dies, or times out, or for
+`task: describe`. A worker that dies or times out is restarted on the next
+request.
+
+### `POST /v1/hear`
+
+Transcribes one WAV clip. `llb-serve` forwards the clip over loopback HTTP to a
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-server` that you
+start. The sidecar picks its own ggml backend: CUDA (`-DGGML_CUDA=ON`), Metal (the
+default on Apple silicon), or CPU. This route is separate from the `--ear`
+transcription route (`/v1/audio/transcriptions`).
+
+1. Build `whisper-server` from whisper.cpp (graded with v1.9.2):
+
+   ```sh
+   cmake -B build -DGGML_CUDA=ON      # omit -DGGML_CUDA=ON on macOS (Metal) or for CPU
+   cmake --build build -j --config Release --target whisper-server
+   ```
+
+2. Download the model
+   [`ggml-base.en-q5_1.bin`](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin)
+   (59,721,011 bytes, sha256
+   `4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f`). You can
+   also run `models/download-ggml-model.sh base.en-q5_1` in the whisper.cpp
+   checkout.
+
+3. Start the sidecar on loopback, then start `llb-serve` with `LLB_HEAR_URL`:
+
+   ```sh
+   build/bin/whisper-server --host 127.0.0.1 --port 8137 -m MODEL_DIR/ggml-base.en-q5_1.bin -t 8 --no-timestamps &
+   export LLB_HEAR_URL=http://127.0.0.1:8137/inference
+   export LLB_HEAR_MODEL_PATH=MODEL_DIR/ggml-base.en-q5_1.bin
+   export LLB_HEAR_MODEL_SHA256=$(sha256sum "$LLB_HEAR_MODEL_PATH" | cut -d' ' -f1)
+   ```
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLB_HEAR_URL` | Unset | `http://HOST:PORT/PATH` of `whisper-server`'s `/inference`. Plain HTTP only. Unset means `503 hearing is not enabled on this backend`. |
+| `LLB_HEAR_MODEL_ID` | `whisper-base.en-q5_1` | Reported as `model` when the request has none. |
+| `LLB_HEAR_MODEL_PATH`, `LLB_HEAR_MODEL_SHA256` | Empty | Reported in `llb`. The server does not open or hash the file. |
+| `LLB_HEAR_ENGINE` | `whisper.cpp` | Reported as `llb.engine`, for example `whisper.cpp (GGML_CUDA)`. |
+| `LLB_HEAR_TIMEOUT_MS` | `30000` | Upstream connect, send, and receive budget. |
+| `LLB_HEAR_MAX_AUDIO_BYTES` | `16777216` | Decoded WAV cap (`413` above). The request body limit (`--max-body-mb`) also applies. |
+
+Request:
+
+| Field | Type | Description |
+|---|---|---|
+| `audio` (or `audio_b64`) | string | Required. A RIFF/WAVE file as a `data:audio/wav;base64,` URL or bare base64. |
+| `task` | string | `transcribe` (default). Any other value returns `503`: this build is transcribe-only. |
+| `language` | string | Echoed back. The sidecar is always asked for English (`base.en`). |
+| `model` | string | Echoed back as `model`. |
+
+Response (`200`):
+
+```json
+{"model":"whisper-base.en-q5_1","task":"transcribe","text":"What advice would you give to a young entrepreneur starting out today?",
+ "language":"en","audio_seconds":3.3810,"usage":{"audio_seconds":3.3810},
+ "llb":{"engine":"whisper.cpp","route":"/v1/hear","ms":…,"rtf":…,"audio_bytes":…,
+        "model_path":"…","model_sha256":"4baf70dd…","upstream":"127.0.0.1:8137/inference"}}
+```
+
+`llb.ms` is the wall time of the upstream call. `llb.rtf` is that time divided by
+the clip length.
+
+Errors: `400` for a bad field, bad base64, or audio that is not RIFF/WAVE;
+`413` for audio over the cap; `503` when the route is not configured, the
+sidecar is unreachable, returns a non-200 status, or returns no `text`.
+
+### `POST /v1/speak`
+
+The `--tts` speech route under the senses name. It takes `{"text": "...",
+"voice"?: "...", "speed"?: N}` and answers like `POST /v1/audio/speech` with
+`response_format: wav`: a 24 kHz WAV body with the `X-LLB-TTS-*` headers. Other
+fields, such as `style`, are ignored. Without `--tts`, it returns
+`503 speech is not enabled on this backend`.
+
 ## Build
 
 ```sh
@@ -633,7 +762,9 @@ OUT=OUT_DIR LLB_ENGINE_C=$W/build/llb-engine.c LLB_ENGINE_GPU=$W/build/llb-engin
 Replace `OUT_DIR` with the output directory. `$W` is the engine worktree that
 holds the emitted C and `.gpu` program.
 
-This builds `OUT_DIR/llb-serve` (serve.c + clef3/json.c). It also builds
+This builds `OUT_DIR/llb-serve` (serve.c + clef3/json.c; serve.c `#include`s
+`see_route.c` and `hear_route.c`) and copies `see_worker.py` and `coco80.json`
+next to it. It also builds
 `OUT_DIR/llb-engine`: the relink of the given emitted C with the rebuilt request
 objects. Compile with clang-21, because `llb-engine.c` uses `#embed`.
 

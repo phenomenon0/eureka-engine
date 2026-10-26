@@ -1,0 +1,56 @@
+--- a/tools/qwen35_engine.c
++++ b/tools/qwen35_engine.c
+@@ -715,7 +715,12 @@
+   Y = (float *)calloc(CONVD > dff ? CONVD : dff, 4);
+   QGN = (float *)calloc(2 * HDIM * H, 4); QN = (float *)calloc(H * HDIM, 4);
+   KN = (float *)calloc(KV * HDIM, 4); KB = (float *)calloc(KV * HDIM, 4); VB = (float *)calloc(KV * HDIM, 4);
+-  ATTN = (float *)calloc(H * HDIM, 4); PROBS = (float *)calloc(cap, 4);
++  ATTN = (float *)calloc(H * HDIM, 4);
++#ifdef LLB_PAR_CORE
++  PROBS = (float *)calloc((size_t)cap * omp_get_max_threads(), 4);  // one row per thread
++#else
++  PROBS = (float *)calloc(cap, 4);
++#endif
+   QT = (float *)calloc(TR * SZ, 4); KT = (float *)calloc(TR * SZ, 4);
+   SCR = (float *)calloc(dff > D ? dff : D, 4); OUT0 = (float *)calloc(VDC > D ? VDC : D, 4);
+   LOGITS = (float *)calloc(V, 4); EMBROW = (float *)calloc(D, 4);
+@@ -781,7 +786,14 @@
+   N("ssm_norm.weight"); const float *sn = fvec(id);
+   if (il == 0) { dl_dump("qt", QT, TR * SZ); dl_dump("kt", KT, TR * SZ); }
+   float *sbase = gS + (size_t)il * TR * SZ * SZ;
++  // heads are independent recurrences; each head keeps its serial order
++#ifdef LLB_PAR_CORE
++  #pragma omp parallel for schedule(LLB_SCHED)
++#endif
+   for (int hh = 0; hh < TR; hh++) {
++#ifdef LLB_PAR_CORE
++    float SCR[SZ];
++#endif
+     float *S = sbase + (size_t)hh * SZ * SZ;
+     const float *qh = QT + hh * SZ, *kh = KT + hh * SZ;
+     const float *vh = yv + hh * VHD;
+@@ -855,7 +867,14 @@
+ 
+   int grp = H / KV;
+   float scale = 1.0f / hf_sqrt((float)HDIM);
++#ifdef LLB_PAR_CORE
++  float *PROBS0 = PROBS;
++  #pragma omp parallel for schedule(LLB_SCHED)
++#endif
+   for (int hh = 0; hh < H; hh++) {
++#ifdef LLB_PAR_CORE
++    float *PROBS = PROBS0 + (size_t)omp_get_thread_num() * gCap;
++#endif
+     int kvh = hh / grp;
+     const float *qh = QN + hh * HDIM;
+     float mx = -INFINITY;
+@@ -1379,6 +1398,9 @@
+   fprintf(stderr, "cpu: omp threads %d (rows split, per-row order serial)\n", omp_get_max_threads());
+   {
+     omp_sched_t k; int ch; omp_get_schedule(&k, &ch);
++#ifdef LLB_PAR_CORE
++    fprintf(stderr, "cpu: heads split in linear_core/full_core (per-head order serial)\n");
++#endif
+     fprintf(stderr, "cpu: row schedule %s (runtime: kind %d chunk %d)\n", LLB_STR(LLB_SCHED), (int)k, ch);
+   }
+ #endif

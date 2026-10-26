@@ -1,0 +1,194 @@
+--- a/tools/qwen35_engine.c
++++ b/tools/qwen35_engine.c
+@@ -351,6 +351,140 @@
+   return v.f;
+ }
+ 
++// ---- OPT-IN order "dot8" (build with -DLLB_DOT8) ---------------------------
++// NOT the byte contract. Q4_K / Q6_K rows dot an int8 copy of x (llama.cpp's
++// Q8_K idea: per 256-block scale xd = amax/127, q = rint(x*127/amax)), with
++// exact integer sub-block sums and one fixed float combine per 256-block:
++//   Q4_K: acc += (d*xd)*(float)sum_j(sc_j*isum_j);  acc -= (dmin*xd)*(float)sum_j(m_j*xsum_j)
++//   Q6_K: acc += (d*xd)*(float)sum_k(sc_k*isum_k)
++// The integers are exact, so the sdot (NEON dotprod) kernels and the scalar
++// reference (-DLLB_DOT8_SCALAR) give the same bits on any machine.
++#ifdef LLB_DOT8
++#if defined(__ARM_FEATURE_DOTPROD) && !defined(LLB_DOT8_SCALAR)
++#include <arm_neon.h>
++#define DOT8_SDOT 1
++#define DOT8_KIND "sdot"
++#else
++#define DOT8_SDOT 0
++#define DOT8_KIND "scalar"
++#endif
++
++// x[cols] -> q[cols] int8, xd[cols/256]
++static void quant_x8(const float *x, int cols, i8 *q, float *xd) {
++  for (int b = 0; b < cols / 256; b++) {
++    const float *xb = x + b * 256;
++    float amax = 0.0f;
++    for (int i = 0; i < 256; i++) { float a = fabsf(xb[i]); if (a > amax) amax = a; }
++    if (amax == 0.0f) { xd[b] = 0.0f; memset(q + b * 256, 0, 256); continue; }
++    float is = 127.0f / amax;
++    for (int i = 0; i < 256; i++) {
++      long v = lrintf(xb[i] * is);
++      q[b * 256 + i] = (i8)(v > 127 ? 127 : v < -127 ? -127 : v);
++    }
++    xd[b] = amax / 127.0f;
++  }
++}
++
++static float dot8_q4k(const uint8_t *row, int cols, const i8 *qx, const float *xd) {
++  float acc = 0.0f;
++  for (int b = 0; b < cols / 256; b++) {
++    const uint8_t *blk = row + (size_t)b * 144;
++    float d = h2f(blk), dmin = h2f(blk + 2);
++    const uint8_t *sc = blk + 4, *qs = blk + 16;
++    const i8 *q8 = qx + b * 256;
++    int32_t s1 = 0, s2 = 0;
++    for (int g = 0; g < 4; g++) {
++      int sd1, sm1, sd2, sm2;
++      gsm4(2 * g, sc, &sd1, &sm1);
++      gsm4(2 * g + 1, sc, &sd2, &sm2);
++      const uint8_t *qq = qs + g * 32;
++      const i8 *xa = q8 + g * 64, *xb = xa + 32;
++      int32_t ia, ib, xsa = 0, xsb = 0;
++#if DOT8_SDOT
++      uint8x16_t w0 = vld1q_u8(qq), w1 = vld1q_u8(qq + 16), m4 = vdupq_n_u8(0xF);
++      int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(w0, m4)), lo1 = vreinterpretq_s8_u8(vandq_u8(w1, m4));
++      int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(w0, 4)), hi1 = vreinterpretq_s8_u8(vshrq_n_u8(w1, 4));
++      int8x16_t a0 = vld1q_s8(xa), a1 = vld1q_s8(xa + 16), b0 = vld1q_s8(xb), b1 = vld1q_s8(xb + 16);
++      int32x4_t z = vdupq_n_s32(0);
++      int8x16_t ones = vdupq_n_s8(1);
++      ia = vaddvq_s32(vdotq_s32(vdotq_s32(z, lo0, a0), lo1, a1));
++      ib = vaddvq_s32(vdotq_s32(vdotq_s32(z, hi0, b0), hi1, b1));
++      xsa = vaddvq_s32(vdotq_s32(vdotq_s32(z, ones, a0), ones, a1));
++      xsb = vaddvq_s32(vdotq_s32(vdotq_s32(z, ones, b0), ones, b1));
++#else
++      ia = 0; ib = 0;
++      for (int l = 0; l < 32; l++) { ia += (qq[l] & 0xF) * xa[l]; xsa += xa[l]; }
++      for (int l = 0; l < 32; l++) { ib += (qq[l] >> 4) * xb[l]; xsb += xb[l]; }
++#endif
++      s1 += sd1 * ia + sd2 * ib;
++      s2 += sm1 * xsa + sm2 * xsb;
++    }
++    float dd = d * xd[b], dm = dmin * xd[b];
++    acc += dd * (float)s1;
++    acc -= dm * (float)s2;
++  }
++  return acc;
++}
++
++static float dot8_q6k(const uint8_t *row, int cols, const i8 *qx, const float *xd) {
++  float acc = 0.0f;
++  for (int b = 0; b < cols / 256; b++) {
++    const uint8_t *blk = row + (size_t)b * 210;
++    const uint8_t *ql = blk, *qh = blk + 128;
++    const int8_t *scb = (const int8_t *)(blk + 192);
++    float d = h2f(blk + 208);
++    const i8 *q8 = qx + b * 256;
++    int32_t s = 0;
++    for (int half = 0; half < 2; half++) {
++      const uint8_t *qlh = ql + half * 64, *qhh = qh + half * 32;
++      for (int qd = 0; qd < 4; qd++) {
++        const uint8_t *qq = qlh + (qd & 1) * 32;
++        const i8 *xq = q8 + half * 128 + qd * 32;
++        const int8_t *sc = scb + half * 8 + 2 * qd;
++        int32_t i0, i1;
++#if DOT8_SDOT
++        uint8x16_t l0 = vld1q_u8(qq), l1 = vld1q_u8(qq + 16);
++        if (qd >= 2) { l0 = vshrq_n_u8(l0, 4); l1 = vshrq_n_u8(l1, 4); }
++        uint8x16_t m4 = vdupq_n_u8(0xF), m3 = vdupq_n_u8(3);
++        l0 = vandq_u8(l0, m4); l1 = vandq_u8(l1, m4);
++        uint8x16_t h0 = vld1q_u8(qhh), h1 = vld1q_u8(qhh + 16);
++        int sh = 2 * qd;
++        h0 = vandq_u8(vshlq_u8(h0, vdupq_n_s8(-sh)), m3);
++        h1 = vandq_u8(vshlq_u8(h1, vdupq_n_s8(-sh)), m3);
++        int8x16_t c0 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(l0, vshlq_n_u8(h0, 4))), vdupq_n_s8(32));
++        int8x16_t c1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(l1, vshlq_n_u8(h1, 4))), vdupq_n_s8(32));
++        int32x4_t z = vdupq_n_s32(0);
++        i0 = vaddvq_s32(vdotq_s32(z, c0, vld1q_s8(xq)));
++        i1 = vaddvq_s32(vdotq_s32(z, c1, vld1q_s8(xq + 16)));
++#else
++        i0 = 0; i1 = 0;
++        for (int l = 0; l < 32; l++) {
++          int nib = (qd < 2) ? (qq[l] & 0xF) : (qq[l] >> 4);
++          int code = (nib | (((qhh[l] >> (2 * qd)) & 3) << 4)) - 32;
++          if (l < 16) i0 += code * xq[l]; else i1 += code * xq[l];
++        }
++#endif
++        s += sc[0] * i0 + sc[1] * i1;
++      }
++    }
++    acc += (d * xd[b]) * (float)s;
++  }
++  return acc;
++}
++
++// per-call int8 activation scratch (one x per gemv; T rows of x per gemm)
++static i8 *gQX;
++static float *gXD;
++static size_t gQXcap;
++static void quant_need(size_t n) {
++  if (n <= gQXcap) return;
++  free(gQX); free(gXD);
++  gQX = (i8 *)malloc(n); gXD = (float *)malloc((n / 256 + 1) * 4);
++  if (!gQX || !gXD) { fprintf(stderr, "dot8 alloc failed\n"); exit(1); }
++  gQXcap = n;
++}
++#endif
++
+ // ---- pack + index --------------------------------------------------------
+ typedef struct { char name[64]; u64 off; u64 bytes; int rows, cols; int is_f32; int row_bytes; int fmt; } TInfo;
+ static TInfo gT[1024];
+@@ -483,6 +617,16 @@
+ #endif
+   int rows = trows(id), cols = tcols(id), fmt = tfmt(id);
+   int rb = (fmt == 0) ? cols * 4 : trb(id);
++#ifdef LLB_DOT8
++  if (fmt == 3 || fmt == 4) {
++    quant_need(cols);
++    quant_x8(x, cols, gQX, gXD);
++    #pragma omp parallel for schedule(static)
++    for (int r = 0; r < rows; r++)
++      y[r] = fmt == 3 ? dot8_q4k(W + (size_t)r * rb, cols, gQX, gXD) : dot8_q6k(W + (size_t)r * rb, cols, gQX, gXD);
++    return;
++  }
++#endif
+   // rows are independent dots, each keeps its serial order: threads change no bits
+   #pragma omp parallel for schedule(static)
+   for (int r = 0; r < rows; r++)
+@@ -790,6 +934,21 @@
+   if (T == 1) { gemv(id, tptr(id), X, Yo); return; }
+   int rows = trows(id), cols = tcols(id), fmt = tfmt(id);
+   int rb = (fmt == 0) ? cols * 4 : trb(id);
++#ifdef LLB_DOT8
++  if (fmt == 3 || fmt == 4) {
++    quant_need((size_t)T * cols);
++    for (int t = 0; t < T; t++) quant_x8(X + (size_t)t * cols, cols, gQX + (size_t)t * cols, gXD + (size_t)t * (cols / 256));
++    const uint8_t *W8 = tptr(id);
++    #pragma omp parallel for schedule(static)
++    for (int r = 0; r < rows; r++)
++      for (int t = 0; t < T; t++) {
++        const i8 *q = gQX + (size_t)t * cols;
++        const float *xd = gXD + (size_t)t * (cols / 256);
++        Yo[(size_t)t * rows + r] = fmt == 3 ? dot8_q4k(W8 + (size_t)r * rb, cols, q, xd) : dot8_q6k(W8 + (size_t)r * rb, cols, q, xd);
++      }
++    return;
++  }
++#endif
+   int nb = (T + TBL - 1) / TBL;
+   size_t need = (size_t)nb * cols * TBL;
+   if (need > gXTcap) {
+@@ -1041,6 +1200,11 @@
+ #ifdef _OPENMP
+   fprintf(stderr, "cpu: omp threads %d (rows split, per-row order serial)\n", omp_get_max_threads());
+ #endif
++#ifdef LLB_DOT8
++  fprintf(stderr, "order: dot8-%s (OPT-IN: int8 activations for Q4_K/Q6_K, NOT the byte contract)\n", DOT8_KIND);
++#else
++  fprintf(stderr, "order: v1 (f32, serial per row: the byte contract)\n");
++#endif
+ #if defined(__CUDACC__) || defined(__METAL__)
+   if (gUseGpu || selftest) {
+     int maxrows = V > dff ? V : dff;

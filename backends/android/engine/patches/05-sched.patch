@@ -1,0 +1,80 @@
+--- a/tools/qwen35_engine.c	2026-10-08 01:57:38.902316735 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 01:57:44.795462511 -0500
+@@ -28,6 +28,13 @@
+ #ifdef _OPENMP
+ #include <omp.h>
+ #endif
++// Row-loop schedule (build -DLLB_SCHED=runtime to take OMP_SCHEDULE). Each row
++// is one thread's serial dot, so any schedule changes no bits; only speed.
++#ifndef LLB_SCHED
++#define LLB_SCHED static
++#endif
++#define LLB_STR_(x) #x
++#define LLB_STR(x) LLB_STR_(x)
+ 
+ #include "../host/llb_formats.h"
+ #include "qwen35_tokenizer.c"
+@@ -621,14 +628,14 @@
+   if (fmt == 3 || fmt == 4) {
+     quant_need(cols);
+     quant_x8(x, cols, gQX, gXD);
+-    #pragma omp parallel for schedule(static)
++    #pragma omp parallel for schedule(LLB_SCHED)
+     for (int r = 0; r < rows; r++)
+       y[r] = fmt == 3 ? dot8_q4k(W + (size_t)r * rb, cols, gQX, gXD) : dot8_q6k(W + (size_t)r * rb, cols, gQX, gXD);
+     return;
+   }
+ #endif
+   // rows are independent dots, each keeps its serial order: threads change no bits
+-  #pragma omp parallel for schedule(static)
++  #pragma omp parallel for schedule(LLB_SCHED)
+   for (int r = 0; r < rows; r++)
+     y[r] = dot_fmt(fmt, W + (size_t)r * rb, cols, x);
+ }
+@@ -1072,7 +1079,7 @@
+     if (!gBS) { fprintf(stderr, "gemm8 alloc failed\n"); exit(1); }
+     gBScap = (size_t)Tp * ns;
+   }
+-  #pragma omp parallel for schedule(static)
++  #pragma omp parallel for schedule(LLB_SCHED)
+   for (int t = 0; t < Tp; t++) {
+     i8 *q = gQX + (size_t)t * cols;
+     if (t < T) quant_x8(X + (size_t)t * cols, cols, q, gXD + (size_t)t * nb);
+@@ -1083,7 +1090,7 @@
+       gBS[(size_t)t * ns + i] = (int16_t)s;
+     }
+   }
+-  #pragma omp parallel for schedule(static)
++  #pragma omp parallel for schedule(LLB_SCHED)
+   for (int r = 0; r < rows; r++)
+     for (int t0 = 0; t0 < T; t0 += GNT) {
+       float o[GNT];
+@@ -1110,7 +1117,7 @@
+     quant_need((size_t)T * cols);
+     for (int t = 0; t < T; t++) quant_x8(X + (size_t)t * cols, cols, gQX + (size_t)t * cols, gXD + (size_t)t * (cols / 256));
+     const uint8_t *W8 = tptr(id);
+-    #pragma omp parallel for schedule(static)
++    #pragma omp parallel for schedule(LLB_SCHED)
+     for (int r = 0; r < rows; r++)
+       for (int t = 0; t < T; t++) {
+         const i8 *q = gQX + (size_t)t * cols;
+@@ -1139,7 +1146,7 @@
+   #pragma omp parallel
+   {
+     float *w = (float *)malloc((size_t)cols * 4);
+-    #pragma omp for schedule(static)
++    #pragma omp for schedule(LLB_SCHED)
+     for (int r = 0; r < rows; r++) {
+       deq_row(fmt, W + (size_t)r * rb, cols, w);
+       for (int b = 0; b < nb; b++) {
+@@ -1370,6 +1377,10 @@
+           gNT, psz, L, D, H, KV, HDIM, dff, V);
+ #ifdef _OPENMP
+   fprintf(stderr, "cpu: omp threads %d (rows split, per-row order serial)\n", omp_get_max_threads());
++  {
++    omp_sched_t k; int ch; omp_get_schedule(&k, &ch);
++    fprintf(stderr, "cpu: row schedule %s (runtime: kind %d chunk %d)\n", LLB_STR(LLB_SCHED), (int)k, ch);
++  }
+ #endif
+ #ifdef LLB_DOT8
+   fprintf(stderr, "order: dot8-%s%s (OPT-IN: int8 activations for Q4_K/Q6_K, NOT the byte contract)\n", DOT8_KIND, DOT8G_KIND);

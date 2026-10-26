@@ -1,0 +1,51 @@
+{
+ "_": "KOKORODROID: the voices that ride in the APK, in the picker's order (owner pick 2026-10-09: af_bella is the house voice; then heart, michael). Mirrors iOS voiceshop voices/bundled.json (same revision + pins). voice/fetch-voice.sh fetches each from hexgrad/Kokoro-82M at `revision`, checks the .pt against `pt_sha256`, and writes assets/voices/kokoro/packs/<id>.bin (510 x 256 float32, 522,240 bytes) + <id>.json + index.json.",
+ "revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+ "voices": [
+  {
+   "id": "af_bella",
+   "name": "Bella",
+   "lang": "en-us",
+   "gender": "female",
+   "grade": "A-",
+   "pt_sha256": "8cb64e02fcc8de0327a8e13817e49c76c945ecf0052ceac97d3081480e8e48d6",
+   "detail": "Target quality A · 10+ hours of training audio"
+  },
+  {
+   "id": "af_heart",
+   "name": "Heart",
+   "lang": "en-us",
+   "gender": "female",
+   "grade": "A",
+   "pt_sha256": "0ab5709b8ffab19bfd849cd11d98f75b60af7733253ad0d67b12382a102cb4ff",
+   "detail": "Kokoro's flagship voice"
+  },
+  {
+   "id": "am_michael",
+   "name": "Michael",
+   "lang": "en-us",
+   "gender": "male",
+   "grade": "C+",
+   "pt_sha256": "9a443b79a4b22489a5b0ab7c651a0bcd1a30bef675c28333f06971abbd47bd37",
+   "detail": "Top-graded American male · hours of audio"
+  },
+  {
+   "id": "af_nicole",
+   "name": "Nicole",
+   "lang": "en-us",
+   "gender": "female",
+   "grade": "B-",
+   "pt_sha256": "c5561808bcf5250fe8c5f5de32caf2d94f27e57e95befdb098c5c85991d4c5da",
+   "detail": "Soft, close-mic · 10+ hours"
+  },
+  {
+   "id": "bf_emma",
+   "name": "Emma",
+   "lang": "en-gb",
+   "gender": "female",
+   "grade": "B-",
+   "pt_sha256": "d0a423deabf4a52b4f49318c51742c54e21bb89bbbe9a12141e7758ddb5da701",
+   "detail": "The best British voice · 10+ hours"
+  }
+ ]
+}

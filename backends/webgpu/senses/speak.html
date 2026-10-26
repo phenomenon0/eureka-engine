@@ -1,0 +1,44 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Speak · Eureka senses</title><link rel="icon" href="data:,"><link rel="stylesheet" href="common.css">
+<body data-page="speak">
+<main><section class="card">
+  <textarea id="text">Hi, I'm Bella. Everything you hear right now was synthesized inside this browser tab, with no server at all.</textarea>
+  <div class="row"><select id="voice"><option value="af_bella">af_bella (Kokoro)</option><option value="af_heart">af_heart (Kokoro)</option></select>
+    <button class="pri" id="say" disabled>Speak (Kokoro, in-page)</button><button id="ws">Speak with WebSpeech (system voice, fallback)</button></div>
+  <audio id="audio" controls style="width:100%;margin-top:8px"></audio><canvas id="wave" width="1200" height="120" style="width:100%;height:90px;margin-top:6px"></canvas>
+  <p class="status" id="status"></p><p class="note" id="wsnote"></p></section>
+<aside class="card"><h2>Measured</h2><div class="stats" id="stats"></div><h2 style="margin-top:14px">Log</h2><div class="log" id="log"></div>
+<p class="note">Kokoro-82M (ONNX) via kokoro-js; the phonemizer (espeak-ng) runs as WASM. WebGPU = fp32 weights on ORT's WebGPU EP; WASM = int8 weights on CPU. The WebSpeech button uses the OS voice and is labelled as such: it is a fallback, not this model.</p></aside></main>
+<script type="module">
+import { KokoroTTS, env, tfenv } from "./vendor/kokoro/kokoro.web.js";
+import { HF, hfBase } from "./hosts.js";
+import { q, S, pickEP, shell, ran, log, status, stats, fail, now, ms } from "./common.js";
+shell("Speak", "Kokoro TTS, in this tab");
+env.wasmPaths = new URL("vendor/kokoro/", location.href).href; tfenv.allowRemoteModels = HF; tfenv.allowLocalModels = !HF; tfenv.localModelPath = new URL("../models/hf/", location.href).pathname; globalThis.__KOKORO_VOICES = hfBase("onnx-community/Kokoro-82M-v1.0-ONNX") + "voices/"; tfenv.backends.onnx.logLevel = "error";
+const $ = (i) => document.getElementById(i), M = "onnx-community/Kokoro-82M-v1.0-ONNX";
+let tts, ep, n = 0;
+function wave(a) { const c = $("wave"), x = c.getContext("2d"), W = c.width, H = c.height, step = Math.max(1, Math.floor(a.length / W)); x.clearRect(0, 0, W, H); x.fillStyle = "#6cb8ff";
+  for (let i = 0; i < W; i++) { let m = 0; for (let j = 0; j < step; j++) m = Math.max(m, Math.abs(a[i * step + j] || 0)); x.fillRect(i, H / 2 - m * H / 2, 1, Math.max(1, m * H)); } }
+async function speak(text, voice) {
+  $("say").disabled = true; status("synthesizing…"); const t0 = now();
+  const out = await tts.generate(text, { voice }); const t1 = now();
+  const a = out.audio, sr = out.sampling_rate, dur = a.length / sr, peak = a.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  $("audio").src = URL.createObjectURL(out.toBlob()); wave(a);
+  const r = { voice, chars: text.length, gen_ms: Math.round(t1 - t0), audio_s: +dur.toFixed(2), rtf: +((t1 - t0) / 1000 / dur).toFixed(3), sr, peak: +peak.toFixed(3) };
+  (S.runs ??= []).push(r); n++; if (q.has("save") && n === 1) S.wav_b64 = await new Promise((ok) => { const fr = new FileReader(); fr.onload = () => ok(fr.result.split(",")[1]); fr.readAsDataURL(out.toBlob()); });
+  stats({ path: ep === "webgpu" ? "WebGPU (fp32)" : "WASM (CPU, q8)", voice, load: ms(S.t.load_ms), [n === 1 ? "first synth" : "synth"]: ms(r.gen_ms), "audio": dur.toFixed(2) + " s @ " + sr + " Hz", "real-time factor": r.rtf + (r.rtf < 1 ? " (faster than real time)" : ""), peak: r.peak });
+  log(`${voice}: ${r.chars} chars → ${r.audio_s} s audio in ${ms(r.gen_ms)} (RTF ${r.rtf})`); status(`spoke ${dur.toFixed(1)} s of audio · generated in ${ms(r.gen_ms)}`, "ok");
+  $("say").disabled = false; if (!q.has("noplay")) $("audio").play().catch(() => {}); return r;
+}
+$("ws").onclick = () => { if (!("speechSynthesis" in self)) return ($("wsnote").textContent = "WebSpeech: not available in this browser.");
+  const u = new SpeechSynthesisUtterance($("text").value); speechSynthesis.speak(u); $("wsnote").textContent = "Fallback: spoken by the operating system's voice through WebSpeech, not by Kokoro."; };
+try {
+  ep = await pickEP(); status("loading Kokoro-82M…"); const t0 = now();
+  tts = await KokoroTTS.from_pretrained(M, { dtype: ep === "webgpu" ? "fp32" : "q8", device: ep });
+  S.t.load_ms = now() - t0; ran(ep); log(`Kokoro ${ep === "webgpu" ? "fp32" : "q8"} on ${ep}: load ${ms(S.t.load_ms)}`); $("say").disabled = false;
+  $("say").onclick = () => speak($("text").value, $("voice").value).catch((e) => fail("speak", e));
+  await speak($("text").value, q.get("voice") ?? "af_bella");
+  if (q.has("warm")) await speak("A second sentence, to time a warm run.", q.get("voice") ?? "af_bella");
+  S.status = "ok";
+} catch (e) { fail("speak", e); status(`In-page voice could not start (${e?.message ?? e}). Use the WebSpeech fallback button, which is labelled as the system voice.`, "err"); }
+</script></body></html>

@@ -1,0 +1,274 @@
+--- a/tools/qwen35_engine.c
++++ b/tools/qwen35_engine.c
+@@ -552,9 +552,11 @@
+ // named scratch buffers (no aliasing across an op)
+ static float *X, *HH, *QKV, *Z, *BETA, *ALPHA, *GATE_PRE, *Y, *CORE;
+ static float *QGN, *QN, *KN, *KB, *VB, *ATTN, *PROBS, *QT, *KT, *SCR, *OUT0, *LOGITS, *EMBROW;
++static float *BETA_PRE, *ALPHA_PRE;
+ 
+ static void buf_alloc(void) {
+   int cap = gCap;
++  BETA_PRE = (float *)calloc(TR, 4); ALPHA_PRE = (float *)calloc(TR, 4);
+   X = (float *)calloc(D, 4); HH = (float *)calloc(D, 4);
+   QKV = (float *)calloc(CONVD, 4); Z = (float *)calloc(VDC, 4);
+   BETA = (float *)calloc(TR, 4); ALPHA = (float *)calloc(TR, 4); GATE_PRE = (float *)calloc(TR, 4);
+@@ -579,19 +581,18 @@
+   fclose(f);
+ }
+ 
+-static void linear_attn(int il, const char *p, const float *h, int pos) {
++// The per-token part of the linear layer: everything between the four input
++// projections (qkv, z, beta, alpha: given) and ssm_out. Writes OUT0[VDC].
++static void linear_core(int il, const char *p, const float *QKV, const float *Z,
++                        const float *bpre, const float *apre) {
+   char nm[80]; int id;
+ #define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
+   int kd = KDC;
+ 
+-  N("attn_qkv.weight"); gemv(id, tptr(id), h, QKV);
+-  N("attn_gate.weight"); gemv(id, tptr(id), h, Z);
+-  N("ssm_beta.weight"); gemv(id, tptr(id), h, SCR);
+-  for (int i = 0; i < TR; i++) BETA[i] = hf_sigmoid(SCR[i]);
+-  N("ssm_alpha.weight"); gemv(id, tptr(id), h, SCR);
++  for (int i = 0; i < TR; i++) BETA[i] = hf_sigmoid(bpre[i]);
+   N("ssm_dt.bias"); const float *dt = fvec(id);
+   N("ssm_a"); const float *alog = fvec(id);
+-  for (int i = 0; i < TR; i++) GATE_PRE[i] = hf_softplus(SCR[i] + dt[i]) * alog[i];
++  for (int i = 0; i < TR; i++) GATE_PRE[i] = hf_softplus(apre[i] + dt[i]) * alog[i];
+ 
+   N("ssm_conv1d.weight"); const float *cw = fvec(id);
+   float *cs = gConv + (size_t)il * (KC - 1) * CONVD;
+@@ -655,6 +656,17 @@
+   }
+   if (il == 0) { dl_dump("core", CORE, TR * SZ); }
+   if (il == 0) dl_dump("out_pre_wo", OUT0, VDC);
++#undef N
++}
++
++static void linear_attn(int il, const char *p, const float *h, int pos) {
++  char nm[80]; int id;
++#define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
++  N("attn_qkv.weight"); gemv(id, tptr(id), h, QKV);
++  N("attn_gate.weight"); gemv(id, tptr(id), h, Z);
++  N("ssm_beta.weight"); gemv(id, tptr(id), h, BETA_PRE);
++  N("ssm_alpha.weight"); gemv(id, tptr(id), h, ALPHA_PRE);
++  linear_core(il, p, QKV, Z, BETA_PRE, ALPHA_PRE);
+   N("ssm_out.weight"); gemv(id, tptr(id), OUT0, SCR);
+   memcpy(OUT0, SCR, D * 4);
+   if (il == 0) dl_dump("out", OUT0, D);
+@@ -662,10 +674,12 @@
+ #undef N
+ }
+ 
+-static void full_attn(int il, const char *p, const float *h, int tpos) {
++// The per-token part of the full-attention layer: q/k norm + rope, cache
++// write, attention, output gate. q/k/v projections given; writes ATTN[H*HDIM].
++static void full_core(int il, const char *p, const float *QGN, const float *KB,
++                      const float *VB, int tpos) {
+   char nm[80]; int id;
+ #define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
+-  N("attn_q.weight"); gemv(id, tptr(id), h, QGN);      // [H * 2hd]
+   N("attn_q_norm.weight"); const float *qnw = fvec(id);
+   N("attn_k_norm.weight"); const float *knw = fvec(id);
+   for (int hh = 0; hh < H; hh++) {
+@@ -676,7 +690,6 @@
+     for (int i = 0; i < HDIM; i++) QN[hh * HDIM + i] = q[i] * s * qnw[i];
+     rope_neox(QN + hh * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
+   }
+-  N("attn_k.weight"); gemv(id, tptr(id), h, KB);
+   for (int g = 0; g < KV; g++) {
+     const float *k = KB + g * HDIM;
+     float ss = 0.0f;
+@@ -685,7 +698,6 @@
+     for (int i = 0; i < HDIM; i++) KN[g * HDIM + i] = k[i] * s * knw[i];
+     rope_neox(KN + g * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
+   }
+-  N("attn_v.weight"); gemv(id, tptr(id), h, VB);
+   size_t base = ((size_t)il * gCap + tpos) * KV * HDIM;
+   memcpy(gK + base, KN, KV * HDIM * 4);
+   memcpy(gV + base, VB, KV * HDIM * 4);
+@@ -719,6 +731,16 @@
+     const float *g = QGN + hh * 2 * HDIM + HDIM;
+     for (int i = 0; i < HDIM; i++) ATTN[hh * HDIM + i] *= hf_sigmoid(g[i]);
+   }
++#undef N
++}
++
++static void full_attn(int il, const char *p, const float *h, int tpos) {
++  char nm[80]; int id;
++#define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
++  N("attn_q.weight"); gemv(id, tptr(id), h, QGN);      // [H * 2hd]
++  N("attn_k.weight"); gemv(id, tptr(id), h, KB);
++  N("attn_v.weight"); gemv(id, tptr(id), h, VB);
++  full_core(il, p, QGN, KB, VB, tpos);
+   N("attn_output.weight"); gemv(id, tptr(id), ATTN, SCR);
+   memcpy(OUT0, SCR, D * 4);
+ #undef N
+@@ -754,6 +776,129 @@
+   }
+ }
+ 
++// ---- batched prefill (layer-major) ---------------------------------------
++// Y[t][r] = dot_fmt(row r, X[t]) for t < T. A row is dequantized once (deq_row
++// yields exactly the factor dot_fmt multiplies by, in the same column order),
++// then dotted with 32 tokens at a time as vector lanes: every (r, t) sum is
++// c = 0..cols-1 with a separate multiply and add, as in dot_fmt. Bit-identical.
++#define TBL 32
++typedef float v8f __attribute__((vector_size(32)));
++static float *gXT;
++static size_t gXTcap;
++
++static void gemm(int id, const float *X, float *Yo, int T) {
++  if (T == 1) { gemv(id, tptr(id), X, Yo); return; }
++  int rows = trows(id), cols = tcols(id), fmt = tfmt(id);
++  int rb = (fmt == 0) ? cols * 4 : trb(id);
++  int nb = (T + TBL - 1) / TBL;
++  size_t need = (size_t)nb * cols * TBL;
++  if (need > gXTcap) {
++    free(gXT);
++    gXT = (float *)aligned_alloc(64, need * 4);
++    if (!gXT) { fprintf(stderr, "gemm: alloc %zu failed\n", need * 4); exit(1); }
++    gXTcap = need;
++  }
++  // XT[b][c][j] = X[b*TBL + j][c], zero-padded past T
++  for (int b = 0; b < nb; b++)
++    for (int c = 0; c < cols; c++)
++      for (int j = 0; j < TBL; j++) {
++        int t = b * TBL + j;
++        gXT[((size_t)b * cols + c) * TBL + j] = t < T ? X[(size_t)t * cols + c] : 0.0f;
++      }
++  const uint8_t *W = tptr(id);
++  #pragma omp parallel
++  {
++    float *w = (float *)malloc((size_t)cols * 4);
++    #pragma omp for schedule(static)
++    for (int r = 0; r < rows; r++) {
++      deq_row(fmt, W + (size_t)r * rb, cols, w);
++      for (int b = 0; b < nb; b++) {
++        const v8f *xt = (const v8f *)(gXT + (size_t)b * cols * TBL);
++        v8f a0 = {0}, a1 = {0}, a2 = {0}, a3 = {0};
++        for (int c = 0; c < cols; c++) {
++          v8f wc = (v8f){0} + w[c];
++          a0 += xt[4 * c + 0] * wc; a1 += xt[4 * c + 1] * wc;
++          a2 += xt[4 * c + 2] * wc; a3 += xt[4 * c + 3] * wc;
++        }
++        float acc[TBL];
++        memcpy(acc, &a0, 32); memcpy(acc + 8, &a1, 32); memcpy(acc + 16, &a2, 32); memcpy(acc + 24, &a3, 32);
++        for (int j = 0; j < TBL && b * TBL + j < T; j++) Yo[(size_t)(b * TBL + j) * rows + r] = acc[j];
++      }
++    }
++    free(w);
++  }
++}
++
++// Batch buffers for up to PFB prompt tokens per chunk.
++#define PFB 64
++static float *PX, *PH, *PA, *PB, *PC, *PD, *PE, *PO;
++
++static void prefill_alloc(void) {
++  size_t wa = (size_t)(CONVD > 2 * HDIM * H ? CONVD : 2 * HDIM * H);
++  size_t wf = (size_t)(dff > VDC ? dff : VDC);
++  if (wf < (size_t)H * HDIM) wf = (size_t)H * HDIM;
++  PX = (float *)malloc((size_t)PFB * D * 4); PH = (float *)malloc((size_t)PFB * D * 4);
++  PA = (float *)malloc(PFB * wa * 4);       PB = (float *)malloc(PFB * wf * 4);
++  PC = (float *)malloc((size_t)PFB * (TR > KV * HDIM ? TR : KV * HDIM) * 4);
++  PD = (float *)malloc((size_t)PFB * (TR > KV * HDIM ? TR : KV * HDIM) * 4);
++  PE = (float *)malloc(PFB * wf * 4);       PO = (float *)malloc((size_t)PFB * D * 4);
++  if (!PX || !PH || !PA || !PB || !PC || !PD || !PE || !PO) { fprintf(stderr, "prefill alloc failed\n"); exit(1); }
++}
++
++// forward_token for T consecutive tokens, layer by layer: the same per-token
++// ops in the same order (a token only depends on earlier tokens of its own
++// layer), with every projection batched through gemm. Leaves X = last token.
++static void prefill_chunk(const int *tok, int T, int pos0) {
++  int id; char p[32], nm[80];
++  int emb = find("token_embd.weight");
++  for (int t = 0; t < T; t++) row_f32(emb, tok[t], PX + (size_t)t * D);
++  for (int il = 0; il < L; il++) {
++    snprintf(p, sizeof p, "blk.%d.", il);
++#define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
++    N("attn_norm.weight");
++    for (int t = 0; t < T; t++) rms_norm(PH + (size_t)t * D, PX + (size_t)t * D, fvec(id), D);
++    if (gFull[il]) {
++      int nq = 2 * HDIM * H, nk = KV * HDIM;
++      N("attn_q.weight"); gemm(id, PH, PA, T);
++      N("attn_k.weight"); gemm(id, PH, PC, T);
++      N("attn_v.weight"); gemm(id, PH, PD, T);
++      for (int t = 0; t < T; t++) {
++        full_core(il, p, PA + (size_t)t * nq, PC + (size_t)t * nk, PD + (size_t)t * nk, pos0 + t);
++        memcpy(PB + (size_t)t * H * HDIM, ATTN, (size_t)H * HDIM * 4);
++      }
++      N("attn_output.weight"); gemm(id, PB, PO, T);
++    } else {
++      N("attn_qkv.weight"); gemm(id, PH, PA, T);
++      N("attn_gate.weight"); gemm(id, PH, PB, T);
++      N("ssm_beta.weight"); gemm(id, PH, PC, T);
++      N("ssm_alpha.weight"); gemm(id, PH, PD, T);
++      for (int t = 0; t < T; t++) {
++        linear_core(il, p, PA + (size_t)t * CONVD, PB + (size_t)t * VDC, PC + (size_t)t * TR, PD + (size_t)t * TR);
++        memcpy(PE + (size_t)t * VDC, OUT0, (size_t)VDC * 4);
++      }
++      N("ssm_out.weight"); gemm(id, PE, PO, T);
++    }
++    N("post_attention_norm.weight");
++    for (int t = 0; t < T; t++) {
++      float *x = PX + (size_t)t * D, *o = PO + (size_t)t * D;
++      for (int i = 0; i < D; i++) x[i] += o[i];
++      rms_norm(PH + (size_t)t * D, x, fvec(id), D);
++    }
++    N("ffn_gate.weight"); gemm(id, PH, PB, T);
++    N("ffn_up.weight"); gemm(id, PH, PE, T);
++    for (size_t i = 0; i < (size_t)T * dff; i++) PB[i] = hf_silu(PB[i]) * PE[i];
++    N("ffn_down.weight"); gemm(id, PB, PO, T);
++    for (size_t i = 0; i < (size_t)T * D; i++) PX[i] += PO[i];
++#undef N
++    if (gMapSz) madvise((void *)gPack, gMapSz, MADV_DONTNEED);
++  }
++  memcpy(X, PX + (size_t)(T - 1) * D, (size_t)D * 4);
++}
++
++static void prefill(const int *tok, int n) {
++  for (int t0 = 0; t0 < n; t0 += PFB) prefill_chunk(tok + t0, n - t0 < PFB ? n - t0 : PFB, t0);
++}
++
+ static void final_logits(void) {
+   int onorm = find("output_norm.weight");
+   rms_norm(HH, X, fvec(onorm), D);
+@@ -804,7 +949,7 @@
+     "    --seed S             RNG seed\n"
+     "    --ids | --text       emit ids / streamed text (default by mode)\n"
+     "    --stop ID            extra stop token (repeatable)\n"
+-    "    --layers L --preload --dump-layers DIR --selftest\n", p);
++    "    --layers L --preload --dump-layers DIR --selftest --tokenwise-prefill\n", p);
+ }
+ 
+ static int is_stop(Q35Tokenizer *t, int id, const int *stops, int nstops) {
+@@ -818,7 +963,7 @@
+ int main(int argc, char **argv) {
+   if (argc < 2) { usage(argv[0]); return 2; }
+   const char *dir = argv[1];
+-  int ids[8192], nids = 0, steps = 8, layers = 0, preload = 0, selftest = 0;
++  int ids[8192], nids = 0, steps = 8, layers = 0, preload = 0, selftest = 0, tokenwise = 0;
+   const char *prompt = NULL, *chat = NULL, *system = NULL, *pack = NULL, *quant = NULL;
+   int emit = 0;              // 0 auto, 1 ids, 2 text
+   int think = 0;             // 0 none, 1 <think>, 2 empty think block
+@@ -834,6 +979,7 @@
+     else if (!strcmp(argv[a], "--gpu") || !strcmp(argv[a], "--metal")) gUseGpu = 1;
+     else if (!strcmp(argv[a], "--cpu")) gUseGpu = 0;
+     else if (!strcmp(argv[a], "--selftest")) selftest = 1;
++    else if (!strcmp(argv[a], "--tokenwise-prefill")) tokenwise = 1;
+     else if (!strcmp(argv[a], "--dump-layers") && a + 1 < argc) gDumpLayers = argv[++a];
+     else if (!strcmp(argv[a], "--pack") && a + 1 < argc) pack = argv[++a];
+     else if (!strcmp(argv[a], "--quant") && a + 1 < argc) quant = argv[++a];
+@@ -978,7 +1124,10 @@
+   int *pidx = (int *)malloc(sizeof(int) * V);
+ 
+   u64 t0 = now_ms();
+-  for (int t = 0; t < npin; t++) forward_token(pin[t], t);
++  if (tokenwise) for (int t = 0; t < npin; t++) forward_token(pin[t], t);
++  else { prefill_alloc(); prefill(pin, npin); }
++  fprintf(stderr, "prefill %d tok %s %llu ms\n", npin, tokenwise ? "tokenwise" : "batched",
++          (unsigned long long)(now_ms() - t0));
+   final_logits();
+   int i1, i2; float v1, v2;
+   top2(&i1, &v1, &i2, &v2);

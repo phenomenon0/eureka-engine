@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8"><title>bend web engine smoke</title>
+<style>body{font:14px ui-monospace,monospace;margin:2em;background:#111;color:#ddd}pre{white-space:pre-wrap}</style>
+<h3>bend in-tab engine smoke (bend-worker.js)</h3><pre id="log"></pre><pre id="out"></pre>
+<script type="module">
+const q = new URLSearchParams(location.search), log = (s) => (document.getElementById("log").textContent += s + "\n");
+const out = document.getElementById("out"), w = new Worker("bend-worker.js");
+const result = { events: [] }; window.__smoke = result;
+const kind = q.get("kind") ?? "pack";
+const source = kind === "gguf" ? { kind: "gguf", url: q.get("url") ?? "../models/Qwen3.5-4B-Q4_K_M.gguf" } : { kind: "pack", base: q.get("base") ?? "../models/web-4b-q4km/" };
+w.onmessage = (e) => {
+  const m = e.data;
+  if (m.t === "progress") { if (m.phase !== "weights" || m.done % 10 === 0 || m.done === m.total) log(JSON.stringify(m)); return; }
+  result.events.push(m); if (m.t !== "token") log(JSON.stringify(m));
+  if (m.t === "ready") { result.ready = m; w.postMessage({ t: "chat", id: 1, system: "", messages: [{ role: "user", content: q.get("p") ?? "What is the capital of France? Answer in one sentence." }], maxNew: Number(q.get("n") ?? 64) }); }
+  if (m.t === "token") out.textContent += m.text;
+  if (m.t === "done" && m.id === 1 && q.has("follow")) { result.first = m; w.postMessage({ t: "chat", id: 2, system: "", messages: [{ role: "user", content: q.get("p") ?? "What is the capital of France? Answer in one sentence." }, { role: "assistant", content: out.textContent }, { role: "user", content: "And of Italy?" }], maxNew: 32 }); out.textContent += "\n---\n"; }
+  else if (m.t === "done" || m.t === "error") { result.done = m; result.text = out.textContent; document.title = "DONE"; }
+};
+w.postMessage({ t: "open", source, ctx: Number(q.get("ctx") ?? 4096), numerics: q.get("numerics") ?? "turbo", tokenizer: "../models/qwen35-tokenizer.bin", vocabSha: "9c144d2eb9c628950b338dd86b2e1bd3526e040a1420362f5f2e5f28d6d9a95c" });
+</script>

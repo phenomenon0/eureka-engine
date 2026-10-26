@@ -1,0 +1,172 @@
+--- a/tools/qwen35_engine.c	2026-10-08 04:27:26.939051553 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 04:27:26.956972636 -0500
+@@ -1031,7 +1031,7 @@
+ #endif
+ #define G8S_(x) #x
+ #define G8S(x) G8S_(x)
+-#define DOT8G_KIND "-gemm" G8S(GNT)
++#define DOT8G_KIND "-gemm" G8S(GNT) "-tile2"
+ static int16_t *gBS;
+ static size_t gBScap;
+ 
+@@ -1150,6 +1150,101 @@
+   for (int t = 0; t < GNT; t++) out[t] = acc[t];
+ }
+ 
++#if DOT8_SDOT
++// 2-row tiles: rows row and row+rb share every x load. Each row's integer sums
++// and float combine are gemm8_q4k / gemm8_q6k's, so each output keeps its bits.
++static void gemm8_q4k2(const uint8_t *row, size_t rb, int cols, const i8 *qx, const float *xd, const int16_t *bs, float *o0, float *o1) {
++  int nb = cols / 256;
++  float acc[2][GNT] = {{0}};
++  const uint8x16_t m4 = vdupq_n_u8(0xF);
++  for (int b = 0; b < nb; b++) {
++    const uint8_t *blk[2] = {row + (size_t)b * 144, row + rb + (size_t)b * 144};
++    int sd[2][8], sm[2][8];
++    int32x4_t sv[2][GNT];
++    for (int i = 0; i < 2; i++) {
++      for (int j = 0; j < 8; j++) gsm4(j, blk[i] + 4, &sd[i][j], &sm[i][j]);
++      for (int t = 0; t < GNT; t++) sv[i][t] = vdupq_n_s32(0);
++    }
++    for (int g = 0; g < 4; g++) {
++      int8x16_t lo0[2], lo1[2], hi0[2], hi1[2];
++      for (int i = 0; i < 2; i++) {
++        const uint8_t *qs = blk[i] + 16 + g * 32;
++        uint8x16_t w0 = vld1q_u8(qs), w1 = vld1q_u8(qs + 16);
++        lo0[i] = vreinterpretq_s8_u8(vandq_u8(w0, m4)); lo1[i] = vreinterpretq_s8_u8(vandq_u8(w1, m4));
++        hi0[i] = vreinterpretq_s8_u8(vshrq_n_u8(w0, 4)); hi1[i] = vreinterpretq_s8_u8(vshrq_n_u8(w1, 4));
++      }
++      for (int t = 0; t < GNT; t++) {
++        const i8 *xa = qx + (size_t)t * cols + b * 256 + g * 64;
++        int8x16_t x0 = vld1q_s8(xa), x1 = vld1q_s8(xa + 16), x2 = vld1q_s8(xa + 32), x3 = vld1q_s8(xa + 48);
++        for (int i = 0; i < 2; i++) {
++          int32x4_t z = vdupq_n_s32(0);
++          int32x4_t ia = vdotq_s32(vdotq_s32(z, lo0[i], x0), lo1[i], x1);
++          int32x4_t ib = vdotq_s32(vdotq_s32(z, hi0[i], x2), hi1[i], x3);
++          sv[i][t] = vmlaq_n_s32(vmlaq_n_s32(sv[i][t], ia, sd[i][2 * g]), ib, sd[i][2 * g + 1]);
++        }
++      }
++    }
++    for (int i = 0; i < 2; i++) {
++      float d = h2f(blk[i]), dmin = h2f(blk[i] + 2);
++      for (int t = 0; t < GNT; t++) {
++        const int16_t *bt = bs + (size_t)t * (cols / 32) + b * 8;
++        int32_t s1 = vaddvq_s32(sv[i][t]), s2 = 0;
++        for (int j = 0; j < 8; j++) s2 += sm[i][j] * bt[j];
++        float x = xd[(size_t)t * nb + b];
++        float dd = d * x, dm = dmin * x;
++        acc[i][t] += dd * (float)s1;
++        acc[i][t] -= dm * (float)s2;
++      }
++    }
++  }
++  for (int t = 0; t < GNT; t++) { o0[t] = acc[0][t]; o1[t] = acc[1][t]; }
++}
++
++static void gemm8_q6k2(const uint8_t *row, size_t rb, int cols, const i8 *qx, const float *xd, float *o0, float *o1) {
++  int nb = cols / 256;
++  float acc[2][GNT] = {{0}};
++  const uint8x16_t m4 = vdupq_n_u8(0xF), m3 = vdupq_n_u8(3);
++  for (int b = 0; b < nb; b++) {
++    const uint8_t *blk[2] = {row + (size_t)b * 210, row + rb + (size_t)b * 210};
++    int32x4_t sv[2][GNT];
++    for (int i = 0; i < 2; i++) for (int t = 0; t < GNT; t++) sv[i][t] = vdupq_n_s32(0);
++    for (int half = 0; half < 2; half++) {
++      uint8x16_t hh0[2], hh1[2];
++      for (int i = 0; i < 2; i++) { hh0[i] = vld1q_u8(blk[i] + 128 + half * 32); hh1[i] = vld1q_u8(blk[i] + 128 + half * 32 + 16); }
++      for (int qd = 0; qd < 4; qd++) {
++        int8x16_t c0[2], c1[2];
++        int sc0[2], sc1[2];
++        int8x16_t sh = vdupq_n_s8(-2 * qd);
++        for (int i = 0; i < 2; i++) {
++          const uint8_t *qq = blk[i] + half * 64 + (qd & 1) * 32;
++          uint8x16_t l0 = vld1q_u8(qq), l1 = vld1q_u8(qq + 16);
++          if (qd >= 2) { l0 = vshrq_n_u8(l0, 4); l1 = vshrq_n_u8(l1, 4); }
++          l0 = vandq_u8(l0, m4); l1 = vandq_u8(l1, m4);
++          uint8x16_t h0 = vandq_u8(vshlq_u8(hh0[i], sh), m3), h1 = vandq_u8(vshlq_u8(hh1[i], sh), m3);
++          c0[i] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(l0, vshlq_n_u8(h0, 4))), vdupq_n_s8(32));
++          c1[i] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(l1, vshlq_n_u8(h1, 4))), vdupq_n_s8(32));
++          const int8_t *scb = (const int8_t *)(blk[i] + 192);
++          sc0[i] = scb[half * 8 + 2 * qd]; sc1[i] = scb[half * 8 + 2 * qd + 1];
++        }
++        for (int t = 0; t < GNT; t++) {
++          const i8 *xq = qx + (size_t)t * cols + b * 256 + half * 128 + qd * 32;
++          int8x16_t x0 = vld1q_s8(xq), x1 = vld1q_s8(xq + 16);
++          for (int i = 0; i < 2; i++) {
++            int32x4_t z = vdupq_n_s32(0);
++            sv[i][t] = vmlaq_n_s32(vmlaq_n_s32(sv[i][t], vdotq_s32(z, c0[i], x0), sc0[i]), vdotq_s32(z, c1[i], x1), sc1[i]);
++          }
++        }
++      }
++    }
++    for (int i = 0; i < 2; i++) {
++      float d = h2f(blk[i] + 208);
++      for (int t = 0; t < GNT; t++) acc[i][t] += (d * xd[(size_t)t * nb + b]) * (float)vaddvq_s32(sv[i][t]);
++    }
++  }
++  for (int t = 0; t < GNT; t++) { o0[t] = acc[0][t]; o1[t] = acc[1][t]; }
++}
++#endif
++
+ // Quantizes X[T] (per token, as gemv's quant_x8), pads to GNT with zero tokens,
+ // then Yo[t][r] as gemm.
+ static void gemm8_quant(const float *X, int cols, int T) {
+@@ -1184,10 +1279,36 @@
+   }
+ }
+ 
++// output rows r and r+1 (r+1 < rows): one 2-row tile on sdot, two gemm8_row calls otherwise
++static void gemm8_row2(int fmt, const uint8_t *row, size_t rb, int cols, int rows, int r, int T, float *Yo) {
++#if DOT8_SDOT
++  int nb = cols / 256, ns = cols / 32;
++  for (int t0 = 0; t0 < T; t0 += GNT) {
++    float o0[GNT], o1[GNT];
++    if (fmt == 3) gemm8_q4k2(row, rb, cols, gQX + (size_t)t0 * cols, gXD + (size_t)t0 * nb, gBS + (size_t)t0 * ns, o0, o1);
++    else gemm8_q6k2(row, rb, cols, gQX + (size_t)t0 * cols, gXD + (size_t)t0 * nb, o0, o1);
++    for (int t = 0; t < GNT && t0 + t < T; t++) {
++      Yo[(size_t)(t0 + t) * rows + r] = o0[t];
++      Yo[(size_t)(t0 + t) * rows + r + 1] = o1[t];
++    }
++  }
++#else
++  gemm8_row(fmt, row, cols, rows, r, T, Yo);
++  gemm8_row(fmt, row + rb, cols, rows, r + 1, T, Yo);
++#endif
++}
++
++// rows of one tensor in pairs; an odd last row goes alone
++static void gemm8_pair(int fmt, const uint8_t *W, int cols, int rows, size_t rb, int pr, int T, float *Yo) {
++  int r = 2 * pr;
++  if (r + 1 < rows) gemm8_row2(fmt, W + (size_t)r * rb, rb, cols, rows, r, T, Yo);
++  else gemm8_row(fmt, W + (size_t)r * rb, cols, rows, r, T, Yo);
++}
++
+ static void gemm8(int fmt, const uint8_t *W, const float *X, int rows, int cols, int rb, int T, float *Yo) {
+   gemm8_quant(X, cols, T);
+   #pragma omp parallel for schedule(LLB_SCHED)
+-  for (int r = 0; r < rows; r++) gemm8_row(fmt, W + (size_t)r * rb, cols, rows, r, T, Yo);
++  for (int pr = 0; pr < (rows + 1) / 2; pr++) gemm8_pair(fmt, W, cols, rows, rb, pr, T, Yo);
+ }
+ #else
+ #define DOT8G_KIND ""
+@@ -1281,13 +1402,16 @@
+ #ifdef LLB_DOT8
+ #ifdef LLB_DOT8_GEMM
+   if (q8) {
++    int p0[9], P = 0;
++    for (int k = 0; k < n; k++) { p0[k] = P; P += (trows(ids[k]) + 1) / 2; }
++    p0[n] = P;
+     gemm8_quant(X, cols, T);
+     #pragma omp parallel for schedule(LLB_SCHED)
+-    for (int r = 0; r < R; r++) {
++    for (int pr = 0; pr < P; pr++) {
+       int k = 0;
+-      while (r >= r0[k + 1]) k++;
+-      int id = ids[k], rl = r - r0[k];
+-      gemm8_row(tfmt(id), tptr(id) + (size_t)rl * trb(id), cols, trows(id), rl, T, Yo[k]);
++      while (pr >= p0[k + 1]) k++;
++      int id = ids[k];
++      gemm8_pair(tfmt(id), tptr(id), cols, trows(id), (size_t)trb(id), pr - p0[k], T, Yo[k]);
+     }
+     return;
+   }

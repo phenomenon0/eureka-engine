@@ -1,0 +1,6 @@
+{
+  "model": "qwen35-4b",
+  "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "prompt": "What is written on the sign? Answer in one line.",
+  "max_tokens": 64
+}

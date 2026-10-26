@@ -1,0 +1,22 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Senses · Eureka web</title><link rel="icon" href="data:,"><link rel="stylesheet" href="common.css">
+<style>table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{color:var(--dim);font-weight:500}
+td a{color:var(--acc)}.y{color:var(--ok)}.n{color:var(--dim)}main{grid-template-columns:1fr}</style>
+<body data-page="hub">
+<header><a href="../" title="Back to the app">←</a><h1>Senses</h1><span class="sub">every modality, in this tab: models are static files, nothing runs on a server</span><span class="sp"></span><span class="chip" id="cap">probing…</span></header>
+<main><section class="card"><h2>Localities (runtime path × modality)</h2>
+<table><thead><tr><th>Modality</th><th>WebGPU</th><th>WGSL emitted by bend</th><th>WASM (CPU)</th><th>Model</th></tr></thead><tbody>
+<tr><td><b>Text</b> · <a href="../">the app</a> · <a href="../engine/smoke.html?kind=gguf">smoke</a></td><td class="y">✓ bend q35 engine (hand-written turbo GEMVs)</td><td class="y">✓ 12 of 23 kernels in emit/</td><td class="n">tokenizer only (tok.wasm); no CPU decode in this build</td><td>Qwen3.5-4B Q4_K_M</td></tr>
+<tr><td><b>Look</b> · <a href="vision.html">vision.html</a></td><td class="y">✓ <a href="vision.html?ep=webgpu">SmolVLM tower + projector + decoder</a> (ORT WebGPU EP)</td><td class="n">– (bend's Qwen3.5 tower is native-only)</td><td class="y">✓ <a href="vision.html?ep=wasm">int8 on CPU</a></td><td>SmolVLM-256M-Instruct</td></tr>
+<tr><td><b>Detect</b> · <a href="detect.html">detect.html</a></td><td class="y">✓ <a href="detect.html?ep=webgpu">boxes + fps</a></td><td class="n">–</td><td class="y">✓ <a href="detect.html?ep=wasm">boxes + fps</a></td><td>D-FINE-n / -s (COCO-80)</td></tr>
+<tr><td><b>Ears</b> · <a href="ears.html">ears.html</a></td><td class="y">✓ <a href="ears.html?ep=webgpu">mic → text</a></td><td class="n">–</td><td class="y">✓ <a href="ears.html?ep=wasm">mic → text</a></td><td>whisper-base.en (tiny.en)</td></tr>
+<tr><td><b>Speak</b> · <a href="speak.html">speak.html</a></td><td class="y">✓ <a href="speak.html?ep=webgpu">af_bella</a></td><td class="n">–</td><td class="y">✓ <a href="speak.html?ep=wasm">af_bella</a></td><td>Kokoro-82M · WebSpeech labelled fallback</td></tr>
+</tbody></table>
+<p class="note"><b>Demo:</b> <a href="../demos/vision/" style="color:var(--acc)">Vision decisions</a>: detect boxes in a photo, then answer a case's questions at once with probabilities, and ask about a tapped box.</p>
+<p class="note"><b>Demo:</b> <a href="../demos/box/" style="color:var(--acc)">Find anything</a>: name an object in your own words, see the box drawn on it, then decide with a probability on every answer.</p>
+<p class="note">WebGPU for the four senses means onnxruntime-web's WebGPU execution provider. ORT generates that WGSL itself at runtime; none of it comes from bend's emitter. The numbers and how to reproduce them are in WEB-MODES.md.</p></section></main>
+<script type="module">
+const ad = navigator.gpu ? await navigator.gpu.requestAdapter().catch(() => null) : null;
+document.getElementById("cap").textContent = `${ad ? "WebGPU ✓" : "no WebGPU"} · ${self.crossOriginIsolated ? "isolated (threaded WASM)" : "not isolated (1-thread WASM)"} · ${navigator.hardwareConcurrency} cores`;
+window.__SENSE__ = { status: "ok", webgpu: !!ad, crossOriginIsolated: self.crossOriginIsolated };
+</script></body></html>

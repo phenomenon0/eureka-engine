@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-accent="neutral">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#141414" />
+<title>Bend · voices</title>
+<!-- KOKORODROID: the voice picker + "More voices" (iOS: VoiceSettingsView). phoneone's stylesheet carries the Arc tokens;
+     update the name when the dist is updated. -->
+<link rel="stylesheet" href="./assets/index-CnYXcMWd.css">
+<style>
+  main { max-width: 34rem; margin: 0 auto; padding: calc(env(safe-area-inset-top) + var(--space-8)) var(--space-5) var(--space-10); }
+  .back { color: var(--text-secondary); text-decoration: none; font-size: .92rem; }
+  h1 { font-family: var(--font-display); font-size: 2.2rem; font-weight: 600; letter-spacing: -.03em; margin: var(--space-4) 0 var(--space-2);
+       background: var(--arc-gradient-ink); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lede { color: var(--text-secondary); margin: 0 0 var(--space-6); }
+  .card { background: var(--arc-gradient-soft); border: 1px solid var(--border); border-radius: var(--radius-panel); padding: var(--space-5); box-shadow: var(--shadow-raised); margin-bottom: var(--space-6); }
+  .card h2 { font-family: var(--font-display); font-size: 1.15rem; font-weight: 600; margin: 0 0 var(--space-2); }
+  .sub { color: var(--text-muted); font-size: .85rem; margin: 0 0 var(--space-3); }
+  .v { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) 0; border-bottom: 1px solid var(--border-subtle); }
+  .v:last-child { border-bottom: 0; }
+  .v .who { flex: 1; min-width: 0; }
+  .v .name { font-weight: 600; }
+  .v .meta { color: var(--text-muted); font-size: .8rem; }
+  .pick { width: 1.4rem; height: 1.4rem; border-radius: 50%; border: 2px solid var(--border-strong); flex: none; }
+  .v.on .pick { border-color: var(--control-on); background: radial-gradient(var(--control-on) 45%, transparent 50%); }
+  button { min-height: var(--control-height-sm); padding: 0 var(--space-4); border: 0; border-radius: var(--radius-control);
+           background: var(--surface-muted); color: var(--foreground); font: 600 .85rem var(--font-body); flex: none; }
+  button.main { background: var(--control-on); color: var(--control-glyph); }
+  button:disabled { opacity: .45; }
+  .bar { height: .35rem; border-radius: var(--radius-pill); background: var(--control-track); overflow: hidden; margin-top: var(--space-2); }
+  .bar > div { height: 100%; width: 0; background: var(--arc-gradient-line); transition: width .3s; }
+  .note { margin: var(--space-3) 0 0; padding: var(--space-3) var(--space-4); border-radius: var(--radius-md); font-size: .88rem; border: 1px solid var(--border); color: var(--text-secondary); }
+  .err { color: var(--danger); background: color-mix(in oklab, var(--danger) 10%, var(--surface)); }
+  .timing { font: .78rem var(--font-mono); color: var(--text-muted); margin-top: var(--space-3); min-height: 1em; }
+  details { color: var(--text-muted); font-size: .85rem; }
+  details input { width: 100%; box-sizing: border-box; margin: var(--space-3) 0 var(--space-2); padding: var(--space-3); border-radius: var(--radius-md);
+                  border: 1px solid var(--border-strong); background: var(--surface); color: var(--foreground); font: .85rem var(--font-mono); }
+  code { font-size: .78rem; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="/index.html">‹ Bend</a>
+  <h1>Voices</h1>
+  <p class="lede">The voice Bend reads its replies in. Every voice runs on this phone.</p>
+  <section class="card">
+    <h2>On this phone</h2>
+    <p class="sub" id="engine"></p>
+    <div id="mine"></div>
+    <div class="timing" id="timing"></div>
+  </section>
+  <section class="card">
+    <h2>More voices</h2>
+    <p class="sub">Downloaded once, then they work offline like the others.</p>
+    <p class="note" id="why" hidden></p>
+    <div id="shop"></div>
+    <button id="retry" hidden>Retry</button>
+  </section>
+  <details>
+    <summary>Your own voices &amp; shop source (developer)</summary>
+    <p>A Kokoro voice file (<code>.bin</code> 510×256 float32, or hexgrad's <code>.pt</code>) put in <code id="drop"></code> appears in the list above.</p>
+    Catalog URL. Empty resets to the built-in one.
+    <input id="url" type="url" inputmode="url" autocapitalize="off" spellcheck="false">
+    <button id="save">Save source</button>
+  </details>
+</main>
+<script>
+const N = window.__BEND_NATIVE__, key = N.key, $ = id => document.getElementById(id);
+const post = (p, body) => fetch(p, { method: 'POST', headers: { 'X-Api-Key': key }, body: JSON.stringify(body || {}) }).then(r => r.json());
+const mb = b => b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : Math.round(b / 1e3) + ' KB';
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const summary = v => [v.lang === 'en-gb' ? 'British' : 'American', v.gender, v.grade && 'grade ' + v.grade].filter(Boolean).join(' · ');
+let urlSet = false, busy = false, audio = null;
+
+function renderMine(s) {
+  $('engine').textContent = s.engine ? `Kokoro 82M · ${s.threads} threads · on device` : 'Kokoro is not in this build (android/voice/fetch-voice.sh)';
+  $('drop').textContent = s.dropIn + '/';
+  $('mine').innerHTML = s.voices.map(v => `
+    <div class="v ${v.id === s.current ? 'on' : ''}" data-id="${esc(v.id)}">
+      <span class="pick"></span>
+      <div class="who"><div class="name">${esc(v.name)}${v.id === s.default ? ' · house voice' : ''}</div>
+        <div class="meta">${esc(summary(v))} · ${v.origin === 'bundled' ? 'built in' : v.origin === 'shop' ? 'downloaded' : 'your file'}</div></div>
+      <button data-preview="${esc(v.id)}">Preview</button>
+    </div>`).join('');
+}
+async function mine() { renderMine(await (await fetch('/voices')).json()); }
+
+$('mine').onclick = async e => {
+  const pv = e.target.closest('[data-preview]'), row = e.target.closest('.v');
+  if (pv) {
+    if (busy) return; busy = true; pv.disabled = true; $('timing').textContent = 'rendering…';
+    const r = await post('/voices/preview', { id: pv.dataset.preview, play: true });
+    $('timing').textContent = r.error ? r.error.message : `${r.name}: first clause ${r.first_clause_ms} ms · RTF ${r.rtf} · ${r.audio_s} s of speech`;
+    pv.disabled = false; busy = false; return;
+  }
+  if (row) renderMine(await post('/voices/select', { id: row.dataset.id }));
+};
+
+function renderShop(s) {
+  if (!urlSet) { $('url').value = s.overridden ? s.catalog : ''; $('url').placeholder = s.catalog; urlSet = true; }
+  $('why').hidden = !s.why; $('why').className = 'note' + (s.listing === 'offline' && !s.voices.length ? ' err' : '');
+  $('why').textContent = s.why ? s.why + (s.voices.length ? ' Showing the list from last time.' : ' Your voices on this phone still work.') : '';
+  $('retry').hidden = s.listing !== 'offline';
+  $('shop').innerHTML = s.voices.map(v => {
+    const pct = (100 * v.have / v.bytes).toFixed(0);
+    const act = v.state === 'downloading' ? `<button data-op="pause" data-id="${esc(v.id)}">Pause</button>`
+      : v.state === 'installed' ? `<button data-op="remove" data-id="${esc(v.id)}">Remove</button>`
+      : v.state === 'paused' ? `<button class="main" data-op="download" data-id="${esc(v.id)}">Resume</button>`
+      : v.state === 'failed' ? `<button class="main" data-op="download" data-id="${esc(v.id)}">Retry</button>`
+      : `<button class="main" data-op="download" data-id="${esc(v.id)}">Get · ${mb(v.bytes)}</button>`;
+    return `<div class="v" data-sid="${esc(v.id)}">
+      <div class="who"><div class="name">${esc(v.name)}</div><div class="meta">${esc(summary(v))} · ${esc(v.license)}</div>
+        ${v.state === 'downloading' || v.state === 'paused' ? `<div class="bar"><div style="width:${pct}%"></div></div><div class="meta">${mb(v.have)} of ${mb(v.bytes)} · ${pct}%</div>` : ''}
+        ${v.state === 'installed' ? '<div class="meta">Installed · in the list above</div>' : ''}
+        ${v.error ? `<div class="meta" style="color:var(--danger)">${esc(v.error)}</div>` : ''}</div>
+      ${v.preview ? `<button data-listen="${esc(v.preview)}">▶</button>` : ''}${act}</div>`;
+  }).join('');
+  if (s.voices.some(v => v.state === 'downloading')) setTimeout(poll, 400);
+}
+let wasDownloading = false;
+async function poll() {
+  const s = await (await fetch('/voices/shop')).json();
+  const now = s.voices.some(v => v.state === 'downloading');
+  if (wasDownloading && !now) mine(); // an install landed: the picker lists it
+  wasDownloading = now; renderShop(s);
+}
+$('shop').onclick = async e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.listen) { audio?.pause(); audio = new Audio(b.dataset.listen); audio.play().catch(() => b.textContent = '✕'); return; }
+  const s = await post('/voices/shop/' + b.dataset.op, { id: b.dataset.id });
+  wasDownloading = s.voices.some(v => v.state === 'downloading'); renderShop(s); if (b.dataset.op === 'remove') mine();
+};
+$('retry').onclick = () => post('/voices/shop/load').then(renderShop);
+$('save').onclick = () => post('/voices/shop/source', { url: $('url').value }).then(s => { urlSet = false; renderShop(s); });
+mine();
+post('/voices/shop/load').then(renderShop);
+</script>
+</body>
+</html>

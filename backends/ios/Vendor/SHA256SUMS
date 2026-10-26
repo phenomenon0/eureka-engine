@@ -1,0 +1,13 @@
+cf37ad957d6fbf6391475d6709ae923f56a20d27b8995087c975b4b103d640dc  ./LLBEngine.xcframework/Info.plist
+8106b41fae9e85b5b20998fdab1e477c3352d03032e1f0fe8b3b64e6b325cea2  ./LLBEngine.xcframework/ios-arm64-simulator/Headers/llb_engine.h
+7b3bacde2ddf7358ef2e1a7e554e700436c4ee1d0890e8fafcc748326d3dc7be  ./LLBEngine.xcframework/ios-arm64-simulator/libllbengine.a
+8106b41fae9e85b5b20998fdab1e477c3352d03032e1f0fe8b3b64e6b325cea2  ./LLBEngine.xcframework/ios-arm64/Headers/llb_engine.h
+0edf19c34563e4670c8628e0d0cedde14552b8ed735aa4d03875bb82c4ffbd45  ./LLBEngine.xcframework/ios-arm64/libllbengine.a
+4d3b2b47700edc31323dfd0c0b0c864516fda73b891351a867e2fa1df11f1f02  ./macos/libllbengine.a
+21df71705231d278c5df9bea8210e193d99e86507e7c796c0fa79af4f4c9a5db  ./EARS.xcframework/Info.plist
+28294fe527a737728ced8f9e91633f830d216586e83ca03610863952f1955df2  ./EARS.xcframework/ios-arm64-simulator/Headers/ears.h
+a50ceb82f676d62c6d529fbadba16c21039923be5ef86ddce3ca3b78da718884  ./EARS.xcframework/ios-arm64-simulator/libears.a
+28294fe527a737728ced8f9e91633f830d216586e83ca03610863952f1955df2  ./EARS.xcframework/ios-arm64/Headers/ears.h
+6a8169144984c444e3278c6696650f4c554de24691b83d0562ff5b54193eb09e  ./EARS.xcframework/ios-arm64/libears.a
+28294fe527a737728ced8f9e91633f830d216586e83ca03610863952f1955df2  ./macos/ears-include/ears.h
+7d3d1fe19ad52960b219b3bb11a43641247b5b6214f2ee9f829bdec92a7a6d24  ./macos/libears.a

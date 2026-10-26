@@ -1,0 +1,191 @@
+--- a/tools/qwen35_engine.c	2026-10-08 03:49:49.590418401 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 03:49:49.609836566 -0500
+@@ -859,72 +859,112 @@
+ #undef N
+ }
+ 
+-// The per-token part of the full-attention layer: q/k norm + rope, cache
+-// write, attention, output gate. q/k/v projections given; writes ATTN[H*HDIM].
+-static void full_core(int il, const char *p, const float *QGN, const float *KB,
+-                      const float *VB, int tpos) {
+-  char nm[80]; int id;
+-#define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
+-  N("attn_q_norm.weight"); const float *qnw = fvec(id);
+-  N("attn_k_norm.weight"); const float *knw = fvec(id);
++// q/k norm + rope of one token: q -> qn[H*HDIM]; normalized k and v -> the cache at tpos.
++static void full_qkv(int il, const float *qnw, const float *knw, const float *QGN, const float *KB,
++                     const float *VB, int tpos, float *qn) {
+   for (int hh = 0; hh < H; hh++) {
+     const float *q = QGN + hh * 2 * HDIM;
+     float ss = 0.0f;
+     for (int i = 0; i < HDIM; i++) ss += q[i] * q[i];
+     float s = 1.0f / hf_sqrt(ss / (float)HDIM + EPS);
+-    for (int i = 0; i < HDIM; i++) QN[hh * HDIM + i] = q[i] * s * qnw[i];
+-    rope_neox(QN + hh * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
++    for (int i = 0; i < HDIM; i++) qn[hh * HDIM + i] = q[i] * s * qnw[i];
++    rope_neox(qn + hh * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
+   }
++  size_t base = ((size_t)il * gCap + tpos) * KV * HDIM;
++  float *kc = gK + base;
+   for (int g = 0; g < KV; g++) {
+     const float *k = KB + g * HDIM;
+     float ss = 0.0f;
+     for (int i = 0; i < HDIM; i++) ss += k[i] * k[i];
+     float s = 1.0f / hf_sqrt(ss / (float)HDIM + EPS);
+-    for (int i = 0; i < HDIM; i++) KN[g * HDIM + i] = k[i] * s * knw[i];
+-    rope_neox(KN + g * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
++    for (int i = 0; i < HDIM; i++) kc[g * HDIM + i] = k[i] * s * knw[i];
++    rope_neox(kc + g * HDIM, tpos, ROPEDIM, HDIM, ROPE_BASE);
+   }
+-  size_t base = ((size_t)il * gCap + tpos) * KV * HDIM;
+-  memcpy(gK + base, KN, KV * HDIM * 4);
+   memcpy(gV + base, VB, KV * HDIM * 4);
++}
+ 
+-  int grp = H / KV;
++// attention of head hh (query qh) at tpos over cache positions 0..tpos -> o[HDIM]; probs: gCap scratch
++static void full_head(int il, const float *qh, int hh, int tpos, float *probs, float *o) {
++  int kvh = hh / (H / KV);
+   float scale = 1.0f / hf_sqrt((float)HDIM);
++  float mx = -INFINITY;
++  for (int tp = 0; tp <= tpos; tp++) {
++    const float *kh = gK + (((size_t)il * gCap + tp) * KV + kvh) * HDIM;
++    float s = 0.0f;
++    for (int i = 0; i < HDIM; i++) s += kh[i] * qh[i];
++    s *= scale;
++    probs[tp] = s;
++    if (s > mx) mx = s;
++  }
++  float sum = 0.0f;
++  for (int tp = 0; tp <= tpos; tp++) { float e = hf_exp(probs[tp] - mx); probs[tp] = e; sum += e; }
++  for (int i = 0; i < HDIM; i++) {
++    float acc = 0.0f;
++    for (int tp = 0; tp <= tpos; tp++) {
++      const float *vh = gV + (((size_t)il * gCap + tp) * KV + kvh) * HDIM;
++      acc += (probs[tp] / sum) * vh[i];
++    }
++    o[i] = acc;
++  }
++}
++
++static void full_gate(const float *QGN, float *attn) {
++  for (int hh = 0; hh < H; hh++) {
++    const float *g = QGN + hh * 2 * HDIM + HDIM;
++    for (int i = 0; i < HDIM; i++) attn[hh * HDIM + i] *= hf_sigmoid(g[i]);
++  }
++}
++
++// The per-token part of the full-attention layer: q/k norm + rope, cache
++// write, attention, output gate. q/k/v projections given; writes ATTN[H*HDIM].
++static void full_core(int il, const char *p, const float *QGN, const float *KB,
++                      const float *VB, int tpos) {
++  char nm[80]; int id;
++#define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
++  N("attn_q_norm.weight"); const float *qnw = fvec(id);
++  N("attn_k_norm.weight"); const float *knw = fvec(id);
++  full_qkv(il, qnw, knw, QGN, KB, VB, tpos, QN);
+ #ifdef LLB_PAR_CORE
+-  float *PROBS0 = PROBS;
+   #pragma omp parallel for schedule(LLB_SCHED)
+ #endif
+   for (int hh = 0; hh < H; hh++) {
+ #ifdef LLB_PAR_CORE
+-    float *PROBS = PROBS0 + (size_t)omp_get_thread_num() * gCap;
++    float *probs = PROBS + (size_t)omp_get_thread_num() * gCap;
++#else
++    float *probs = PROBS;
+ #endif
+-    int kvh = hh / grp;
+-    const float *qh = QN + hh * HDIM;
+-    float mx = -INFINITY;
+-    for (int tp = 0; tp <= tpos; tp++) {
+-      const float *kh = gK + (((size_t)il * gCap + tp) * KV + kvh) * HDIM;
+-      float s = 0.0f;
+-      for (int i = 0; i < HDIM; i++) s += kh[i] * qh[i];
+-      s *= scale;
+-      PROBS[tp] = s;
+-      if (s > mx) mx = s;
+-    }
+-    float sum = 0.0f;
+-    for (int tp = 0; tp <= tpos; tp++) { float e = hf_exp(PROBS[tp] - mx); PROBS[tp] = e; sum += e; }
+-    for (int i = 0; i < HDIM; i++) {
+-      float acc = 0.0f;
+-      for (int tp = 0; tp <= tpos; tp++) {
+-        const float *vh = gV + (((size_t)il * gCap + tp) * KV + kvh) * HDIM;
+-        acc += (PROBS[tp] / sum) * vh[i];
+-      }
+-      ATTN[hh * HDIM + i] = acc;
+-    }
++    full_head(il, QN + hh * HDIM, hh, tpos, probs, ATTN + hh * HDIM);
+   }
+-  for (int hh = 0; hh < H; hh++) {
+-    const float *g = QGN + hh * 2 * HDIM + HDIM;
+-    for (int i = 0; i < HDIM; i++) ATTN[hh * HDIM + i] *= hf_sigmoid(g[i]);
++  full_gate(QGN, ATTN);
++#undef N
++}
++
++#ifdef LLB_PAR_CORE
++static float *PQ;  // prefill: per-token normalized q, PFB x H*HDIM
++
++// full_core for T prompt tokens at pos0.. (prefill): the cache rows of all T tokens first, then
++// attention over (token, head) pairs in parallel; each pair is full_core's serial loop over the
++// positions <= its own, so no bits change. Writes out[T][H*HDIM] (= ATTN per token).
++static void full_core_n(int il, const char *p, const float *QA, const float *KA, const float *VA,
++                        int T, int pos0, float *out) {
++  char nm[80]; int id;
++  int nq = 2 * HDIM * H, nk = KV * HDIM, na = H * HDIM;
++#define N(s) (snprintf(nm, sizeof nm, "%s%s", p, s), id = find(nm))
++  N("attn_q_norm.weight"); const float *qnw = fvec(id);
++  N("attn_k_norm.weight"); const float *knw = fvec(id);
++  #pragma omp parallel for schedule(LLB_SCHED)
++  for (int t = 0; t < T; t++)
++    full_qkv(il, qnw, knw, QA + (size_t)t * nq, KA + (size_t)t * nk, VA + (size_t)t * nk, pos0 + t, PQ + (size_t)t * na);
++  #pragma omp parallel for schedule(LLB_SCHED)
++  for (int th = 0; th < T * H; th++) {
++    int t = th / H, hh = th % H;
++    full_head(il, PQ + (size_t)t * na + hh * HDIM, hh, pos0 + t, PROBS + (size_t)omp_get_thread_num() * gCap,
++              out + (size_t)t * na + hh * HDIM);
+   }
++  for (int t = 0; t < T; t++) full_gate(QA + (size_t)t * nq, out + (size_t)t * na);
+ #undef N
+ }
++#endif
+ 
+ static void full_attn(int il, const char *p, const float *h, int tpos) {
+   char nm[80]; int id;
+@@ -1285,6 +1325,10 @@
+   PC = (float *)malloc((size_t)PFB * (TR > KV * HDIM ? TR : KV * HDIM) * 4);
+   PD = (float *)malloc((size_t)PFB * (TR > KV * HDIM ? TR : KV * HDIM) * 4);
+   PE = (float *)malloc(PFB * wf * 4);       PO = (float *)malloc((size_t)PFB * D * 4);
++#ifdef LLB_PAR_CORE
++  PQ = (float *)malloc((size_t)PFB * H * HDIM * 4);
++  if (!PQ) { fprintf(stderr, "prefill alloc failed\n"); exit(1); }
++#endif
+   if (!PX || !PH || !PA || !PB || !PC || !PD || !PE || !PO) { fprintf(stderr, "prefill alloc failed\n"); exit(1); }
+ }
+ 
+@@ -1305,10 +1349,15 @@
+       int ig[3]; float *og[3] = {PA, PC, PD};
+       N("attn_q.weight"); ig[0] = id; N("attn_k.weight"); ig[1] = id; N("attn_v.weight"); ig[2] = id;
+       gemm_n(3, ig, PH, og, T);
++#ifdef LLB_PAR_CORE
++      full_core_n(il, p, PA, PC, PD, T, pos0, PB);
++      (void)nq; (void)nk;
++#else
+       for (int t = 0; t < T; t++) {
+         full_core(il, p, PA + (size_t)t * nq, PC + (size_t)t * nk, PD + (size_t)t * nk, pos0 + t);
+         memcpy(PB + (size_t)t * H * HDIM, ATTN, (size_t)H * HDIM * 4);
+       }
++#endif
+       N("attn_output.weight"); gemm(id, PB, PO, T);
+     } else {
+       int ig[4]; float *og[4] = {PA, PB, PC, PD};
+@@ -1499,6 +1548,7 @@
+     omp_sched_t k; int ch; omp_get_schedule(&k, &ch);
+ #ifdef LLB_PAR_CORE
+     fprintf(stderr, "cpu: heads split in linear_core/full_core (per-head order serial)\n");
++    fprintf(stderr, "cpu: prefill full_core over (token, head) pairs (per-pair order serial)\n");
+ #endif
+     fprintf(stderr, "cpu: row schedule %s (runtime: kind %d chunk %d)\n", LLB_STR(LLB_SCHED), (int)k, ch);
+   }

@@ -1,0 +1,59 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>trunk smoke</title></head>
+<body style="background:#111;color:#ddd;font:13px ui-monospace,monospace;white-space:pre-wrap">
+<div id="st">loading…</div><div id="out"></div>
+<script>
+// trunk smoke (WEB-TRUNK-PORT): ?m=<inventory id>&ctx=4096&n=64&p=<prompt> | &ids=1,2,3 (raw ids, no template) &top=10 (logits top-k at each output)
+window.__smoke = { errors: [], result: null };
+addEventListener("error", e => __smoke.errors.push(String(e.message)));
+addEventListener("unhandledrejection", e => __smoke.errors.push(String(e.reason?.stack ?? e.reason)));
+const oe = console.error; console.error = (...a) => { __smoke.errors.push(a.map(String).join(" ")); oe(...a); };
+window.Module = { locateFile: (p) => "/engine/" + p };
+window.__tokReady = new Promise(r => { Module.onRuntimeInitialized = r; });
+</script>
+<script src="/engine/tok.js"></script>
+<script type="module">
+import { gguf_read } from "/engine/gguf.js";
+import { gguf_vocab_sha256 } from "/engine/ggufpack.js";
+import { trunk_open, trunk_check, trunk_resident } from "./trunk_engine.js";
+const q = new URLSearchParams(location.search), st = document.getElementById("st"), out = document.getElementById("out");
+const id = q.get("m") ?? "clef-flash-Q4_K_S.gguf", url = "/models/" + id, ctx = Number(q.get("ctx") ?? 4096), N = Number(q.get("n") ?? 64), TOP = Number(q.get("top") ?? 0);
+const read = async (o, n) => { const r = await fetch(url, { headers: { range: `bytes=${o}-${o + n - 1}` } }); if (r.status !== 206) throw new Error("range read " + r.status); return new Uint8Array(await r.arrayBuffer()); };
+try {
+  await __tokReady; const T = Module;
+  T.FS.mkdir("/tok"); T.FS.writeFile("/tok/tokenizer.bin", new Uint8Array(await (await fetch("/models/qwen35-tokenizer.bin")).arrayBuffer()));
+  if (T._tok_init() !== 0) throw new Error("tokenizer.bin did not load");
+  const encode = (text) => { const n = T.lengthBytesUTF8(text) + 1, p = T._malloc(n); T.stringToUTF8(text, p, n); const cap = 16384, o = T._malloc(cap * 4), got = T._tok_encode(p, o, cap); const ids = Array.from(T.HEAP32.subarray(o >> 2, (o >> 2) + got)); T._free(p); T._free(o); return ids; };
+  const piece = (i) => { const p = T._malloc(65536), n = T._tok_piece(i, p, 65536), b = T.HEAPU8.slice(p, p + n); T._free(p); return b; };
+  const t0 = performance.now();
+  const g = await gguf_read(read), chk = trunk_check(g), sha = await gguf_vocab_sha256(g);
+  const vocab_ok = sha === "9c144d2eb9c628950b338dd86b2e1bd3526e040a1420362f5f2e5f28d6d9a95c";
+  if (!vocab_ok) throw new Error("vocabulary hash " + sha.slice(0, 12) + " isn't the bundled Qwen3.5 tokenizer's");
+  st.textContent = `${id}: ${chk.ok ? "trunk graph OK" : chk.problems.join(" ")} — est ${(trunk_resident(chk, ctx) / 1e9).toFixed(2)} GB at ${ctx}`;
+  const e = await trunk_open(read, { ctx, gguf: g, onProgress: ({ done, total }) => { st.textContent = `loading ${id}: ${(done / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`; } });
+  const open_ms = performance.now() - t0;
+  const prompt = q.get("p") ?? "What is the capital of France? Answer in one sentence.";
+  const ids = q.has("ids") ? q.get("ids").split(",").map(Number) : encode(`<|im_start|>user\n${prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`);
+  const stops = new Set([e.shape.eos, 248046, 248044].filter(x => x != null));
+  const topk = (L) => { const a = []; for (let i = 0; i < L.length; i++) { if (a.length < TOP || L[i] > a[a.length - 1][1]) { a.push([i, L[i]]); a.sort((x, y) => y[1] - x[1]); if (a.length > TOP) a.pop(); } } let m = -Infinity; for (const v of L) m = Math.max(m, v); let z = 0; for (const v of L) z += Math.exp(v - m); const lse = m + Math.log(z); return a.map(([i, v]) => [i, +v.toFixed(4), +(v - lse).toFixed(5)]); };
+  let r, pre = 0; const tops = [];
+  const TF = Number(q.get("tf") ?? 1);   // teacher forcing: top-k at each of the last TF prompt positions
+  for (let i = 0; i < ids.length; i++) { r = await e.step(ids[i], { wantLogits: TOP > 0 && i >= ids.length - TF }); pre += r.ms; if (r.logits) tops.push(topk(r.logits)); }
+  const gen = [r.id]; let dec = 0; const td = new TextDecoder();
+  out.textContent = td.decode(piece(r.id), { stream: true });
+  while (gen.length < N && !stops.has(gen[gen.length - 1])) {
+    r = await e.step(gen[gen.length - 1], { wantLogits: TOP > 0 && tops.length < Number(q.get("ntop") ?? 4) }); dec += r.ms; gen.push(r.id);
+    if (r.logits) tops.push(topk(r.logits));
+    if (!stops.has(r.id)) out.textContent += td.decode(piece(r.id), { stream: true });
+  }
+  const steps = gen.length - 1;
+  __smoke.result = { model: id, arch: e.shape.arch, shape: { layers: e.shape.n_layer, d: e.shape.d, ff: e.shape.ff, heads: e.shape.nh, kv: e.shape.nkv, vheads: e.shape.hv },
+    ctx, open_ms: Math.round(open_ms), resident_bytes: e.resident_bytes, estimate_bytes: trunk_resident(chk, ctx), dispatches: e.dispatches, limits: e.limits, adapter: e.adapter,
+    skipped_tensors: chk.skipped.length, prompt_tokens: ids.length, prefill_ms: Math.round(pre), prefill_tok_s: +(ids.length * 1000 / pre).toFixed(1),
+    decode_steps: steps, decode_ms: Math.round(dec), tokens_per_second: steps ? +(steps * 1000 / dec).toFixed(1) : null,
+    ids: gen, text: out.textContent, tops, ua: navigator.userAgent };
+  st.textContent = `${id}: ${__smoke.result.tokens_per_second} tok/s decode, prefill ${__smoke.result.prefill_tok_s} tok/s, open ${(open_ms / 1000).toFixed(1)} s, resident ${(e.resident_bytes / 1e9).toFixed(2)} GB`;
+  e.free();
+} catch (err) { __smoke.errors.push(String(err.stack ?? err)); st.textContent = "ERROR " + (err.stack ?? err); __smoke.result = { error: String(err.message ?? err) }; }
+document.title = "DONE";
+</script></body></html>

@@ -1,0 +1,53 @@
+--- a/tools/qwen35_engine.c	2026-10-08 05:30:09.906342313 -0500
++++ b/tools/qwen35_engine.c	2026-10-08 05:30:09.906649587 -0500
+@@ -888,23 +888,37 @@
+   int kvh = hh / (H / KV);
+   float scale = 1.0f / hf_sqrt((float)HDIM);
+   float mx = -INFINITY;
+-  for (int tp = 0; tp <= tpos; tp++) {
+-    const float *kh = gK + (((size_t)il * gCap + tp) * KV + kvh) * HDIM;
++  const size_t st = (size_t)KV * HDIM;
++  const float *k0 = gK + ((size_t)il * gCap * KV + kvh) * HDIM, *v0 = gV + ((size_t)il * gCap * KV + kvh) * HDIM;
++  // 4 positions at once = 4 independent dot chains, each in the serial i order
++  int tp = 0;
++  for (; tp + 3 <= tpos; tp += 4) {
++    const float *a = k0 + tp * st, *b = a + st, *c = b + st, *d = c + st;
++    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
++    for (int i = 0; i < HDIM; i++) { s0 += a[i] * qh[i]; s1 += b[i] * qh[i]; s2 += c[i] * qh[i]; s3 += d[i] * qh[i]; }
++    probs[tp] = s0 * scale; probs[tp + 1] = s1 * scale; probs[tp + 2] = s2 * scale; probs[tp + 3] = s3 * scale;
++  }
++  for (; tp <= tpos; tp++) {
++    const float *kh = k0 + tp * st;
+     float s = 0.0f;
+     for (int i = 0; i < HDIM; i++) s += kh[i] * qh[i];
+-    s *= scale;
+-    probs[tp] = s;
+-    if (s > mx) mx = s;
++    probs[tp] = s * scale;
+   }
++  for (tp = 0; tp <= tpos; tp++) if (probs[tp] > mx) mx = probs[tp];
+   float sum = 0.0f;
+-  for (int tp = 0; tp <= tpos; tp++) { float e = hf_exp(probs[tp] - mx); probs[tp] = e; sum += e; }
+-  for (int i = 0; i < HDIM; i++) {
+-    float acc = 0.0f;
+-    for (int tp = 0; tp <= tpos; tp++) {
+-      const float *vh = gV + (((size_t)il * gCap + tp) * KV + kvh) * HDIM;
+-      acc += (probs[tp] / sum) * vh[i];
+-    }
+-    o[i] = acc;
++  for (tp = 0; tp <= tpos; tp++) { float e = hf_exp(probs[tp] - mx); probs[tp] = e; sum += e; }
++  for (tp = 0; tp <= tpos; tp++) probs[tp] = probs[tp] / sum;
++  // position-outer: each o[i] still sums its terms in position order, now contiguous in i
++  for (int i = 0; i < HDIM; i++) o[i] = 0.0f;
++  for (tp = 0; tp + 3 <= tpos; tp += 4) {
++    const float *a = v0 + tp * st, *b = a + st, *c = b + st, *d = c + st;
++    float p0 = probs[tp], p1 = probs[tp + 1], p2 = probs[tp + 2], p3 = probs[tp + 3];
++    for (int i = 0; i < HDIM; i++) o[i] = (((o[i] + p0 * a[i]) + p1 * b[i]) + p2 * c[i]) + p3 * d[i];
++  }
++  for (; tp <= tpos; tp++) {
++    const float *vh = v0 + tp * st;
++    float pw = probs[tp];
++    for (int i = 0; i < HDIM; i++) o[i] += pw * vh[i];
+   }
+ }
+ 

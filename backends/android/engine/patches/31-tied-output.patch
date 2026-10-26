@@ -1,0 +1,10 @@
+--- a/tools/qwen35_engine.c
++++ b/tools/qwen35_engine.c
+@@ -1601,6 +1601,7 @@
+   int onorm = find("output_norm.weight");
+   rms_norm(HH, X, fvec(onorm), D);
+   int ow = find("output.weight");
++  if (ow < 0) ow = find("token_embd.weight");  // tied embeddings: no output.weight in the pack
+   gemv(ow, tptr(ow), HH, LOGITS);
+ }
+ 

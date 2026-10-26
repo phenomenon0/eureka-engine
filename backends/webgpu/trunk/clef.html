@@ -1,0 +1,43 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>clef decision head</title></head>
+<body style="background:#111;color:#ddd;font:13px ui-monospace,monospace;white-space:pre-wrap">
+<div id="st">loading…</div><div id="out"></div>
+<script>
+// clef.html (CLEF-HEAD): Clef's /v1/systemone in the page. ?cases=<url of a JSON array of {name, body}> runs each and leaves
+// window.__smoke.result = {open, cases: [{name, answers, usage, stats, debug}]}; without it, one demo request.
+// Console helper: await clefDecide({state, questions}) once the page says ready.
+window.__smoke = { errors: [], result: null };
+addEventListener("error", e => __smoke.errors.push(String(e.message)));
+addEventListener("unhandledrejection", e => __smoke.errors.push(String(e.reason?.stack ?? e.reason)));
+const oe = console.error; console.error = (...a) => { __smoke.errors.push(a.map(String).join(" ")); oe(...a); };
+window.Module = { locateFile: (p) => "/engine/" + p };
+window.__tokReady = new Promise(r => { Module.onRuntimeInitialized = r; });
+</script>
+<script src="/engine/tok.js"></script>
+<script type="module">
+import { ClefDecider } from "./clef_session.js";
+const q = new URLSearchParams(location.search), st = document.getElementById("st"), out = document.getElementById("out");
+const url = "/models/" + (q.get("m") ?? "clef-flash-Q4_K_S.gguf");
+const read = async (o, n) => { const r = await fetch(url, { headers: { range: `bytes=${o}-${o + n - 1}` } }); if (r.status !== 206) throw new Error("range read " + r.status); return new Uint8Array(await r.arrayBuffer()); };
+const DEMO = [{ name: "demo", body: { state: "The customer wrote: my package arrived broken and I want my money back.",
+  questions: { refund: { type: "noul", instructions: "Does the customer ask for a refund?" },
+    mood: { type: "choice", instructions: "The mood of the customer.", criteria: { happy: "pleased", angry: "upset or annoyed", neutral: null } } } } }];
+try {
+  await __tokReady;
+  const c = new ClefDecider();
+  const open = await c.open(read, { ctx: Number(q.get("ctx") ?? 4096), onProgress: ({ done, total }) => { st.textContent = `loading: ${(done / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`; } });
+  window.clefDecide = (body) => c.decide(body);
+  const cases = q.has("cases") ? await (await fetch(q.get("cases"))).json() : DEMO, res = [];
+  for (const [i, k] of cases.entries()) {
+    st.textContent = `ready (open ${(open.open_ms / 1000).toFixed(1)} s) — case ${i + 1}/${cases.length}: ${k.name}`;
+    try { res.push({ name: k.name, ...(await c.decide(k.body, { debug: true })) }); }
+    catch (err) { res.push({ name: k.name, error: String(err.message ?? err) }); }
+    const r = res[res.length - 1];
+    out.textContent += `${k.name}: ${r.error ?? JSON.stringify(Object.fromEntries(Object.entries(r.answers).map(([id, a]) => [id, a.choice ?? a.noul ?? a.score])))}  [${r.usage?.input_tokens} tok, trunk ${r.stats?.trunk_ms} ms, head ${r.stats?.head_ms} ms]\n`;
+  }
+  __smoke.result = { open, ua: navigator.userAgent, cases: res };
+  st.textContent = `ready — ${res.length} case(s) done. Console: await clefDecide({state, questions})`;
+  if (q.get("keep") !== "1") c.free();
+} catch (err) { __smoke.errors.push(String(err.stack ?? err)); st.textContent = "ERROR " + (err.stack ?? err); __smoke.result = { error: String(err.message ?? err) }; }
+document.title = "DONE";
+</script></body></html>

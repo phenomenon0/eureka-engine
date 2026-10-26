@@ -1,0 +1,209 @@
+# Bend iOS shell. Generate with `xcodegen generate` in this folder (scripts/build-ios.sh does it).
+# The web app is built by Vite into ../dist and synced into ./web by scripts/build-ios.sh;
+# the app bundles it as a folder reference and loads web/index.html from disk. No network
+# beyond loopback: the engine serves on 127.0.0.1, see docs/ENGINE-NATIVE.md.
+#
+# Two targets, one app (same bundle id, same web app, same loopback contract):
+#   Bend       (default) OUR engine: Vendor/LLBEngine.xcframework (PHONECAM: KEVPHONE's resident engine + ENGINE-IPHONEVIS's 4B Metal vision tower + the camera API, emitted C b0ffd9af…, checked in,
+#              hashes in Vendor/SHA256SUMS), Engines/LLB. docs/ENGINE-NATIVE.md.
+#   BendLlama  the R7 fallback: llama.cpp + the in-process llama-server, Engines/Llama. Built only with
+#              BEND_ENGINE=llama (scripts/build-ios.sh, scripts/deploy-phone.sh). Frameworks/llama.xcframework is a
+#              symlink build-ios.sh makes to $LLAMA_XCFRAMEWORK (default ~/bend-phone-prep/ios/llama.xcframework);
+#              it is not checked in (58 MB).
+name: Bend
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "27.0"
+  createIntermediateGroups: true
+targetTemplates:
+  BendApp:
+    type: application
+    platform: iOS
+    info:
+      path: Bend/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # The web view (file://) and the native client reach the engines on 127.0.0.1.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # Models arrive in Documents/models (devicectl copy, or Finder file sharing).
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        # R15 (docs/AGENT.md): one opportunistic BGAppRefreshTask that nudges the Core's job runner.
+        UIBackgroundModes: [fetch, audio]  # VOICESHOP2: a reply that is playing finishes if the screen locks
+        BGTaskSchedulerPermittedIdentifiers: [com.example.bend.refresh]
+        # PHONEVOICE: push-to-talk voice mode. Hearing and speaking run on the phone (docs/VOICE.md).
+        NSMicrophoneUsageDescription: Eureka listens while you hold the talk button, and turns your words into text on this phone.
+        NSSpeechRecognitionUsageDescription: Eureka turns what you say into text on this phone. Nothing is sent anywhere.
+        # BENDFIX-2: the map's opt-in "Use my location" (src/subapps/map/here.ts): one fix per tap, never tracked.
+        NSLocationWhenInUseUsageDescription: Eureka shows where you are on its map and measures places from you, only when you tap Use my location. It stays on this phone.
+        # IOSFETCH: the first-run model download can come from a computer on the same Wi-Fi (the demo host, docs/MODELS.md).
+        NSLocalNetworkUsageDescription: Eureka downloads its models from a computer on your network when one is set as the model host.
+        # bend://shortcut is where a Shortcuts x-callback returns to.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.example.bend
+            CFBundleURLSchemes: [bend]
+        # PHONEUX: the launch screen is the wordmark on the app's background (Assets.xcassets), never a flat black frame.
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+          UIImageName: LaunchMark
+          UIImageRespectsSafeAreaInsets: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.bend
+        PRODUCT_NAME: Eureka
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Eureka
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
+        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        # PHONECAM: the camera surface (Bend target only; frames stay in the process, judged by our engine).
+        # BENDHARVEST H11 (the crew's b3af4c4 lesson: without this key iOS kills the app when WebKit asks for the camera,
+        # a TCC SIGABRT seen on the phone in R19-DEVICE): the words now cover chat's Take photo and Describe too.
+        INFOPLIST_KEY_NSCameraUsageDescription: "Eureka uses the camera when you take a photo to show it, or point it at something to ask about. Photos and frames are looked at on the phone itself and never leave the device."
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        ENABLE_DEBUG_DYLIB: NO
+        # PHONEUX: Assets.xcassets carries the launch screen only (no app icon set yet)
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        # Both engine libraries' simulator slices are arm64 only.
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+        DEVELOPMENT_TEAM: "${BEND_TEAM_ID}"  # export BEND_TEAM_ID=<your Apple team ID> before xcodegen
+        CODE_SIGN_STYLE: Automatic
+targets:
+  Bend:
+    templates: [BendApp]
+    sources:
+      - path: Bend
+        excludes:
+          - "Engines/Llama/**"
+          - "Engines/LLB/engine-check/**"
+          - "Engines/Provider/provider-check/**"
+          - "Voice/voice-check/**"
+      # -engineCheck fixtures (engine-phone2's travel request and the Mac's reply), in the bundle as /engine-check
+      - path: Bend/Engines/LLB/engine-check
+        type: folder
+        buildPhase: resources
+      # IOS-FOLD F0: the five frozen contract requests + their expected shapes, in the bundle as /provider-check
+      - path: Bend/Engines/Provider/provider-check
+        type: folder
+        buildPhase: resources
+      # PHONEVOICE: -voiceCheck's fixture clips, in the bundle as /voice-check
+      - path: Bend/Voice/voice-check
+        type: folder
+        buildPhase: resources
+      # VOICEREAL: the neural voice's files (Supertonic 2 F1, ~93 MB), in the bundle as /voices/supertonic2
+      - path: Vendor/voices
+        type: folder
+        buildPhase: resources
+        optional: true
+      - path: web
+        type: folder # blue folder reference: the whole tree lands in the bundle as /web
+        buildPhase: resources
+    dependencies:
+      - framework: Vendor/LLBEngine.xcframework
+        embed: false # static library: the Bend-emitted engine + its wrapper, the Jev head and the tokenizer
+      - framework: Vendor/onnxruntime.xcframework
+        embed: false # VOICEREAL: static onnxruntime 1.24.2 (MIT) for the neural voice (scripts/fetch-voice.sh); G38: its CoreML EP runs the .onnx pocket detector (D-FINE-N)
+      # G38: EARS v3, the ASR tower (ios-ears' Metal Qwen3 AuT + Qwen3-ASR-0.6B on llama.cpp 2ca15f5, prelinked: only
+      # ears_* exported), behind -voiceASR ears. Built by Vendor/ears-src/build-ears-v3.sh; hashes in Vendor/SHA256SUMS.
+      - framework: Vendor/EARS.xcframework
+        embed: false
+      - sdk: Accelerate.framework
+      - sdk: Metal.framework
+      - sdk: Foundation.framework
+      - sdk: Speech.framework
+      - sdk: AVFoundation.framework
+    entitlements:
+      path: Bend/Bend.entitlements
+      properties:
+        # The engine reads a 4B model into one GPU span of ~5.9–6 GB (engine-phone2 REPORT.md §2):
+        # Extended Virtual Addressing for the span's reservation, Increased Memory Limit for the ~4.2 GB footprint.
+        com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.developer.kernel.extended-virtual-addressing: true
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: Bend/Engines/LLB/Bend-LLB-Bridging-Header.h
+        OTHER_LDFLAGS: ["$(inherited)", "-lc++"] # VOICEREAL: onnxruntime is C++ (static)
+        # PHONECAM: Camera/ (OUR engine's vision path) is compiled into this target only
+        # PHONEUX: BEND_LLB, this shell's boot overlay + shell info (BootOverlay.swift; the llama fallback has neither)
+        # IOSFETCH: BEND_FETCH, Models/ (the first-run download into the LLB layout) too
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) BEND_CAMERA BEND_LLB BEND_FETCH BEND_EARS"
+        # G38: ears.h for the bridging header (the xcframework's slice headers)
+        "HEADER_SEARCH_PATHS[sdk=iphoneos*]": ["$(inherited)", "$(PROJECT_DIR)/Vendor/EARS.xcframework/ios-arm64/Headers"]
+        "HEADER_SEARCH_PATHS[sdk=iphonesimulator*]": ["$(inherited)", "$(PROJECT_DIR)/Vendor/EARS.xcframework/ios-arm64-simulator/Headers"]
+  BendLlama:
+    templates: [BendApp]
+    sources:
+      - path: Bend
+        excludes:
+          - "Engines/LLB/**"
+          - "Engines/Provider/**"
+          - "Camera/**"
+          - "Models/**"
+          - "Voice/voice-check/**"
+          - "BootOverlay.swift"
+      - path: Vendor/voices
+        type: folder
+        buildPhase: resources
+        optional: true
+      - path: web
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - framework: Frameworks/llama.xcframework
+        embed: false # static library: llama.cpp + the in-process llama-server
+      - framework: Vendor/onnxruntime.xcframework
+        embed: false # VOICEREAL: the neural voice
+      - sdk: Accelerate.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: Speech.framework
+      - sdk: AVFoundation.framework
+    entitlements:
+      path: Bend/Engines/Llama/BendLlama.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: Bend/Engines/Llama/Bend-Llama-Bridging-Header.h
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        OTHER_LDFLAGS: ["-lc++"]
+  # ATTACHVIS: the photo path by real taps in the simulator (scripts/attach-sim.sh).
+  # VOICESHOP: real taps on the voice picker + shop too (ios/UITests/VoicesUITests.swift; scripts/voices-uitest.sh): the same target
+  BendUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: Bend
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.bend.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        TEST_TARGET_NAME: Bend
+        DEVELOPMENT_TEAM: "${BEND_TEAM_ID}"  # export BEND_TEAM_ID=<your Apple team ID> before xcodegen
+        CODE_SIGN_STYLE: Automatic
+schemes:
+  Bend:
+    build:
+      targets:
+        Bend: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets: [BendUITests]
+  BendLlama:
+    build:
+      targets:
+        BendLlama: all
+    run:
+      config: Debug
