@@ -17,6 +17,10 @@ typedef struct {
 // so the legacy kinds 17 / 18 / 22 run the 9B
 static LlbShape llb_sh = { 4096, 12288, 16, 4, 256, 16, 32, 128 };
 
+// tools/payload-anyshape.patch: a full-attention layer is one whose table row holds attn_q
+// (Offs word 14), pass_mail's rule, so any full_attention_interval (was (i + 1) % 4 == 0)
+#define llb_full(i) (gpu_mail->pt[(i)][14] != 0)
+
 // the engine's cdepth: a Q8 GEMV's column depth, ceil(log2(cols)) - 2
 static u32 llb_cdepth(u32 cols) {
   u32 d = 0;
@@ -24,6 +28,36 @@ static u32 llb_cdepth(u32 cols) {
     d += 1;
   }
   return d - 2;
+}
+
+// tools/payload-anyshape.patch: whether a tuned GEMV body covers a cols-wide row of format fm
+// -- Q8_0 llb_warp_q8's trees at d 7..12 (6 carry slots), F32 llb_warp at d 9..12, Q4_K /
+// Q6_K the pair body (whole superblock quads, d 8..13) or the tile body (d 9..11), Q5_K the
+// pair body only. Elsewhere llb_gemv_any runs the row (any width; not the fixed tree).
+static bool llb_tuned(u32 fm, u32 cols) {
+  u32 d = llb_cdepth(cols), cg = cols / 4;
+  if (fm == LLB_FM_Q8_0) {
+    return d >= 7 && d <= 12;
+  }
+  if (fm == LLB_FM_F32) {
+    return d >= 9 && d <= 12;
+  }
+  if (fm == LLB_FM_Q4_K || fm == LLB_FM_Q6_K) {
+    return (cg % 256 == 0 && d >= 8 && d <= 13) || (d >= 9 && d <= 11);
+  }
+  return fm == LLB_FM_Q5_K && cg % 256 == 0 && d >= 8 && d <= 13;
+}
+
+// y = W x by llb_gemv_any: n rows of cols in format fm (F32, Q8_0, Q4_K, Q6_K, Q5_K)
+static void llb_gany(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n) {
+  u32 rb = LLB_FM_RB(fm, cols), cg = cols / 4, g = (n + 3) / 4;
+  g = g < 4096 ? g : 4096;
+  if (fm != LLB_FM_F32 && fm != LLB_FM_Q8_0 && fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K && fm != LLB_FM_Q5_K) {
+    err_fail("warp pass: no GEMV body for a table format");
+  }
+  if (!LLB_LAUNCH(gpu_gany, g, 1, 128, &w, &rb, &fm, &cg, &x, &y, &n)) {
+    err_fail("device launch failed");
+  }
 }
 
 // one GEMV of a pass tensor in its own format (the table's fm): n rows of
@@ -36,6 +70,10 @@ static void llb_kgemv(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n, u32 grid) {
   // llb_warp addresses float4 rows, so its stride is cols / 4, not bytes.
   if (fm == LLB_FM_F32) {
     u32 rq = cols / 4;
+    if (!llb_tuned(fm, cols)) {
+      llb_gany(fm, w, cols, x, y, n);
+      return;
+    }
     if (!LLB_LAUNCH(gpu_warp, grid, 1, 128, &w, &rq, &cg, &x, &y, &n, &d)) {
       err_fail("device launch failed");
     }
@@ -52,6 +90,10 @@ static void llb_kgemv(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n, u32 grid) {
   }
   if (fm != LLB_FM_Q8_0 && fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K && fm != LLB_FM_Q5_K) {
     err_fail("warp pass: no GEMV body for a table format");
+  }
+  if (!llb_tuned(fm, cols)) {
+    llb_gany(fm, w, cols, x, y, n);
+    return;
   }
   // Q4_K / Q6_K at the default grid take 984 = 3 waves of 82 SMs x 4 blocks
   // (Q4B M5; Q5_K is best at 768). The grid moves rows between warps only
@@ -139,9 +181,9 @@ static void llb_hidden_init(void) {
 }
 static void llb_hidden_put(u32 pos, u32 width, llb_dptr row) {
   if (!llb_hidden_path || pos >= llb_hidden_tokens || !llb_hidden_positions[pos]) return;
-  static float buf[8192];
+  static float buf[32768];
   u32 header[2] = {pos, width};
-  if (width > 8192 || !llb_read(buf, row, (size_t)width * 4))
+  if (width > 32768 || !llb_read(buf, row, (size_t)width * 4))
     err_fail("LLB_DUMP_HIDDEN: read failed");
   FILE* f = fopen(llb_hidden_path, llb_hidden_written ? "ab" : "wb");
   if (!f || fwrite(header, 4, 2, f) != 2 || fwrite(buf, 4, width, f) != width)
@@ -190,9 +232,10 @@ static void llb_fbn_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
     : LLB_LAUNCH(gpu_rnadd, 1, 1, 1024, &xp17, &ap17, &postp17, &x1b, &h2b, &n4))) {
     err_fail("device launch failed");
   }
-  // warpqc is the d 10 cat: d 8 (the 0.8B, tools/payload-w1024.patch) takes the GEMVs below
-  if (fg == 1 && fu == 1 && dgu >= 10) {
-    if (!LLB_LAUNCH(gpu_warpqc, grid, 1, 128, &rg17, &cgu, &h2b, &c17)) {
+  // warpqc is the d 10 cat, warpqc11 the d 11 one: other depths (d 8, the 0.8B,
+  // tools/payload-w1024.patch; past 8192 cols) take the GEMVs below (tools/payload-anyshape.patch)
+  if (fg == 1 && fu == 1 && (dgu == 10 || dgu == 11)) {
+    if (!LLB_LAUNCH(dgu == 11 ? gpu_warpqc11 : gpu_warpqc, grid, 1, 128, &rg17, &cgu, &h2b, &c17)) {
       err_fail("device launch failed");
     }
   } else if (fg == LLB_FM_Q4_K && fu == LLB_FM_Q4_K && llb_q4dp_ok(dm, 1)) {
@@ -213,7 +256,9 @@ static void llb_fbn_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
     : LLB_LAUNCH(gpu_silu, siluG, 1, 256, &ggb, &uub, &aab, &ngu))) {
     err_fail("device launch failed");
   }
-  if (fd == 1) {
+  // llb_warp_q8_res is the d 12 body over 24 real vblocks: 8192 < f <= 12288 (the 9B's);
+  // other Q8_0 down widths run llb_kgemv + vadd below (tools/payload-anyshape.patch)
+  if (fd == 1 && dfd == 12 && df <= 12288) {
     if (!LLB_LAUNCH(gpu_warpqr, 82 * 8, 1, 192, &fdp17, &rd17, &cgd, &aab, &yp, &n4, &x1b)) {
       err_fail("device launch failed");
     }
@@ -245,7 +290,9 @@ static void llb_linb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
   u64 gtp = base18 + o->bq, bop = base18 + o->bg, aop = base18 + o->bb;
   u64 sap = base18 + o->ba, dtp = base18 + o->bsa, cvp = base18 + o->bdt;
   u64 snp = base18 + o->bcv, sop = base18 + o->bsn;
-  u32 rg18 = o->brg, cg18 = rg18 / 17 * 4, ro18 = o->bro, co18 = ro18 / 17 * 4;
+  // ssm_out's Q8_0 row bytes from its own width lv (o->bro is attn_output's, nh * hd columns:
+  // the same on every shape with nh hd = lvh sd; tools/payload-anyshape.patch)
+  u32 rg18 = o->brg, cg18 = rg18 / 17 * 4, ro18 = llb_sh.lvh * llb_sh.sd / 32 * 34, co18 = ro18 / 17 * 4;
   // conv's [q lk][k lk][v lv] channels; qt / kt hold lk and its copies, lv in
   // all (lvh = 2 lkh the 9B, 3 the 27B); hb18 past them (39040 the 9B's)
   u32 lk = llb_sh.lkh * llb_sh.sd, lv = llb_sh.lvh * llb_sh.sd, cv = 2 * lk + lv;
@@ -273,8 +320,9 @@ static void llb_linb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
   (void)qt2; (void)kt2; (void)one;
   u32 fq = tw ? tw[5] >> 28 : 1, fz = tw ? tw[6] >> 28 : 1;
   u32 fb = tw ? tw[7] >> 28 : 1, fa = tw ? tw[8] >> 28 : 1, fo = tw ? tw[13] >> 28 : 1;
-  // the Q8_0 cats are d 10 / 11: d 8 (the 0.8B) runs each GEMV (tools/payload-w1024.patch)
-  bool q8 = fq == 1 && fz == 1 && fb == 1 && fa == 1 && d10 >= 10;
+  // the Q8_0 cats are d 10 / 11: d 8 (the 0.8B) runs each GEMV (tools/payload-w1024.patch), as
+  // does any depth past 11 (tools/payload-anyshape.patch)
+  bool q8 = fq == 1 && fz == 1 && fb == 1 && fa == 1 && (d10 == 10 || d10 == 11);
   // mixed: per tensor, beta + alpha one 2-member cat when both Q8_0
   Q8Cat ba = { { bop, aop, 0, 0 }, { bpre, apre, 0, 0 }, { n32, 2 * n32, 2 * n32, 2 * n32 } };
   bool dp18 = q8 && (llb_q4dp & 16) && n4 % 256 == 0;
@@ -300,8 +348,8 @@ static void llb_linb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
     } else {
       llb_kgemv(fz, gtp, n4, hb18, zz, nz, grid);
       // warpqc's cat is d 10 only; the 0.8B's d 8 (tools/payload-w1024.patch) runs each GEMV
-      if (fb == 1 && fa == 1 && d10 >= 10) {
-        if (!LLB_LAUNCH(gpu_warpqc, grid, 1, 128, &rg18, &cg18, &hb18, &ba)) {
+      if (fb == 1 && fa == 1 && (d10 == 10 || d10 == 11)) {
+        if (!LLB_LAUNCH(d10 == 11 ? gpu_warpqc11 : gpu_warpqc, grid, 1, 128, &rg18, &cg18, &hb18, &ba)) {
           err_fail("device launch failed");
         }
       } else {
@@ -320,10 +368,10 @@ static void llb_linb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
     || (fo == 1 && (llb_q4dp & 16) && lv % 256 == 0
       ? !LLB_LAUNCH(gpu_q8x2, q8Go, 1, 256, &normed, &qx18, &dxo, &nz)
         || !LLB_LAUNCH(gpu_q8dp2, n4, 1, 128, &sop, &ro18, &qx18, &dxo, &yp, &n4)
-      : fo == 1 && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &sop, &ro18, &co18, &normed, &yp, &n4, &dso))) {
+      : fo == 1 && llb_tuned(fo, lv) && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &sop, &ro18, &co18, &normed, &yp, &n4, &dso))) {
     err_fail("device launch failed");
   }
-  if (fo != 1) {
+  if (fo != 1 || (!((llb_q4dp & 16) && lv % 256 == 0) && !llb_tuned(fo, lv))) {
     llb_kgemv(fo, sop, lv, normed, yp, n4, grid);
   }
 }
@@ -338,7 +386,9 @@ static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
   // q heads then gates (qa each), k and v (kv each)
   u32 qa = llb_sh.nh * llb_sh.hd, kv = llb_sh.nkv * llb_sh.hd;
   u64 kslot22 = kcp22 + (u64)pos22 * kv * 4, vslot22 = vcp22 + (u64)pos22 * kv * 4;
-  u64 s22 = gpu_atts, p22 = gpu_atts + ((u64)llb_sh.nh << 17) * 4;
+  // the score planes: 2^max(dT, 17) floats a head (llb_attn4; tools/payload-anyshape.patch)
+  u32 pl22 = (c22 & 31) > 17 ? (c22 & 31) : 17;
+  u64 s22 = gpu_atts, p22 = gpu_atts + ((u64)llb_sh.nh << pl22) * 4;
   llb_dptr attn22 = gpu_blk, gated22 = attn22 + qa * 4;
   llb_dptr h22 = gpu_blk + 2 * qa * 4, qgn22 = h22 + llb_sh.d * 4;
   llb_dptr qg22 = qgn22 + 2 * qa * 4, gate22 = qg22 + qa * 4;
@@ -355,7 +405,7 @@ static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
   (void)q22; (void)k22; (void)v22;
   u32 fq = tw ? tw[14] >> 28 : 1, fk = tw ? tw[15] >> 28 : 1;
   u32 fv = tw ? tw[16] >> 28 : 1, fo = tw ? tw[19] >> 28 : 1;
-  bool q8 = fq == 1 && fk == 1 && fv == 1 && d10 >= 10;
+  bool q8 = fq == 1 && fk == 1 && fv == 1 && (d10 == 10 || d10 == 11);
   bool dp22 = q8 && (llb_q4dp & 16) && n4 % 256 == 0;
   llb_dptr qx22 = gpu_q8c, dx22 = qx22 + 2 * n4;
   u32 q8G22 = n4 / 256, nc22 = qc22.end[3];
@@ -374,15 +424,16 @@ static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
   }
   if (!LLB_LAUNCH(gpu_qkr, rq22, 1, 256, &qgn22, &wqnp22, &qg22, &n8192, &one, &pos22)
     || !LLB_LAUNCH(gpu_qkr, rk22, 1, 256, &kb22, &wknp22, &kn22, &n1024, &zero, &pos22)
-    // a slot is kv floats: 1024 every 4-kv-head model, 512 the 0.8B (tools/payload-w1024.patch)
-    || !LLB_LAUNCH(gpu_slot, 1, 1, kv, &kn22, &kslot22)
-    || !LLB_LAUNCH(gpu_slot, 1, 1, kv, &vb22, &vslot22)
+    // a slot is kv floats: 1024 every 4-kv-head model, 512 the 0.8B (tools/payload-w1024.patch);
+    // past 1024, blocks of 256 (tools/payload-anyshape.patch)
+    || !LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &kn22, &kslot22)
+    || !LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &vb22, &vslot22)
     || !LLB_LAUNCH(gpu_attn4, ah22, 1, 1024, &qg22, &kcp22, &vcp22, &attn22, &s22, &p22, &c22, &grp22)
     || !LLB_LAUNCH(gpu_og, gog22, 1, 1024, &attn22, &gate22, &gated22, &nqa)
-    || (fo == 1 && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wop22, &ro22, &co22, &gated22, &yp, &n4, &dqa))) {
+    || (fo == 1 && llb_tuned(fo, qa) && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wop22, &ro22, &co22, &gated22, &yp, &n4, &dqa))) {
     err_fail("device launch failed");
   }
-  if (fo != 1) {
+  if (fo != 1 || !llb_tuned(fo, qa)) {
     llb_kgemv(fo, wop22, qa, gated22, yp, n4, grid);
   }
 }
@@ -396,11 +447,14 @@ static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
 // it) and S (2^19); per full layer kc, vc (2^(dT + 10)). Zeroed at first use
 // as Array.new(F32, _, 0.0) was; each layer must then see pos, pos + 1, ...
 // a and the x ping-pong are fully written (4096 rows) before each read.
-// ponytail: commits 16 x 2^(dT + 10) f32 of caches up front (8 GB at dT 17);
-// allocate by pos if long contexts matter.
-static llb_dptr pass_b[64], pass_S[64], pass_kc[64], pass_vc[64], pass_x[3];
-static u32  pass_r[64], pass_pos[64], pass_dT;
-static bool pass_on[64];
+// tools/payload-anyshape.patch: the caches are allocated by position (pass_kv), up to the
+// pass's KV capacity (pass_cap, the config word: prompt + steps), not 2^dT up front; the layer
+// arrays hold LLB_MAXL layers (comp.ts, was 64).
+static llb_dptr pass_b[LLB_MAXL], pass_S[LLB_MAXL], pass_kc[LLB_MAXL], pass_vc[LLB_MAXL], pass_x[3];
+static u32  pass_r[LLB_MAXL], pass_pos[LLB_MAXL], pass_dT;
+static size_t pass_kcap[LLB_MAXL];  // slots allocated in pass_kc[i] / pass_vc[i]
+static u32  pass_cap;               // the KV capacity in positions (Mail cfg[3])
+static bool pass_on[LLB_MAXL];
 
 static llb_dptr pass_zero(size_t n) {
   llb_dptr p = llb_alloc_zero(n * 4);
@@ -422,12 +476,12 @@ static llb_dptr pass_zero(size_t n) {
 // may change from that position on), and a hit also compares the ids themselves.
 // LLB_PREFIX_CHUNK (C, default 128), LLB_PREFIX_SLOTS (default 8, <= 64; the lowest boundary is
 // evicted first). Off under LLB_SPEC / LLB_MTP (they keep their own copies of the state).
-typedef struct { u32 pos; u64 h; bool done[64]; u32 r[64]; llb_dptr b[64], S[64]; } PfxSnap;
+typedef struct { u32 pos; u64 h; bool done[LLB_MAXL]; u32 r[LLB_MAXL]; llb_dptr b[LLB_MAXL], S[LLB_MAXL]; } PfxSnap;
 static int pfx_on = -1;  // -1 unread, 0 off, 1 on
 static u32 pfx_C = 128, pfx_ns = 8, pfx_n, pfx_cap, pfx_K;
 static int pfx_arm = -1;
 static u32* pfx_ids;
-static unsigned char pfx_kind[64];  // 1 GDN, 2 full (as pass_layer last saw layer i)
+static unsigned char pfx_kind[LLB_MAXL];  // 1 GDN, 2 full (as pass_layer last saw layer i)
 static PfxSnap pfx_s[64];
 
 int llb_pfx_on(void) {
@@ -464,7 +518,7 @@ static bool pfx_valid(const PfxSnap* s) {
   if (s->pos == 0) {
     return false;
   }
-  for (u32 i = 0; i < 64; i += 1) {
+  for (u32 i = 0; i < LLB_MAXL; i += 1) {
     if (pfx_kind[i] == 1 && !s->done[i]) {
       return false;
     }
@@ -582,9 +636,10 @@ static void pfx_take(u32 i, bool full, u32 pos, LlbShape sh) {
 // writes them fully before reading. The request layer (tools/sys1dual/dual.c) selects the
 // bank before llb_pfx_begin, between requests only.
 typedef struct {
-  llb_dptr b[64], S[64], kc[64], vc[64];
-  u32 r[64], pos[64];
-  bool on[64];
+  llb_dptr b[LLB_MAXL], S[LLB_MAXL], kc[LLB_MAXL], vc[LLB_MAXL];
+  size_t kcap[LLB_MAXL];
+  u32 r[LLB_MAXL], pos[LLB_MAXL];
+  bool on[LLB_MAXL];
   u32 pfx_n, pfx_cap, pfx_K;
   int pfx_arm;
   u32* pfx_ids;
@@ -621,13 +676,13 @@ int llb_bank_select(int j) {
   }
   LlbBank* o = &llb_bank[llb_bcur];
   memcpy(o->b, pass_b, sizeof pass_b), memcpy(o->S, pass_S, sizeof pass_S);
-  memcpy(o->kc, pass_kc, sizeof pass_kc), memcpy(o->vc, pass_vc, sizeof pass_vc);
+  memcpy(o->kc, pass_kc, sizeof pass_kc), memcpy(o->vc, pass_vc, sizeof pass_vc), memcpy(o->kcap, pass_kcap, sizeof pass_kcap);
   memcpy(o->r, pass_r, sizeof pass_r), memcpy(o->pos, pass_pos, sizeof pass_pos), memcpy(o->on, pass_on, sizeof pass_on);
   o->pfx_n = pfx_n, o->pfx_cap = pfx_cap, o->pfx_K = pfx_K, o->pfx_arm = pfx_arm, o->pfx_ids = pfx_ids;
   memcpy(o->pfx_s, pfx_s, sizeof pfx_s);
   LlbBank* n = &llb_bank[j];
   memcpy(pass_b, n->b, sizeof pass_b), memcpy(pass_S, n->S, sizeof pass_S);
-  memcpy(pass_kc, n->kc, sizeof pass_kc), memcpy(pass_vc, n->vc, sizeof pass_vc);
+  memcpy(pass_kc, n->kc, sizeof pass_kc), memcpy(pass_vc, n->vc, sizeof pass_vc), memcpy(pass_kcap, n->kcap, sizeof pass_kcap);
   memcpy(pass_r, n->r, sizeof pass_r), memcpy(pass_pos, n->pos, sizeof pass_pos), memcpy(pass_on, n->on, sizeof pass_on);
   pfx_n = n->pfx_n, pfx_cap = n->pfx_cap, pfx_K = n->pfx_K, pfx_arm = n->pfx_arm, pfx_ids = n->pfx_ids;
   memcpy(pfx_s, n->pfx_s, sizeof pfx_s);
@@ -638,18 +693,57 @@ int llb_bank_select(int j) {
 // layer i's state at pos: allocated (pos 0), zeroed (pos 0 again: the next prompt of a
 // multi-prompt run, engine ids cut at ","), else pos must follow the last
 static void pf_dump(u32 i, bool full, u32 pos, LlbShape sh);  // llb_pf.h: G3's LLB_PF_DUMP
+static int spec_k;                 // LLB_SPEC's K (-1 off; defined below), set in warp_serve
+static const char* spec_mtp;       // LLB_MTP
+int llb_bx_max(void);
+// tools/payload-anyshape.patch: full layer i's KV slots by position. A step at pos may write
+// slots up to pos + 4096 (a fast prefill chunk) + 64 (spec drafts); the layer grows to
+// min(pass_cap, max(that, 2x)) slots, zeroed past the copied ones, one layer's copy in flight
+// at a time. LLB_SPEC / LLB_MTP / LLB_BATCH (whose kernels read every slot of the 2^dT tree)
+// take all of pass_cap at once.
+static void pass_kv(u32 i, u32 pos, LlbShape sh) {
+  size_t row = (size_t)sh.nkv * sh.hd, need = (size_t)pos + 4096 + 64;
+  if (spec_k >= 0 || spec_mtp || llb_bx_max() >= 2 || need > pass_cap) {
+    need = pass_cap;
+  }
+  if (pass_kcap[i] >= need) {
+    return;
+  }
+  size_t n = 2 * pass_kcap[i] > need ? 2 * pass_kcap[i] : need;
+  n = n < pass_cap ? n : pass_cap;
+  llb_dptr k = llb_alloc_zero(n * row * 4), v = llb_alloc_zero(n * row * 4);
+  if (!k || !v) {
+    fprintf(stderr, "warp pass: cannot allocate %zu KV slots (%.1f MiB) for layer %u; free VRAM or lower the context\n",
+      n, 2.0 * n * row * 4 / 1048576.0, i);
+    err_fail("warp pass: out of device memory for the KV cache");
+  }
+  if (pass_kcap[i] != 0) {
+    if (!llb_copy(k, pass_kc[i], pass_kcap[i] * row * 4) || !llb_copy(v, pass_vc[i], pass_kcap[i] * row * 4)
+      || !llb_sync() || cuMemFree(pass_kc[i]) != CUDA_SUCCESS || cuMemFree(pass_vc[i]) != CUDA_SUCCESS) {
+      err_fail("warp pass: cannot grow the KV cache");
+    }
+  }
+  pass_kc[i] = k;
+  pass_vc[i] = v;
+  pass_kcap[i] = n;
+}
+
 static void pass_layer(u32 i, bool full, u32 pos, u32 dT, LlbShape sh) {
   u32 cv = 2 * sh.lkh * sh.sd + sh.lvh * sh.sd;
+  (void)dT;
   pf_dump(i, full, pos, sh);
   pfx_restore(i, full, pos, sh);  // W1-KVPFX
+  if (i >= LLB_MAXL) {
+    err_fail("warp pass: more layers than LLB_MAXL");
+  }
+  if (full) {
+    pass_kv(i, pos, sh);
+  }
   if (!pass_on[i]) {
     if (pos != 0) {
       err_fail("warp pass: a layer's state must start at pos 0");
     }
-    if (full) {
-      pass_kc[i] = pass_zero(((size_t)1 << dT) * sh.nkv * sh.hd);
-      pass_vc[i] = pass_zero(((size_t)1 << dT) * sh.nkv * sh.hd);
-    } else {
+    if (!full) {
       pass_b[i] = pass_zero(4 * (size_t)cv);
       pass_S[i] = pass_zero((size_t)sh.lvh * sh.sd * sh.sd);
     }
@@ -662,8 +756,8 @@ static void pass_layer(u32 i, bool full, u32 pos, u32 dT, LlbShape sh) {
     // at the retained pos + 1 and skips this branch, passing the guard below
     // unchanged (pass_pos[i] + 1 == pos). Served request-side today in
     // tools/sys1dual/dual.c (retained session record). === end S2 SOURCE-SPEC ===
-    bool z = full ? llb_zero(pass_kc[i], ((size_t)1 << dT) * sh.nkv * sh.hd * 4)
-        && llb_zero(pass_vc[i], ((size_t)1 << dT) * sh.nkv * sh.hd * 4)
+    bool z = full ? llb_zero(pass_kc[i], pass_kcap[i] * sh.nkv * sh.hd * 4)
+        && llb_zero(pass_vc[i], pass_kcap[i] * sh.nkv * sh.hd * 4)
       : llb_zero(pass_b[i], 4 * (size_t)cv * 4) && llb_zero(pass_S[i], (size_t)sh.lvh * sh.sd * sh.sd * 4);
     if (!z) {
       err_fail("warp pass: cannot reset the layer state");
@@ -2222,6 +2316,85 @@ static bool bx_take(volatile WarpOp* o, u32 pos, u32 dT, LlbShape sh, u64 yp, u3
   return true;
 }
 
+// tools/payload-anyshape.patch: a device scratch buffer at least n bytes (zeroed when grown:
+// the GEMV bodies read x's pad tail to the next power of two, so every pad must be finite)
+static void llb_scratch(CUdeviceptr* p, size_t* have, size_t n, const char* what) {
+  if (n <= *have) {
+    return;
+  }
+  llb_graph_bail();
+  if (*p != 0 && (!llb_sync() || cuMemFree(*p) != CUDA_SUCCESS)) {
+    err_fail("warp pass: cannot free a scratch buffer");
+  }
+  *p = llb_alloc_zero(n);
+  if (!*p) {
+    fprintf(stderr, "warp pass: cannot allocate %zu bytes of %s scratch\n", n, what);
+    err_fail("warp pass: out of device memory for the scratch");
+  }
+  *have = n;
+}
+
+static u64 llb_p2(u64 n) {
+  u64 p = 1;
+  while (p < n) {
+    p <<= 1;
+  }
+  return p;
+}
+
+// the shapes LLB_SPEC / LLB_MTP / LLB_BATCH were gated on (the 9B and 27B: d_model 4096 /
+// 5120, 4 kv heads, GQA 4 or 6, lvh 2 or 3 lkh, full_attention_interval 4, 2^17 score
+// planes): llb_t_attn4's 1024-float kv stride, the spec embed's rows and the bx_* scratch
+// are sized for them
+static bool llb_legacy(LlbShape sh, u32 dT, u32 nl) {
+  u32 qa = sh.nh * sh.hd, lv = sh.lvh * sh.sd;
+  bool ok = (sh.d == 4096 || sh.d == 5120) && sh.f > 8192 && sh.f <= 17408 && sh.hd == 256 && sh.sd == 128
+    && (sh.nh == 4 * sh.nkv || sh.nh == 6 * sh.nkv) && sh.nkv == 4 && sh.lkh * sh.sd == 2048
+    && (sh.lvh == 2 * sh.lkh || sh.lvh == 3 * sh.lkh) && qa == lv && dT <= 17 && nl <= 64;
+  for (u32 i = 0; ok && i < nl; i += 1) {
+    ok = llb_full(i) == ((i + 1) % 4 == 0);
+  }
+  return ok;
+}
+
+// the first pass: the config words to the device (llb_cfg: eps, rope base, rope dims), the
+// scratch sized from the shape, one stderr line naming both
+static void llb_pass_init(LlbShape sh, u32 dT, u32 nl) {
+  u32 cf[4] = { gpu_mail->cfg[0], gpu_mail->cfg[1], gpu_mail->cfg[2], gpu_mail->cfg[3] };
+  CUdeviceptr cp;
+  size_t cz;
+  if (cuModuleGetGlobal(&cp, &cz, gpu_lib, "llb_cfg") != CUDA_SUCCESS || cz != 16 || !llb_write(cp, cf, 16)) {
+    err_fail("warp pass: cannot set the model config on the device");
+  }
+  pass_cap = cf[3];
+  u64 d = sh.d, f = sh.f, qa = (u64)sh.nh * sh.hd, kv = (u64)sh.nkv * sh.hd, lv = (u64)sh.lvh * sh.sd;
+  u64 lvh = sh.lvh, cv = 2 * (u64)sh.lkh * sh.sd + lv, e18 = 4 * lv + 4 * lvh + cv, hb = e18 > 39040 ? e18 : 39040;
+  // gpu_blk (floats): fbn x1 h2 g u silu (+ silu's pad), linb's rows to normed and hb18 (+ pads),
+  // fulb's rows (+ h22's and gated22's pads)
+  u64 nb = 2 * d + 3 * f;
+  nb = nb > 2 * d + 2 * f + llb_p2(f) ? nb : 2 * d + 2 * f + llb_p2(f);
+  nb = nb > d + llb_p2(d) ? nb : d + llb_p2(d);
+  nb = nb > hb + llb_p2(d) ? nb : hb + llb_p2(d);
+  nb = nb > e18 + llb_p2(lv) ? nb : e18 + llb_p2(lv);
+  nb = nb > e18 + lv ? nb : e18 + lv;
+  nb = nb > 6 * qa + d + 3 * kv ? nb : 6 * qa + d + 3 * kv;
+  nb = nb > 2 * qa + llb_p2(d) ? nb : 2 * qa + llb_p2(d);
+  nb = nb > qa + llb_p2(qa) ? nb : qa + llb_p2(qa);
+  u64 mc = d > f ? d : f;
+  mc = mc > qa ? mc : qa;
+  mc = mc > lv ? mc : lv;
+  static size_t hblk = 81920 * 4, hq8b = 32768, hq8c = 40960, hhead = 8192 * 4, hatts = (size_t)2 * 24 * (1u << 17) * 4;
+  llb_scratch(&gpu_blk, &hblk, nb * 4, "gpu_blk");
+  llb_scratch(&gpu_q8b, &hq8b, mc + mc / 32 * 4 + 256, "gpu_q8b");
+  llb_scratch(&gpu_q8c, &hq8c, 2 * mc + mc / 32 * 4 + 256, "gpu_q8c");
+  llb_scratch(&gpu_headh, &hhead, llb_p2(d) * 4, "gpu_headh");
+  llb_scratch(&gpu_atts, &hatts, (size_t)2 * sh.nh * ((size_t)1 << (dT > 17 ? dT : 17)) * 4, "gpu_atts");
+  union { u32 u; float f; } ep = { cf[0] }, rb = { cf[1] };
+  fprintf(stderr, "shape d_model %u d_ff %u heads %u kv %u layers %u lin %u/%u sd %u eps %g rope %g/%u kv_cap %u (dT %u)%s\n",
+    sh.d, sh.f, sh.nh, sh.nkv, nl, sh.lkh, sh.lvh, sh.sd, (double)ep.f, (double)rb.f, cf[2], cf[3], dT,
+    llb_legacy(sh, dT, nl) ? "" : " [generic shape: spec / batch off]");
+}
+
 static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
   u32 c = o->c, dT = c & 31, pos = c >> 5, s = o->n, k = o->d;
   volatile LlbShape* ms = &gpu_mail->sh;
@@ -2232,6 +2405,7 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
       pass_x[b] = pass_zero(sh.d);
     }
     pass_dT = dT;
+    llb_pass_init(sh, dT, s + k);
   }
   if (dT != pass_dT) {
     err_fail("warp pass: dT changed");
@@ -2239,10 +2413,14 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
   if (memcmp(&sh, &llb_sh, sizeof sh) != 0) {
     err_fail("warp pass: the shape record changed");
   }
-  // the 0.8B (d_model 1024, tools/payload-w1024.patch) is gated on the exact single-sequence step only
-  // (llb_t_attn4's 1024 kv stride, the spec embed's Q4_K / Q8_0 rows, the bx_* bodies at d >= 9)
-  if (sh.d < 2048 && (spec_k >= 0 || spec_mtp || llb_bx_max() >= 2)) {
-    err_fail("LLB_SPEC / LLB_MTP / LLB_BATCH: not gated for this shape (d_model < 2048); run without them");
+  if (pos >= pass_cap) {
+    err_fail("warp pass: the position is past the KV capacity (prompt + steps); raise --steps");
+  }
+  // LLB_SPEC / LLB_MTP / LLB_BATCH keep the shapes they were gated on (llb_legacy; the 0.8B,
+  // d_model 1024, was refused here before tools/payload-anyshape.patch too)
+  if ((spec_k >= 0 || spec_mtp || llb_bx_max() >= 2) && !llb_legacy(sh, dT, s + k)) {
+    err_fail("LLB_SPEC / LLB_MTP / LLB_BATCH: gated on the 9B / 27B shapes only (d_model 4096 / 5120, 4 kv heads, "
+      "full_attention_interval 4, context <= 131072); run without them");
   }
   llb_hidden_init();
   if (llb_hidden_path && !o->w) err_fail("LLB_DUMP_HIDDEN: folded pass required");
@@ -2289,7 +2467,7 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
   }
   for (u32 j = 0; j < k; j += 1) {
     u32  i = s + j;
-    bool full = (i + 1) % 4 == 0;
+    bool full = llb_full(i);
     pass_layer(i, full, pos, dT, sh);
     u64 base = gpu_mail->pw[j];
     // the layer's table row (tools/payload-table.patch): offset | fm << 28
@@ -2342,7 +2520,7 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
     // (o->bg its format) into gpu_logit, llb_amax's four words into y
     u64 wn = o->k, wo = o->v, op2 = gpu_headh, lg = gpu_logit;
     u32 n4 = sh.d, nh = o->gm, rq = o->bq, cg = o->bq / 17 * 4, dh = llb_cdepth(sh.d);
-    bool q8 = o->bg == LLB_FM_Q8_0;
+    bool q8 = o->bg == LLB_FM_Q8_0 && llb_tuned(LLB_FM_Q8_0, sh.d);
     if (!LLB_LAUNCH(gpu_rnorm, 1, 1, 1024, &cur, &wn, &op2, &n4)
       || (q8 && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wo, &rq, &cg, &op2, &lg, &nh, &dh))) {
       err_fail("device launch failed");
@@ -2379,7 +2557,11 @@ static bool warp_serve(Corpus H) {
     return false;
   }
   if (gpu_mail->bad != 0) {
-    err_fail(gpu_mail->bad == 2 ? "warp attention: unsupported operands"
+    err_fail(gpu_mail->bad == 7 ? "warp pass: the model shape is outside the CUDA kernels' envelope (head_dim 256, "
+        "ssm_state_size 128, n_heads a multiple of n_kv_heads, ssm_time_step_rank a multiple of ssm_group_count "
+        "and <= 256, d_model <= 32768, every width a multiple of 256)"
+      : gpu_mail->bad == 6 ? "warp pass: bad config words or a position past the KV capacity (prompt + steps)"
+      : gpu_mail->bad == 2 ? "warp attention: unsupported operands"
       : gpu_mail->bad == 3 ? "warp rms: unsupported operands"
       : gpu_mail->bad == 4 ? "warp GEMV: row format refused (untagged"
         " 17 | rb reads as F32 or Q8_0, or a bad tag)"

@@ -1,0 +1,584 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4987,6 +4987,7 @@
+ static CUfunction gpu_attn4;
+ static CUfunction gpu_mid;
+ static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc, gpu_warpqc11;
++static CUfunction gpu_gany;  // tools/payload-anyshape.patch: llb_gemv_any
+ // tools/payload-pf.patch: the fast prefill tier (pfmm.cuh's wide leaves take dynamic shared memory)
+ static CUfunction gpu_pfq8x, gpu_pfq4m, gpu_pfq4mr, gpu_pfq4mg, gpu_pfq8m, gpu_pfq8mr, gpu_pfq8mc, gpu_pfq5m, gpu_pfq5mr, gpu_pfq6w, gpu_pfq6wr;
+ static CUfunction gpu_pfrms, gpu_pfmc, gpu_pfring, gpu_pfl2qk, gpu_pfgdl, gpu_pfgrn, gpu_pfqkr, gpu_pfslot, gpu_pfog, gpu_pfattn, gpu_pfmark;
+@@ -7147,16 +7148,21 @@
+   u32 bq, bg, bb, ba, bsa, bdt, bcv, bsn, bso, ban, brg, bro;
+ } WarpOp;
+ 
++// the most layers a pass serves (tools/payload-anyshape.patch: was 64)
++#define LLB_MAXL 256u
+ typedef struct Mail {
+   u32    front, err, done, m, bad;
+   // the pass bang's layer weight bases (tools/payload-pass.patch) and the
+   // format table (tools/payload-table.patch): table.bin's words 1..20 per
+   // absolute layer (offset | fm << 28); tbk/wlk/skk key the last validated
+   // pass (table address, layer list, s | k << 16)
+-  u64    pw[64];
++  u64    pw[LLB_MAXL];
+   u64    tbk, wlk, skk;
+-  u32    pt[64][20];
++  u32    pt[LLB_MAXL][20];
+   LlbShape sh;
++  // the pass bang's config words 66..69 (tools/payload-anyshape.patch): rms eps (F32 bits),
++  // rope base (F32 bits), rope dims, the KV capacity in positions
++  u32    cfg[4];
+   WarpOp op[WARP_MAX];
+ } Mail;
+ 
+@@ -7480,6 +7486,14 @@
+ }
+ 
+ #if defined(BEND_RTC) && defined(LLB_WARP_FID)
++// tools/payload-anyshape.patch: the model's config the kernels read -- [0] the rms eps (F32
++// bits), [1] the rope base (F32 bits), [2] the rope dims -- the host copies the pass bang's
++// config words here (llb_host.c llb_cfg_put); the defaults are the Qwen3.5 values (1e-6, 1e7, 64)
++#ifndef LLB_CFG_DEF
++#define LLB_CFG_DEF
++__device__ u32 llb_cfg[4] = { 0x358637BDu, 0x4B189680u, 64u, 0u };
++#define LLB_EPS __uint_as_float(llb_cfg[0])
++#endif
+ // The contract GEMV (reports/llb-headprobe.md (c)): a warp per row; in each
+ // chunk of 512 groups lane l owns groups 32i+l (one coalesced 512 B LDG.128
+ // per warp per i); leaf (w0*x0 + w1*x1) + (w2*x2 + w3*x3), padding 0*x; group
+@@ -8655,6 +8669,76 @@
+   kp_warp<9, 1>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
+ }
+ 
++// group g of a Q5_K row (GGUF block layout, 176 bytes a super-block: f16 d, dmin, sc[12],
++// qh[32], qs[128]): ggml's dequantize_row_q5_K, w = d1 * (nib + 16 hbit) - m1, the scales as
++// q4k_w; the fifth bit of column 64 b + 32 hi + l is bit 2 b + hi of qh[l]
++INLINE float4 q5k_w(const u8* __restrict__ row, u32 g) {
++  u32  c4 = 4 * g, blk = c4 >> 8, rr = c4 & 255;
++  u32  b = rr >> 6, r = rr & 63, l = r & 31, hi = r >> 5;
++  const u8* B = row + (u64)blk * 176;
++  float d  = llb_f16(*(const unsigned short*)(B + 0));
++  float dm = llb_f16(*(const unsigned short*)(B + 2));
++  const u8* sc = B + 4;
++  u32  sb = 2 * b + hi, dsc, msc;
++  if (sb < 4) {
++    dsc = sc[sb] & 63; msc = sc[sb + 4] & 63;
++  } else {
++    dsc = (sc[sb + 4] & 15) | ((u32)(sc[sb - 4] >> 6) << 4);
++    msc = (sc[sb + 4] >> 4) | ((u32)(sc[sb] >> 6) << 4);
++  }
++  float d1 = __fmul_rn(d, (float)dsc), m1 = __fmul_rn(dm, (float)msc);
++  const u8* qs = B + 48 + b * 32 + l;
++  const u8* qh = B + 16 + l;
++  float w[4];
++  #pragma unroll
++  for (u32 k = 0; k < 4; k++) {
++    u32 q = (hi ? qs[k] >> 4 : qs[k] & 15) | ((qh[k] >> sb) & 1) << 4;
++    w[k] = __fsub_rn(__fmul_rn(d1, (float)q), m1);
++  }
++  return make_float4(w[0], w[1], w[2], w[3]);
++}
++
++// tools/payload-anyshape.patch: the any-width GEMV, where no tuned body applies (a K-quant row
++// of cols % 1024 != 0 past the tile body's depths, Q5_K below whole quads, Q8_0 / F32 outside
++// their tree depths): a warp a row, lane l sums the groups l, l + 32, .. of the cg = cols / 4,
++// then the xor butterfly. fm: 0 F32, 1 Q8_0 (row-split), 3 Q4_K, 4 Q6_K, 9 Q5_K. x is read to
++// cols only (no pad). Not the engine's fixed tree: tolerance-class, used by no shape the
++// tuned bodies cover
++extern "C" __global__ void __launch_bounds__(128) llb_gemv_any(
++  const u8* __restrict__ W, u32 rb, u32 fm, u32 cg, const float* __restrict__ x,
++  float* __restrict__ y, u32 n) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  for (u32 r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); r < n; r += nw) {
++    const u8* row = W + (u64)r * rb;
++    float acc = 0.0f;
++    for (u32 g = l; g < cg; g += 32) {
++      float4 w;
++      if (fm == 1) {
++        w = q8_w(row, cg, g);
++      } else if (fm == 3) {
++        w = q4k_w(row, g);
++      } else if (fm == 4) {
++        w = q6k_w(row, g);
++      } else if (fm == 9) {
++        w = q5k_w(row, g);
++      } else {
++        const float* f = (const float*)row + 4 * (u64)g;
++        w = make_float4(f[0], f[1], f[2], f[3]);
++      }
++      const float* xv = x + 4 * (u64)g;
++      acc = __fadd_rn(acc, __fadd_rn(__fadd_rn(__fmul_rn(w.x, xv[0]), __fmul_rn(w.y, xv[1])),
++        __fadd_rn(__fmul_rn(w.z, xv[2]), __fmul_rn(w.w, xv[3]))));
++    }
++    #pragma unroll
++    for (u32 m = 16; m > 0; m >>= 1) {
++      acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, m));
++    }
++    if (l == 0) {
++      y[r] = acc;
++    }
++  }
++}
++
+ // group g of a Q2_0 (qk = 64) or PQ2_0 (qk = 128) row (tools/q20.py): f16 d +
+ // qs[qk/4], 18 or 34 bytes a block. Weight j = ((qs[j/4] >> (j%4)*2) & 3 - 1)
+ // * d, ggml's dequantize_row_q2_0 / _pq2_0; (q-1)*d is exact. A group of four
+@@ -9027,8 +9111,11 @@
+   const u32 g = (h / grp) * 256, ks = (gridDim.x / grp) * 256;
+   const float scale = __fdiv_rn(1.0f, __fsqrt_rn(256.0f));
+   const float ninf = __uint_as_float(0xFF800000u);
+-  float* sh = sc + (u64)h * (1u << 17);
+-  float* ph = pr + (u64)h * (1u << 17);
++  // a head's two planes: 2^max(dT, 17) floats each (tools/payload-anyshape.patch; the host
++  // sizes gpu_atts to match), so the trees reach any context the KV holds
++  const u32 pl = dT > 17 ? dT : 17;
++  float* sh = sc + ((u64)h << pl);
++  float* ph = pr + ((u64)h << pl);
+   const float* qh = q + (u64)h * 256;
+   // Only slots t <= pos are live: the trees run over T2 = the power of two
+   // >= pos + 1 (masked leaves -inf / +0 as before). The 2^dT tree is that tree
+@@ -9109,14 +9196,16 @@
+   const u32 j = threadIdx.x & 255, pq = threadIdx.x >> 8;
+   const u32 PQ = T2 >= 4 ? 4 : 1, L = T2 / PQ, t0 = pq * L;
+   if (pq < PQ) {
+-    float st[18];
++    float st[26];
+     u32   sp = 0;
+     u32   t = 0;
+     for (; t + 16 <= L; t += 16) {
+       float vv[16], pp[16];
+ #pragma unroll
+       for (u32 u = 0; u < 16; u++) {
+-        vv[u] = vc[(u64)(t0 + t + u) * ks + g + j];
++        // slots past pos weigh +0 (p = 0): read as +0, never loaded, so the KV holds only
++        // the slots a request reaches (tools/payload-anyshape.patch; the same bits)
++        vv[u] = t0 + t + u < n ? vc[(u64)(t0 + t + u) * ks + g + j] : 0.0f;
+         pp[u] = ph[t0 + t + u];
+       }
+ #pragma unroll
+@@ -9125,7 +9214,7 @@
+       }
+     }
+     for (; t < L; t++) {
+-      attn_push(st, &sp, t, __fmul_rn(vc[(u64)(t0 + t) * ks + g + j], ph[t0 + t]));
++      attn_push(st, &sp, t, __fmul_rn(t0 + t < n ? vc[(u64)(t0 + t) * ks + g + j] : 0.0f, ph[t0 + t]));
+     }
+     vq[pq][j] = st[0];
+   }
+@@ -9159,7 +9248,7 @@
+   }
+   if (t == 0) {
+     sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 2048.0f),
+-      __uint_as_float(0x358637BDu))));
++      LLB_EPS)));
+   }
+   __syncthreads();
+   const float s = sv;
+@@ -9620,15 +9709,24 @@
+   // stride (2 kv heads; llb_attn4 takes the stride from its grid), lvh = lkh
+   // (l2norm_qk rep 1), the 8192 rms tree at n 1024, K-quant GEMVs at d 8 on
+   // kp_pair's one-quad body, the 3584-col down on the tile body (d 10) + vadd
+-  bool env08 = dm == 1024 && df == 3584 && sh.hd == 256 && sh.sd == 128 && sh.nh == 4 * sh.nkv
+-    && kv == 512 && lk == 2048 && sh.lvh == sh.lkh && qa == lv
++  // tools/payload-anyshape.patch: the envelope is structural, what the kernels instantiate
++  // (was the 9B / 27B / 0.8B shapes): head_dim 256 (llb_attn4 / llb_qkr: a 256-thread head),
++  // ssm_state_size 128 (l2norm_qk / gdl / grn), q heads a whole multiple of the kv heads (GQA)
++  // and value heads of the key heads (l2norm_qk's copies), <= 256 value heads (midconv's block
++  // 0), every width whole 256-col superblocks, d_model <= 32768 (rms_wide); the host picks a
++  // GEMV body per width (llb_kgemv, llb_gemv_any where no tuned body applies). The config
++  // words (66..69): eps and rope base finite and > 0, rope dims even 2..256, pos < the KV
++  // capacity <= 2^dT, dT <= 26 (pos rides 27 bits of c)
++  u32  cf[4] = { (u32)H[a + 66], (u32)H[a + 67], (u32)H[a + 68], (u32)H[a + 69] };
++  bool env = sh.hd == 256 && sh.sd == 128 && sh.nkv >= 1 && sh.nh >= sh.nkv && sh.nh % sh.nkv == 0
++    && sh.lkh >= 1 && sh.lvh >= sh.lkh && sh.lvh % sh.lkh == 0 && sh.lvh <= 256
++    && dm >= 256 && dm <= 32768 && dm % 256 == 0 && df >= 256 && df <= 65536 && df % 256 == 0
++    && qa <= 32768 && lv <= 32768 && cv <= 65536
+     && rg == dm / 32 * 34 && rd == df / 32 * 34;
+-  bool env = ((dm == 4096 || dm == 5120) && df > 8192 && df <= 17408 && df % 32 == 0
+-    && sh.hd == 256 && sh.sd == 128 && (sh.nh == 4 * sh.nkv || sh.nh == 6 * sh.nkv)
+-    && kv == 1024 && lk == 2048 && (sh.lvh == 2 * sh.lkh || sh.lvh == 3 * sh.lkh) && qa == lv
+-    && rg == dm / 32 * 34 && rd == df / 32 * 34) || env08;
+-  bool ok = env && fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
+-    && dT >= 1 && dT <= 17 && pos < (1u << dT) && k >= 1 && s + k <= 64
++  bool cfo = cf[0] != 0 && cf[0] < 0x7f800000u && cf[1] != 0 && cf[1] < 0x7f800000u
++    && cf[2] >= 2 && cf[2] <= 256 && cf[2] % 2 == 0 && cf[3] >= 1 && cf[3] <= (1u << dT);
++  bool ok = env && cfo && fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0
++    && dT >= 1 && dT <= 26 && pos < cf[3] && k >= 1 && s + k <= LLB_MAXL
+     && term_tag(x) != TAG_ARR && term_tag(y) != TAG_ARR
+     && (fold || blk_cls(x) == 12) && blk_cls(y) >= (fold ? 2 : 12);
+   o->w = 0;
+@@ -9643,7 +9741,7 @@
+       : (rwh >> 31 ? 2 : (rbh % 17 == 0));
+     u32      fme = (ewh >> 28 & 3) + ((ewh >> 31 & 1) << 2) + ((ewh >> 27 & 1) << 3);
+     ok = s == 0 && term_tag(eb) == TAG_STR && str_nar(qe) == 2
+-      && te && (fme == LLB_FM_Q8_0 || fme == LLB_FM_Q4_K || (env08 && fme == LLB_FM_Q6_K)) && rbe == LLB_FM_RB(fme, dm)
++      && te && (fme == LLB_FM_Q8_0 || fme == LLB_FM_Q4_K || fme == LLB_FM_Q6_K) && rbe == LLB_FM_RB(fme, dm)
+       && (u64)eat + rbe <= qe.len
+       && term_tag(hb) == TAG_STR && str_nar(qh) == 2
+       && (fmh == LLB_FM_Q8_0 || fmh == LLB_FM_Q4_K || fmh == LLB_FM_Q6_K || fmh == LLB_FM_Q5_K)
+@@ -9699,7 +9797,10 @@
+     // is Q8_0 or a K-quant with a pair body (tools/payload-kpair.patch), whole
+     // superblock quads (cols % 1024: d_model and nh * hd are 4096 by the
+     // envelope, d_ff is checked); PRB(f, cols) its row bytes in its format
+-    bool full = (i + 1) % 4 == 0;
++    // a full-attention layer is one whose table row holds attn_q (Offs word 14; a GEMV, so
++    // never the F32 at offset 0 an absent tensor reads): any full_attention_interval
++    // (tools/payload-anyshape.patch; was (i + 1) % 4 == 0)
++    bool full = tw[i * 32 + 1 + 14] != 0;
+     u32  has = full ? 0xFC01Fu : 0x3FFFu, q8 = full ? 0x9C01Cu : 0x21FCu;
+     u32  p[20];
+     ok = tw[i * 32] == q.len;
+@@ -9711,7 +9812,8 @@
+     }
+ #define PRB(f, c) ((u64)LLB_FM_RB(tw[i * 32 + 1 + (f)] >> 28, (u32)(c)))
+     // the 0.8B's 3584-col down: 14 superblocks on the K-quant tile body (tools/payload-w1024.patch)
+-    ok = ok && (tw[i * 32 + 5] >> 28 == LLB_FM_Q8_0 || df % 1024 == 0 || (env08 && df % 256 == 0));
++    // any K-quant width: llb_kgemv takes llb_gemv_any where no pair / tile body applies
++    ok = ok && df % 256 == 0;
+     // fbn: post, fg, fu, fd at Offs words 1..4
+     ok = ok && p[1] % 4 == 0 && ((u64)(base + p[2]) & 15) == 0
+       && ((u64)(base + p[3]) & 15) == 0 && ((u64)(base + p[4]) & 15) == 0
+@@ -9747,11 +9849,13 @@
+ #undef PRB
+   }
+   if (!ok) {
+-    *bad = *bad != 0 ? *bad : 5;
++    // 7: the shape is outside the envelope, 6: the config words or the position past the KV
++    // capacity (tools/payload-anyshape.patch: llb_host.c names them), else 5
++    *bad = *bad != 0 ? *bad : !env ? 7 : !cfo || pos >= cf[3] ? 6 : 5;
+     return;
+   }
+   if (!hit) {
+-    u32 nr = qt.len / 128 < 64 ? (u32)(qt.len / 128) : 64;
++    u32 nr = qt.len / 128 < LLB_MAXL ? (u32)(qt.len / 128) : LLB_MAXL;
+     for (u32 i = 0; i < nr; i += 1) {
+       for (u32 f = 0; f < 20; f += 1) {
+         M->pt[i][f] = tw[i * 32 + 1 + f];
+@@ -9766,6 +9870,7 @@
+   o->bro = ro;
+   o->bsn = w47 >> 30 & 1 ? (w47 >> 29 & 1 ? 2 + (w47 & 0xffffu) : 1) : 0;
+   M->sh = sh;
++  M->cfg[0] = cf[0]; M->cfg[1] = cf[1]; M->cfg[2] = cf[2]; M->cfg[3] = cf[3];
+ }
+ 
+ // warp_serve's operand reads and checks, on the device (bad: 1 GEMV,
+@@ -10539,7 +10644,7 @@
+     }
+     if (t == 0) {
+       sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 128.0f),
+-        __uint_as_float(0x358637BDu))));
++        LLB_EPS)));
+     }
+     __syncthreads();
+     const float s = sv;
+@@ -10598,7 +10703,7 @@
+   }
+   if (t == 0) {
+     const float rt = __fsqrt_rn(a[0]);
+-    const float ep = __uint_as_float(0x358637BDu);
++    const float ep = LLB_EPS;
+     sv = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
+   }
+   __syncthreads();
+@@ -10643,7 +10748,7 @@
+   }
+   if (t == 0) {
+     sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 128.0f),
+-      __uint_as_float(0x358637BDu))));
++      LLB_EPS)));
+   }
+   __syncthreads();
+   const float s = sv;
+@@ -10987,6 +11092,32 @@
+   return a[32];
+ }
+ 
++// tools/payload-anyshape.patch: n past 8192 (<= 32768): thread t owns leaves t L .. t L + L - 1,
++// L the power of two >= n / 1024 (16 or more), +0 pad leaves, a balanced in-thread tree, then
++// rms_tree as the 8-leaf trees; x1 := x + z when z (rmsnorm_add's store)
++__device__ __noinline__ float rms_wide(const float* __restrict__ x, const float* __restrict__ z,
++  float* __restrict__ x1, u32 n, u32 t) {
++  u32 L = 16;
++  while (L * 1024 < n) {
++    L <<= 1;
++  }
++  float b[32];
++  for (u32 k = 0; k < L; k++) {
++    const u64 i = (u64)t * L + k;
++    const float v = i < n ? (z != nullptr ? __fadd_rn(x[i], z[i]) : x[i]) : 0.0f;
++    if (x1 != nullptr && i < n) {
++      x1[i] = v;
++    }
++    b[k] = i < n ? __fmul_rn(v, v) : 0.0f;
++  }
++  for (u32 s = 1; s < L; s <<= 1) {
++    for (u32 k = 0; k < L; k += 2 * s) {
++      b[k] = __fadd_rn(b[k], b[k + s]);
++    }
++  }
++  return b[0];
++}
++
+ // fbn's head: x1 := x + z (K.vadd), then llb_rmsnorm over x1 (n = 4096)
+ extern "C" __global__ void __launch_bounds__(1024) llb_rmsnorm_add(
+   const float* __restrict__ x, const float* __restrict__ z,
+@@ -10995,7 +11126,9 @@
+   __shared__ float a[33];
+   const u32 t = threadIdx.x;
+   float acc;
+-  if (n <= 4096 && n != 1024) {
++  if (n > 8192) {
++    acc = rms_wide(x, z, x1, n, t);
++  } else if (n == 4096) {
+     const u64 o = (u64)t * 4;
+     float v[4];
+     #pragma unroll
+@@ -11023,7 +11156,7 @@
+   }
+   const float sum = rms_tree(acc, a, t, 32);
+   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
+-    __uint_as_float(0x358637BDu))));
++    LLB_EPS)));
+   for (u32 i = t; i < n; i += 1024) {
+     y[i] = __fmul_rn(__fmul_rn(__fadd_rn(x[i], z[i]), s), w[i]);
+   }
+@@ -11043,7 +11176,7 @@
+   const float sum = rms_tree(__fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y)),
+     a, t, 2);
+   const float rt = __fsqrt_rn(sum);
+-  const float ep = __uint_as_float(0x358637BDu);
++  const float ep = LLB_EPS;
+   const float s = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
+   const float2 r = make_float2(__fmul_rn(x.x, s), __fmul_rn(x.y, s));
+   float* y = (kq ? yk : yq) + ((u64)h << 7);
+@@ -11093,11 +11226,14 @@
+   const u32 q = n >> 10;
+   const float* xp = x + (u64)t * q;
+   float acc;
+-  if (q == 4) {
++  if (n > 8192) {
++    acc = rms_wide(x, nullptr, nullptr, n, t);
++  } else if (n == 4096) {
+     const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
+     const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
+     acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+-  } else if (n > 4096 || n == 1024) {
++  } else if (n != 2048) {
++    // tools/payload-anyshape.patch: any n <= 8192 but 2048 / 4096 (was n > 4096 or 1024)
+     // n 5120 (the 27B, tools/payload-27b.patch) or 1024 (the 0.8B, tools/payload-w1024.patch):
+     // the tree over 8192, +0 pad leaves
+     float b[8];
+@@ -11114,7 +11250,7 @@
+   // the strides as rms_tree's shuffles (tools/payload-fuse.patch)
+   const float sum = rms_tree(acc, a, t, 32);
+   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
+-    __uint_as_float(0x358637BDu))));
++    LLB_EPS)));
+   for (u32 i = t; i < n; i += 1024) {
+     y[i] = __fmul_rn(__fmul_rn(x[i], s), w[i]);
+   }
+@@ -11159,7 +11295,9 @@
+   __shared__ float a[33];
+   const u32 t = threadIdx.x;
+   float acc;
+-  if (n <= 4096) {
++  if (n > 8192) {
++    acc = rms_wide(x, z, x1, n, t);
++  } else if (n == 4096) {
+     const u64 o = (u64)t * 4;
+     float v[4];
+     #pragma unroll
+@@ -11185,7 +11323,7 @@
+   }
+   const float sum = rms_tree(acc, a, t, 32);
+   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
+-    __uint_as_float(0x358637BDu))));
++    LLB_EPS)));
+   for (u32 i = t; i < n; i += 1024) {
+     const float r = __fmul_rn(__fmul_rn(__fadd_rn(x[i], z[i]), s), w[i]);
+     y[i] = r;
+@@ -11202,11 +11340,13 @@
+   const u32 q = n >> 10;
+   const float* xp = x + (u64)t * q;
+   float acc;
+-  if (q == 4) {
++  if (n > 8192) {
++    acc = rms_wide(x, nullptr, nullptr, n, t);
++  } else if (n == 4096) {
+     const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
+     const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
+     acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+-  } else if (n > 4096) {
++  } else if (n != 2048) {
+     float b[8];
+     #pragma unroll
+     for (u32 k = 0; k < 8; k++) {
+@@ -11220,7 +11360,7 @@
+   }
+   const float sum = rms_tree(acc, a, t, 32);
+   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
+-    __uint_as_float(0x358637BDu))));
++    LLB_EPS)));
+   for (u32 i = t; i < n; i += 1024) {
+     const float r = __fmul_rn(__fmul_rn(x[i], s), w[i]);
+     y[i] = r;
+@@ -11385,7 +11525,8 @@
+ // K.put's 1024-f32 slot (tools/payload-slot.patch): y is already the slot
+ extern "C" __global__ void llb_slot(const float* __restrict__ x,
+   float* __restrict__ y) {
+-  y[threadIdx.x] = x[threadIdx.x];
++  const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
++  y[i] = x[i];
+ }
+ 
+ #ifndef LLB_MR_DEF
+@@ -11423,7 +11564,8 @@
+   // 256), so ful's split_qg is one top-level ANode (tools/payload-sqg.patch)
+   float* yr = y + (u64)blockIdx.x * 256;
+   const float xv = xr[t];
+-  const float xb = xr[t + 32];
++  const u32 rh = llb_cfg[2] >> 1;  // rope pairs (tools/payload-anyshape.patch)
++  const float xb = xr[t + rh];
+   const float xg = qk != 0 ? xr[256 + t] : 0.0f;
+   a[t] = __fmul_rn(xv, xv);
+   __syncthreads();
+@@ -11436,23 +11578,23 @@
+   }
+   if (t == 0) {
+     sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 256.0f),
+-      __uint_as_float(0x358637BDu))));
++      LLB_EPS)));
+   }
+   __syncthreads();
+   const float s = sv;
+   const float v = __fmul_rn(__fmul_rn(xv, s), w[t]);
+-  if (t < 32) {
+-    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)10000000.0f,
+-      (double)__fdiv_rn(-(float)(2 * t), 64.0f)));
++  if (t < rh) {
++    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)__uint_as_float(llb_cfg[1]),
++      (double)__fdiv_rn(-(float)(2 * t), (float)(2 * rh))));
+     const float co = (float)cos((double)th), si = (float)sin((double)th);
+-    const float b = __fmul_rn(__fmul_rn(xb, s), w[t + 32]);
++    const float b = __fmul_rn(__fmul_rn(xb, s), w[t + rh]);
+     // neox.pairs returns ANode{a', b'} per pair: the 64 rotated leaves come
+     // out interleaved [a0', b0', a1', b1', ...], not at (i, i + 32)
+     const float r0 = __fsub_rn(__fmul_rn(v, co), __fmul_rn(b, si));
+     const float r1 = __fadd_rn(__fmul_rn(v, si), __fmul_rn(b, co));
+     yr[2 * t]     = r0;
+     yr[2 * t + 1] = r1;
+-  } else if (t >= 64) {
++  } else if (t >= 2 * rh) {
+     yr[t] = v;
+   }
+   if (qk != 0) {
+@@ -11475,7 +11617,9 @@
+   x += rw * n; z += rw * n; x1 += rw * n; y += rw * n; qx += rw * 2 * n; dx += rw * (n / 32);
+   const u32 t = threadIdx.x;
+   float acc;
+-  if (n <= 4096) {
++  if (n > 8192) {
++    acc = rms_wide(x, z, x1, n, t);
++  } else if (n == 4096) {
+     const u64 o = (u64)t * 4;
+     float v[4];
+     #pragma unroll
+@@ -11501,7 +11645,7 @@
+   }
+   const float sum = rms_tree(acc, a, t, 32);
+   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
+-    __uint_as_float(0x358637BDu))));
++    LLB_EPS)));
+   for (u32 i = t; i < n; i += 1024) {
+     const float r = __fmul_rn(__fmul_rn(__fadd_rn(x[i], z[i]), s), w[i]);
+     y[i] = r;
+@@ -11519,11 +11663,13 @@
+   const u32 q = n >> 10;
+   const float* xp = x + (u64)t * q;
+   float acc;
+-  if (q == 4) {
++  if (n > 8192) {
++    acc = rms_wide(x, nullptr, nullptr, n, t);
++  } else if (n == 4096) {
+     const float a0 = __fmul_rn(xp[0], xp[0]), a1 = __fmul_rn(xp[1], xp[1]);
+     const float a2 = __fmul_rn(xp[2], xp[2]), a3 = __fmul_rn(xp[3], xp[3]);
+     acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+-  } else if (n > 4096) {
++  } else if (n != 2048) {
+     float b[8];
+     #pragma unroll
+     for (u32 k = 0; k < 8; k++) {
+@@ -11537,7 +11683,7 @@
+   }
+   const float sum = rms_tree(acc, a, t, 32);
+   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
+-    __uint_as_float(0x358637BDu))));
++    LLB_EPS)));
+   for (u32 i = t; i < n; i += 1024) {
+     const float r = __fmul_rn(__fmul_rn(x[i], s), w[i]);
+     y[i] = r;
+@@ -11602,7 +11748,8 @@
+   const float* xr = x + off;
+   float* yr = y + (u64)blockIdx.x * 256;
+   const float xv = xr[t];
+-  const float xb = xr[t + 32];
++  const u32 rh = llb_cfg[2] >> 1;  // rope pairs (tools/payload-anyshape.patch)
++  const float xb = xr[t + rh];
+   const float xg = qk != 0 ? xr[256 + t] : 0.0f;
+   a[t] = __fmul_rn(xv, xv);
+   __syncthreads();
+@@ -11615,21 +11762,21 @@
+   }
+   if (t == 0) {
+     sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 256.0f),
+-      __uint_as_float(0x358637BDu))));
++      LLB_EPS)));
+   }
+   __syncthreads();
+   const float s = sv;
+   const float v = __fmul_rn(__fmul_rn(xv, s), w[t]);
+-  if (t < 32) {
+-    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)10000000.0f,
+-      (double)__fdiv_rn(-(float)(2 * t), 64.0f)));
++  if (t < rh) {
++    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)__uint_as_float(llb_cfg[1]),
++      (double)__fdiv_rn(-(float)(2 * t), (float)(2 * rh))));
+     const float co = (float)cos((double)th), si = (float)sin((double)th);
+-    const float b = __fmul_rn(__fmul_rn(xb, s), w[t + 32]);
++    const float b = __fmul_rn(__fmul_rn(xb, s), w[t + rh]);
+     const float r0 = __fsub_rn(__fmul_rn(v, co), __fmul_rn(b, si));
+     const float r1 = __fadd_rn(__fmul_rn(v, si), __fmul_rn(b, co));
+     yr[2 * t]     = r0;
+     yr[2 * t + 1] = r1;
+-  } else if (t >= 64) {
++  } else if (t >= 2 * rh) {
+     yr[t] = v;
+   }
+   if (qk != 0) {
+@@ -11797,7 +11944,7 @@
+   const float sum = rms_tree(__fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y)),
+     a, t, 2);
+   const float rt = __fsqrt_rn(sum);
+-  const float ep = __uint_as_float(0x358637BDu);
++  const float ep = LLB_EPS;
+   const float s = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
+   const float2 r = make_float2(__fmul_rn(x.x, s), __fmul_rn(x.y, s));
+   float* y = (kq ? yk : yq) + ((u64)h << 7);
+@@ -11867,7 +12014,7 @@
+   }
+   if (t == 0) {
+     sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 128.0f),
+-      __uint_as_float(0x358637BDu))));
++      LLB_EPS)));
+   }
+   __syncthreads();
+   const float s = sv;
+@@ -12470,6 +12617,7 @@
+     || cuModuleGetFunction(&gpu_warpqt, gpu_lib, "llb_warp_q8_two") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpqc, gpu_lib, "llb_warp_q8_cat") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpqc11, gpu_lib, "llb_warp_q8_cat11") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_gany, gpu_lib, "llb_gemv_any") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_pfq8x, gpu_lib, "pf_q8x") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_pfq4m, gpu_lib, "pf_q4k_m") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_pfq4mr, gpu_lib, "pf_q4k_mr") != CUDA_SUCCESS

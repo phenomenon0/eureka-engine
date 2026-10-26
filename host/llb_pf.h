@@ -48,7 +48,7 @@ static llb_dptr pf_alloc(size_t bytes) {
 // host from the device F32 rows); the exact path keeps reading the F32 rows. Tolerance-gated, not byte-exact.
 #include <math.h>
 static u32 pf_sq8 = 2;  // 2 unread, 1 on, 0 off
-static llb_dptr pf_sw[64][2];
+static llb_dptr pf_sw[LLB_MAXL][2];
 static bool pf_sq8_on(void) {
   if (pf_sq8 == 2) {
     const char* e = getenv("LLB_PF_SSMQ8");
@@ -115,7 +115,7 @@ static bool pf_formats(u32 k, LlbShape sh) {
   static const char* nm[10] = { "F32", "Q8_0", "F16", "Q4_K", "Q6_K", "Q3_K", "Q2_0", "PQ2_0", "IQ4_XS", "Q5_K" };
   u32 lv = sh.lvh * sh.sd, qa = sh.nh * sh.hd;
   for (u32 i = 0; i < k; i += 1) {
-    bool full = (i + 1) % 4 == 0;
+    bool full = llb_full(i);
     for (u32 j = 0; j < 8; j += 1) {
       u32 q = gs[full][j];
       u32 fm = gpu_mail->pt[i][q] >> 28, c = q == 4 ? sh.f : q == 13 ? lv : q == 19 ? qa : sh.d;
@@ -135,14 +135,14 @@ static bool pf_formats(u32 k, LlbShape sh) {
 static bool pf_fast(u32 k, LlbShape sh) {
   if (pf_mode == 2) {
     const char* e = getenv("LLB_PREFILL");
-    // the fast tier is ungated below d 2048 (the 0.8B, tools/payload-w1024.patch): exact only
-    if (e != NULL && strcmp(e, "fast") == 0 && sh.d < 2048) {
-      err_fail("fast prefill: not gated for this shape (d_model < 2048); run exact (--exact)");
-    }
+    // tools/payload-anyshape.patch: any shape the formats admit (the 0.8B's d 1024 was refused:
+    // its Q6_K embedding rows went through llb_embed's Q8_0 body in pf_push; now llb_embed6)
     pf_mode = e != NULL && strcmp(e, "fast") == 0 && pf_formats(k, sh);
     if (pf_mode) {
       const char* t = getenv("LLB_PF_T");
       pf_T = t != NULL && atoi(t) > 0 ? (u32)atoi(t) : 512;
+      // a chunk writes KV slots up to pos0 + T: pass_kv's slack is 4096
+      pf_T = pf_T < 4096 ? pf_T : 4096;
       const char* ms = getenv("LLB_PF_MS");
       pf_ms = ms != NULL && atof(ms) > 0 ? atof(ms) : 0;
       pf_lim = pf_T;
@@ -160,8 +160,8 @@ static bool pf_fast(u32 k, LlbShape sh) {
       pf_go = pf_alloc(T * lv * 4); pf_nm = pf_alloc(T * lv * 4);
       pf_g = pf_alloc(T * f * 4); pf_u = pf_alloc(T * f * 4);
       pf_kb = pf_alloc(T * kv * 4); pf_vb = pf_alloc(T * kv * 4); pf_kn = pf_alloc(T * kv * 4);
-      for (u32 i = 0; pf_sq8_on() && i < k && i < 64; i += 1) {
-        for (u32 q = 7; (i + 1) % 4 != 0 && q <= 8; q += 1) {
+      for (u32 i = 0; pf_sq8_on() && i < k && i < LLB_MAXL; i += 1) {
+        for (u32 q = 7; !llb_full(i) && q <= 8; q += 1) {
           if (gpu_mail->pt[i][q] >> 28 == LLB_FM_F32) {
             pf_sw[i][q - 7] = pf_ssmq8(gpu_mail->pw[i] + (gpu_mail->pt[i][q] & 0x0fffffffu), sh.lvh, sh.d);
           }
@@ -253,7 +253,7 @@ static void pf_chunk(u32 T, u32 k, u32 dT, LlbShape sh) {
   union { u32 u; float f; } sq = { 0x413504f3u };
   llb_dptr cur = pf_x[0];
   for (u32 i = 0; i < k; i += 1) {
-    bool full = (i + 1) % 4 == 0;
+    bool full = llb_full(i);
     pass_layer(i, full, pos0, dT, sh);
     pass_pos[i] = pos0 + T - 1;
     u64 base = gpu_mail->pw[i];
@@ -300,7 +300,7 @@ static void pf_chunk(u32 T, u32 k, u32 dT, LlbShape sh) {
       u32 gdy = sh.sd / 16;  // pf_gdl: 16 rows a block
       pass_r[i] = r0 + T;
       u64 cw4[4] = { base + p[5], base + p[6], base + p[7], base + p[8] };
-      for (u32 q = 0; q < 2 && i < 64; q += 1) {
+      for (u32 q = 0; q < 2 && i < LLB_MAXL; q += 1) {
         if (pf_sw[i][q]) {
           cw4[2 + q] = pf_sw[i][q];
           fm[7 + q] = LLB_FM_Q8_0;
@@ -386,7 +386,7 @@ static void pf_push(u64 er, u32 fm, u32 pos, u32 tok, u32 k, u32 dT, LlbShape sh
   }
   u32 c4 = sh.d;
   llb_dptr row = pf_x[0] + (llb_dptr)pf_n * sh.d * 4;
-  if (!LLB_LAUNCH(fm == LLB_FM_Q4_K ? gpu_embedk : gpu_embed, (c4 + 255) / 256, 1, 256, &er, &c4, &row)) {
+  if (!LLB_LAUNCH(fm == LLB_FM_Q4_K ? gpu_embedk : fm == LLB_FM_Q6_K ? gpu_embed6 : gpu_embed, (c4 + 255) / 256, 1, 256, &er, &c4, &row)) {
     err_fail("device launch failed");
   }
   pf_tk[pf_n] = tok;

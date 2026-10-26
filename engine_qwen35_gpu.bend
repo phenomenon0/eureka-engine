@@ -65,9 +65,16 @@ type Offs is Data:
 type Shape is Data:
   Shape{d: U32, f: U32, nh: U32, nkv: U32, hd: U32, lkh: U32, lvh: U32, sd: U32}
 
+# The model config the kernels read (tools/payload-anyshape.patch): the rms eps and rope base as
+# F32 bits, the rope dims, the vocabulary (the head's rows), the KV capacity in positions (the
+# run's prompt + steps; 0 until run.go sets it). The pass bang carries all but voc as its config
+# words 66..69 (comp.ts pass_mail; llb_host.c llb_pass_init puts eps / rope on the device)
+type Cfg is Data:
+  Cfg{eps: U32, rb: U32, rd: U32, voc: U32, cap: U32}
+
 type Model is Data:
   Model{nl: Nat, lin: Offs, ful: Offs, ws: List<&2, Bytes()>, pk: Bytes(), ep: Bytes(), ooff: U32, noff: U32,
-    sh: Shape, tb: Bytes(), orw: U32, erw: U32}
+    sh: Shape, tb: Bytes(), orw: U32, erw: U32, cf: Cfg}
 
 def ws.at(n: Nat, ws: List<&2, Bytes()>) -> Bytes():
   match n ws:
@@ -80,69 +87,113 @@ def ws.at(n: Nat, ws: List<&2, Bytes()>) -> Bytes():
 
 def m.nl(m: Model) -> Nat:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       nl
 
 def m.lino(m: Model) -> Offs:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       lin
 
 def m.fulo(m: Model) -> Offs:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       ful
 
 def m.ws(m: Model) -> List<&2, Bytes()>:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       ws
 
 # pack.bin output+output_norm resident region (pk, ooff/noff inside it) and the
 # token_embd region (ep, its rows at tok*4352)
 def m.pk(m: Model) -> Bytes():
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       pk
 
 def m.ep(m: Model) -> Bytes():
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       ep
 
 def m.ow(m: Model) -> U32:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       ooff
 
 def m.nb(m: Model) -> U32:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       noff
 
 def m.sh(m: Model) -> Shape:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       sh
 
 # table.bin (tools/pack_table.py): a 32-word row per layer, [0] the layer
 # file's bytes, [1..20] each tensor's offset | fm << 28 in Offs order
 def m.tb(m: Model) -> Bytes():
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       tb
 
 # the head (output.weight) and embedding (token_embd) rows as tagged row words
 # (kw): the pass bang's words 55 and 65, the row stride tok * (erw & 0x07ffffff)
 def m.orw(m: Model) -> U32:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       orw
 
 def m.erw(m: Model) -> U32:
   match m:
-    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw}:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
       erw
+
+def m.cf(m: Model) -> Cfg:
+  match m:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
+      cf
+
+def cf.eps(c: Cfg) -> U32:
+  match c:
+    case Cfg{eps, rb, rd, voc, cap}:
+      eps
+
+def cf.rb(c: Cfg) -> U32:
+  match c:
+    case Cfg{eps, rb, rd, voc, cap}:
+      rb
+
+def cf.rd(c: Cfg) -> U32:
+  match c:
+    case Cfg{eps, rb, rd, voc, cap}:
+      rd
+
+def cf.voc(c: Cfg) -> U32:
+  match c:
+    case Cfg{eps, rb, rd, voc, cap}:
+      voc
+
+def cf.cap(c: Cfg) -> U32:
+  match c:
+    case Cfg{eps, rb, rd, voc, cap}:
+      cap
+
+def cf.with_cap(c: Cfg, +k: U32) -> Cfg:
+  match c:
+    case Cfg{eps, rb, rd, voc, cap}:
+      Cfg{eps, rb, rd, voc, k}
+
+def m.voc(+m: Model) -> U32:
+  cf.voc(m.cf(m))
+
+# the model with its KV capacity set (run.go, once dT is known)
+def m.with_cap(m: Model, +c: U32) -> Model:
+  match m:
+    case Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf}:
+      Model{nl, lin, ful, ws, pk, ep, ooff, noff, sh, tb, orw, erw, cf.with_cap(cf, c)}
 
 # Resident weight files
 # ---------------------
@@ -272,21 +323,14 @@ def mf.validate(+s: String) -> IO(Unit):
       Bool.and(String.eq(mf.scalar(s, "format"), "\"llama-bend-pack-q35-quant/v0\""),
         String.eq(mf.scalar(s, "dtype"), "\"mixed-quant\""))), "format/dtype")
     mf.config(s, "architecture", "\"qwen3_5\"")
-    # the 9B (32 layers, 16 heads, d 4096, FFN 12288) or the 27B (64, 24, 5120, 17408),
-    # or the 0.8B (24, 8, 1024, 3584: Qwen3.5-0.8B; tools/payload-w1024.patch)
-    mf.check(Bool.or(Bool.or(Bool.and(Bool.and(mf.cv(s, "n_layers", "32"), mf.cv(s, "n_heads", "16")),
-        Bool.and(mf.cv(s, "d_model", "4096"), mf.cv(s, "d_ff", "12288"))),
-      Bool.and(Bool.and(mf.cv(s, "n_layers", "64"), mf.cv(s, "n_heads", "24")),
-        Bool.and(mf.cv(s, "d_model", "5120"), mf.cv(s, "d_ff", "17408")))),
-      Bool.and(Bool.and(mf.cv(s, "n_layers", "24"), mf.cv(s, "n_heads", "8")),
-        Bool.and(mf.cv(s, "d_model", "1024"), mf.cv(s, "d_ff", "3584")))),
-      "n_layers/n_heads/d_model/d_ff")
-    # 4 kv heads; 2 only on the 0.8B shape (its 512-wide kv slot)
-    mf.check(Bool.or(mf.cv(s, "n_kv_heads", "4"),
-      Bool.and(mf.cv(s, "d_model", "1024"), mf.cv(s, "n_kv_heads", "2"))), "n_kv_heads")
-    mf.config(s, "head_dim", "256")
-    mf.config(s, "vocab_size", "248320")
-    mf.config(s, "full_attention_interval", "4")
+    # tools/payload-anyshape.patch: any dense Qwen3.5 shape the CUDA kernels instantiate (was a
+    # whitelist of the 9B, 27B and 0.8B); the widths are checked in mf.shape once read. These
+    # two are kernel instantiations: llb_attn4 / llb_qkr run a 256-thread head, l2norm_qk /
+    # gated_delta / gated_rmsnorm a 128-wide state
+    mf.check(mf.cv(s, "head_dim", "256"), "head_dim (the CUDA kernels need 256)")
+    mf.check(mf.cv(s, "ssm_state_size", "128"), "ssm_state_size (the CUDA kernels need 128)")
+    mf.check(Bool.or(mf.cv(s, "ssm_conv_kernel", "4"), String.eq(mf.value(s, "config", "ssm_conv_kernel"), "")),
+      "ssm_conv_kernel (the CUDA conv1d needs 4)")
 
 # a head / embedding tensor's registry format (host/llb_formats.h): the Q8_0
 # pack is all Q8_0; else its src_type, 0 (refused) outside Q8_0 / Q4_K / Q6_K / Q5_K
@@ -395,6 +439,43 @@ def mf.offl.ful(+s: String, +p: String) -> IO(Offs):
     aor : U32 <- mf.rel("attn_output", ao, base, 17825792)
     return Offs{anr, postr, fgr, fur, fdr, 0, 0, 0, 0, 0, 0, 0, 0, 0, aqr, akr, avr, aqnr, aknr, aor}
 
+# a manifest integer, dflt when absent (tools/payload-anyshape.patch: rope_dim)
+def mf.u32or(m: Maybe<&2, U32>, +dflt: U32) -> U32:
+  match m:
+    case Some{v}:
+      v
+    case None{}:
+      dflt
+
+# a manifest float (decimal text, as json.dumps wrote it) as F32 bits; dflt when absent or
+# unreadable (tools/payload-anyshape.patch: rms_norm_eps, rope_freq_base)
+def mf.f32bits.of(m: Maybe<&2, F64>, +dflt: U32) -> U32:
+  match m:
+    case Some{v}:
+      F32.bits(F64.to_f32(v))
+    case None{}:
+      dflt
+
+def mf.f32bits(s: String, +dflt: U32) -> U32:
+  mf.f32bits.of(F64.read(s), dflt)
+
+# the structural shape check (tools/payload-anyshape.patch; comp.ts pass_mail's envelope
+# backs it on the device): what the CUDA kernels instantiate, the rest any value
+def mf.shape(+nl: U32, +dm: U32, +dff: U32, +nh: U32, +nkv: U32, +lkh: U32, +lvh: U32, +iv: U32) -> IO(Unit):
+  do IO<Unit>:
+    mf.check(Bool.and((nl >= 1 : U32), (nl <= 256 : U32)), "n_layers (1..256: the CUDA pass's layer tables)")
+    mf.check(Bool.and(Bool.and((dm >= 256 : U32), (dm <= 32768 : U32)), U32.is_eq(U32.mod(dm, 256), 0)),
+      "d_model (a multiple of 256, 256..32768: the rms trees and K-quant rows)")
+    mf.check(Bool.and(Bool.and((dff >= 256 : U32), (dff <= 65536 : U32)), U32.is_eq(U32.mod(dff, 256), 0)),
+      "d_ff (a multiple of 256, 256..65536)")
+    mf.check(Bool.and(Bool.and((nkv >= 1 : U32), (nh >= nkv : U32)), U32.is_eq(U32.mod(nh, nkv), 0)),
+      "n_heads / n_kv_heads (a whole number of q heads per kv head)")
+    mf.check(Bool.and(Bool.and((lkh >= 1 : U32), (lvh >= lkh : U32)), Bool.and(U32.is_eq(U32.mod(lvh, lkh), 0), (lvh <= 256 : U32))),
+      "ssm_time_step_rank / ssm_group_count (a whole number of value heads per key head, <= 256)")
+    mf.check(Bool.and((nh <= 128 : U32), (lkh <= 128 : U32)), "n_heads / ssm_group_count (<= 128: q / k widths <= 32768)")
+    mf.check(Bool.and((iv >= 2 : U32), (iv <= nl : U32)),
+      "full_attention_interval (2..n_layers: a hybrid with a linear layer first)")
+
 def mf.model(+dir: String, +ly: U32) -> IO(Model):
   do IO<Model>:
     f : File <- IO.try(File, File.open(dir ++ "/manifest.json", "r"))
@@ -411,11 +492,11 @@ def mf.model(+dir: String, +ly: U32) -> IO(Model):
     +erb : U32 <- mf.need("token_embd row_bytes", mf.num(s, "token_embd.weight", "row_bytes"))
     +ofm : U32 = mf.fm(s, "output.weight")
     +efm : U32 = mf.fm(s, "token_embd.weight")
-    # embeddings Q8_0 / Q4_K (llb_embed / _embedk); Q6_K (llb_embed6) only on the
-    # 0.8B shape, its tied table (tools/payload-w1024.patch)
+    # embeddings Q8_0 / Q4_K / Q6_K (llb_embed / _embedk / _embed6; Q6_K any width since
+    # tools/payload-anyshape.patch, was the 0.8B's only); heads Q8_0 / Q4_K / Q6_K / Q5_K
     mf.check(Bool.and(Bool.not(U32.is_eq(ofm, 0)), Bool.or(Bool.or(U32.is_eq(efm, 1), U32.is_eq(efm, 3)),
-      Bool.and(U32.is_eq(efm, 4), mf.cv(s, "d_model", "1024")))),
-      "head/embedding format")
+      U32.is_eq(efm, 4))),
+      "head/embedding format (head Q8_0 / Q4_K / Q6_K / Q5_K, embedding Q8_0 / Q4_K / Q6_K)")
     +dm : U32 <- mf.need("d_model", mf.num(s, "config", "d_model"))
     +dff : U32 <- mf.need("d_ff", mf.num(s, "config", "d_ff"))
     +nhd : U32 <- mf.need("n_heads", mf.num(s, "config", "n_heads"))
@@ -427,10 +508,24 @@ def mf.model(+dir: String, +ly: U32) -> IO(Model):
     +inner : U32 <- mf.need("ssm_inner_size", mf.num(s, "config", "ssm_inner_size"))
     # the value heads are sd wide (gdl / grn): the record has no separate key
     mf.check(U32.is_eq(inner, (lvh * sd : U32)), "ssm_inner_size != ssm_time_step_rank * ssm_state_size")
+    +voc : U32 <- mf.need("vocab_size", mf.num(s, "config", "vocab_size"))
+    +iv : U32 <- mf.need("full_attention_interval", mf.num(s, "config", "full_attention_interval"))
+    +rd : U32 = mf.u32or(mf.num(s, "config", "rope_dim"), 64)
+    +eps : U32 = mf.f32bits(mf.value(s, "config", "rms_norm_eps"), 897988541)
+    +rbase : U32 = mf.f32bits(mf.value(s, "config", "rope_freq_base"), 1259902592)
+    mf.shape(nl, dm, dff, nhd, nkv, lkh, lvh, iv)
+    mf.check(Bool.and(Bool.and((rd >= 2 : U32), (rd <= 256 : U32)), U32.is_eq(U32.and(rd, 1), 0)),
+      "rope_dim (even, 2..256)")
+    mf.check(Bool.and(Bool.not(U32.is_eq(eps, 0)), (eps < 2139095040 : U32)), "rms_norm_eps (finite, > 0)")
+    mf.check(Bool.and(Bool.not(U32.is_eq(rbase, 0)), (rbase < 2139095040 : U32)), "rope_freq_base (finite, > 0)")
+    # the head's rows: gpu_logit holds 2^18 floats less llb_amax_part's 4 x 128-word tail
+    mf.check(Bool.and((voc >= 1 : U32), (voc <= 261632 : U32)), "vocab_size (1..261632: the CUDA head's logit buffer)")
+    mf.check(U32.is_eq((ob / orb : U32), voc), "output.weight rows != vocab_size")
     mf.check(Bool.and((emb <= 3225419776 : U32), Bool.and((out <= 3225419776 : U32),
       (onorm <= 4294959104 : U32))), "head offset exceeds U32")
     lin : Offs <- mf.offl.lin(s, "blk.0.")
-    ful : Offs <- mf.offl.ful(s, "blk.3.")
+    # the first full-attention layer: blk.(interval - 1) (was blk.3)
+    ful : Offs <- mf.offl.ful(s, "blk." ++ U32.show((iv - 1 : U32)) ++ ".")
     +n : Nat = U32.to_nat(Bool.pick(U32, U32.is_eq(ly, 0), nl, ly))
     # output.weight and output_norm sit contiguously at the front of pack.bin;
     # token_embd follows. Bytes are capped at 2^31, so read the head region in
@@ -453,7 +548,7 @@ def mf.model(+dir: String, +ly: U32) -> IO(Model):
     IO.print_err("resident head " ++ Nat.show(Nat.add(headn, U32.to_nat(eb)))
       ++ " bytes + layers in " ++ Nat.show(Nat.sub(t1, t0)) ++ " ms")
     return Model{n, lin, ful, ws, pk, ep, U32.from_nat(out0), U32.from_nat(norm0),
-      Shape{dm, dff, nhd, nkv, hd, lkh, lvh, sd}, tb, kw(ofm, orb), kw(efm, erb)}
+      Shape{dm, dff, nhd, nkv, hd, lkh, lvh, sd}, tb, kw(ofm, orb), kw(efm, erb), Cfg{eps, rbase, rd, voc, 0}}
 
 # the loader needs ws.at; define after Model so the field order matches
 def ws.at2(n: Nat, ws: List<&2, Bytes()>) -> Bytes():
@@ -677,7 +772,7 @@ def step.tops(+t: Array<F32>) -> Tops:
 @unsafe
 def head(+m: Model, x: Array<F32>) -> Tops:
   step.tops(F.llb.head_warp!(2n, m.pk(m), x, Array.new(F32, 2n, 0.0), m.nb(m),
-    m.ow(m), 248320, q8rw(4096)))
+    m.ow(m), m.voc(m), q8rw(4096)))
 
 # the head as a device bang (its q8mv is a warp task): a bang in a sequential
 # lane faults, so it is entered directly, as engine_gpu's head! is.
@@ -747,14 +842,16 @@ def fwd.grp(+s: Nat, +k: Nat, +m: Model, +pos: U32, +dT: Nat, +nT: U32,
 @unsafe
 def llb.pass_warp(+f: Nat, +ws: List<&2, Bytes()>, x: Array<F32>, y: Array<F32>, +lo: Offs, +fo: Offs,
   +c: U32, +rg: U32, +rd: U32, +s: U32, +k: U32, +eb: Bytes(), +eat: U32, +hb: Bytes(),
-  +noff: U32, +ooff: U32, +nh: U32, +rwh: U32, +sh: Shape, +tb: Bytes(), +ew: U32) -> Array<F32>:
+  +noff: U32, +ooff: U32, +nh: U32, +rwh: U32, +sh: Shape, +tb: Bytes(), +ew: U32,
+  +eps: U32, +rb: U32, +rd: U32, +cap: U32) -> Array<F32>:
   Array.new(F32, 12n, K.f32_from_bits(2143289344))
 
 @unsafe
 def fwd.pass(+s: Nat, +k: Nat, +m: Model, +pos: U32, +dT: Nat, x: Array<F32>) -> Array<F32>:
   llb.pass_warp!(14n, m.ws(m), x, Array.new(F32, 12n, 0.0), m.lino(m), m.fulo(m),
     (U32.from_nat(dT) .|. (pos << 5n) : U32), sh.rg(m.sh(m)), sh.rd(m.sh(m)), U32.from_nat(s), U32.from_nat(k),
-    m.ep(m), 0, m.pk(m), 0, 0, 0, 0, m.sh(m), m.tb(m), 0)
+    m.ep(m), 0, m.pk(m), 0, 0, 0, 0, m.sh(m), m.tb(m), 0,
+    cf.eps(m.cf(m)), cf.rb(m.cf(m)), cf.rd(m.cf(m)), cf.cap(m.cf(m)))
 
 # The folded step (tools/payload-fold.patch): embed, the whole pass and the head
 # as one bang -- the host dequantizes the token's row, runs the layers, then
@@ -764,7 +861,8 @@ def fwd.step(+m: Model, +pos: U32, +dT: Nat, +tok: U32, +fl: U32) -> Tops:
   step.tops(llb.pass_warp!(14n, m.ws(m), Array.new(F32, 12n, 0.0), Array.new(F32, 12n, 0.0),
     m.lino(m), m.fulo(m), (U32.from_nat(dT) .|. (pos << 5n) : U32), sh.rg(m.sh(m)), sh.rd(m.sh(m)),
     fl, U32.from_nat(m.nl(m)), m.ep(m), (tok * U32.and(m.erw(m), 134217727) : U32), m.pk(m), m.nb(m),
-    m.ow(m), 248320, m.orw(m), m.sh(m), m.tb(m), m.erw(m)))
+    m.ow(m), m.voc(m), m.orw(m), m.sh(m), m.tb(m), m.erw(m),
+    cf.eps(m.cf(m)), cf.rb(m.cf(m)), cf.rd(m.cf(m)), cf.cap(m.cf(m))))
 
 # the fast prefill tier's batch (tools/payload-pf.patch): cnt prompt ids in ids (as F32) from
 # pos on, word 47 bits 30 and 29; the host queues them all (row 0 the embedding's base)
@@ -773,7 +871,8 @@ def fwd.batch(+m: Model, +pos: U32, +dT: Nat, ids: Array<F32>, +cnt: U32) -> Top
   step.tops(llb.pass_warp!(14n, m.ws(m), ids, Array.new(F32, 12n, 0.0),
     m.lino(m), m.fulo(m), (U32.from_nat(dT) .|. (pos << 5n) : U32), sh.rg(m.sh(m)), sh.rd(m.sh(m)),
     (1610612736 .|. cnt : U32), U32.from_nat(m.nl(m)), m.ep(m), 0, m.pk(m), m.nb(m),
-    m.ow(m), 248320, m.orw(m), m.sh(m), m.tb(m), m.erw(m)))
+    m.ow(m), m.voc(m), m.orw(m), m.sh(m), m.tb(m), m.erw(m),
+    cf.eps(m.cf(m)), cf.rb(m.cf(m)), cf.rd(m.cf(m)), cf.cap(m.cf(m))))
 
 def layers.fin(+t0: Nat, r: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)> & Array<F32>) ->
   IO(List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)> & Array<F32>):
@@ -998,16 +1097,18 @@ def cfg(xs: List<String>, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb:
       (List.reverse(&2, U32, ts),
         (Bool.pick(U32, Bool.and(ok, U32.is_eq(mode, 0)), st, 0), (ly, (em, (lb, sp)))))
 
-def ok_ids.go(ts: List<&2, U32>, ok: Bool) -> Bool:
+# every id below the vocabulary v (or the "," cut); run.chk passes 4294967294 (any id, the
+# model not yet read), run.go the model's vocab_size (tools/payload-anyshape.patch)
+def ok_ids.go(ts: List<&2, U32>, +v: U32, ok: Bool) -> Bool:
   match ts:
     case Con{t0, rest}:
       +t = t0
-      ok_ids.go(rest, Bool.and(Bool.or((t < 248320 : U32), U32.is_eq(t, 4294967294)), ok))
+      ok_ids.go(rest, v, Bool.and(Bool.or((t < v : U32), U32.is_eq(t, 4294967294)), ok))
     case Nil{}:
       ok
 
-def ok_ids(ts: List<&2, U32>) -> Bool:
-  ok_ids.go(ts, True{})
+def ok_ids(ts: List<&2, U32>, +v: U32) -> Bool:
+  ok_ids.go(ts, v, True{})
 
 def count_ids(ts: List<&2, U32>, n: Nat) -> Nat:
   match ts:
@@ -1017,7 +1118,7 @@ def count_ids(ts: List<&2, U32>, n: Nat) -> Nat:
       n
 
 def usage() -> String:
-  "usage: engine_qwen35 <packdir> <tok>... [--steps N] [--layers L] [--emit L] [--lpb K] [--pos K]  (N>=1, ids<248320)"
+  "usage: engine_qwen35 <packdir> <tok>... [--steps N] [--layers L] [--emit L] [--lpb K] [--pos K]  (N>=1, ids<vocab_size, prompt+N-1 <= 2^26, L/K <= 256)"
 
 # ids "a b , c d": prompts cut at "," (4294967294), each from pos 0 on fresh
 # states after one load; stdout "end" between them (tools/q4dp K2/K3 batches)
@@ -1095,7 +1196,9 @@ def srv.one(ok: Bool, ts: List<&2, U32>, +st: U32, +sp: U32, +m: Model, +b: Nat,
 
 @unsafe
 def srv.chk(+ts: List<&2, U32>, +st: U32, +sp: U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
-  srv.one(Bool.and(Bool.and(ok_ids(ts), (st >= 1 : U32)), Bool.and(Bool.and((st <= 131073 : U32), (sp <= 131072 : U32)), ((sp + st) <= 131073 : U32))), ts, st, sp, m, b, em, dT, k)
+  # the request inside the run's KV capacity (was 131072; tools/payload-anyshape.patch)
+  +c = cf.cap(m.cf(m))
+  srv.one(Bool.and(Bool.and(ok_ids(ts, m.voc(m)), (st >= 1 : U32)), Bool.and(Bool.and((st <= (c + 1 : U32) : U32), (sp <= c : U32)), ((sp + st) <= (c + 1 : U32) : U32))), ts, st, sp, m, b, em, dT, k)
 
 @unsafe
 def srv.run(c: List<&2, U32> & U32 & U32 & U32 & U32 & U32, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> IO(Unit)) -> IO(Unit):
@@ -1134,12 +1237,16 @@ def run.go(ok: Bool, +dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: 
     case True{}:
       do IO<Unit>:
         t0 : Nat <- IO.now()
-        +m : Model <- mf.model(dir, ly)
+        +m0 : Model <- mf.model(dir, ly)
+        mf.check(ok_ids(ts, m.voc(m0)), "a prompt id >= vocab_size")
+        # the KV capacity: the longest prompt + steps - 1 positions (2^dT rounds it up; the
+        # host allocates the slots by position up to it, tools/payload-anyshape.patch)
+        +m : Model = m.with_cap(m0, (maxlen(ts, 0, 0) + st - 1 : U32))
         # the split path (--emit / --lpb < layers) has Q8_0-only embed and head
         mf.check(Bool.or(Bool.and(U32.is_eq(m.orw(m), q8rw(4096)), U32.is_eq(m.erw(m), q8rw(4096))),
           Bool.and(U32.is_eq(em, 4294967295), (lb >= U32.from_nat(m.nl(m)) : U32))),
           "quantized head/embedding needs the folded step (no --emit, --lpb >= layers)")
-        +dT : Nat = lg(17n, 0n, (maxlen(ts, 0, 0) + st - 1 : U32))
+        +dT : Nat = lg(26n, 0n, (maxlen(ts, 0, 0) + st - 1 : U32))
         se : Result<&1, &1, U32 & String, String> <- IO.get_env("LLB_SYS1")
         srv.or(G.gguf.on(se), dir, ts, m, U32.to_nat(lb), em, dT, st)
         t1 : Nat <- IO.now()
@@ -1150,14 +1257,15 @@ def run.go(ok: Bool, +dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: 
 @unsafe
 def run.chk(dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: U32, +lb: U32) -> IO(Unit):
   +nt = U32.from_nat(count_ids(ts, 0n))
-  +ok = Bool.and(ok_ids(ts), (nt >= 1 : U32))
+  # tools/payload-anyshape.patch: prompt + steps - 1 <= 2^26 positions (was 2^17), layers 256
+  +ok = Bool.and(ok_ids(ts, 4294967294), (nt >= 1 : U32))
   +ok1 = Bool.and(ok, (st >= 1 : U32))
-  +ok2 = Bool.and(ok1, (st <= 131072 : U32))
-  +ok3 = Bool.and(ok2, (ly <= 64 : U32))
-  +ok4 = Bool.and(ok3, Bool.or(U32.is_eq(em, 4294967295), (em <= 64 : U32)))
+  +ok2 = Bool.and(ok1, (st <= 67108864 : U32))
+  +ok3 = Bool.and(ok2, (ly <= 256 : U32))
+  +ok4 = Bool.and(ok3, Bool.or(U32.is_eq(em, 4294967295), (em <= 256 : U32)))
   +ok5 = Bool.and(ok4, (lb >= 1 : U32))
-  +ok6 = Bool.and(ok5, (lb <= 64 : U32))
-  run.go(Bool.and(ok6, (nt <= (131073 - st : U32) : U32)), dir, ts, st, ly, em, lb)
+  +ok6 = Bool.and(ok5, (lb <= 256 : U32))
+  run.go(Bool.and(ok6, (nt <= (67108865 - st : U32) : U32)), dir, ts, st, ly, em, lb)
 
 @unsafe
 def run.sl(dir: String, ts: List<&2, U32>, sl: U32 & U32 & U32 & U32 & U32) -> IO(Unit):

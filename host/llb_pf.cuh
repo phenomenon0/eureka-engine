@@ -4,7 +4,7 @@
 // same per-token ops, so the tier's numerics differ from the exact path only in the GEMMs.
 // Rows are [T][n]; pos0 / r0 the chunk's first position / conv ring index.
 
-// llb_rmsnorm (any n <= 8192), token blockIdx.x
+// llb_rmsnorm (any n <= 8192; past it rms_wide, tools/payload-anyshape.patch), token blockIdx.x
 extern "C" __global__ void __launch_bounds__(1024) pf_rmsnorm(const float* __restrict__ x0,
   const float* __restrict__ w, float* __restrict__ y0, u32 n) {
   __shared__ float a[33];
@@ -12,7 +12,9 @@ extern "C" __global__ void __launch_bounds__(1024) pf_rmsnorm(const float* __res
   const float* x = x0 + (u64)blockIdx.x * n;
   float* y = y0 + (u64)blockIdx.x * n;
   float acc;
-  if (n == 4096) {
+  if (n > 8192) {
+    acc = rms_wide(x, nullptr, nullptr, n, t);
+  } else if (n == 4096) {
     const float* xp = x + (u64)t * 4;
     acc = __fadd_rn(__fadd_rn(__fmul_rn(xp[0], xp[0]), __fmul_rn(xp[1], xp[1])),
       __fadd_rn(__fmul_rn(xp[2], xp[2]), __fmul_rn(xp[3], xp[3])));
@@ -28,7 +30,7 @@ extern "C" __global__ void __launch_bounds__(1024) pf_rmsnorm(const float* __res
   }
   const float sum = rms_tree(acc, a, t, 32);
   const float s = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, (float)n),
-    __uint_as_float(0x358637BDu))));
+    LLB_EPS)));
   for (u32 i = t; i < n; i += 1024) {
     y[i] = __fmul_rn(__fmul_rn(x[i], s), w[i]);
   }
@@ -91,7 +93,7 @@ extern "C" __global__ void __launch_bounds__(64) pf_l2qk(
   const float2 x = ((const float2*)((kq ? vk0 : vq0) + vo + ((u64)h << 7)))[t];
   const float sum = rms_tree(__fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y)), a, t, 2);
   const float rt = __fsqrt_rn(sum);
-  const float ep = __uint_as_float(0x358637BDu);
+  const float ep = LLB_EPS;
   const float s = __fdiv_rn(__fdiv_rn(1.0f, (rt < ep ? ep : rt)), sc);
   const float2 r = make_float2(__fmul_rn(x.x, s), __fmul_rn(x.y, s));
   float* y = (kq ? yk0 : yq0) + yo + ((u64)h << 7);
@@ -190,7 +192,7 @@ extern "C" __global__ void __launch_bounds__(64) pf_grn(
   }
   if (t == 0) {
     sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 128.0f),
-      __uint_as_float(0x358637BDu))));
+      LLB_EPS)));
   }
   __syncthreads();
   const float s = sv;
@@ -233,7 +235,8 @@ extern "C" __global__ void __launch_bounds__(256) pf_qkr(
   float* y = y0 + (u64)blockIdx.y * n;
   float* yr = y + (u64)blockIdx.x * 256;
   const float xv = xr[t];
-  const float xb = xr[t + 32];
+  const u32 rh = llb_cfg[2] >> 1;  // rope pairs (tools/payload-anyshape.patch)
+  const float xb = xr[t + rh];
   const float xg = qk != 0 ? xr[256 + t] : 0.0f;
   a[t] = __fmul_rn(xv, xv);
   __syncthreads();
@@ -246,19 +249,19 @@ extern "C" __global__ void __launch_bounds__(256) pf_qkr(
   }
   if (t == 0) {
     sv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a[0], 256.0f),
-      __uint_as_float(0x358637BDu))));
+      LLB_EPS)));
   }
   __syncthreads();
   const float s = sv;
   const float v = __fmul_rn(__fmul_rn(xv, s), w[t]);
-  if (t < 32) {
-    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)10000000.0f,
-      (double)__fdiv_rn(-(float)(2 * t), 64.0f)));
+  if (t < rh) {
+    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)__uint_as_float(llb_cfg[1]),
+      (double)__fdiv_rn(-(float)(2 * t), (float)(2 * rh))));
     const float co = (float)cos((double)th), si = (float)sin((double)th);
-    const float b = __fmul_rn(__fmul_rn(xb, s), w[t + 32]);
+    const float b = __fmul_rn(__fmul_rn(xb, s), w[t + rh]);
     yr[2 * t]     = __fsub_rn(__fmul_rn(v, co), __fmul_rn(b, si));
     yr[2 * t + 1] = __fadd_rn(__fmul_rn(v, si), __fmul_rn(b, co));
-  } else if (t >= 64) {
+  } else if (t >= 2 * rh) {
     yr[t] = v;
   }
   if (qk != 0) {
