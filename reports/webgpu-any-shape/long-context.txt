@@ -1,0 +1,2 @@
+q08b.gguf|hay20k.txt|32768: prompt 20973 tokens, prefill 129 s (162.2 tok/s), decode 73.9 tok/s, answer 'PELICAN-7342'
+q08b.gguf|hay140k.txt|160000: prompt 153352 tokens, prefill 1586 s (96.7 tok/s), decode 49.2 tok/s, answer 'PELICAN-7342'

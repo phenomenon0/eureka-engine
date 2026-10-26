@@ -1,0 +1,36 @@
+q08b.gguf|fr                 match   7/  7  
+q08b.gguf|sea                match  58/ 63  diverge@58: llama top1-top2 gap 0.018; trunk's pick is llama #2
+q08b.gguf|sky                match  29/ 36  diverge@29: llama top1-top2 gap 0.042; trunk's pick is llama #2
+q08b.gguf|code               match  63/ 63  
+q2b.gguf|fr                  match   7/  7  
+q2b.gguf|sea                 match  45/ 63  diverge@45: llama top1-top2 gap 0.144; trunk's pick is llama #2
+q2b.gguf|sky                 match  11/ 63  diverge@11: llama top1-top2 gap 0.061; trunk's pick is llama #3
+q2b.gguf|code                match  63/ 63  
+q4b.gguf|fr                  match   7/  7  
+q4b.gguf|sea                 match  14/ 63  diverge@14: llama top1-top2 gap 0.165; trunk's pick is llama #2
+q4b.gguf|sky                 match  10/ 55  diverge@10: llama top1-top2 gap 0.052; trunk's pick is llama #2
+q4b.gguf|code                match  63/ 63  
+q9b.gguf|fr                  match   7/  7  
+q9b.gguf|sea                 match   1/ 63  diverge@1: llama top1-top2 gap 0.034; trunk's pick is llama #3
+q9b.gguf|sky                 match   5/ 61  diverge@5: llama top1-top2 gap 0.008; trunk's pick is llama #2
+q9b.gguf|code                match  63/ 63  
+pure-Q5_0.gguf|sky           match   5/ 23  diverge@5: llama top1-top2 gap 0.107; trunk's pick is llama #2
+pure-Q5_1.gguf|sky           match  32/ 32  
+pure-IQ4_NL.gguf|sky         match  18/ 38  diverge@18: llama top1-top2 gap 0.046; trunk's pick is llama #2
+08b-IQ4_XS-imat.gguf|sky     match  25/ 47  diverge@25: llama top1-top2 gap 0.012; trunk's pick is llama #2
+08b-Q2_K-imat.gguf|sky       match  63/ 63  
+08b-Q3_K_M.gguf|sky          match  12/ 36  diverge@12: llama top1-top2 gap 0.122; trunk's pick is llama #3
+08b-Q5_K_M.gguf|sky          match  32/ 32  
+08b-Q6_K.gguf|sky            match  23/ 44  diverge@23: llama top1-top2 gap 0.007; trunk's pick is llama #2
+08b-Q8_0.gguf|sky            match  28/ 44  diverge@28: llama top1-top2 gap 0.137; trunk's pick is llama #2
+08b-IQ2_M-imat.gguf|sky      match  10/ 40  diverge@10: llama top1-top2 gap 0.044; trunk's pick is llama #2
+08b-IQ2_XXS-imat.gguf|sky    match   0/ 63  diverge@0: llama top1-top2 gap 0.456; trunk's pick is llama #3
+08b-IQ3_XXS-imat.gguf|sky    match  36/ 63  diverge@36: llama top1-top2 gap 0.167; trunk's pick is llama #2
+08b-IQ3_S-imat.gguf|sky      match  26/ 34  diverge@26: llama top1-top2 gap 0.129; trunk's pick is llama #2
+pure-IQ2_XS.gguf|sky         match  63/ 63  
+pure-IQ1_S.gguf|sky          match   0/  1  diverge@0: llama top1-top2 gap 1.576; trunk's pick not in llama top5
+pure-IQ1_M.gguf|sky          match   0/ 63  diverge@0: llama top1-top2 gap 0.442; trunk's pick not in llama top5
+08b-BF16.gguf|sky            match  37/ 37  
+pure-F16.gguf|sky            match  37/ 37  
+pure-Q4_0.gguf|sky           match  56/ 56  
+pure-Q4_1.gguf|sky           match  42/ 42  

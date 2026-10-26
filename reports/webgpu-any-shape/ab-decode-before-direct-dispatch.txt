@@ -1,0 +1,4 @@
+q08b.gguf|code new [94.3, 98.5, 97.3] median 97.3
+q08b.gguf|code old [109.3, 109.7, 109.4] median 109.4
+q2b.gguf|code new [51.4, 51.1, 51.3] median 51.3
+q2b.gguf|code old [54.4, 54.9, 54.7] median 54.7

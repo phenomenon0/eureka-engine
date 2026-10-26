@@ -25,7 +25,7 @@ lines inside the patch.
 | Metal, macOS (`backends/metal`) | 4B (d 2560), 9B, 27B K-quant pack, 35B MoE | 131,072 | One heap span (`--gpu`); f32 KV |
 | Metal, iOS (`backends/ios`) | Same engine as macOS; shipped with 4B and Kev-4B | 131,072 (`llb_open` cap) | One span: GGUF + 3 GiB |
 | WebGPU, shipped (`backends/webgpu/engine`) | 4B only | 4,096 | Whole model on the GPU, split into ≤128 MiB buffers |
-| WebGPU, trunk (`backends/webgpu/trunk`) | Any shape with head_dim 256, SSM state 128, conv 4 | Bounded by the GPU's buffer-binding limit | Weights split by rows to fit the device |
+| WebGPU, trunk (`backends/webgpu/trunk`) | Any Qwen3.5 shape, dense or MoE (head, state, conv read from the file); 21 GGUF formats | Bounded by the GPU's binding limit for one layer's f16 KV (about 2M tokens for the 0.8B on an RTX 3090) | Weights split by rows (or experts) to fit the device |
 
 ## What blocks each case
 
@@ -49,8 +49,8 @@ lines inside the patch.
 - **WebGPU shipped:** `q35_tensors` asserts the 4B geometry
   (`engine/q35_plan.js` 30–34), and the emitted kernels bake in its widths,
   head counts, and vocabulary.
-- **WebGPU trunk:** accepts 0.8B shapes (not tested here); quant support is F32, Q8_0, Q4_K, Q5_K,
-  Q6_K only (`trunk/trunk_kernels.js` 102).
+- **WebGPU trunk:** runs them (0.8B and 2B tested against llama.cpp; see
+  [reports/webgpu-any-shape](../reports/webgpu-any-shape/REPORT.md)).
 
 ### Bigger models (above 27B)
 
@@ -101,7 +101,6 @@ lines inside the patch.
 | Metal | Use the stride-parameter attention (`llb_m_attn5x`) for every KV-head count | Kernel |
 | CUDA, Metal | Instantiate head_dim 128 and SSM state 64 | Kernel |
 | CUDA, Metal | f16 KV, allocated by position | Kernel |
-| WebGPU trunk | Add F16, BF16, Q4_0 units (about 20 lines each) | Cap |
 | WebGPU shipped | Use the in-place KV write for decode | Cap |
 | All servers | Replace the 16,384-token prompt arrays with buffers sized by the KV capacity | Cap |
 | Android app | Choose the thread count and CPU mask from `/sys/devices/system/cpu/*/cpu_capacity` | Cap |
@@ -113,3 +112,7 @@ lines inside the patch.
   IQ4_XS refused at load instead of computing zeros; tensor cap 1,024 → 4,096.
 - **CPU engine, patch 41:** `kev.c` reads the head width from the decide
   head; the head is optional, so chat runs on any Qwen3.5 pack.
+- **WebGPU trunk:** any Qwen3.5 shape including MoE, 21 GGUF formats, f16 KV
+  with split-KV attention (context bounded by the binding limit), batched
+  prompt submissions; the old 16,384-token tokenizer cap is gone
+  ([report](../reports/webgpu-any-shape/REPORT.md)).

@@ -1,0 +1,16 @@
+q08b.gguf|fr       old-vs-new match 8/8  old 104.5 tok/s  new 80.3 tok/s
+q08b.gguf|sea      old-vs-new match 64/64  old 94.3 tok/s  new 82.2 tok/s
+q08b.gguf|sky      old-vs-new match 37/37  old 97 tok/s  new 77.7 tok/s
+q08b.gguf|code     old-vs-new match 64/64  old 100 tok/s  new 76.6 tok/s
+q2b.gguf|fr        old-vs-new match 8/8  old 50.2 tok/s  new 44.6 tok/s
+q2b.gguf|sea       old-vs-new match 64/64  old 54.2 tok/s  new 45.9 tok/s
+q2b.gguf|sky       old-vs-new match 64/64  old 52.4 tok/s  new 46.5 tok/s
+q2b.gguf|code      old-vs-new match 64/64  old 55 tok/s  new 45.3 tok/s
+q4b.gguf|fr        old-vs-new match 8/8  old 27.5 tok/s  new 24 tok/s
+q4b.gguf|sea       old-vs-new match 64/64  old 27.7 tok/s  new 24.7 tok/s
+q4b.gguf|sky       old-vs-new match 56/56  old 26.4 tok/s  new 27.2 tok/s
+q4b.gguf|code      old-vs-new match 64/64  old 26.9 tok/s  new 27.3 tok/s
+q9b.gguf|fr        old-vs-new match 8/8  old 15.2 tok/s  new 15.4 tok/s
+q9b.gguf|sea       old-vs-new match 64/64  old 15.2 tok/s  new 15.5 tok/s
+q9b.gguf|sky       old-vs-new match 62/62  old 15.4 tok/s  new 15.5 tok/s
+q9b.gguf|code      old-vs-new match 64/64  old 15.3 tok/s  new 14.5 tok/s

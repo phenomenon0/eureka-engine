@@ -1,0 +1,6 @@
+synth-dense-odd: greedy 24/24 equal to llama.cpp (CPU, F32 weights)
+synth-moe: greedy 24/24 equal to llama.cpp (CPU, F32 weights)
+synth-moe-fused: greedy 24/24 equal to llama.cpp (CPU, F32 weights)
+pure-IQ1_M vs llama.cpp on the same weights dequantized to F32: greedy 32/32 equal
+pure-IQ1_S vs llama.cpp on the same weights dequantized to F32: greedy 1/1 equal
+08b-IQ2_XXS-imat vs llama.cpp on the same weights dequantized to F32: greedy 32/32 equal

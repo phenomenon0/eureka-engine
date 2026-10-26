@@ -3,7 +3,8 @@
 <body style="background:#111;color:#ddd;font:13px ui-monospace,monospace;white-space:pre-wrap">
 <div id="st">loading…</div><div id="out"></div>
 <script>
-// trunk smoke (WEB-TRUNK-PORT): ?m=<inventory id>&ctx=4096&n=64&p=<prompt> | &ids=1,2,3 (raw ids, no template) &top=10 (logits top-k at each output)
+// trunk smoke (WEB-TRUNK-PORT): ?m=<inventory id>&ctx=4096&n=64&p=<prompt> | &pfile=<file under /models/> (the prompt text) | &ids=1,2,3 (raw ids,
+// no template) &top=10 (logits top-k at each output) &pf=0 (prefill token by token instead of in batched submissions)
 window.__smoke = { errors: [], result: null };
 addEventListener("error", e => __smoke.errors.push(String(e.message)));
 addEventListener("unhandledrejection", e => __smoke.errors.push(String(e.reason?.stack ?? e.reason)));
@@ -23,7 +24,7 @@ try {
   await __tokReady; const T = Module;
   T.FS.mkdir("/tok"); T.FS.writeFile("/tok/tokenizer.bin", new Uint8Array(await (await fetch("/models/qwen35-tokenizer.bin")).arrayBuffer()));
   if (T._tok_init() !== 0) throw new Error("tokenizer.bin did not load");
-  const encode = (text) => { const n = T.lengthBytesUTF8(text) + 1, p = T._malloc(n); T.stringToUTF8(text, p, n); const cap = 16384, o = T._malloc(cap * 4), got = T._tok_encode(p, o, cap); const ids = Array.from(T.HEAP32.subarray(o >> 2, (o >> 2) + got)); T._free(p); T._free(o); return ids; };
+  const encode = (text) => { const n = T.lengthBytesUTF8(text) + 1, p = T._malloc(n); T.stringToUTF8(text, p, n); const cap = n + 16, o = T._malloc(cap * 4), got = T._tok_encode(p, o, cap); const ids = Array.from(T.HEAP32.subarray(o >> 2, (o >> 2) + got)); T._free(p); T._free(o); return ids; };
   const piece = (i) => { const p = T._malloc(65536), n = T._tok_piece(i, p, 65536), b = T.HEAPU8.slice(p, p + n); T._free(p); return b; };
   const t0 = performance.now();
   const g = await gguf_read(read), chk = trunk_check(g), sha = await gguf_vocab_sha256(g);
@@ -32,13 +33,15 @@ try {
   st.textContent = `${id}: ${chk.ok ? "trunk graph OK" : chk.problems.join(" ")} — est ${(trunk_resident(chk, ctx) / 1e9).toFixed(2)} GB at ${ctx}`;
   const e = await trunk_open(read, { ctx, gguf: g, onProgress: ({ done, total }) => { st.textContent = `loading ${id}: ${(done / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`; } });
   const open_ms = performance.now() - t0;
-  const prompt = q.get("p") ?? "What is the capital of France? Answer in one sentence.";
+  const prompt = q.has("pfile") ? await (await fetch("/models/" + q.get("pfile"))).text() : q.get("p") ?? "What is the capital of France? Answer in one sentence.";
   const ids = q.has("ids") ? q.get("ids").split(",").map(Number) : encode(`<|im_start|>user\n${prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`);
   const stops = new Set([e.shape.eos, 248046, 248044].filter(x => x != null));
   const topk = (L) => { const a = []; for (let i = 0; i < L.length; i++) { if (a.length < TOP || L[i] > a[a.length - 1][1]) { a.push([i, L[i]]); a.sort((x, y) => y[1] - x[1]); if (a.length > TOP) a.pop(); } } let m = -Infinity; for (const v of L) m = Math.max(m, v); let z = 0; for (const v of L) z += Math.exp(v - m); const lse = m + Math.log(z); return a.map(([i, v]) => [i, +v.toFixed(4), +(v - lse).toFixed(5)]); };
   let r, pre = 0; const tops = [];
   const TF = Number(q.get("tf") ?? 1);   // teacher forcing: top-k at each of the last TF prompt positions
-  for (let i = 0; i < ids.length; i++) { r = await e.step(ids[i], { wantLogits: TOP > 0 && i >= ids.length - TF }); pre += r.ms; if (r.logits) tops.push(topk(r.logits)); }
+  const PF = q.get("pf") !== "0", first = PF ? Math.max(0, ids.length - TF) : 0;
+  if (first > 0) { r = await e.prefill(ids.slice(0, first), { noHead: true }); pre += r.ms; }
+  for (let i = first; i < ids.length; i++) { r = await e.step(ids[i], { wantLogits: TOP > 0 && i >= ids.length - TF }); pre += r.ms; if (r.logits) tops.push(topk(r.logits)); }
   const gen = [r.id]; let dec = 0; const td = new TextDecoder();
   out.textContent = td.decode(piece(r.id), { stream: true });
   while (gen.length < N && !stops.has(gen[gen.length - 1])) {
@@ -51,7 +54,7 @@ try {
     ctx, open_ms: Math.round(open_ms), resident_bytes: e.resident_bytes, estimate_bytes: trunk_resident(chk, ctx), dispatches: e.dispatches, limits: e.limits, adapter: e.adapter,
     skipped_tensors: chk.skipped.length, prompt_tokens: ids.length, prefill_ms: Math.round(pre), prefill_tok_s: +(ids.length * 1000 / pre).toFixed(1),
     decode_steps: steps, decode_ms: Math.round(dec), tokens_per_second: steps ? +(steps * 1000 / dec).toFixed(1) : null,
-    ids: gen, text: out.textContent, tops, ua: navigator.userAgent };
+    ids: gen, prompt_ids: q.has("pids") ? ids : undefined, max_ctx: e.max_ctx, text: out.textContent, tops, ua: navigator.userAgent };
   st.textContent = `${id}: ${__smoke.result.tokens_per_second} tok/s decode, prefill ${__smoke.result.prefill_tok_s} tok/s, open ${(open_ms / 1000).toFixed(1)} s, resident ${(e.resident_bytes / 1e9).toFixed(2)} GB`;
   e.free();
 } catch (err) { __smoke.errors.push(String(err.stack ?? err)); st.textContent = "ERROR " + (err.stack ?? err); __smoke.result = { error: String(err.message ?? err) }; }

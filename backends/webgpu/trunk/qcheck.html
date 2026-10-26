@@ -1,0 +1,55 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>trunk quant check</title></head>
+<body style="background:#111;color:#ddd;font:13px ui-monospace,monospace;white-space:pre-wrap">
+<div id="st">loading…</div>
+<script type="module">
+// qcheck: run the trunk GEMV and embedding-gather kernels on the first rows of GGUF tensors, for an outside reference to check.
+//   ?m=<file under /models/>&t=<tensor>,<tensor>&rows=16
+// window.__q = {results: {name: {type, K, rows, x_seed, y: [rows], row0: [K], rowN: [K]}}, errors}
+// x[i] = sin(0.731 i + 0.3) * (1 + 0.1 (i % 7)), as f32 (tools/qref.py builds the same vector).
+import { gguf_read } from "/engine/gguf.js";
+import * as K from "./trunk_kernels.js";
+import { iq_grids } from "./trunk_iq_grids.js";
+window.__q = { results: {}, errors: [] };
+const q = new URLSearchParams(location.search), st = document.getElementById("st");
+const url = "/models/" + q.get("m"), names = (q.get("t") ?? "").split(",").filter(Boolean), ROWS = Number(q.get("rows") ?? 16);
+const read = async (o, n) => { const r = await fetch(url, { headers: { range: `bytes=${o}-${o + n - 1}` } }); if (r.status !== 206) throw new Error("range read " + r.status); return new Uint8Array(await r.arrayBuffer()); };
+try {
+  const g = await gguf_read(read), by = new Map(g.tensors.map(t => [t.name, t]));
+  const adapter = await navigator.gpu.requestAdapter(), device = await adapter.requestDevice();
+  const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+  const buf = (bytes) => device.createBuffer({ size: Math.max(16, Math.ceil(bytes / 16) * 16), usage: SU });
+  const put = (data) => { const pad = new Uint8Array(Math.ceil(data.byteLength / 16) * 16 || 16); pad.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)); const b = buf(pad.byteLength); device.queue.writeBuffer(b, 0, pad); return b; };
+  const uni = (w) => { const b = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, new Uint32Array([...w, 0, 0, 0, 0, 0, 0, 0, 0].slice(0, 8))); return b; };
+  const grid = put(iq_grids());
+  async function readback(b, n) {
+    const r = device.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const e = device.createCommandEncoder(); e.copyBufferToBuffer(b, 0, r, 0, n * 4); device.queue.submit([e.finish()]);
+    await r.mapAsync(GPUMapMode.READ); const a = Array.from(new Float32Array(r.getMappedRange().slice(0))); r.unmap(); return a;
+  }
+  function run(code, entries, x, y = 1) {
+    const p = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" } });
+    const bg = device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: entries.map((b, i) => ({ binding: i, resource: { buffer: b } })) });
+    const e = device.createCommandEncoder(), pass = e.beginComputePass(); pass.setPipeline(p); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(x, y); pass.end(); device.queue.submit([e.finish()]);
+  }
+  for (const name of names) {
+    st.textContent = "checking " + name;
+    const t = by.get(name); if (!t) { __q.errors.push("no tensor " + name); continue; }
+    if (!K.TRUNK_QUANTS.includes(t.type)) { __q.errors.push(`${name}: ${t.type} not in TRUNK_QUANTS`); continue; }
+    const Kd = t.dims[0], all = t.dims.slice(1).reduce((a, b) => a * b, 1), R = Math.min(ROWS, all), rb = t.bytes / all;
+    const W = put(await read(t.abs, R * rb));
+    const xs = new Float32Array(Kd); for (let i = 0; i < Kd; i++) xs[i] = Math.sin(0.731 * i + 0.3) * (1 + 0.1 * (i % 7));
+    const X = put(xs), Y = buf(R * 4), withG = (e) => K.NEEDS_GRID.has(t.type) ? [...e, grid] : e;
+    run(K.gemv(t.type), withG([W, X, Y, uni([R, Kd, 0, 0, 0, Math.ceil(R / 8), 0, 0])]), Math.ceil(R / 8));
+    const y = await readback(Y, R), rows = {};
+    for (const r of [0, R - 1]) {
+      const ids = put(new Uint32Array([r, 0, 0, 0])), E = buf(Kd * 4);
+      run(K.embed(t.type), withG([W, ids, E, uni([Kd, 0, R, 0])]), Math.ceil(Kd / 256));
+      rows[r] = await readback(E, Kd);
+    }
+    __q.results[name] = { type: t.type, K: Kd, rows: R, y, row0: rows[0], rowN: rows[R - 1] };
+  }
+  st.textContent = "done: " + Object.keys(__q.results).length + " tensors";
+} catch (err) { __q.errors.push(String(err.stack ?? err)); st.textContent = "ERROR " + (err.stack ?? err); }
+document.title = "DONE";
+</script></body></html>

@@ -1,0 +1,4 @@
+q08b.gguf|code new [104.1, 100.8, 104.6] median 104.1 ids same as before: True
+q08b.gguf|code old [106.9, 104.5, 105.5] median 105.5 ids same as before: True
+q2b.gguf|code new [54, 53.7, 54] median 54 ids same as before: True
+q2b.gguf|code old [54.5, 54.4, 55] median 54.5 ids same as before: True

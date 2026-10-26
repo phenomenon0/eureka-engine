@@ -30,6 +30,37 @@ issues 413 GPU dispatches per token.
 `see`, `hear`, and `speak` use onnxruntime-web, not Bend WGSL, so they live
 with the app.
 
+## Models, formats, and context
+
+The trunk engine reads the model's shape from the GGUF and builds its kernels
+for it. `trunk_check(g)` says in sentences why a file can't run.
+
+| What | Accepted |
+|---|---|
+| Architectures | `qwen35` (every dense size: 0.8B, 2B, 4B, 9B, 27B, and Kev), `qwen35moe` (35B-A3B, 122B-A10B, 397B-A17B: softmax top-k routing, renormalized, plus the gated shared expert; separate or fused `gate_up` experts), `clef` |
+| Shapes | Head size any multiple of 32 up to 512; delta-net state 16 to 256 (a power of two); conv kernel 2 to 16; any head counts that divide; up to 1024 experts. NextN/MTP blocks are skipped. |
+| Weight formats | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely |
+| Context | Any length whose f16 KV buffer for one full-attention layer fits the GPU's binding limit (`e.max_ctx`; about 2 million tokens for the 0.8B on an RTX 3090). Attention is split-KV over 256-token chunks, dispatched for the tokens in use. |
+| Memory | The whole trunk is resident on the GPU; `trunk_resident(check, ctx)` estimates it. There is no offload. |
+
+`e.prefill(tokens)` runs a prompt in submissions of 64 tokens with no
+per-token readback. Each token is still one pass of the decode graph, so
+prompt speed is about decode speed.
+
+### Verification
+
+Receipts are in [`reports/webgpu-any-shape/`](../../reports/webgpu-any-shape/REPORT.md).
+
+| Check | Result |
+|---|---|
+| Kernels: `trunk/qcheck.html` against gguf-py's reference dequantizers (`tools/qref.py`) | 30/30 tensors over all 21 quantized and float formats: dequantized values equal, GEMV relative error ≤ 2.6e-6 |
+| Real models, greedy, 4 prompts x 64 tokens, against llama.cpp on the CPU | 0.8B, 2B, 4B, 9B: same first token every time; every divergence is a near tie in llama.cpp itself (top-2 gap ≤ 0.17 logit; the trunk's pick is its #2 or #3) |
+| Every format on the 0.8B | All 21 run. IQ1_S, IQ1_M, IQ2_XXS differ from llama.cpp's quantized-activation CPU path, but equal llama.cpp on the same weights dequantized to F32 (32/32 tokens) |
+| Random-weight files in shapes no release has: head 128, state 64, conv 3, 2 KV heads; MoE with 16 experts / 4 used and a shared expert, separate and fused | 24/24 greedy tokens equal to llama.cpp |
+| Old engine vs this one on the shapes the old one ran (0.8B, 2B, 4B, 9B) | Same ids 16/16; decode speed within 1.3% (interleaved medians) |
+| Needle in a long prompt, 0.8B, RTX 3090 | Found at 20,973 tokens (129 s prefill) and 153,352 tokens (1,586 s prefill, 49 tok/s decode after) |
+| Chrome on an M3 Ultra (Metal) | 0.8B, 2B, 4B, 9B, five formats, and the synthetic dense and MoE files run; 0.8B 169 tok/s, 9B 36 tok/s |
+
 ## Layout
 
 | Path | Contents |
@@ -39,6 +70,8 @@ with the app.
 | `emit/` | WGSL kernels for the 4B engine in `engine/`. |
 | `tools/serve.mjs` | Static server with byte ranges and COOP/COEP headers. |
 | `tools/run_chat.mjs` | Playwright driver that loads a page N times and print the results as JSON. |
+| `trunk/qcheck.html`, `tools/qref.py` | Kernel check: runs the GEMV and embedding kernels on GGUF tensors; `qref.py` compares them with gguf-py's reference dequantizers. |
+| `trunk/trunk_iq_grids.js` | The IQ quant codebooks from ggml (MIT), as one table. |
 
 ## Requirements
 
