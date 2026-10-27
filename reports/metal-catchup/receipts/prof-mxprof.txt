@@ -1,0 +1,8 @@
+mxprof trunk   n   1920 total   267.001 ms mean   139.06 us
+mxprof addrms  n   1920 total    15.908 ms mean     8.29 us
+mxprof rdot    n   1920 total    18.139 ms mean     9.45 us
+mxprof route   n   1920 total    72.594 ms mean    37.81 us
+mxprof gu      n   1920 total   322.305 ms mean   167.87 us
+mxprof gus     n   1920 total    39.004 ms mean    20.31 us
+mxprof dn      n   1920 total   252.202 ms mean   131.36 us
+mxprof tail    n   1920 total    15.937 ms mean     8.30 us

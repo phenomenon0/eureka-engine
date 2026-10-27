@@ -256,9 +256,12 @@ dense range.
 ## Any MoE
 
 The default build also applies `cc/metal-moe-cc.patch` and
-`engine/metal-moe-engine.patch` (emitted C `a20c8ee2…`). `LLB_METAL_ANY=1`
-stops before them (the any-shape build, `00979448`); `VISION=1` does not take
-them. They run any `qwen35moe` GGUF on the generic pass:
+`engine/metal-moe-engine.patch`, then `cc/metal-catchup-cc.patch` and
+`engine/metal-catchup-engine.patch` (emitted C `5a766ce4…`;
+`LLB_METAL_MOE1=1` stops before the catch-up patches: the first MoE build,
+`a20c8ee2`). `LLB_METAL_ANY=1` stops before both (the any-shape build,
+`00979448`); `VISION=1` does not take them. They run any `qwen35moe` GGUF on
+the generic pass:
 
 - **Sidecar.** `gguf2pack MODEL.gguf --sidecar-only DIR --target metal`
   takes a `qwen35moe` GGUF (without `--target metal` it writes the CUDA
@@ -286,14 +289,40 @@ them. They run any `qwen35moe` GGUF on the generic pass:
   `LLB_MX_STREAM=1` forces streaming (tests). `LLB_MX_DUMP=FILE` writes each
   layer's FFN input, output and routing for the float64 oracle in
   `reports/metal-moe/`.
-- **Arithmetic** (llama.cpp's order): router `ffn_gate_inp · x`, softmax over
-  every expert, top-k (ties to the lowest id), the k weights renormalized,
-  no weight scale; expert `down(silu(gate · x) * (up · x))`, summed in rank
-  order; the shared expert's SwiGLU times `sigmoid(ffn_gate_inp_shexp · x)`,
-  added last. Not byte-exact to anything: a numerics-changing path.
+- **Arithmetic** (llama.cpp's operations): router `ffn_gate_inp · x`,
+  softmax over every expert, top-k (ties to the lowest id), the k weights
+  renormalized, no weight scale; expert `down(silu(gate · x) * (up · x))`
+  weighted and summed; the shared expert's SwiGLU times
+  `sigmoid(ffn_gate_inp_shexp · x)`. Not byte-exact to anything: a
+  numerics-changing path.
+- **Decode kernels** (catch-up). Per layer: `[router | shared gate/up]`,
+  `[routing | shared down]`, routed gate/up, routed down + combine, each a
+  dispatch (the pairs in brackets run side by side). The routing is one
+  threadgroup (top-k by rank counting, no reduction rounds); a row dot is cut
+  into 256-column units of 8 lanes with the dense path's fused K-quant
+  leaves (Q4_K, Q5_K, Q6_K; Q8_0 a 32-column block a lane; F32 / F16 / BF16
+  the generic chunk); `exp` is the hardware's `precise::exp`. The trunk
+  GEMVs of a MoE model (not of a dense one) take the same unit bodies
+  (`LLB_MX_TRUNK=0`: the dense bodies). `LLB_MX_V1=1` selects the first MoE
+  build's kernels and schedule (its bits, exactly). `LLB_MX_PROF=1` cuts the
+  command buffer after every stage and prints each stage's GPU time at exit
+  (a diagnostic: same bits, slower).
+- **Fast prefill chunk** (catch-up). The generic chunk (up to 512 tokens,
+  the default for prompts of 13 or more ids, as the dense shapes) runs a MoE
+  layer's FFN batched: the router for all tokens, the routing per token, a
+  GPU grouping of the (token, slot) entries by expert, the routed gate/up
+  and down as gathered simdgroup-matrix GEMMs (64 weight rows x 32 entries,
+  f32 operands; Q8_0, Q4_K, Q5_K, Q6_K experts), the shared expert on the
+  dense chunk's GEMMs, then the weighted combine. The chunk attention takes
+  GQA 8 (`llb_f8_attn*`; the 35B-A3B's 16 q heads over 2 kv heads). With
+  streamed experts each layer of a chunk reads its grouping back and copies
+  every expert some token chose into a whole-layer staging. Other expert
+  formats are refused by name in the chunk (run them with `--exactpf`).
+  `--exactpf` keeps the exact per-token prefill.
+- **Streamed decode** copies the chosen experts on all cores (pieces of 256
+  KiB) and commits each layer's routed part as soon as it is encoded.
 - **Context.** The dense path's: up to 2^27 slots, bounded by the largest
-  buffer (`--ctx C`, `@FILE`). Prefill is exact, one token at a time: there
-  is no MoE fast chunk, and `--fastpf` is ignored for these models.
+  buffer (`--ctx C`, `@FILE`).
 
 Checked on the M3 Ultra, 2026-10-26 (receipts: `reports/metal-moe/`):
 
@@ -327,11 +356,28 @@ Checked on the M3 Ultra, 2026-10-26 (receipts: `reports/metal-moe/`):
   131k, the generic attention's cost doubling with each power of two). With
   `--ctx 1048576` the first 16 ids equal the default capacity's; `--ctx
   16777216` is refused (642.19 GiB needed, the largest buffer is 58.32 GiB).
-- **Speed.** 35B decode 21.6 ms a token at short context (resident experts;
-  streamed about 15% slower); llama.cpp `e70802a01` on Metal: 86.3 tok/s
-  (11.6 ms, `llama-bench -n 64`). Prefill is one token at a time.
+- **Speed** (first MoE build). 35B decode 21.6 ms a token at short context;
+  prefill one token at a time.
 
-Not done: a MoE fast prefill chunk; a 122B-A10B or 397B-A17B run (no file on
+Catch-up, checked on the M3 Ultra, 2026-10-27 (receipts:
+`reports/metal-catchup/`; medians of 3 interleaved rounds, llama.cpp
+`e70802a01` on Metal):
+
+| 35B-A3B Q4_K_S | Before (`a20c8ee2`) | After (`5a766ce4`) | llama.cpp Metal |
+|---|---|---|---|
+| Decode, resident | 21.8 ms (45.9 tok/s) | 10.15 ms (98.5 tok/s) | 86.3 tok/s (tg128) |
+| Decode, streamed (`LLB_MX_STREAM=1`) | 44.2 ms | 27.2 ms | — |
+| Prefill, 4,096 ids | 41.7 tok/s (exact) | 1,251 tok/s | 1,707 tok/s (pp4096) |
+| Needle, 153,352 ids | 14,908 s | 599 s | — |
+
+Quality: teacher-forced top-1 against llama.cpp CPU 187/192, the same five
+positions as llama.cpp's own Metal path; the MoE FFN (decode kernels and the
+fast chunk) against the float64 oracle at most 2.1e-6, the chosen experts
+equal on every record; dense 4B / 9B ids and logits unchanged; split,
+streamed and resident give the same bits, and `LLB_MX_V1=1` gives the first
+MoE build's bits.
+
+Not done: a 122B-A10B or 397B-A17B run (no file on
 the test Mac; the split and streamed paths that such a model takes were
 forced on small ones); BF16 or IQ-format trunk tensors; the served
 `generate` route (`llb-serve`) on a MoE model.

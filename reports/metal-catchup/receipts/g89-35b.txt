@@ -1,0 +1,10 @@
+G8 Qwen3.5-35B-A3B-Q4_K_S p2.ids resident:          ids 4067c8491eafb08a logits 3acdc9ea49c55b82
+G8 Qwen3.5-35B-A3B-Q4_K_S p2.ids LLB_MX_SPLIT=3: ids 4067c8491eafb08a logits 3acdc9ea49c55b82 same=YES
+G8 Qwen3.5-35B-A3B-Q4_K_S p2.ids LLB_MX_STREAM=1: ids 4067c8491eafb08a logits 3acdc9ea49c55b82 same=YES
+G9 Qwen3.5-35B-A3B-Q4_K_S p2.ids LLB_X=0: base ids 4067c8491eafb08a logits 34a9b967b3d6c077 | final+V1 ids 4067c8491eafb08a logits 34a9b967b3d6c077 same=YES
+G9 Qwen3.5-35B-A3B-Q4_K_S p2.ids LLB_MX_STREAM=1: base ids 4067c8491eafb08a logits 34a9b967b3d6c077 | final+V1 ids 4067c8491eafb08a logits 34a9b967b3d6c077 same=YES
+G8 Qwen3.5-35B-A3B-Q4_K_S pp1000.ids resident:          ids 65d9743c1b0c13c4 logits 0b1577d687f41664
+G8 Qwen3.5-35B-A3B-Q4_K_S pp1000.ids LLB_MX_SPLIT=3: ids 65d9743c1b0c13c4 logits 0b1577d687f41664 same=YES
+G8 Qwen3.5-35B-A3B-Q4_K_S pp1000.ids LLB_MX_STREAM=1: ids 65d9743c1b0c13c4 logits 0b1577d687f41664 same=YES
+G9 Qwen3.5-35B-A3B-Q4_K_S pp1000.ids LLB_X=0: base ids 65d9743c1b0c13c4 logits a8754fbb2798c397 | final+V1 ids 65d9743c1b0c13c4 logits a8754fbb2798c397 same=YES
+G9 Qwen3.5-35B-A3B-Q4_K_S pp1000.ids LLB_MX_STREAM=1: base ids 65d9743c1b0c13c4 logits a8754fbb2798c397 | final+V1 ids 65d9743c1b0c13c4 logits a8754fbb2798c397 same=YES

@@ -1,0 +1,21 @@
+round 1 engine decode: 10.101 ms (119 steps)
+round 1 llama.cpp tg128:          86.10 ± 1.13 
+round 1 engine prefill pp4096: 3279 ms raw 4739 (chunks 4727 + last step 12 - pool 1460) = 1249.2 tok/s
+round 1 llama.cpp pp4096:        1702.92 ± 6.77 
+round 1 engine streamed decode: 27.202 ms (119 steps)
+round 1 base decode: 21.815 ms (119 steps)
+round 1 base streamed decode: 43.731 ms (119 steps)
+round 2 engine decode: 10.244 ms (119 steps)
+round 2 llama.cpp tg128:          86.30 ± 0.94 
+round 2 engine prefill pp4096: 3273 ms raw 4883 (chunks 4870 + last step 13 - pool 1610) = 1251.5 tok/s
+round 2 llama.cpp pp4096:        1706.95 ± 2.10 
+round 2 engine streamed decode: 27.227 ms (119 steps)
+round 2 base decode: 21.798 ms (119 steps)
+round 2 base streamed decode: 44.454 ms (119 steps)
+round 3 engine decode: 10.151 ms (119 steps)
+round 3 llama.cpp tg128:          85.77 ± 1.54 
+round 3 engine prefill pp4096: 3275 ms raw 4685 (chunks 4672 + last step 13 - pool 1410) = 1250.7 tok/s
+round 3 llama.cpp pp4096:        1707.43 ± 1.70 
+round 3 engine streamed decode: 27.353 ms (119 steps)
+round 3 base decode: 21.798 ms (119 steps)
+round 3 base streamed decode: 44.235 ms (119 steps)

@@ -140,8 +140,14 @@ bounds it:
   experts of each layer copied to staging each token). `LLB_MX_SPLIT=N` and
   `LLB_MX_STREAM=1` force the split and streamed paths (same bits as
   resident). One expert must fit one buffer (k of them when streamed).
-- **Refused / not done:** fast prefill (exact per-token prefill; `--fastpf`
-  is ignored for these files), the split path (`--emit`, `--lpb` < layers),
+- **Speed** ([reports/metal-catchup](../reports/metal-catchup/REPORT.md)):
+  35B-A3B Q4_K_S decode 10.15 ms a token (llama.cpp Metal 86.3 tok/s =
+  11.6 ms), streamed 27.2 ms; the fast prefill chunk (batched router,
+  gather-by-expert GEMMs, GQA 8 chunk attention) 1,251 tok/s on 4,096 ids
+  (llama.cpp Metal 1,707). The chunk takes Q8_0 / Q4_K / Q5_K / Q6_K
+  experts (others: `--exactpf`) and the dense chunk's attention rule (GQA 4,
+  6 or 8 over 2 or 4 kv heads; other shapes prefill exactly).
+- **Refused / not done:** the split path (`--emit`, `--lpb` < layers),
   `VISION=1` builds. No 122B-A10B or 397B-A17B file was run.
 
 ### Bigger models (above 27B)
@@ -204,8 +210,8 @@ bounds it:
   The CLI takes `@FILE` for prompts past the OS argument limit; the
   `generate` request of `link/dual.c` and `server/src/dualm.c` takes prompts
   up to the KV capacity. `decide` keeps CLEF's 16,384 budget. MoE models on
-  the general path have the same range (the 35B-A3B found a needle at 153,352 tokens; `--ctx 1048576` runs, `--ctx 16777216` is refused with the 642 GiB it needs); their prefill is exact,
-  one token at a time (no MoE fast chunk). The registered 35B pack's own arm
+  the general path have the same range (the 35B-A3B found a needle at 153,352 tokens; `--ctx 1048576` runs, `--ctx 16777216` is refused with the 642 GiB it needs); a 153,352-token prompt
+  prefills in 599 s through the MoE fast chunk (14,908 s exact). The registered 35B pack's own arm
   stays at 2^17.
 - **CPU:** KV capacity is fixed at launch; prompts are capped at 16,384
   tokens in `kev.c`.
@@ -222,8 +228,8 @@ bounds it:
 
 | Engine | Change | Class |
 |---|---|---|
-| Metal | Fast chunk attention for GQA other than 4 and 6, or more than 4 KV heads | Kernel |
-| Metal | A fast prefill chunk for the general MoE path (grouped expert GEMM); faster MoE decode kernels | Kernel |
+| Metal | Fast chunk attention for GQA other than 4, 6 and 8, or more than 4 KV heads | Kernel |
+| Metal | Streamed MoE decode: prefetch the next layer's likely experts during attention (the copy now idles the GPU) | Kernel |
 | CUDA, Metal | Instantiate head_dim 128 and SSM state 64; rope base, eps as kernel arguments | Kernel |
 | CUDA, Metal | f16 KV (CUDA now allocates f32 KV by position) | Kernel |
 | WebGPU shipped | Use the in-place KV write for decode | Cap |
@@ -252,6 +258,12 @@ bounds it:
   (teacher-forced top-1 187/192 for both); the MoE FFN matches a float64
   oracle to 1e-6. Dense 4B / 9B ids and logits unchanged
   ([report](../reports/metal-moe/REPORT.md)).
+- **Metal MoE catch-up** (`backends/metal/cc/metal-catchup-cc.patch`,
+  `engine/metal-catchup-engine.patch`): new decode kernels and a MoE fast
+  prefill chunk. 35B-A3B decode 21.8 → 10.15 ms (1.14× llama.cpp Metal),
+  prefill 41.7 → 1,251 tok/s on 4,096 ids (0.73×); the same 187/192
+  teacher-forced agreement as llama.cpp's Metal path
+  ([report](../reports/metal-catchup/REPORT.md)).
 - **CUDA MoE speed** ([report](../reports/cuda-moe-speed/REPORT.md)):
   - What changed: bit-exact expert kernels, fused launches and CUDA graphs. The stream residency now copies
     through pinned memory with threads.

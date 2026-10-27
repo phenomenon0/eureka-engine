@@ -1,0 +1,54 @@
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 1 engine decode: 
+round 1 llama.cpp tg128:          84.93 ± 0.49 
+awk: can't open file $1=="chunkf" {c+=$4} $1=="step" && $2==n-1 {s=$3} /^mx pool/ {match($0, /, [0-9.]+ s$/); l=substr($0, RSTART+2, RLENGTH-4)*1000}
+    END {printf "%.0f ms raw %.0f (chunks %.0f + last step %.0f - pool %.0f) = %.1f tok/s", c+s-l, c+s, c, s, l, n*1000/(c+s-l)}
+ source line number 1
+round 1 engine prefill pp4096: 
+round 1 llama.cpp pp4096:        1708.83 ± 2.33 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 1 engine streamed decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 1 base decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 1 base streamed decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 2 engine decode: 
+round 2 llama.cpp tg128:          86.19 ± 1.29 
+awk: can't open file $1=="chunkf" {c+=$4} $1=="step" && $2==n-1 {s=$3} /^mx pool/ {match($0, /, [0-9.]+ s$/); l=substr($0, RSTART+2, RLENGTH-4)*1000}
+    END {printf "%.0f ms raw %.0f (chunks %.0f + last step %.0f - pool %.0f) = %.1f tok/s", c+s-l, c+s, c, s, l, n*1000/(c+s-l)}
+ source line number 1
+round 2 engine prefill pp4096: 
+round 2 llama.cpp pp4096:        1707.46 ± 2.43 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 2 engine streamed decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 2 base decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 2 base streamed decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 3 engine decode: 
+round 3 llama.cpp tg128:          86.11 ± 0.59 
+awk: can't open file $1=="chunkf" {c+=$4} $1=="step" && $2==n-1 {s=$3} /^mx pool/ {match($0, /, [0-9.]+ s$/); l=substr($0, RSTART+2, RLENGTH-4)*1000}
+    END {printf "%.0f ms raw %.0f (chunks %.0f + last step %.0f - pool %.0f) = %.1f tok/s", c+s-l, c+s, c, s, l, n*1000/(c+s-l)}
+ source line number 1
+round 3 engine prefill pp4096: 
+round 3 llama.cpp pp4096:        1706.73 ± 2.67 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 3 engine streamed decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 3 base decode: 
+awk: can't open file $1=="step" && $2>=n {k++; if (k>8 && k<=128) {s+=$3; c++}} END {printf "%.3f ms (%d steps)", s/c, c}
+ source line number 1
+round 3 base streamed decode: 

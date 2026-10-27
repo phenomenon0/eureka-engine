@@ -1,0 +1,20 @@
+G8 s128x8b-Q4_K_M p2.ids resident:          ids 2112c1027f484d74 logits bdd7300b02778390
+G8 s128x8b-Q4_K_M p2.ids LLB_MX_SPLIT=3: ids 2112c1027f484d74 logits bdd7300b02778390 same=YES
+G8 s128x8b-Q4_K_M p2.ids LLB_MX_STREAM=1: ids 2112c1027f484d74 logits bdd7300b02778390 same=YES
+G9 s128x8b-Q4_K_M p2.ids LLB_X=0: base ids 2112c1027f484d74 logits 0ddd2a5928f09947 | final+V1 ids 2112c1027f484d74 logits 0ddd2a5928f09947 same=YES
+G9 s128x8b-Q4_K_M p2.ids LLB_MX_STREAM=1: base ids 2112c1027f484d74 logits 0ddd2a5928f09947 | final+V1 ids 2112c1027f484d74 logits 0ddd2a5928f09947 same=YES
+G8 s60x6-Q4_K_M p2.ids resident:          ids a5692c90333122aa logits e08e40ed7a7eed11
+G8 s60x6-Q4_K_M p2.ids LLB_MX_SPLIT=3: ids a5692c90333122aa logits e08e40ed7a7eed11 same=YES
+G8 s60x6-Q4_K_M p2.ids LLB_MX_STREAM=1: ids a5692c90333122aa logits e08e40ed7a7eed11 same=YES
+G9 s60x6-Q4_K_M p2.ids LLB_X=0: base ids a5692c90333122aa logits a755ca0deb06222e | final+V1 ids a5692c90333122aa logits a755ca0deb06222e same=YES
+G9 s60x6-Q4_K_M p2.ids LLB_MX_STREAM=1: base ids a5692c90333122aa logits a755ca0deb06222e | final+V1 ids a5692c90333122aa logits a755ca0deb06222e same=YES
+G8 s40x5f-Q4_K_M p2.ids resident:          ids 055db73fe062f149 logits bf8225b0ab1f872b
+G8 s40x5f-Q4_K_M p2.ids LLB_MX_SPLIT=3: ids 055db73fe062f149 logits bf8225b0ab1f872b same=YES
+G8 s40x5f-Q4_K_M p2.ids LLB_MX_STREAM=1: ids 055db73fe062f149 logits bf8225b0ab1f872b same=YES
+G9 s40x5f-Q4_K_M p2.ids LLB_X=0: base ids 055db73fe062f149 logits cdf471b94e878a98 | final+V1 ids 055db73fe062f149 logits cdf471b94e878a98 same=YES
+G9 s40x5f-Q4_K_M p2.ids LLB_MX_STREAM=1: base ids 055db73fe062f149 logits cdf471b94e878a98 | final+V1 ids 055db73fe062f149 logits cdf471b94e878a98 same=YES
+G8 s40x5f-Q8_0 p2.ids resident:          ids e61efee08ef91cbf logits 7f65a0dc097d66ba
+G8 s40x5f-Q8_0 p2.ids LLB_MX_SPLIT=3: ids e61efee08ef91cbf logits 7f65a0dc097d66ba same=YES
+G8 s40x5f-Q8_0 p2.ids LLB_MX_STREAM=1: ids e61efee08ef91cbf logits 7f65a0dc097d66ba same=YES
+G9 s40x5f-Q8_0 p2.ids LLB_X=0: base ids e61efee08ef91cbf logits d458ef05aa2dd853 | final+V1 ids e61efee08ef91cbf logits d458ef05aa2dd853 same=YES
+G9 s40x5f-Q8_0 p2.ids LLB_MX_STREAM=1: base ids e61efee08ef91cbf logits d458ef05aa2dd853 | final+V1 ids e61efee08ef91cbf logits d458ef05aa2dd853 same=YES

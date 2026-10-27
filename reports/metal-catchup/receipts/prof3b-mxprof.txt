@@ -1,0 +1,12 @@
+mxprof trunkL  n   1440 total   194.079 ms mean   134.78 us
+mxprof addrms  n   1920 total    16.291 ms mean     8.48 us
+mxprof sgu     n   1920 total    26.950 ms mean    14.04 us
+mxprof sdn     n   1920 total    18.681 ms mean     9.73 us
+mxprof gu      n   1920 total    63.586 ms mean    33.12 us
+mxprof route   n   1920 total    24.094 ms mean    12.55 us
+mxprof dn      n   1920 total    42.547 ms mean    22.16 us
+mxprof tail    n   1920 total    16.046 ms mean     8.36 us
+mxprof trunkF  n    480 total    71.863 ms mean   149.71 us
+mxprof rdot    n   1920 total    16.951 ms mean     8.83 us
+mxprof x       n      0 total     0.000 ms mean     0.00 us
+mxprof y       n      0 total     0.000 ms mean     0.00 us

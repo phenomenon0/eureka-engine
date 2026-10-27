@@ -1,0 +1,1 @@
+{"variant": "final", "ref": "llama.cpp CPU", "model": "Qwen3.5-35B-A3B-Q4_K_S", "prompt": "runs/pf2k.ids", "n": 64, "rc": 0, "first_equal": true, "free_prefix": 64, "tf_agree": 64, "tf_rate": 1.0, "max_dis_margin": 0, "dlogit_mean": 0.1898, "dlogit_max": 0.9837, "disagreements": [], "wall": ["wall_ms 4294"]}
