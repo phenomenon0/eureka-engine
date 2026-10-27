@@ -1,0 +1,1 @@
+6cb9e03f18567a9e927dc084a9fdb6e35b0fcc7706f51aa9874fce230c0e9874  /dev/shm/cuda-moe-speed/gate/s60-q8.gguf

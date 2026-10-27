@@ -1,0 +1,1 @@
+moe: 4 layers, experts 3.19 GiB -> stream (mmapped GGUF, the k experts copied per token) [free VRAM 0.93 GiB (LLB_MOE_VRAM), MemAvailable 0.93 GiB (LLB_MOE_RAM)]

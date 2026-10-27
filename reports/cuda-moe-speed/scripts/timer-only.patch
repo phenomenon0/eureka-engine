@@ -1,0 +1,22 @@
+--- a/host/llb_host.c
++++ b/host/llb_host.c
+@@ -2702,6 +2702,19 @@
+   if (fold && pf_take(o, pos, dT, sh, yp)) {
+     return;
+   }
++  if (fold && getenv("LLB_STEP_US") != NULL) {
++    // LLB_STEP_US (reports/cuda-moe-speed): `stepus POS US` on stderr, the microseconds since the
++    // previous folded step began (the whole token period: the Bend loop, the pass and the head);
++    // timing only, nothing else changes
++    static struct timespec sp;
++    struct timespec tn;
++    clock_gettime(CLOCK_MONOTONIC, &tn);
++    if (sp.tv_sec != 0) {
++      fprintf(stderr, "stepus %u %lld\n", pos,
++        (long long)(tn.tv_sec - sp.tv_sec) * 1000000 + (tn.tv_nsec - sp.tv_nsec) / 1000);
++    }
++    sp = tn;
++  }
+   if (fold) {
+     llb_graph_begin();
+     // the folded step: the token's embedding row into pass_x[0] (o->bb its

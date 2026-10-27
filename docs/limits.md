@@ -92,6 +92,20 @@ skipped; checked on synthetic random-weight files against llama.cpp
   a k-slot VRAM staging area each token; disk and page-cache speed).
   `LLB_MOE_EXPERTS` forces a residency; `LLB_MOE_VRAM` / `LLB_MOE_RAM` stand
   in for the free amounts. One GPU only.
+- **Speed** ([reports/cuda-moe-speed](../reports/cuda-moe-speed/REPORT.md); synthetic 4-layer 35B-A3B-like
+  Q4_K_M; decode tok/s):
+
+  | residency | engine | llama.cpp |
+  |---|---|---|
+  | device | 807 | 1772 (CUDA), 0.46x |
+  | host | 252 | 536 (experts on CPU, `-ot exps=CPU`) |
+  | stream | 207 | — |
+
+  - Each added MoE layer costs 154 us, against llama.cpp's 122 us.
+  - What bounds the device figure is the engine's fixed per-token loop, about 0.8 ms. The dense models pay it
+    too.
+  - The host residency runs at the PCIe read rate: about 60 MB of chosen experts per token over the bus.
+  - Prefill goes one token at a time: 755 tok/s, against llama.cpp's batched 26,596.
 - **Refused:** fast prefill (the MoE file runs the exact tier, with a stderr
   note), `LLB_SPEC`, `LLB_MTP`, `LLB_BATCH`, the split path (`--emit`,
   `--lpb` < layers), and the pack path (the experts load from `LLB_GGUF`).
@@ -238,6 +252,12 @@ bounds it:
   (teacher-forced top-1 187/192 for both); the MoE FFN matches a float64
   oracle to 1e-6. Dense 4B / 9B ids and logits unchanged
   ([report](../reports/metal-moe/REPORT.md)).
+- **CUDA MoE speed** ([report](../reports/cuda-moe-speed/REPORT.md)):
+  - What changed: bit-exact expert kernels, fused launches and CUDA graphs. The stream residency now copies
+    through pinned memory with threads.
+  - Decode on the device: 589 → 807 tok/s.
+  - Stream: 128 → 207 tok/s.
+  - The bits are identical to the earlier build.
 - **Metal any-shape** (`backends/metal/cc/metal-anyshape-cc.patch`,
   `engine/metal-anyshape-engine.patch`, `link/dual-anyshape.patch`): any
   dense Qwen3.5 quant-pack shape (structural manifest check), any KV-head

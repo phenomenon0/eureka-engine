@@ -36,7 +36,21 @@ tools/run27b.sh --gguf MODEL.gguf --gpu 40GB --threads 16 -- SIDECAR 760 6511 31
   three give the same bits. Checked against llama.cpp on synthetic files only
   (no real MoE checkpoint was loaded): [reports/cuda-moe](../../reports/cuda-moe/REPORT.md).
   MoE runs the exact tier (fast prefill, spec, batch, MTP are dense only)
-  and the folded step (no `--emit`).
+  and the folded step (no `--emit`). Each step runs as a CUDA graph unless
+  `LLB_GRAPH` is set.
+- **MoE speed:** these are 4-layer synthetic Q4_K_M files, decode tok/s, medians of 3 interleaved rounds. The MoE
+  kernels are bit-exact with the earlier build.
+
+  | file | device | host | stream | llama.cpp CUDA |
+  |---|---|---|---|---|
+  | 35B-A3B-like (256 experts, top-8) | 807 | 252 | 207 | 1772 |
+  | 128 experts, top-8, fused gate/up | 917 | 324 | 308 | 2196 |
+
+  - Device is 0.46x llama.cpp on the 35B-like file. About 0.8 ms of each 1.24 ms token is the engine's fixed
+    per-token loop, which the dense models share.
+  - Per added MoE layer the cost is 154 us, against 122 us for llama.cpp (1.26x).
+  - Prompts run one token at a time.
+  - Details: [reports/cuda-moe-speed](../../reports/cuda-moe-speed/REPORT.md).
 - **Not on every shape:** `LLB_SPEC`, `LLB_MTP`, and `LLB_BATCH` run on the
   9B and 27B shapes only (d_model 4096 / 5120, 4 KV heads, context up to
   131,072); elsewhere they are refused.

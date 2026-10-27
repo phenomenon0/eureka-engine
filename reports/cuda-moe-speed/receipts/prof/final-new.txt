@@ -1,0 +1,25 @@
+median period 1514.2 us: pass span 632.2 us, outside the pass 880.2 us
+steps 121 (skip 10): median wall 1514.2 us, median GPU busy 1014.7 us, gaps 499.5 us, launches/step 113
+  bend_dev                        329.7 us/step  x16
+  llb_warp_q4k                    200.0 us/step  x21
+  llb_moe_gu                       99.6 us/step  x4
+  llb_moe_dn                       70.6 us/step  x4
+  llb_warp_q6k                     51.7 us/step  x3
+  memcpy                           43.3 us/step  x26
+  llb_moe_topk                     37.1 us/step  x4
+  llb_warp                         24.1 us/step  x4
+  llb_attn4                        22.7 us/step  x1
+  llb_rmsnorm_add                  16.9 us/step  x4
+  llb_embedk                       16.3 us/step  x1
+  llb_rmsnorm                      16.3 us/step  x5
+  llb_gated_delta                  12.5 us/step  x3
+  llb_qkr                          12.1 us/step  x2
+  llb_midconv                      12.1 us/step  x3
+  llb_deliver                      11.0 us/step  x1
+  llb_mail                          9.8 us/step  x2
+  llb_gated_rmsnorm                 9.0 us/step  x3
+  llb_outputgate                    6.9 us/step  x1
+  llb_l2norm_qk                     5.5 us/step  x3
+  llb_amax_part                     3.3 us/step  x1
+  llb_amax                          2.6 us/step  x1
+  llb_slot                          2.2 us/step  x2

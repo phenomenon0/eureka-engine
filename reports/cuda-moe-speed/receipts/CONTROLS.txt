@@ -1,0 +1,5 @@
+s35-q4km C vs Mrev: 0/6 identical
+subtle mutant (gate/up groups reversed in a unit) vs candidate, S35 Q4_K_M TF: 169/206 positions with a different top-1 logit line; top-1 id equal 206/206; rms top-1 logit difference 0.000003
+s512-q8 C vs Mlow: 0/6 identical
+G-X s512-q8 candidate Mlow: top-1 = X 11/192; rms(C - X) 1.3663 vs rms(R - X) 0.3433 -> (i) FAIL
+G-X VERDICT FAIL

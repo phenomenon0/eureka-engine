@@ -1,0 +1,1 @@
+90723713f979fe203525088f5ab6b6fdcab821b71c32efe66ea13a2abe443a29  /dev/shm/cuda-moe-speed/gate/s512-q5km.gguf

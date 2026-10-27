@@ -1,0 +1,1 @@
+736529f53b11bae7583746a98987778d04015335598f2f882cf579f41363ea17  /dev/shm/cuda-moe-speed/gate/s128f-q4km.gguf

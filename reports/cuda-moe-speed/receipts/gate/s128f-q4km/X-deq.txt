@@ -1,0 +1,2 @@
+wrote /dev/shm/.../s128f-q4km-f32.gguf
+-rw-r--r-- 6296597440 Oct 27 03:35 /dev/shm/.../s128f-q4km-f32.gguf

@@ -1,0 +1,1 @@
+d844c1e1110280c40c06c3be06e810ac8112e5cf77df9c583fbf33c0b4484ed6  /dev/shm/cuda-moe-speed/gate/s512-q8.gguf

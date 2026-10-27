@@ -1,0 +1,1 @@
+subtle mutant (gate/up groups reversed in a unit) vs candidate, S35 Q4_K_M TF: 169/206 positions with a different top-1 logit line; top-1 id equal 206/206; rms top-1 logit difference 0.000003
