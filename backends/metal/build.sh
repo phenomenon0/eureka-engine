@@ -11,8 +11,11 @@
 #   4. emit C (platform-independent); on Darwin also link sys1mac exactly as engine-vision3/mac/build.sh
 #   5. (default) cc/metal-anyshape-cc.patch + engine/metal-anyshape-engine.patch: any Qwen3.5 dense shape and any
 #      context (docs/limits.md); LLB_METAL_BASE=1 leaves them out and reproduces the product hashes above
+#   6. (default) cc/metal-moe-cc.patch + engine/metal-moe-engine.patch: any qwen35moe shape on the general MoE path
+#      (README.md "Any MoE"); LLB_METAL_ANY=1 stops after step 5 (the any-shape build, emitted C 00979448), and so
+#      does VISION=1
 # Env: LLB_ROOT, LLB_BEND (Bend checkout), LLB_OUT (default $LLB_ROOT/build/metal), VISION, LLB_METAL_EMIT_ONLY,
-#      LLB_METAL_BASE.
+#      LLB_METAL_BASE, LLB_METAL_ANY.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LLB_ROOT=${LLB_ROOT:-$(cd -- "$here/../.." && pwd)}
@@ -26,6 +29,8 @@ EXPECT_C_VISION=fbdefec75fe9f02a1f85e5bc8b7a3f1f461a8501c47db51dd8e0f454cd25f10a
 # the same with the any-shape patches (the default build)
 EXPECT_C_ANY=009794484c3860bd111eb131a9fc1d73f995a031ee81114847ecfc221b93fb55
 EXPECT_C_ANY_VISION=85c8d3c489dda683d5bbd12b8928e2645a6268efdec6871d3e755fd1d6c56447
+# the same with the general MoE patches too (the default build; VISION=1 does not take them)
+EXPECT_C_MOE=add7f6f6a5f3f878592b8cdd5150b7a65ad450f32cb72c9c78404927b1c7be5e
 die() { echo "backends/metal/build.sh: $*" >&2; exit 1; }
 BUN=$(command -v bun || echo "$HOME/.bun/bin/bun"); [ -x "$BUN" ] || die "missing tool: bun"
 (cd "$here" && sha256sum -c --quiet SHA256SUMS 2>/dev/null || shasum -a 256 -c --quiet SHA256SUMS) \
@@ -67,6 +72,12 @@ if [ -z "${LLB_METAL_BASE:-}" ]; then
   patch --batch --silent --fuzz=0 -d "$LLB_OUT/tree" -p1 < "$here/engine/metal-anyshape-engine.patch" \
     || die "metal-anyshape-engine"
   expect=$([ -n "${VISION:-}" ] && echo "$EXPECT_C_ANY_VISION" || echo "$EXPECT_C_ANY")
+  # (the vision patches move host/llb_gguf.c: a VISION=1 build stays the any-shape build)
+  if [ -z "${LLB_METAL_ANY:-}" ] && [ -z "${VISION:-}" ]; then
+    patch --batch --silent --fuzz=0 -d "$LLB_OUT/cc" -p1 < "$here/cc/metal-moe-cc.patch" || die "metal-moe-cc"
+    patch --batch --silent --fuzz=0 -d "$LLB_OUT/tree" -p1 < "$here/engine/metal-moe-engine.patch" || die "metal-moe-engine"
+    expect=$EXPECT_C_MOE
+  fi
 fi
 find "$LLB_OUT/cc" "$LLB_OUT/tree" -name '*.orig' -delete
 (cd "$LLB_OUT/tree" && BEND_NO_TELEMETRY=1 "$BUN" ../cc/bend2/main.ts engine_qwen35_gpu.bend -o "$LLB_OUT/sys1mac.c" \
@@ -74,7 +85,7 @@ find "$LLB_OUT/cc" "$LLB_OUT/tree" -name '*.orig' -delete
 got=$( (sha256sum "$LLB_OUT/sys1mac.c" 2>/dev/null || shasum -a 256 "$LLB_OUT/sys1mac.c") | cut -d' ' -f1)
 echo "sys1mac.c $got"
 [ "$got" = "$expect" ] || [ -n "${LLB_METAL_NOHASH:-}" ] || die "emitted C $got != product $expect"
-lab=$([ -n "${LLB_METAL_BASE:-}" ] || echo "any-shape ")
+lab=$([ -n "${LLB_METAL_BASE:-}" ] || { [ -n "${LLB_METAL_ANY:-}${VISION:-}" ] && echo "any-shape " || echo "any-shape + MoE "; })
 echo "emitted C == the Mac product build (${VISION:+VISION=1 }$lab${expect:0:8})"
 
 [ "$(uname -s)" = Darwin ] && [ -z "${LLB_METAL_EMIT_ONLY:-}" ] || exit 0

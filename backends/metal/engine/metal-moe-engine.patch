@@ -1,0 +1,266 @@
+diff --git a/engine_qwen35_gpu.bend b/engine_qwen35_gpu.bend
+index fce1b3a..5c451fb 100755
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -163,14 +163,20 @@ def m.vc(m: Model) -> U32:
+ 
+ # (METAL-ANYSHAPE) one of the shapes the engine ran before (the 9B, the 27B, the 4B, the 35B MoE): those keep every
+ # arm and tier they had; any other shape is generic (the fused step; the fast tier when the host has its attention)
++# (METAL-MOE) the general MoE path: the table's MoE words (gguf2pack --sidecar-only on a qwen35moe GGUF: row 0,
++# word 24 = "MXG1"); the host reads the rest of them. Word 24 of a dense or Q8 table (or none) is 0
++def m.gm(+m: Model) -> Bool:
++  U32.is_eq(Bytes.word_le(m.tb(m), 96n), 826759245)
++
+ def m.leg(+m: Model) -> Bool:
+   +dm = m.dm(m)
+   +df = m.df(m)
+   +sh = m.sh(m)
+-  Bool.or(Bool.or(Bool.and(Bool.and(U32.is_eq(dm, 4096), U32.is_eq(df, 12288)), U32.is_eq(sh, 537920528)),
++  # (METAL-MOE) a general-path MoE is never legacy (the 35B-A3B through it has the 35B arm's widths)
++  Bool.and(Bool.not(m.gm(m)), Bool.or(Bool.or(Bool.and(Bool.and(U32.is_eq(dm, 4096), U32.is_eq(df, 12288)), U32.is_eq(sh, 537920528)),
+       Bool.and(Bool.and(U32.is_eq(dm, 5120), U32.is_eq(df, 17408)), U32.is_eq(sh, 806355992))),
+     Bool.or(Bool.and(Bool.and(U32.is_eq(dm, 2560), U32.is_eq(df, 9216)), U32.is_eq(sh, 537920528)),
+-      Bool.and(U32.is_eq(dm, 2048), U32.is_eq(df, 512))))
++      Bool.and(U32.is_eq(dm, 2048), U32.is_eq(df, 512)))))
+ 
+ # a generic shape's fast chunk: GQA 4 or 6 over 2 or 4 kv heads (the host's chunk attention bodies)
+ def m.gfast(+m: Model) -> Bool:
+@@ -386,12 +392,12 @@ def mf.cvo(+s: String, +key: String, want: String) -> Bool:
+ # v), SSM heads of 128 with state 128 and a 4-tap conv, a full-attention layer every fourth, the 1e7 rope over 64
+ # dims and eps 1e-6 are compiled into the kernels; the head counts, widths, layer count and vocabulary are read
+ # here and passed to the host (m.sh, m.vc), which sizes its scratch from them. Each refusal names the field.
+-def mf.dense(+s: String) -> IO(Unit):
++# (METAL-MOE) with the FFN width f given (the shared expert's for a MoE); mf.dense below passes d_ff
++def mf.dense.f(+s: String, +f: U32) -> IO(Unit):
+   +nl = mf.cn(s, "n_layers")
+   +nh = mf.cn(s, "n_heads")
+   +nkv = mf.cn(s, "n_kv_heads")
+   +d = mf.cn(s, "d_model")
+-  +f = mf.cn(s, "d_ff")
+   +lkh = mf.cn(s, "ssm_group_count")
+   +lvh = mf.cn(s, "ssm_time_step_rank")
+   +inner = mf.cn(s, "ssm_inner_size")
+@@ -415,6 +421,9 @@ def mf.dense(+s: String) -> IO(Unit):
+     mf.check(mf.cvo(s, "rope_freq_base", "10000000.0"), "rope_freq_base (the kernels' rope base is 1e7)")
+     mf.check(mf.cvo(s, "rms_norm_eps", "9.999999974752427e-07"), "rms_norm_eps (the kernels' eps is 1e-6)")
+ 
++def mf.dense(+s: String) -> IO(Unit):
++  mf.dense.f(s, mf.cn(s, "d_ff"))
++
+ def mf.legacy(+s: String) -> IO(Unit):
+   +kq = mf.kq(s)
+   +moe = mf.moe(s)
+@@ -453,6 +462,33 @@ def mf.anyshape(on: Bool, +s: String) -> IO(Unit):
+     case False{}:
+       mf.legacy(s)
+ 
++# (METAL-MOE) a qwen35moe sidecar for the general MoE path (gguf2pack --sidecar-only: config "experts": "gguf");
++# the registered 35B pack (pack_moe.py's, experts.idx) has no such key and keeps the 35B arm
++def mf.gm(+s: String) -> Bool:
++  Bool.and(mf.moe(s), String.eq(mf.value(s, "config", "experts"), "\"gguf\""))
++
++# (METAL-MOE) the general MoE path's structural check: the dense trunk's (mf.dense.f), then the experts' counts and
++# widths. The host checks the rest (formats, shapes, its scratch)
++def mf.gmoe(+s: String) -> IO(Unit):
++  +ne = mf.cn(s, "n_experts")
++  +k = mf.cn(s, "n_experts_used")
++  +ef = mf.cn(s, "d_ff")
++  +sf = mf.cn(s, "d_ff_shared")
++  do IO<Unit>:
++    # the trunk's checks at a nominal FFN width (the dense FFN is not run; the host sizes the MoE from the words)
++    mf.dense.f(s, 256)
++    mf.check((ne >= 1 : U32), "n_experts (at least 1)")
++    mf.check(Bool.and((k >= 1 : U32), (k <= ne : U32)), "n_experts_used (1 .. n_experts)")
++    mf.check(Bool.and((ef >= 32 : U32), mf.dv(ef, 32)), "d_ff (the routed experts' ff: a multiple of 32)")
++    mf.check(Bool.and((sf >= 32 : U32), mf.dv(sf, 32)), "d_ff_shared (the shared expert's ff: a multiple of 32)")
++
++def mf.anymoe(gm: Bool, on: Bool, +s: String) -> IO(Unit):
++  match gm:
++    case True{}:
++      mf.gmoe(s)
++    case False{}:
++      mf.anyshape(on, s)
++
+ def mf.validate(+s: String) -> IO(Unit):
+   +kq = mf.kq(s)
+   +moe = mf.moe(s)
+@@ -462,7 +498,7 @@ def mf.validate(+s: String) -> IO(Unit):
+       String.eq(mf.scalar(s, "dtype"), "\"q8_0-rowsplit\"")), "dtype")
+     mf.check(Bool.or(Bool.not(moe), kq), "format (qwen35moe)")
+     mf.config(s, "architecture", Bool.pick(String, moe, "\"qwen35moe\"", "\"qwen3_5\""))
+-    mf.anyshape(Bool.and(kq, Bool.not(moe)), s)
++    mf.anymoe(mf.gm(s), Bool.and(kq, Bool.not(moe)), s)
+ 
+ def mf.need(what: String, m: Maybe<&2, U32>) -> IO(U32):
+   match m:
+@@ -694,7 +730,9 @@ def mf.model(+dir: String, +ly: U32) -> IO(Model):
+     mf.validate(s)
+     +nl : U32 <- mf.need("n_layers", mf.num(s, "config", "n_layers"))
+     +dm : U32 <- mf.need("d_model", mf.num(s, "config", "d_model"))
+-    +df : U32 <- mf.need("d_ff", mf.num(s, "config", "d_ff"))
++    +df0 : U32 <- mf.need("d_ff", mf.num(s, "config", "d_ff"))
++    # (METAL-MOE) the general MoE path: the host's FFN shape word is the shared expert's ff
++    +df : U32 = Bool.pick(U32, mf.gm(s), mf.cn(s, "d_ff_shared"), df0)
+     +emb : U32 <- mf.need("token_embd offset", mf.num(s, "token_embd.weight", "offset"))
+     +onorm : U32 <- mf.need("output_norm offset", mf.num(s, "output_norm.weight", "offset"))
+     +out : U32 <- mf.need("output offset", mf.num(s, "output.weight", "offset"))
+@@ -704,7 +742,8 @@ def mf.model(+dir: String, +ly: U32) -> IO(Model):
+     ful : Offs <- mf.offl.ful(s, "blk.3.")
+     +n : Nat = U32.to_nat(Bool.pick(U32, U32.is_eq(ly, 0), nl, ly))
+     +kq : Bool = mf.kq(s)
+-    +moe : Bool = mf.moe(s)
++    # (METAL-MOE) moe: the registered 35B pack only (its arm, experts.idx); a general-path MoE loads as a quant pack
++    +moe : Bool = Bool.and(mf.moe(s), Bool.not(mf.gm(s)))
+     +hf : U32 = Bool.pick(U32, kq, mf.fm(s, "output.weight"), 1)
+     +ef : U32 = Bool.pick(U32, kq, mf.fm(s, "token_embd.weight"), 1)
+     # (ENGINE-4B) the 4B Q4_K_M's tied token_embd is Q6_K (ef 4): the fused step's llb_m_embk6, d_model 2560 only
+@@ -1502,7 +1541,9 @@ def m.fast(+m: Model, +b: Nat, +em: U32) -> Bool:
+   # (METAL-ANYSHAPE) or a generic shape whose GQA the chunk attention has (m.gfast), any of the three embeddings
+   +gen = Bool.and(Bool.and(Bool.not(m.leg(m)), m.gfast(m)),
+     Bool.or(Bool.or(U32.is_eq(m.ef(m), 1), U32.is_eq(m.ef(m), 3)), U32.is_eq(m.ef(m), 4)))
+-  Bool.or(Bool.and(m.leg(m), old), Bool.and(gen, Bool.and(Nat.is_le(m.nl(m), b), U32.is_eq(em, 4294967295))))
++  # (METAL-MOE) a general-path MoE has no fast chunk: exact per-token prefill (an explicit --fastpf too)
++  Bool.and(Bool.not(m.gm(m)),
++    Bool.or(Bool.and(m.leg(m), old), Bool.and(gen, Bool.and(Nat.is_le(m.nl(m), b), U32.is_eq(em, 4294967295)))))
+ 
+ # (lane m32, f35) the chunk size: the 35B's K (<= 4096); the 27B / 9B at most 512 (their chunk area)
+ # (METAL-ANYSHAPE) the 35B by its d_ff too (the 2B's d_model is also 2048)
+@@ -1524,7 +1565,7 @@ def m.dfk(+m: Model, +nt: U32, +dT: Nat) -> U32:
+     Bool.pick(U32, U32.is_eq(m.dm(m), 2560), k4, 0)))
+   # (METAL-ANYSHAPE) a generic shape with a fast chunk: the 4B's rule (512 at nt >= 13)
+   +k = Bool.pick(U32, Bool.and(Bool.not(m.leg(m)), m.gfast(m)), k4, k0)
+-  Bool.pick(U32, Nat.is_le(5n, dT), k, 0)
++  Bool.pick(U32, Bool.and(Nat.is_le(5n, dT), Bool.not(m.gm(m))), k, 0)
+ 
+ def run.fgen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +steps: U32, +sp: List<&2, U32>,
+   r: U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) -> IO(Unit):
+diff --git a/host/llb_gguf.c b/host/llb_gguf.c
+index 69b9ae5..5d38ebe 100755
+--- a/host/llb_gguf.c
++++ b/host/llb_gguf.c
+@@ -121,6 +121,8 @@ typedef struct {
+   uint64_t bytes;    // same in both layouts
+   uint64_t rb;       // row bytes (Q8_0 only)
+   int layer;         // blk.N -> N, else -1
++  uint64_t ne[4];    // (METAL-MOE) the GGUF shape (ne[0] = columns)
++  uint32_t nd;
+ } GgT;
+ 
+ typedef struct {
+@@ -130,6 +132,8 @@ typedef struct {
+   int nl;
+   uint64_t *lo, *hi;  // layer N = pack [lo[N], hi[N])
+   uint64_t pack_bytes;
++  GgT *x;             // (METAL-MOE) qwen35moe: the routed-expert tensors, kept out of the pack layout
++  size_t nx;
+ } GgFile;
+ 
+ typedef struct {
+@@ -215,14 +219,22 @@ static int gg_moe_order(const void *a, const void *b) {
+   return x->src < y->src ? -1 : x->src > y->src;
+ }
+ 
++// (METAL-MOE) the expert tensors are kept in g->x (the general MoE path maps them from the file itself, by
++// llb_gg_moe_pool); a fused ffn_gate_up_exps counts as gate and up. The trunk's formats are no longer checked
++// here: the registered 35B arm checks its own (Q8_0 / F32) on the host, the general path its table formats.
+ static int gg_moe_layout(GgFile *g, char *err) {
+   size_t kept = 0, experts = 0, heads = 0;
++  g->x = calloc(g->nt ? g->nt : 1, sizeof *g->x), g->nx = 0;
++  if (!g->x) return gg_fail(err, "out of memory");
+   for (size_t i = 0; i < g->nt; i++) {
+     GgT t = g->t[i];
+     const char *s = t.layer < 0 ? "" : strchr(t.name + 4, '.') + 1;
+     if (!strcmp(s, "ffn_gate_exps.weight") || !strcmp(s, "ffn_up_exps.weight") ||
+-        !strcmp(s, "ffn_down_exps.weight")) { free(t.name); experts++; continue; }
+-    if (t.ty != 0 && t.ty != 8) return gg_fail(err, "%s: MoE trunk needs F32/Q8_0", t.name);
++        !strcmp(s, "ffn_down_exps.weight") || !strcmp(s, "ffn_gate_up_exps.weight")) {
++      g->x[g->nx++] = t;
++      experts += strcmp(s, "ffn_gate_up_exps.weight") ? 1 : 2;
++      continue;
++    }
+     if (t.layer < 0) {
+       if (strcmp(t.name, "output.weight") && strcmp(t.name, "output_norm.weight") &&
+           strcmp(t.name, "token_embd.weight")) return gg_fail(err, "%s: unexpected MoE head", t.name);
+@@ -233,7 +245,7 @@ static int gg_moe_layout(GgFile *g, char *err) {
+     if (shared && strncmp(s, "ffn_gate_inp", 12)) memmove(shared, shared + 6, strlen(shared + 6) + 1);
+     g->t[kept++] = t;
+   }
+-  if (heads != 3 || experts != (size_t)g->nl * 3) return gg_fail(err, "incomplete MoE heads/experts");
++  if (heads != 3 || experts < (size_t)g->nl * 3 - 3) return gg_fail(err, "incomplete MoE heads/experts");
+   g->nt = kept;
+   qsort(g->t, g->nt, sizeof *g->t, gg_moe_order);
+   return 0;
+@@ -287,6 +299,8 @@ static int gg_open(GgFile *g, const char *path, char *err) {
+     if (n % (uint64_t)el) { free(r.buf); return gg_fail(err, "%s: not a whole number of blocks", t->name); }
+     t->bytes = n / (uint64_t)el * (uint64_t)bb;
+     t->ty = ty;
++    t->nd = nd;
++    for (uint32_t j = 0; j < nd; j++) t->ne[j] = ne[j];
+     t->q8 = ty == 8;
+     if (t->q8) {
+       if (nd != 2 || ne[0] % 32) { free(r.buf); return gg_fail(err, "%s: Q8_0 needs 2-D, cols %% 32", t->name); }
+@@ -320,6 +334,11 @@ static int gg_open(GgFile *g, const char *path, char *err) {
+     }
+   }
+   g->pack_bytes = pos;
++  for (size_t i = 0; i < g->nx; i++) {
++    GgT *t = &g->x[i];
++    t->src += data;
++    if (t->src + t->bytes > (uint64_t)st.st_size) return gg_fail(err, "%s: data past the end of %s (truncated)", t->name, path);
++  }
+   for (int L = 0; L < g->nl; L++)
+     if (g->lo[L] == UINT64_MAX) return gg_fail(err, "layer %d has no tensors", L);
+   return 0;
+@@ -501,6 +520,42 @@ static int gg_threads(void) {
+   return n > 0 ? n : 8;
+ }
+ 
++// ---------------------------------------------------------------- the routed experts (METAL-MOE)
++
++// llb_gg_moe_pool: the routed-expert tensors of a qwen35moe GGUF for layers 0 .. nl - 1, for the host's general
++// MoE path (it maps them read-only from the file and binds them as no-copy buffers). Per layer, 3 slots: gate
++// (or the fused gate_up, then *fused[L] = 1 and the up slot is 0), up, down; each the absolute file offset, the
++// ggml type, the bytes and the GGUF shape (columns, rows, experts). 0, or -1 with err (256 bytes).
++int llb_gg_moe_pool(const char *path, int nl, uint64_t *src, uint32_t *ty, uint64_t *bytes, uint64_t *shp,
++                    int *fused, char *err) {
++  GgFile g;
++  if (gg_open(&g, path, err)) return -1;
++  int rc = 0;
++  if (!g.x) rc = gg_fail(err, "%s: not a qwen35moe GGUF", path);
++  memset(src, 0, (size_t)nl * 3 * sizeof *src), memset(ty, 0, (size_t)nl * 3 * sizeof *ty);
++  memset(bytes, 0, (size_t)nl * 3 * sizeof *bytes), memset(shp, 0, (size_t)nl * 9 * sizeof *shp);
++  memset(fused, 0, (size_t)nl * sizeof *fused);
++  for (size_t i = 0; !rc && i < g.nx; i++) {
++    const GgT *t = &g.x[i];
++    if (t->layer >= nl) continue;  // a NextN (MTP) block past the decoder's layers
++    const char *s = strchr(t->name + 4, '.') + 1;
++    int k = !strcmp(s, "ffn_up_exps.weight") ? 1 : !strcmp(s, "ffn_down_exps.weight") ? 2 : 0;
++    if (!strcmp(s, "ffn_gate_up_exps.weight")) fused[t->layer] = 1;
++    if (t->nd != 3) { rc = gg_fail(err, "%s: %u dims, want 3 (cols, rows, experts)", t->name, t->nd); break; }
++    size_t j = (size_t)t->layer * 3 + (size_t)k;
++    src[j] = t->src, ty[j] = t->ty, bytes[j] = t->bytes;
++    for (int d = 0; d < 3; d++) shp[j * 3 + (size_t)d] = t->ne[d];
++  }
++  for (int L = 0; !rc && L < nl; L++)
++    if (!bytes[L * 3] || !bytes[L * 3 + 2] || (!fused[L] && !bytes[L * 3 + 1]))
++      rc = gg_fail(err, "layer %d: the routed experts are incomplete (gate, up or gate_up, down)", L);
++  if (g.fd > 0) close(g.fd);
++  for (size_t i = 0; i < g.nt; i++) free(g.t[i].name);
++  for (size_t i = 0; i < g.nx; i++) free(g.x[i].name);
++  free(g.t), free(g.x), free(g.lo), free(g.hi);
++  return rc;
++}
++
+ // ---------------------------------------------------------------- the effect
+ 
+ #ifdef CID_GGUF_READ
+@@ -521,7 +576,9 @@ static int gguf_close(void) {
+   pthread_mutex_lock(&gg_mu);
+   if (gg_file.fd > 0) close(gg_file.fd);
+   for (size_t i = 0; gg_file.t && i < gg_file.nt; i++) free(gg_file.t[i].name);
++  for (size_t i = 0; gg_file.x && i < gg_file.nx; i++) free(gg_file.x[i].name);
+   free(gg_file.t);
++  free(gg_file.x);
+   free(gg_file.lo);
+   free(gg_file.hi);
+   memset(&gg_file, 0, sizeof gg_file);

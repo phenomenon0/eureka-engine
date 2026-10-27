@@ -59,3 +59,27 @@ format outside the GEMV set, a missing shared expert, top-k or expert count past
 ## Not gated (reported)
 
 Decode ms/token (engine and llama.cpp), load time, peak memory.
+
+---
+
+## Amendment 1 — 2026-10-26 (after the first synthetic runs; the gates above are unchanged)
+
+Why: on the random-weight synthetic models the G4 instrument (teacher-forced top-1 against llama.cpp **CPU**)
+fails llama.cpp's own Metal path too (s40x5f-Q4_K_M: 18/32 and 23/32; s60x6-Q4_K_M: 5/32 and 3/32), and does not
+separate the garbage control (no_renorm scored 23/32 against the correct build's 21/32 on s40x5f p1). llama.cpp's
+CPU path quantizes activations to Q8 for its K-quant dots; on a random network that noise compounds across layers.
+Under Verdict Gates v2 an instrument that fails the floor is broken; its G4 verdict is reported as preregistered and
+labeled as such, not re-thresholded. Two forms are added and decide the synthetic shapes:
+
+G4b — MoE FFN oracle (component, numerics-changing). `LLB_MX_DUMP` writes, for every MoE layer and position, the
+FFN input, the engine's FFN output and its chosen experts / weights / shared gate; `mx_ref.py` recomputes the FFN
+from the GGUF's bytes in float64 (gguf-py dequantize; softmax over all experts, top-k, renormalized; SwiGLU;
+sigmoid-gated shared expert). PASS: the chosen ids equal on every record and the relative error
+|out - ref| / |ref| <= 1e-5 on every record (float32 arithmetic gives ~1e-6). Controls: the no_renorm mutant must
+FAIL (it does: rel 0.88 on the 35B).
+
+G4c — the paired form against llama.cpp **Metal** (float activations, like this engine): teacher-forced top-1 >= 0.90
+pooled per shape+quant over two prompts x 32; disagreements documented with margins.
+
+G8 — forced paths (bit-exact class): the split-buffer path (`LLB_MX_SPLIT=N`) and the streamed path
+(`LLB_MX_STREAM=1`) give the same ids and the same logits lines as the resident path on every model run.

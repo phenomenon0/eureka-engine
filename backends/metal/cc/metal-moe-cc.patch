@@ -1,0 +1,951 @@
+diff --git a/bend2/comp.ts b/bend2/comp.ts
+index 4ecb709..55442de 100644
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -12342,6 +12342,322 @@ kernel void llb_f27_copy(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
+   }
+ }
+ 
++// ---- (METAL-MOE) the general MoE FFN (any qwen35moe shape) --------------------------------------------------------
++// llama.cpp's (and the WebGPU trunk's) arithmetic order: router = ffn_gate_inp . x; softmax over every expert;
++// top-k (ties to the lowest id); the k weights renormalized (sum clamped at 2^-14); expert e's output =
++// down_e(silu(gate_e . x) * (up_e . x)); moe = w_0 y_0 + w_1 y_1 + .. in rank order; the shared expert the same
++// SwiGLU on ffn_*_shexp, times sigmoid(ffn_gate_inp_shexp . x), added last. The routed experts are the GGUF's own
++// bytes, reached through a pointer table (buffer 3: one entry a chunk of epc experts of a tensor, each chunk its own
++// no-copy buffer over the mapped file, or the staging buffer the host copies the chosen experts into); the shared
++// expert and the router are the heap's (its Q8_0 row-split). The MoE scratch W (buffer 4) is sized from the model:
++// logits [ne + 1], the route [ids k | weights k | gs], the shared act [sff], the routed act [k][eff].
++// A row dot: one simdgroup, lane l takes the 32-column chunks l, l + 32, ..; each chunk dequantized in place (the
++// GGUF block layouts), the lanes joined by simd_sum. The numerics-changing class (reports/metal-moe).
++#define MX_F32  0u
++#define MX_F16  1u
++#define MX_BF16 2u
++#define MX_Q8   3u
++#define MX_Q8R  4u
++#define MX_Q4K  5u
++#define MX_Q5K  6u
++#define MX_Q6K  7u
++
++struct MxPtr {
++  device const u8* p;
++};
++
++struct MxArgs {
++  u64 x, out;              // serve addresses: the FFN input h2, the FFN output
++  u64 s[3];                // shared gate / up / down (serve addresses)
++  u64 wr, wrs;             // router [ne][d] and shared gate [d] (F32, serve addresses)
++  u64 es[3], wo[3];        // routed: expert stride (bytes), offset inside an expert (the fused tensor's up rows)
++  u64 lg, rt, xs, act;     // W offsets (floats)
++  u32 t[3], epc[3];        // routed: the tensor's first pointer-table entry, experts a chunk
++  u32 f[3], fs[3];         // formats (MX_*)
++  u32 rb[3], rbs[3];       // row bytes
++  u32 d, eff, sff, ne, k, mut, mode, pad;   // pad: llb_mx_dn's staging flag
++};
++
++INLINE float mx_hf(device const u8* p) {
++  return (float)as_type<half>((ushort)((ushort)p[0] | ((ushort)p[1] << 8)));
++}
++
++// K-quant scale and min j of a superblock's 12 packed bytes (ggml's get_scale_min_k4)
++INLINE void mx_sm(device const u8* q, u32 j, thread float* sc, thread float* mn) {
++  if (j < 4) {
++    *sc = (float)(q[j] & 63);
++    *mn = (float)(q[j + 4] & 63);
++  } else {
++    *sc = (float)((q[j + 4] & 15) | ((q[j - 4] >> 6) << 4));
++    *mn = (float)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
++  }
++}
++
++// the sum over chunk c (columns 32 c .. 32 c + 31) of a row r of cols columns in format f, times x (x in device or
++// threadgroup memory: XP)
++template <typename XP>
++INLINE float mx_chunk(device const u8* r, u32 f, u32 cols, u32 c, XP x) {
++  float a = 0.0f;
++  if (f == MX_F32) {
++    device const float* w = (device const float*)r + 32 * c;
++    for (u32 i = 0; i < 32; i += 1) {
++      a += w[i] * x[i];
++    }
++    return a;
++  }
++  if (f == MX_F16) {
++    device const half* w = (device const half*)r + 32 * c;
++    for (u32 i = 0; i < 32; i += 1) {
++      a += (float)w[i] * x[i];
++    }
++    return a;
++  }
++  if (f == MX_BF16) {
++    device const ushort* w = (device const ushort*)r + 32 * c;
++    for (u32 i = 0; i < 32; i += 1) {
++      a += as_type<float>((uint)w[i] << 16) * x[i];
++    }
++    return a;
++  }
++  if (f == MX_Q8 || f == MX_Q8R) {
++    device const u8* q = f == MX_Q8 ? r + 34 * c + 2 : r + 32 * c;
++    const float d = mx_hf(f == MX_Q8 ? r + 34 * c : r + cols + 2 * c);
++    for (u32 i = 0; i < 32; i += 1) {
++      a += (float)(char)q[i] * x[i];
++    }
++    return a * d;
++  }
++  const u32 j = c & 7;
++  if (f == MX_Q4K || f == MX_Q5K) {
++    device const u8* b = r + (u64)(c >> 3) * (f == MX_Q4K ? 144 : 176);
++    float sc, mn, sq = 0.0f, sx = 0.0f;
++    mx_sm(b + 4, j, &sc, &mn);
++    const u32 g = j >> 1, hi = j & 1;
++    device const u8* q = b + (f == MX_Q4K ? 16 : 48) + 32 * g;
++    device const u8* qh = b + 16;
++    const u32 bit = 1u << (2 * g + hi);
++    for (u32 i = 0; i < 32; i += 1) {
++      u32 v = hi ? q[i] >> 4 : q[i] & 15;
++      if (f == MX_Q5K && (qh[i] & bit) != 0) {
++        v += 16;
++      }
++      sq += (float)v * x[i];
++      sx += x[i];
++    }
++    return mx_hf(b) * sc * sq - mx_hf(b + 2) * mn * sx;
++  }
++  // Q6_K: ql[128] qh[64] scales[16] d; chunk j: half n = j / 4, quarter cc = j % 4 (ggml's dequantize_row_q6_K)
++  device const u8* b = r + (u64)(c >> 3) * 210;
++  const u32 n = j >> 2, cc = j & 3;
++  device const u8* ql = b + 64 * n + (cc & 1) * 32;
++  device const u8* qh = b + 128 + 32 * n;
++  device const u8* sc = b + 192 + 8 * n + 2 * cc;
++  const u32 sh = 2 * cc;
++  float s0 = 0.0f, s1 = 0.0f;
++  for (u32 i = 0; i < 32; i += 1) {
++    const u32 lo = cc < 2 ? ql[i] & 15 : ql[i] >> 4;
++    const int v = (int)(lo | (((qh[i] >> sh) & 3) << 4)) - 32;
++    if (i < 16) {
++      s0 += (float)v * x[i];
++    } else {
++      s1 += (float)v * x[i];
++    }
++  }
++  return mx_hf(b + 208) * ((float)(char)sc[0] * s0 + (float)(char)sc[1] * s1);
++}
++
++template <typename XP>
++INLINE float mx_dot(device const u8* r, u32 f, u32 cols, XP x, u32 l) {
++  float a = 0.0f;
++  for (u32 c = l; c < cols / 32; c += 32) {
++    a += mx_chunk(r, f, cols, c, x + 32 * c);
++  }
++  return simd_sum(a);
++}
++
++INLINE device const u8* mx_sa(device u8* C, device u8* S, u64 a) {
++  return (device const u8*)sa_f(C, S, a);
++}
++
++// routed tensor r's row of expert e: its chunk's pointer, the expert inside the chunk, the row
++INLINE device const u8* mx_row(device const MxPtr* T, constant MxArgs& A, u32 r, u64 e, u32 row) {
++  const u32 epc = A.epc[r];
++  return T[A.t[r] + (u32)(e / epc)].p + (e % epc) * A.es[r] + A.wo[r] + (u64)row * A.rb[r];
++}
++
++// 1. the router's ne rows and the shared gate (row ne): lg[row] = w_row . x (F32), 4 rows a group of 128
++kernel void llb_mx_rdot(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device float* W [[buffer(4)]], uint g [[threadgroup_position_in_grid]],
++  ushort sg [[simdgroup_index_in_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
++  const u32 row = g * 4 + sg;
++  if (row > A.ne) {
++    return;
++  }
++  device const u8* w = row < A.ne ? mx_sa(C, S, A.wr) + (u64)row * A.d * 4 : mx_sa(C, S, A.wrs);
++  const float v = mx_dot(w, MX_F32, A.d, (device const float*)sa_f(C, S, A.x), l);
++  if (l == 0) {
++    W[A.lg + row] = v;
++  }
++}
++
++// 2. the routing: one group of 1024, thread i holding experts i, i + 1024, ..: softmax over the ne logits, k argmax
++// rounds (ties to the lowest id), the k weights renormalized; the shared gate's sigmoid. W[rt ..]: ids[k] (u32),
++// weights[k], gs. The probabilities are kept in W[act ..] (the routed act's space, written only later)
++kernel void llb_mx_route(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device float* W [[buffer(4)]], uint i [[thread_position_in_threadgroup]]) {
++  threadgroup float red[1024];
++  threadgroup uint ri[1024];
++  device const float* lg = W + A.lg;
++  device float* pv = W + A.act;
++  device uint* ids = (device uint*)(W + A.rt);
++  device float* wt = W + A.rt + A.k;
++  const float ninf = as_type<float>(0xFF800000u);
++  float m = ninf;
++  for (u32 e = i; e < A.ne; e += 1024) {
++    m = max(m, lg[e]);
++  }
++  red[i] = m;
++  for (u32 w = 512; w > 0; w >>= 1) {
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (i < w) {
++      red[i] = max(red[i], red[i + w]);
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  m = red[0];
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  float z = 0.0f;
++  for (u32 e = i; e < A.ne; e += 1024) {
++    const float p = attn_exp(lg[e] - m);
++    pv[e] = p;
++    z += p;
++  }
++  red[i] = z;
++  for (u32 w = 512; w > 0; w >>= 1) {
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (i < w) {
++      red[i] = red[i] + red[i + w];
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  z = red[0];
++  for (u32 e = i; e < A.ne; e += 1024) {
++    pv[e] = pv[e] / z;
++  }
++  for (u32 s = 0; s < A.k; s += 1) {
++    threadgroup_barrier(mem_flags::mem_device);
++    float bv = -1.0f;
++    uint bi = 0xFFFFFFFFu;
++    for (u32 e = i; e < A.ne; e += 1024) {
++      if (pv[e] > bv) {
++        bv = pv[e];
++        bi = e;
++      }
++    }
++    red[i] = bv;
++    ri[i] = bi;
++    for (u32 w = 512; w > 0; w >>= 1) {
++      threadgroup_barrier(mem_flags::mem_threadgroup);
++      if (i < w) {
++        const float b = red[i + w];
++        if (b > red[i] || (b == red[i] && ri[i + w] < ri[i])) {
++          red[i] = b;
++          ri[i] = ri[i + w];
++        }
++      }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (i == 0) {
++      ids[s] = ri[0];
++      wt[s] = red[0];
++      pv[ri[0]] = -1.0f;
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_device);
++  if (i == 0) {
++    float sum = 0.0f;
++    for (u32 s = 0; s < A.k; s += 1) {
++      sum += wt[s];
++    }
++    sum = max(sum, 6.103515625e-5f);
++    if ((A.mut & 1) == 0) {
++      for (u32 s = 0; s < A.k; s += 1) {
++        wt[s] = wt[s] / sum;
++      }
++    }
++    wt[A.k] = 1.0f / (1.0f + attn_exp(-lg[A.ne]));
++  }
++}
++
++// 3. gate / up / SiLU: act[slot eff + row] = silu(gate . x) * (up . x). mode 0: slot = the grid's y, expert ids[slot]
++// through the pointer table; mode 1: the shared expert (heap tensors) into xs
++kernel void llb_mx_gu(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device const MxPtr* T [[buffer(3)]], device float* W [[buffer(4)]],
++  uint2 g [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort l [[thread_index_in_simdgroup]], ushort tx [[thread_index_in_threadgroup]]) {
++  // x (d <= 8192 floats: the trunk's own bound) staged once a group of 8 rows
++  threadgroup float x[8192];
++  device const float* xd = sa_f(C, S, A.x);
++  for (u32 j = tx; j < A.d; j += 256) {
++    x[j] = xd[j];
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  const u32 row = g.x * 8 + sg, rows = A.mode == 0 ? A.eff : A.sff;
++  if (row >= rows) {
++    return;
++  }
++  float gv, uv;
++  if (A.mode == 0) {
++    const u64 e = ((device const uint*)(W + A.rt))[g.y];
++    gv = mx_dot(mx_row(T, A, 0, e, row), A.f[0], A.d, (threadgroup const float*)x, l);
++    uv = mx_dot(mx_row(T, A, 1, e, row), A.f[1], A.d, (threadgroup const float*)x, l);
++  } else {
++    gv = mx_dot(mx_sa(C, S, A.s[0]) + (u64)row * A.rbs[0], A.fs[0], A.d, (threadgroup const float*)x, l);
++    uv = mx_dot(mx_sa(C, S, A.s[1]) + (u64)row * A.rbs[1], A.fs[1], A.d, (threadgroup const float*)x, l);
++  }
++  if (l == 0) {
++    W[A.mode == 0 ? A.act + (u64)g.y * A.eff + row : A.xs + row] = (gv / (1.0f + attn_exp(-gv))) * uv;
++  }
++}
++
++// 4. down + combine: out[row] = (w_0 down_0 . act_0 + w_1 down_1 . act_1 + ..) + gs (shared down . xs)
++// A.pad = 1: the routed act and the shared act (k eff + sff <= 8192 floats) staged in threadgroup memory
++kernel void llb_mx_dn(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device const MxPtr* T [[buffer(3)]], device float* W [[buffer(4)]],
++  uint g [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort l [[thread_index_in_simdgroup]], ushort tx [[thread_index_in_threadgroup]]) {
++  threadgroup float xa[8192];
++  const u32 na = A.k * A.eff;
++  if (A.pad != 0) {
++    for (u32 j = tx; j < na; j += 256) {
++      xa[j] = W[A.act + j];
++    }
++    for (u32 j = tx; j < A.sff; j += 256) {
++      xa[na + j] = W[A.xs + j];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++  }
++  const u32 row = g * 8 + sg;
++  if (row >= A.d) {
++    return;
++  }
++  device const uint* ids = (device const uint*)(W + A.rt);
++  device const float* wt = W + A.rt + A.k;
++  float acc = 0.0f, sh;
++  for (u32 s = 0; s < A.k; s += 1) {
++    device const u8* r = mx_row(T, A, 2, ids[s], row);
++    const float v = A.pad != 0 ? mx_dot(r, A.f[2], A.eff, (threadgroup const float*)xa + s * A.eff, l)
++      : mx_dot(r, A.f[2], A.eff, (device const float*)W + A.act + (u64)s * A.eff, l);
++    acc += wt[s] * v;
++  }
++  device const u8* rs = mx_sa(C, S, A.s[2]) + (u64)row * A.rbs[2];
++  sh = A.pad != 0 ? mx_dot(rs, A.fs[2], A.sff, (threadgroup const float*)xa + na, l)
++    : mx_dot(rs, A.fs[2], A.sff, (device const float*)W + A.xs, l);
++  if (l == 0) {
++    sa_f(C, S, A.out)[row] = acc + sh * wt[A.k];
++  }
++}
++
+ // ---- lane m32 (f35): the 35B-A3B fast chunk's kernels -----------------------------------------------------------
+ // the host's MoeBuf row stride (F35_MBS) is the device's
+ static_assert(sizeof(MoeBuf) == F35_MBS, "f35: MoeBuf row stride");
+@@ -16114,6 +16430,9 @@ typedef struct {
+   // legacy four (every arm below keeps its legacy dispatches when gen is false)
+   u32 nkv, kvd, vc;
+   bool gen;
++  // (METAL-MOE) the general MoE path (mx_shape): n_experts (0 = dense), top-k, the expert ff, a fused gate_up, the
++  // float offset in M9_BLK of x1 / h2 / the FFN output
++  u32 mxe, mxk, mxf, mxfl, mxb;
+ } M9Rows;
+ 
+ // (METAL-ANYSHAPE) the layer arrays' bound (was 64, the 27B's layers); the engine refuses more
+@@ -16130,6 +16449,7 @@ static bool m9_shape(M9Rows* R, u32 d, u32 f) {
+   R->d = d; R->f = f; R->nh = b27 ? 24 : 16; R->lkh = 16;
+   R->lvh = b27 ? 48 : 32; R->nl = b27 ? 64 : 32;
+   R->nkv = 4; R->kvd = 1024; R->vc = 248320; R->gen = false;
++  R->mxe = 0; R->mxk = 0; R->mxf = 0; R->mxfl = 0; R->mxb = 0;
+   if (b4) {
+     R->rb[13] = R->rb[19] = LLB_FM_RB(LLB_FM_Q8_0, R->nh * 256);
+   }
+@@ -16656,6 +16976,507 @@ static id<MTLComputeCommandEncoder> m30_split(void) {
+   return m30_en;
+ }
+ 
++// ---- (METAL-MOE) the general MoE FFN, host side -------------------------------------------------------------------
++// A qwen35moe model of any shape on the generic pass (m9_pass_run): every layer's FFN is mx_ffn_run instead of
++// m9_fbn_run. Admission: the table (gguf2pack --sidecar-only on a qwen35moe GGUF) carries the MoE words in every
++// row: 24 MX_MAGIC, 25 n_experts, 26 n_experts_used, 27 the expert ff, 28 the shared ff, 29 bit 0 a fused
++// ffn_gate_up_exps; words 21 / 22 the router (F32 ne x d) and the shared gate (F32 d) in the layer blob. The
++// registered 35B pack (experts.idx at task word 50, no MoE words) keeps its own arm (m24_pass_arm), unchanged.
++//
++// The routed experts never enter the heap. mx_pool maps LLB_GGUF read-only and takes one of two modes:
++// - resident: each expert tensor is cut into chunks of epc experts, each chunk a no-copy MTLBuffer over the mapped
++//   file no longer than the device's largest buffer (LLB_MX_SPLIT=N forces N experts a chunk); the kernels reach a
++//   chunk through the pointer table (gpuAddress) and the encoder declares the layer's chunks (useResources);
++// - streamed, when the experts do not fit the GPU's working set with the heap (or LLB_MX_STREAM=1): per layer the
++//   command buffer is committed after the routing, the host reads the k chosen ids and copies only those experts'
++//   bytes from the map into a staging buffer (k experts a tensor), and the layer goes on from there. The file's
++//   pages of the other experts are never touched.
++// Both modes run the same kernels on the same bytes: streamed and resident give the same bits.
++#define MX_MAGIC 0x3147584Du
++#define MX_F32  0u
++#define MX_F16  1u
++#define MX_BF16 2u
++#define MX_Q8   3u
++#define MX_Q8R  4u
++#define MX_Q4K  5u
++#define MX_Q5K  6u
++#define MX_Q6K  7u
++static id<MTLComputePipelineState> gpu_mx_rdot, gpu_mx_route, gpu_mx_gu, gpu_mx_dn;
++// per layer and routed tensor (gate or gate_up, up, down): the GGUF offset, expert stride, row bytes, format, the
++// offset inside an expert (the fused up rows), the first pointer-table entry and experts a chunk
++typedef struct {
++  u64 src, es, wo;
++  u32 rb, f, t, epc;
++} MxTen;
++static MxTen*        mx_ten;
++static id<MTLBuffer> mx_tab, mx_scr, mx_stage[3];
++static NSMutableArray<id<MTLBuffer>>* mx_chunks;
++static u32*  mx_lch;      // layer i's chunks are mx_chunks[mx_lch[i] .. mx_lch[i + 1])
++static u32   mx_nl, mx_mut, mx_ne, mx_k, mx_ef;
++static bool  mx_stream, mx_fused;
++static u8*   mx_map;
++static u64   mx_maplen, mx_scrn;
++static char  mx_path[1024];
++
++typedef struct {
++  u64 x, out;
++  u64 s[3];
++  u64 wr, wrs;
++  u64 es[3], wo[3];
++  u64 lg, rt, xs, act;
++  u32 t[3], epc[3];
++  u32 f[3], fs[3];
++  u32 rb[3], rbs[3];
++  u32 d, eff, sff, ne, k, mut, mode, pad;
++} MxArgs;
++
++int llb_gg_moe_pool(const char *path, int nl, uint64_t *src, uint32_t *ty, uint64_t *bytes, uint64_t *shp,
++                    int *fused, char *err);
++
++// the table row's MoE words, or false (a dense / legacy table). tw: layer 0's row
++static bool mx_words(const u32* tw, u32* ne, u32* k, u32* ef, u32* sf, u32* fu) {
++  if (tw == NULL || tw[24] != MX_MAGIC) {
++    return false;
++  }
++  *ne = tw[25]; *k = tw[26]; *ef = tw[27]; *sf = tw[28]; *fu = tw[29] & 1;
++  return true;
++}
++
++// the MoE words checked, the Shape given the shared ff (the engine's rd word, checked by the caller); x1 / h2 / the FFN out
++// (3 d floats) placed in M9_BLK past both places the next layer's rmsnorm writes (m28_ndst), so the final addrms
++// never reads what it writes. Everything else of the MoE lives in its own buffer, sized from these words
++static bool mx_shape(M9Rows* R, u32 ne, u32 k, u32 ef, u32 sf, u32 fu) {
++  const char* why = NULL;
++  u32 lk = R->lkh * 128, lv = R->lvh * 128, cv = 2 * lk + lv, end = 4 * lv + 4 * R->lvh + cv;
++  u64 nl = end > 39040 ? end : 39040, nf = 2ull * R->nh * 256;
++  u64 b = (nl + R->d > nf + R->d ? nl + R->d : nf + R->d);
++  b = (b + 63) & ~63ull;
++  if (ne == 0) {
++    why = "n_experts (at least 1)";
++  } else if (k == 0 || k > ne) {
++    why = "n_experts_used (1 .. n_experts)";
++  } else if (ef == 0 || ef % 32 != 0) {
++    why = "expert_feed_forward_length (a multiple of 32: whole blocks a row)";
++  } else if (sf == 0 || sf % 32 != 0) {
++    why = "expert_shared_feed_forward_length (a multiple of 32)";
++  } else if (b + 3ull * R->d > 81920) {
++    why = "d_model (x1, h2 and the FFN output in M9_BLK)";
++  }
++  if (why != NULL) {
++    fprintf(stderr, "warp pass: unsupported qwen35moe shape d %u experts %u top %u expert ff %u shared ff %u: %s\n",
++      R->d, ne, k, ef, sf, why);
++    return false;
++  }
++  R->gen = true;
++  R->f = sf;
++  R->mxe = ne; R->mxk = k; R->mxf = ef; R->mxfl = fu; R->mxb = (u32)b;
++  return true;
++}
++
++// a ggml type id as an MX format and its block (elements, bytes); false if the kernels do not read it
++static bool mx_fmt(u32 ty, u32* f, u32* el, u32* bb) {
++  switch (ty) {
++    case 0: *f = MX_F32; *el = 1; *bb = 4; return true;
++    case 1: *f = MX_F16; *el = 1; *bb = 2; return true;
++    case 30: *f = MX_BF16; *el = 1; *bb = 2; return true;
++    case 8: *f = MX_Q8; *el = 32; *bb = 34; return true;
++    case 12: *f = MX_Q4K; *el = 256; *bb = 144; return true;
++    case 13: *f = MX_Q5K; *el = 256; *bb = 176; return true;
++    case 14: *f = MX_Q6K; *el = 256; *bb = 210; return true;
++  }
++  return false;
++}
++
++// a heap tensor's table format (LLB_FM_*) as an MX format (the heap's Q8_0 is row-split)
++static u32 mx_hfmt(u32 fm) {
++  return fm == LLB_FM_Q8_0 ? MX_Q8R : fm == LLB_FM_Q4_K ? MX_Q4K : fm == LLB_FM_Q5_K ? MX_Q5K
++    : fm == LLB_FM_Q6_K ? MX_Q6K : MX_F32;
++}
++
++static FILE* mx_dumpf;
++static void mx_close(void) {
++  if (mx_dumpf != NULL) {
++    fclose(mx_dumpf);
++  }
++  mx_dumpf = NULL;
++  mx_chunks = nil;
++  mx_tab = nil; mx_scr = nil;
++  mx_stage[0] = nil; mx_stage[1] = nil; mx_stage[2] = nil;
++  free(mx_ten);
++  free(mx_lch);
++  mx_ten = NULL;
++  mx_lch = NULL;
++  if (mx_map != NULL) {
++    munmap(mx_map, mx_maplen);
++  }
++  mx_map = NULL;
++  mx_maplen = 0;
++  mx_nl = 0;
++  mx_scrn = 0;
++  mx_path[0] = 0;
++  gpu_mx_rdot = nil; gpu_mx_route = nil; gpu_mx_gu = nil; gpu_mx_dn = nil;
++}
++
++static u64 mx_envu(const char* k) {
++  const char* v = getenv(k);
++  return v != NULL && *v != 0 ? strtoull(v, NULL, 10) : 0;
++}
++
++// the expert pool for layers 0 .. nl - 1 (once a model): every routed tensor checked (format, shape [ne][rows]
++// [cols], whole blocks a row), then the resident chunks or the streamed staging (above)
++static void mx_pool(const M9Rows* R) {
++  const char* path = getenv("LLB_GGUF");
++  if (mx_nl == R->nl && path != NULL && strcmp(path, mx_path) == 0) {
++    return;
++  }
++  if (path == NULL || *path == 0 || strlen(path) >= sizeof mx_path) {
++    err_fail("qwen35moe: the general MoE path maps its experts from LLB_GGUF (unset)");
++  }
++  mx_close();
++  gpu_mx_rdot  = warp_pipe("llb_mx_rdot");
++  gpu_mx_route = warp_pipe("llb_mx_route");
++  gpu_mx_gu    = warp_pipe("llb_mx_gu");
++  gpu_mx_dn    = warp_pipe("llb_mx_dn");
++  if (gpu_mx_rdot.maxTotalThreadsPerThreadgroup < 128 || gpu_mx_route.maxTotalThreadsPerThreadgroup < 1024
++    || gpu_mx_gu.maxTotalThreadsPerThreadgroup < 256 || gpu_mx_dn.maxTotalThreadsPerThreadgroup < 256) {
++    err_fail("qwen35moe: a MoE kernel's threadgroup does not fit");
++  }
++  const char* mt = getenv("LLB_MX_MUT");
++  mx_mut = mt != NULL && strcmp(mt, "no_renorm") == 0 ? 1u : 0u;
++  if (mt != NULL && *mt != 0 && mx_mut == 0) {
++    err_fail("LLB_MX_MUT: unknown mutant (no_renorm)");
++  }
++  if (mx_mut != 0) {
++    fprintf(stderr, "mx: MUTANT %s\n", mt);
++  }
++  u32 nl = R->nl;
++  u64* src = calloc((size_t)nl * 3, 8);
++  u64* by  = calloc((size_t)nl * 3, 8);
++  u64* sh  = calloc((size_t)nl * 9, 8);
++  u32* ty  = calloc((size_t)nl * 3, 4);
++  int* fu  = calloc((size_t)nl, sizeof(int));
++  mx_ten = calloc((size_t)nl * 3, sizeof *mx_ten);
++  mx_lch = calloc((size_t)nl + 1, sizeof *mx_lch);
++  char err[256] = "";
++  if (src == NULL || by == NULL || sh == NULL || ty == NULL || fu == NULL || mx_ten == NULL || mx_lch == NULL) {
++    err_fail("qwen35moe: out of memory (expert pool)");
++  }
++  if (llb_gg_moe_pool(path, (int)nl, src, ty, by, sh, fu, err) != 0) {
++    fprintf(stderr, "qwen35moe: %s\n", err);
++    err_fail("qwen35moe: the GGUF's routed experts are refused");
++  }
++  static const char* nm[3] = { "gate", "up", "down" };
++  u64 tot = 0, maxes[3] = { 0, 0, 0 };
++  for (u32 i = 0; i < nl; i += 1) {
++    for (u32 r = 0; r < 3; r += 1) {
++      bool fz = fu[i] != 0 && r == 1;
++      u32 tj = fz ? i * 3 : i * 3 + r;
++      u32 f, el, bb;
++      u64 cols = sh[tj * 3], rows = sh[tj * 3 + 1], ne = sh[tj * 3 + 2];
++      u64 wr = r == 2 ? R->d : fu[i] != 0 ? 2ull * R->mxf : R->mxf, wc = r == 2 ? R->mxf : R->d;
++      if (!mx_fmt(ty[tj], &f, &el, &bb)) {
++        fprintf(stderr, "qwen35moe: layer %u expert %s: ggml type %u (the general MoE path reads F32 F16 BF16 Q8_0"
++          " Q4_K Q5_K Q6_K)\n", i, fz ? "gate_up" : nm[r], ty[tj]);
++        err_fail("qwen35moe: an expert format is refused");
++      }
++      if (ne != R->mxe || rows != wr || cols != wc || cols % el != 0 || cols % 32 != 0 || by[tj] % ne != 0
++        || by[tj] / ne != rows * (cols / el * bb)) {
++        fprintf(stderr, "qwen35moe: layer %u expert %s: shape [%llu][%llu][%llu], want [%u][%llu][%llu] (whole"
++          " %u-element blocks a row)\n", i, nm[r], (unsigned long long)ne, (unsigned long long)rows,
++          (unsigned long long)cols, R->mxe, (unsigned long long)wr, (unsigned long long)wc, el);
++        err_fail("qwen35moe: an expert tensor's shape is refused");
++      }
++      MxTen* T = &mx_ten[i * 3 + r];
++      T->src = src[tj];
++      T->es = by[tj] / ne;
++      T->rb = (u32)(cols / el * bb);
++      T->f = f;
++      T->wo = fz ? (u64)R->mxf * T->rb : 0;
++      tot += fz ? 0 : by[tj];
++      maxes[r] = T->es > maxes[r] ? T->es : maxes[r];
++    }
++  }
++  int fd = open(path, O_RDONLY);
++  struct stat st;
++  if (fd < 0 || fstat(fd, &st) != 0) {
++    err_fail("qwen35moe: cannot open LLB_GGUF");
++  }
++  u64 pg = 16384, flen = ((u64)st.st_size + pg - 1) & ~(pg - 1);
++  u8* F = mmap(NULL, flen, PROT_READ, MAP_SHARED, fd, 0);
++  close(fd);
++  if (F == MAP_FAILED) {
++    err_fail("qwen35moe: cannot map LLB_GGUF");
++  }
++  mx_map = F;
++  mx_maplen = flen;
++  mx_ne = R->mxe; mx_k = R->mxk; mx_ef = R->mxf; mx_fused = fu[0] != 0;
++  // the mode: streamed when the experts and the heap do not fit the working set together, or when asked
++  u64 ws = (u64)[gpu_dev recommendedMaxWorkingSetSize], heap = gpu_buf != nil ? (u64)[gpu_buf length] : 0;
++  u64 lim = (u64)[gpu_dev maxBufferLength], split = mx_envu("LLB_MX_SPLIT");
++  mx_stream = mx_envu("LLB_MX_STREAM") != 0 || tot + heap > ws;
++  // the MoE scratch: logits ne + 1 (rounded), the route 3 k + 1 (ids, weights, gs, the streamed ids), the shared act, the routed act or the
++  // probabilities (whichever is longer)
++  u64 lg = 0, rt = ((u64)R->mxe + 1 + 63) & ~63ull, xs = rt + ((3ull * R->mxk + 1 + 63) & ~63ull);
++  u64 act = xs + (((u64)R->f + 63) & ~63ull), an = (u64)R->mxk * R->mxf > R->mxe ? (u64)R->mxk * R->mxf : R->mxe;
++  (void)lg;
++  mx_scrn = act + an;
++  mx_scr = [gpu_dev newBufferWithLength:mx_scrn * 4 options:MTLResourceStorageModeShared];
++  if (mx_scr == nil) {
++    err_fail("qwen35moe: cannot allocate the MoE scratch");
++  }
++  mx_chunks = [NSMutableArray array];
++  u32 ntab = 0;
++  struct timespec t0, t1;
++  clock_gettime(CLOCK_MONOTONIC, &t0);
++  if (mx_stream) {
++    // staging: k experts a tensor; the table's three entries point at them (epc = k: the slot is the expert)
++    for (u32 r = 0; r < 3; r += 1) {
++      if (r == 1 && mx_fused) {
++        continue;
++      }
++      if (maxes[r] * R->mxk > lim) {
++        err_fail("qwen35moe: k experts of one tensor exceed the device's largest buffer (streamed mode)");
++      }
++      mx_stage[r] = [gpu_dev newBufferWithLength:maxes[r] * R->mxk options:MTLResourceStorageModeShared];
++      if (mx_stage[r] == nil) {
++        err_fail("qwen35moe: cannot allocate the expert staging");
++      }
++    }
++    mx_tab = [gpu_dev newBufferWithLength:3 * 8 options:MTLResourceStorageModeShared];
++    u64* tb = (u64*)[mx_tab contents];
++    for (u32 r = 0; r < 3; r += 1) {
++      tb[r] = (u64)[mx_stage[r == 1 && mx_fused ? 0 : r] gpuAddress];
++    }
++    for (u32 i = 0; i < nl; i += 1) {
++      for (u32 r = 0; r < 3; r += 1) {
++        mx_ten[i * 3 + r].t = r;
++        mx_ten[i * 3 + r].epc = R->mxk;
++      }
++      mx_lch[i + 1] = 0;
++    }
++    ntab = 3;
++  } else {
++    // resident: chunks of epc experts, each window (page-aligned) within the largest buffer
++    u64 cap = 1;
++    for (u32 i = 0; i < nl; i += 1) {
++      for (u32 r = 0; r < 3; r += 1) {
++        const MxTen* T = &mx_ten[i * 3 + r];
++        u64 e = (lim - 2 * pg) / T->es;
++        if (e == 0) {
++          err_fail("qwen35moe: one expert exceeds the device's largest buffer");
++        }
++        if (split != 0 && split < e) {
++          e = split;
++        }
++        cap += (R->mxe + e - 1) / e;
++      }
++    }
++    mx_tab = [gpu_dev newBufferWithLength:cap * 8 options:MTLResourceStorageModeShared];
++    u64* tb = (u64*)[mx_tab contents];
++    for (u32 i = 0; i < nl; i += 1) {
++      mx_lch[i] = (u32)[mx_chunks count];
++      for (u32 r = 0; r < 3; r += 1) {
++        MxTen* T = &mx_ten[i * 3 + r];
++        if (r == 1 && fu[i] != 0) {
++          T->t = mx_ten[i * 3].t;
++          T->epc = mx_ten[i * 3].epc;
++          continue;
++        }
++        u64 e = (lim - 2 * pg) / T->es;
++        if (split != 0 && split < e) {
++          e = split;
++        }
++        T->epc = (u32)(e < R->mxe ? e : R->mxe);
++        T->t = ntab;
++        for (u64 c = 0; c < R->mxe; c += T->epc) {
++          u64 n = R->mxe - c < T->epc ? R->mxe - c : T->epc;
++          u64 a = T->src + c * T->es, lo = a & ~(pg - 1), hi = (a + n * T->es + pg - 1) & ~(pg - 1);
++          if (hi > flen) {
++            err_fail("qwen35moe: an expert chunk lies past the GGUF's end");
++          }
++          madvise(F + lo, hi - lo, MADV_WILLNEED);
++          id<MTLBuffer> b = [gpu_dev newBufferWithBytesNoCopy:F + lo length:hi - lo
++            options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked deallocator:nil];
++          if (b == nil) {
++            err_fail("qwen35moe: cannot wrap an expert chunk in a buffer");
++          }
++          [mx_chunks addObject:b];
++          tb[ntab++] = (u64)[b gpuAddress] + (a - lo);
++        }
++      }
++    }
++    mx_lch[nl] = (u32)[mx_chunks count];
++    // the pages once, up front (the load time); skipped under LLB_MX_NOTOUCH
++    if (mx_envu("LLB_MX_NOTOUCH") == 0) {
++      volatile u64 sink = 0;
++      for (u32 i = 0; i < nl; i += 1) {
++        for (u32 r = 0; r < 3; r += 1) {
++          const MxTen* T = &mx_ten[i * 3 + r];
++          if (r == 1 && fu[i] != 0) {
++            continue;
++          }
++          for (u64 q = T->src & ~(pg - 1); q < T->src + (u64)R->mxe * T->es; q += pg) {
++            sink += F[q];
++          }
++        }
++      }
++      (void)sink;
++    }
++  }
++  clock_gettime(CLOCK_MONOTONIC, &t1);
++  f64 s = (f64)(t1.tv_sec - t0.tv_sec) + (f64)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
++  fprintf(stderr, "mx pool: %u layers, %u experts top %u, expert ff %u (%s), %llu bytes of experts mapped from %s;"
++    " %s (%u chunk buffers, %u experts a chunk in layer 0's gate; working set %.1f GiB, heap %.1f GiB), %.2f s\n",
++    nl, R->mxe, R->mxk, R->mxf, mx_fused ? "fused gate_up" : "gate, up", (unsigned long long)tot, path,
++    mx_stream ? "streamed: the chosen experts copied each token" : "resident", (u32)[mx_chunks count],
++    mx_ten[0].epc, (f64)ws / (1ull << 30), (f64)heap / (1ull << 30), s);
++  free(src); free(by); free(sh); free(ty); free(fu);
++  mx_nl = nl;
++  snprintf(mx_path, sizeof mx_path, "%s", path);
++}
++
++static void mx_go(id<MTLComputeCommandEncoder> en, id<MTLComputePipelineState> p, const MxArgs* A,
++  u32 gx, u32 gy, u32 threads) {
++  [en setBuffer:gpu_scr offset:0 atIndex:1];
++  [en setBuffer:mx_tab offset:0 atIndex:3];
++  [en setBuffer:mx_scr offset:0 atIndex:4];
++  [en setComputePipelineState:p];
++  [en setBytes:A length:sizeof *A atIndex:2];
++  [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
++  m28_bar(en);
++}
++
++// end and run the command buffer so far; a new one goes on (m30_cb / m30_en, as m30_split leaves them)
++static id<MTLComputeCommandEncoder> mx_cut(void) {
++  [m30_en endEncoding];
++  [m30_cb commit];
++  [m30_cb waitUntilCompleted];
++  if ([m30_cb error]) {
++    gpu_fail([m30_cb error]);
++  }
++  m30_cb = [gpu_que commandBuffer];
++  m30_en = [m30_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:0];
++  [m30_en setBuffer:gpu_att offset:0 atIndex:1];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:3];
++  return m30_en;
++}
++
++// (diagnostic) LLB_MX_DUMP=FILE: after every MoE layer the command buffer is cut and the layer's record appended:
++// u32 layer, d, k; f32 h2[d] (the FFN input), out[d] (the FFN output before the residual); u32 ids[k]; f32 w[k], gs.
++// reports/metal-moe's mx_ref.py recomputes each record from the GGUF in float64 (the MoE FFN's own oracle)
++static void mx_dump(u32 i, const M9Rows* R, u64 h2b, u64 ffo, u64 rt) {
++  if (mx_dumpf == NULL) {
++    mx_dumpf = fopen(getenv("LLB_MX_DUMP"), "ab");
++    if (mx_dumpf == NULL) {
++      err_fail("LLB_MX_DUMP: cannot open the file");
++    }
++  }
++  u32 hd[3] = { i, R->d, R->mxk };
++  const u8* S = (const u8*)[gpu_scr contents];
++  const u8* W = (const u8*)[mx_scr contents];
++  fwrite(hd, 4, 3, mx_dumpf);
++  fwrite(S + (h2b & ~SA_SCR), 4, R->d, mx_dumpf);
++  fwrite(S + (ffo & ~SA_SCR), 4, R->d, mx_dumpf);
++  fwrite(W + rt * 4, 4, 2 * R->mxk + 1, mx_dumpf);
++  fflush(mx_dumpf);
++}
++
++// streamed mode: end and run the command buffer so far (through the routing), then copy the k chosen experts of
++// layer i into the staging and point the route's ids at the staging slots; a new command buffer goes on
++static id<MTLComputeCommandEncoder> mx_sync(u32 i, u64 rt) {
++  id<MTLComputeCommandEncoder> en = mx_cut();
++  u32* ids = (u32*)((u8*)[mx_scr contents] + rt * 4);
++  for (u32 s = 0; s < mx_k; s += 1) {
++    if (ids[s] >= mx_ne) {
++      err_fail("qwen35moe: the routing chose no expert (non-finite logits?)");
++    }
++    for (u32 r = 0; r < 3; r += 1) {
++      const MxTen* T = &mx_ten[i * 3 + r];
++      if (r == 1 && mx_fused) {
++        continue;
++      }
++      memcpy((u8*)[mx_stage[r] contents] + (u64)s * T->es, mx_map + T->src + (u64)ids[s] * T->es, T->es);
++    }
++  }
++  // the kernels address the staging by slot; the chosen ids are kept past the weights (W[rt + 2k + 1 ..]) for a dump
++  for (u32 s = 0; s < mx_k; s += 1) {
++    ids[2 * mx_k + 1 + s] = ids[s];
++    ids[s] = s;
++  }
++  return en;
++}
++
++// layer i's MoE FFN (the place of m9_fbn_run): x1 = x + a and h2 = rms(x1) post in one addrms; the router and the
++// shared gate; the routing; the routed and the shared gate / up / SiLU; down + combine; y = x1 + ffn_out (with the
++// next rmsnorm when nw, as m9_fbn_run's lever 6). b: the layer blob, p: its Offs words, row: its table row. Returns
++// the encoder to go on with (a new one after a streamed layer's sync)
++static id<MTLComputeCommandEncoder> mx_ffn_run(id<MTLComputeCommandEncoder> en, u64 b, const u32* p, const u32* row,
++  const M9Rows* R, u32 i, u64 x, u64 at, u64 y, u64 nw, u64 nh) {
++  const u32 dm = R->d, ne = R->mxe, k = R->mxk, ef = R->mxf, sf = R->f;
++  const u64 x1b = M9_BLK + (u64)R->mxb * 4, h2b = x1b + dm * 4, ffo = h2b + dm * 4;
++  HybArgs HA;
++  m9_args(&HA, x, at, h2b, x1b, b + p[1], 0, 0, dm, 0, 0, 0.0f);
++  m9_go(en, gpu_m_addrms, &HA, 1, 1024);
++  MxArgs A;
++  memset(&A, 0, sizeof A);
++  A.x = h2b; A.out = ffo;
++  A.lg = 0; A.rt = ((u64)ne + 1 + 63) & ~63ull; A.xs = A.rt + ((3ull * k + 1 + 63) & ~63ull);
++  A.act = A.xs + (((u64)sf + 63) & ~63ull);
++  A.wr = b + (row[21] & 0x0fffffffu); A.wrs = b + (row[22] & 0x0fffffffu);
++  for (u32 r = 0; r < 3; r += 1) {
++    const MxTen* T = &mx_ten[i * 3 + r];
++    A.es[r] = T->es; A.wo[r] = T->wo; A.t[r] = T->t; A.epc[r] = T->epc; A.f[r] = T->f; A.rb[r] = T->rb;
++    A.s[r] = b + p[2 + r]; A.fs[r] = mx_hfmt(R->fm[2 + r]); A.rbs[r] = R->rb[2 + r];
++  }
++  A.d = dm; A.eff = ef; A.sff = sf; A.ne = ne; A.k = k; A.mut = mx_mut;
++  mx_go(en, gpu_mx_rdot, &A, (ne + 1 + 3) / 4, 1, 128);
++  mx_go(en, gpu_mx_route, &A, 1, 1, 1024);
++  if (mx_stream) {
++    if (en != m30_en) {
++      err_fail("qwen35moe: the streamed experts need the serve's own encoder");
++    }
++    en = mx_sync(i, A.rt);
++    [en useResource:mx_stage[0] usage:MTLResourceUsageRead];
++    if (mx_stage[1] != nil) {
++      [en useResource:mx_stage[1] usage:MTLResourceUsageRead];
++    }
++    [en useResource:mx_stage[2] usage:MTLResourceUsageRead];
++  } else {
++    u32 c0 = mx_lch[i], c1 = mx_lch[i + 1];
++    for (u32 c = c0; c < c1; c += 1) {
++      [en useResource:mx_chunks[c] usage:MTLResourceUsageRead];
++    }
++  }
++  A.mode = 0;
++  mx_go(en, gpu_mx_gu, &A, (ef + 7) / 8, k, 256);
++  A.mode = 1;
++  mx_go(en, gpu_mx_gu, &A, (sf + 7) / 8, 1, 256);
++  A.pad = (u64)k * ef + sf <= 8192 ? 1u : 0u;
++  mx_go(en, gpu_mx_dn, &A, (dm + 7) / 8, 1, 256);
++  [en setBuffer:gpu_buf offset:0 atIndex:3];
++  if (getenv("LLB_MX_DUMP") != NULL) {
++    if (en != m30_en) {
++      err_fail("LLB_MX_DUMP: needs the serve's own encoder");
++    }
++    en = mx_cut();
++    if (mx_stream) {
++      u32* ids = (u32*)((u8*)[mx_scr contents] + A.rt * 4);
++      for (u32 s = 0; s < k; s += 1) {
++        ids[s] = ids[2 * k + 1 + s];
++      }
++    }
++    mx_dump(i, R, h2b, ffo, A.rt);
++  }
++  if (nw != 0) {
++    m9_args(&HA, x1b, ffo, nh, y, nw, 0, 0, dm, 0, 0, 0.0f);
++    m9_go(en, gpu_m_addrms, &HA, 1, 1024);
++    return en;
++  }
++  m9_elem(en, 0, x1b, ffo, y, dm);
++  return en;
++}
++
+ // lane m26 (tools/metal-f27.patch): a new sequence (pos 0 after state): the
+ // layer state zeroed in place, the slots re-taken in m9_pass_init's order
+ static void m26_reset(u32 dT, const M9Rows* S0) {
+@@ -16682,6 +17503,10 @@ static void m9_pass_run(id<MTLComputeCommandEncoder> en, u64 x, u64 y, u32 c,
+   }
+   u64 cv = 2 * S0->lkh * 128 + S0->lvh * 128;
+   m9_pass_init(dT, S0);
++  // (METAL-MOE) the routed experts, mapped once a model
++  if (S0->mxe != 0) {
++    mx_pool(S0);
++  }
+   if (dT != pass_dT) {
+     err_fail("warp pass: dT changed");
+   }
+@@ -16744,8 +17569,12 @@ static void m9_pass_run(id<MTLComputeCommandEncoder> en, u64 x, u64 y, u32 c,
+       nw = hw;
+       nh = M9_HEADH;
+     }
+-    m9_fbn_run(en, b, p[1], p[2], p[3], p[4], &R, cur, pass_x[2], nxt,
+-      grid, nw, nh);
++    if (S0->mxe != 0) {
++      en = mx_ffn_run(en, b, p, tw + i * 32, &R, i, cur, pass_x[2], nxt, nw, nh);
++    } else {
++      m9_fbn_run(en, b, p[1], p[2], p[3], p[4], &R, cur, pass_x[2], nxt,
++        grid, nw, nh);
++    }
+     cur = nxt;
+     if (j + 1 == m30_split_at && j + 1 < k && m30_en == en && m30_cb0 == nil) {
+       en = m30_split();
+@@ -17710,6 +18539,15 @@ static bool m9_serve(Env e, Corpus H, id<MTLComputeCommandEncoder> en, Term t,
+     // (METAL-ANYSHAPE) the Shape from the row words and the engine's shape words 52 .. 54, as the pass arm;
+     // a generic Shape takes the chunk with its table; dT up to 27
+     bool moe35 = rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u);
++    // (METAL-MOE) the general MoE path has no fast chunk (the engine never asks; refused by name if it does)
++    if (term_tag(H[a + 47]) == TAG_STR) {
++      StrParts q0 = str_peek_ro(e, H[a + 47]);
++      const u32* t0 = (const u32*)((const u8*)(H + term_peek_ro(e, q0.data)) + q0.off);
++      u32 x0, x1, x2, x3, x4;
++      if (str_nar(q0) == 2 && ((uintptr_t)t0 & 3) == 0 && q0.len >= 128 && mx_words(t0, &x0, &x1, &x2, &x3, &x4)) {
++        err_fail("fast chunk: the general MoE path has no fast prefill tier (exact per-token prefill)");
++      }
++    }
+     bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0 && !moe35
+       && m9_shape_w(&S0, rg / 17 * 16, rd / 17 * 16, (u32)H[a + 52], (u32)H[a + 53],
+         (u32)H[a + 54])
+@@ -17918,10 +18756,22 @@ static bool m9_serve(Env e, Corpus H, id<MTLComputeCommandEncoder> en, Term t,
+     // (METAL-ANYSHAPE) the Shape from the row words and the engine's shape words 57 .. 59 (heads, vocabulary,
+     // layers): a legacy Shape as before, any other generic (m9_shape_w); the 35B's words keep its own arm.
+     // dT up to 27 (c = dT | pos << 5): the kv and the attention planes are sized from it (pass_reserve)
+-    bool moe35 = rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u);
++    // (METAL-MOE) a table with the MoE words (row 0, words 24 .. 29) is the general MoE path: a generic Shape
++    // whatever its widths (mx_shape; the dense FFN's checks do not apply: the Shape is taken at d_ff 256, then
++    // given the shared ff), never the 35B arm (which has experts.idx at word 50 and no MoE words)
++    u32  mxe = 0, mxk = 0, mxf = 0, mxs = 0, mxu = 0;
++    bool mxg = false;
++    if (term_tag(H[a + 49]) == TAG_STR) {
++      StrParts q0 = str_peek_ro(e, H[a + 49]);
++      const u32* t0 = (const u32*)((const u8*)(H + term_peek_ro(e, q0.data)) + q0.off);
++      mxg = str_nar(q0) == 2 && ((uintptr_t)t0 & 3) == 0 && q0.len >= 128
++        && mx_words(t0, &mxe, &mxk, &mxf, &mxs, &mxu);
++    }
++    bool moe35 = rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u) && !mxg;
+     bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0 && !moe35
+-      && m9_shape_w(&S0, rg / 17 * 16, rd / 17 * 16, (u32)H[a + 57], (u32)H[a + 58],
++      && m9_shape_w(&S0, rg / 17 * 16, mxg ? 256 : rd / 17 * 16, (u32)H[a + 57], (u32)H[a + 58],
+         (u32)H[a + 59])
++      && (!mxg || ((S0.nl = (u32)H[a + 59]) != 0 && mxs == rd / 17 * 16 && mx_shape(&S0, mxe, mxk, mxf, mxs, mxu)))
+       && dT >= 1 && dT <= 27 && pos < (1u << dT) && k >= 1 && s + k <= S0.nl
+       && !M9_ARR(y) && a32_load(a32_at(H, H_WARP_N)) == 1
+       && H[a + 50] == term_pak(CID_SNIL, 0);
+@@ -18016,6 +18866,21 @@ static bool m9_serve(Env e, Corpus H, id<MTLComputeCommandEncoder> en, Term t,
+             : fm == LLB_FM_F32));
+           sz += has >> f & 1 ? m9_tsz(&R, f) : 0;
+         }
++        // (METAL-MOE) a MoE layer's blob also holds its router (word 21, F32 ne x d) and shared gate (22, F32 d)
++        // in source order, and every row carries the same MoE words
++        if (S0.mxe != 0) {
++          u32 wr = tw[i * 32 + 21], wg = tw[i * 32 + 22], o1 = wr & 0x0fffffffu, o2 = wg & 0x0fffffffu;
++          ok = ok && wr >> 28 == LLB_FM_F32 && wg >> 28 == LLB_FM_F32 && o1 % 16 == 0 && o2 % 16 == 0
++            && (u64)o1 + (u64)S0.mxe * S0.d * 4 <= q.len && (u64)o2 + (u64)S0.d * 4 <= q.len;
++          for (u32 w = 24; w < 30; w += 1) {
++            ok = ok && tw[i * 32 + w] == tw[w];
++          }
++          sz += (u64)S0.mxe * S0.d * 4 + (u64)S0.d * 4;
++          if (!ok) {
++            fprintf(stderr, "warp pass: qwen35moe layer %u's table row is refused (router / shared gate F32, the"
++              " shared expert Q8_0 or a K-quant, the same MoE words in every row)\n", i);
++          }
++        }
+         // (tools/metal-27b.patch) the blob is exactly its tensors at this
+         // Shape (the packs have no gaps): a 27B layer read at the 9B's Shape
+         // (or any other mismatch) is refused here, not run
+@@ -21505,6 +22370,8 @@ static int bend_close(void) {
+   gpu_t27_rnorm = nil; gpu_t27_addrms = nil; gpu_t27_elem = nil;
+   gpu_t27_grn = nil; gpu_t27_mida = nil; gpu_t27_midb = nil;
+   gpu_t27_slot = nil; gpu_t27_qkr = nil; gpu_t27_l2nr = nil;
++  // (METAL-MOE) the general MoE path's expert pool, scratch and pipelines
++  mx_close();
+   // (METAL-ANYSHAPE) the generic arms' pipelines and the scratch size
+   gpu_f27_attn2 = nil; gpu_f9_attn2 = nil;
+   gpu_m_attn6 = nil; gpu_m_a6s = nil; gpu_m_a6m = nil; gpu_m_a6p = nil; gpu_m_a6z = nil;

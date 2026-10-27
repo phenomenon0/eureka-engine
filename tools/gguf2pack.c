@@ -2,7 +2,7 @@
 //
 //   gguf2pack MODEL.gguf OUT_DIR [--format q8|quant] [--head-only]
 //   gguf2pack MODEL.gguf --verify-against PACK_DIR [--format q8|quant]
-//   gguf2pack MODEL.gguf --sidecar-only OUT_DIR [--sha] [--format q8|quant]
+//   gguf2pack MODEL.gguf --sidecar-only OUT_DIR [--sha] [--format q8|quant] [--target cuda|metal]
 //   gguf2pack MODEL.gguf --probe
 //
 // qwen35moe: MODEL.gguf OUT_DIR [--format quant] writes heads, layer files,
@@ -544,7 +544,7 @@ static Cfg build_config(Gguf *g) {
   Val arch = kvv(g, "general.architecture", 1);
   if (arch.k != VS || (strcmp(arch.s, "qwen35") && strcmp(arch.s, "clef") && strcmp(arch.s, "qwen35moe")))
     die("architecture %s: only qwen35 or clef (Qwen3.5 hybrid backbone) is packed", arch.k == VS ? arch.s : "?");
-  // qwen35moe (--sidecar-only, moe_sidecar): the same backbone keys; d_ff is the wider of the
+  // qwen35moe (--sidecar-only, moe_sidecar_cuda): the same backbone keys; d_ff is the wider of the
   // routed and the shared expert widths (the dense scratch the shared expert runs in)
   int moe = !strcmp(arch.s, "qwen35moe");
   static const int64_t zero4[4] = {0, 0, 0, 0};
@@ -1164,7 +1164,7 @@ static void moe_order(T *t, size_t n) {
   }
 }
 
-static int moe_sidecar(Gguf *g, const char *src, const char *out) {
+static int moe_sidecar_cuda(Gguf *g, const char *src, const char *out) {
   static const char *fmn[] = {"Q8_0", "Q4_K", "Q5_K", "Q6_K"};
   Cfg cfg = build_config(g);
   int64_t L0 = cfg_int(&cfg, "n_layers"), D = cfg_int(&cfg, "d_model");
@@ -1344,12 +1344,210 @@ static int moe_sidecar(Gguf *g, const char *src, const char *out) {
   return 0;
 }
 
+// ---------------------------------------------------------------- qwen35moe sidecar (Metal GGUF load)
+// MODEL.gguf --sidecar-only OUT_DIR --target metal, any qwen35moe shape, for the Metal engine's general MoE path
+// (backends/metal, METAL-MOE; the CUDA sidecar above is the default and has another layout): manifest.json + table.bin only. The engine reads
+// the trunk from the GGUF (LLB_GGUF, host/llb_gguf.c's MoE virtual layout: heads, then each layer's non-expert
+// tensors in source order, 64-aligned) and maps the routed experts from the same file itself, so nothing else
+// is written. Unlike the registered 35B pack above: the trunk may be F32 / Q8_0 / Q4_K / Q5_K / Q6_K, the
+// shared expert's width may differ from the routed experts', the experts may be fused (ffn_gate_up_exps, gate
+// rows first), and the NextN (MTP) blocks are dropped. The config says "experts": "gguf" (the general MoE path).
+static int moe_known_expert(const char *tn) {
+  static const char *ok[] = {"F32", "F16", "BF16", "Q8_0", "Q4_K", "Q5_K", "Q6_K"};
+  for (size_t i = 0; i < sizeof ok / sizeof *ok; i++)
+    if (!strcmp(ok[i], tn)) return 1;
+  return 0;
+}
+
+static int moe_sidecar_metal(Gguf *g, const char *src, const char *out) {
+  static const char *heads[] = {"output.weight", "output_norm.weight", "token_embd.weight"};
+  static const char *shared[] = {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
+  static const char *gates[] = {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight"};
+  static const char *keys[][2] = {
+      {"n_layers", "block_count"}, {"n_heads", "attention.head_count"},
+      {"n_kv_heads", "attention.head_count_kv"}, {"d_model", "embedding_length"},
+      {"head_dim", "attention.key_length"}, {"d_ff", "expert_feed_forward_length"},
+      {"d_ff_shared", "expert_shared_feed_forward_length"},
+      {"n_experts", "expert_count"}, {"n_experts_used", "expert_used_count"},
+      {"vocab_size", NULL}, {"rope_freq_base", "rope.freq_base"},
+      {"rope_dim", "rope.dimension_count"}, {"rms_norm_eps", "attention.layer_norm_rms_epsilon"},
+      {"full_attention_interval", "full_attention_interval"}, {"ssm_conv_kernel", "ssm.conv_kernel"},
+      {"ssm_state_size", "ssm.state_size"}, {"ssm_group_count", "ssm.group_count"},
+      {"ssm_time_step_rank", "ssm.time_step_rank"}, {"ssm_inner_size", "ssm.inner_size"}};
+  Cfg cfg = {0};
+  cfg_put(&cfg, "architecture", (Val){VS, 0, 0, "qwen35moe", NULL, 0});
+  KV *tok = kv_get(g, "tokenizer.ggml.tokens");
+  if (!tok || tok->t != 9) die("GGUF has no tokenizer.ggml.tokens array");
+  for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
+    char key[128];
+    snprintf(key, sizeof key, "qwen35moe.%s", keys[i][1] ? keys[i][1] : "");
+    Val v = keys[i][1] ? kvv(g, key, 0) : vint((int64_t)tok->an);
+    if (v.k == VN) die("qwen35moe: GGUF has no %s (the general MoE path needs it)", key);
+    cfg_put(&cfg, keys[i][0], v);
+  }
+  // the routing the engine runs: softmax over every expert, top-k, renormalized, no scale. Refuse files that
+  // declare anything else (llama.cpp's expert_weights_scale / expert_weights_norm / expert_gating_func keys)
+  Val sc = kvv(g, "qwen35moe.expert_weights_scale", 0), nw = kvv(g, "qwen35moe.expert_weights_norm", 0);
+  Val gf = kvv(g, "qwen35moe.expert_gating_func", 0);
+  if (sc.k == VF && sc.f != 0.0 && sc.f != 1.0) die("qwen35moe: expert_weights_scale %g (the engine applies none)", sc.f);
+  if (nw.k == VB && !nw.i) die("qwen35moe: expert_weights_norm false (the engine renormalizes the top-k weights)");
+  if ((gf.k == VI || gf.k == VU) && gf.i != 1) die("qwen35moe: expert_gating_func %lld (the engine's router is softmax, 1)", (long long)gf.i);
+  for (int i = 1; i < cfg.n; i++)
+    if (strcmp(cfg.e[i].k, "rope_freq_base") && strcmp(cfg.e[i].k, "rms_norm_eps") && cfg_int(&cfg, cfg.e[i].k) <= 0)
+      die("qwen35moe: %s must be positive", cfg.e[i].k);
+  int64_t L0 = cfg_int(&cfg, "n_layers");
+  Val mtp = kvv(g, "qwen35moe.nextn_predict_layers", 0);
+  int64_t nmtp = mtp.k == VI || mtp.k == VU ? mtp.i : 0;
+  if (nmtp < 0 || nmtp >= L0) die("qwen35moe: nextn_predict_layers %lld of %lld blocks", (long long)nmtp, (long long)L0);
+  int nl = (int)(L0 - nmtp);
+  for (int i = 0; i < cfg.n; i++)
+    if (!strcmp(cfg.e[i].k, "n_layers")) cfg.e[i].v = vint(nl);
+  if (nmtp) fprintf(stderr, "gguf2pack: qwen35moe: %lld NextN (MTP) block(s) dropped (blk.%d..; plain decode)\n", (long long)nmtp, nl);
+  if (nl > 4096 || cfg_int(&cfg, "n_experts_used") > cfg_int(&cfg, "n_experts")) die("qwen35moe: invalid layer/expert counts");
+  cfg_put(&cfg, "experts", (Val){VS, 0, 0, "gguf", NULL, 0});
+  int64_t ne = cfg_int(&cfg, "n_experts"), D = cfg_int(&cfg, "d_model"), F = cfg_int(&cfg, "d_ff");
+  int64_t FS = cfg_int(&cfg, "d_ff_shared");
+  Cfg shapes = cfg;
+  int64_t inner = cfg_int(&cfg, "ssm_inner_size"), tr = cfg_int(&cfg, "ssm_time_step_rank");
+  int64_t kd = cfg_int(&cfg, "ssm_state_size") * cfg_int(&cfg, "ssm_group_count");
+  for (int i = 0; i < shapes.n; i++)
+    if (!strcmp(shapes.e[i].k, "d_ff")) shapes.e[i].v = vint(FS);  // the trunk's ffn_* are the shared expert
+  cfg_put(&shapes, "linear_key_dim", vint(kd));
+  cfg_put(&shapes, "linear_value_dim", vint(inner));
+  cfg_put(&shapes, "linear_conv_dim", vint(2 * kd + inner));
+  cfg_put(&shapes, "linear_value_head_dim", vint(inner / tr));
+  for (size_t i = 0; i < g->nt; i++)
+    for (size_t j = 0; j < i; j++)
+      if (!strcmp(g->t[i].name, g->t[j].name)) die("%s: duplicate tensor", g->t[i].name);
+  T *ts = xmalloc(g->nt * sizeof(T));
+  size_t nt = 0, nexp = 0, nmtpt = 0;
+  int *fz = xmalloc((size_t)nl * sizeof *fz);
+  for (int i = 0; i < 3; i++) ts[nt++] = *moe_tensor(g, heads[i]);
+  for (int L = 0; L < nl; L++) {
+    size_t start = nt;
+    char name[128];
+    snprintf(name, sizeof name, "blk.%d.ffn_gate_up_exps.weight", L);
+    int fused = fz[L] = has_tensor(g, name);
+    for (size_t i = 0; i < g->nt; i++) {
+      T t = g->t[i];
+      if (t.layer != L) continue;
+      const char *s = strchr(t.name + 4, '.') + 1;
+      if (!strcmp(s, "ffn_gate_exps.weight") || !strcmp(s, "ffn_up_exps.weight") ||
+          !strcmp(s, "ffn_down_exps.weight") || !strcmp(s, "ffn_gate_up_exps.weight")) {
+        int dn = !strcmp(s, "ffn_down_exps.weight"), gu = !strcmp(s, "ffn_gate_up_exps.weight");
+        if (fused && !dn && !gu) die("%s: separate gate/up experts beside ffn_gate_up_exps", t.name);
+        if (!moe_known_expert(t.tn))
+          die("%s: expert type %s (the general MoE path reads F32 F16 BF16 Q8_0 Q4_K Q5_K Q6_K experts)", t.name, t.tn);
+        int64_t rows = dn ? D : gu ? 2 * F : F, cols = dn ? F : D;
+        int el = t.f ? t.f->elems : 1;
+        if (t.nd != 3 || t.sh[0] != ne || t.sh[1] != rows || t.sh[2] != cols || cols % el || cols % 32)
+          die("%s: shape [%lld, %lld, %lld], want [%lld, %lld, %lld] (whole %d-element blocks a row)", t.name,
+              (long long)t.sh[0], (long long)t.sh[1], (long long)(t.nd > 2 ? t.sh[2] : 0), (long long)ne,
+              (long long)rows, (long long)cols, el);
+        nexp++;
+        continue;
+      }
+      for (int j = 0; j < 3; j++)
+        if (!strcmp(s, shared[j])) {
+          t.name = xmalloc(96);
+          snprintf(t.name, 96, "blk.%d.%s", L, OFFS[2 + j]);
+        }
+      ts[nt++] = t;
+    }
+    qsort(ts + start, nt - start, sizeof(T), source_order);
+    for (int j = 0; j < 3; j++) {
+      snprintf(name, sizeof name, "blk.%d.%s", L, shared[j]);
+      if (!has_tensor(g, name)) die("qwen35moe: %s missing (the general MoE path needs the shared expert)", name);
+    }
+    for (int j = 0; j < 2; j++) {
+      snprintf(name, sizeof name, "blk.%d.%s", L, gates[j]);
+      T *t = moe_tensor(g, name);
+      if (strcmp(t->tn, "F32") || (j ? t->nd != 1 || t->sh[0] != D : t->nd != 2 || t->sh[0] != ne || t->sh[1] != D))
+        die("%s: the router must be F32 [%lld, %lld] (shared gate [%lld])", name, (long long)ne, (long long)D, (long long)D);
+    }
+  }
+  for (size_t i = 0; i < g->nt; i++) nmtpt += g->t[i].layer >= nl;
+  if (nt + nexp + nmtpt != g->nt) die("qwen35moe: unexpected tensors outside heads/layers");
+  Gguf trunk = *g;
+  trunk.t = xmalloc(g->nt * sizeof(T)), trunk.nt = 0;
+  for (size_t i = 0; i < nt; i++) {
+    T *t = &ts[i];
+    const char *s = t->layer < 0 ? "" : strchr(t->name + 4, '.') + 1;
+    if (strcmp(s, gates[0]) && strcmp(s, gates[1])) trunk.t[trunk.nt++] = *t;
+    if (strcmp(t->tn, "F32") && strcmp(t->tn, "Q8_0") && strcmp(t->tn, "Q4_K") && strcmp(t->tn, "Q5_K") && strcmp(t->tn, "Q6_K"))
+      die("%s: %s outside the trunk formats (F32 Q8_0 Q4_K Q5_K Q6_K; requantize, e.g. BF16 -> Q8_0)", t->name, t->tn);
+    if (strcmp(t->tn, "F32")) {
+      if (t->nd != 2 || t->sh[1] % t->f->elems) die("%s: %s needs 2-D whole blocks", t->name, t->tn);
+      t->rb = (uint64_t)t->sh[1] / (uint64_t)t->f->elems * (uint64_t)t->f->bytes;
+    }
+  }
+  if (check_shapes(&trunk, &shapes)) die("qwen35moe shape check failed (above)");
+  free(trunk.t);
+  uint32_t *table = xmalloc((size_t)nl * 128);
+  memset(table, 0, (size_t)nl * 128);
+  uint64_t pos = 0, lo = 0;
+  int cur = -1;
+  for (size_t i = 0; i < nt; i++) {
+    T *t = &ts[i];
+    pos += (ALIGN - pos % ALIGN) % ALIGN;
+    t->off = pos, pos += t->bytes;
+    if (t->layer < 0) continue;
+    if (t->layer != cur) cur = t->layer, lo = t->off;
+    const char *s = strchr(t->name + 4, '.') + 1;
+    int j = 0;
+    while (j < 22 && strcmp(s, j < 20 ? OFFS[j] : gates[j - 20])) j++;
+    if (j == 22) die("%s: outside the MoE table", t->name);
+    if (pos - lo >= 1u << 28) die("layer %d: bytes >= 2^28", t->layer);
+    table[t->layer * 32 + 1 + j] = (uint32_t)(t->off - lo) | (uint32_t)t->f->fm << 28;
+    table[t->layer * 32] = (uint32_t)(pos - lo);
+  }
+  // the MoE words the host reads (every row): 24 "MXG1", 25 n_experts, 26 top-k, 27 expert ff, 28 shared ff,
+  // 29 bit 0 a fused ffn_gate_up_exps
+  int64_t K = cfg_int(&cfg, "n_experts_used");
+  if (ne > UINT32_MAX || F > UINT32_MAX || FS > UINT32_MAX) die("qwen35moe: n_experts / expert ff / shared ff above 2^32");
+  for (int L = 0; L < nl; L++) {
+    table[L * 32 + 24] = 0x3147584Du;
+    table[L * 32 + 25] = (uint32_t)ne;
+    table[L * 32 + 26] = (uint32_t)K;
+    table[L * 32 + 27] = (uint32_t)F;
+    table[L * 32 + 28] = (uint32_t)FS;
+    table[L * 32 + 29] = (uint32_t)fz[L];
+  }
+  free(fz);
+  char path[4096];
+  if (strlen(out) > sizeof path - 64) die("output path too long");
+  if (mkdir(out, 0755) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
+  snprintf(path, sizeof path, "%s/manifest.json", out);
+  if (!access(path, F_OK)) die("%s exists; refusing to overwrite a pack", path);
+  Buf m = {0};
+  bs(&m, "{\n \"format\": \"llama-bend-pack-q35-quant/v0\",\n \"alignment\": 64,\n \"dtype\": \"mixed-quant\",\n \"source\": {\n  \"file\": ");
+  bjstr(&m, src, 1);
+  bs(&m, "\n },\n \"config\": {");
+  for (int i = 0; i < cfg.n; i++) {
+    bs(&m, i ? ",\n  " : "\n  "), bjstr(&m, cfg.e[i].k, 0), bs(&m, ": ");
+    bjval(&m, cfg.e[i].v, 2, 1);
+  }
+  bs(&m, "\n },\n \"tensors\": {\n");
+  for (size_t i = 0; i < nt; i++) {
+    if (i) bs(&m, ",\n");
+    manifest_tensor(&m, &ts[i], 0, NULL, NULL);
+  }
+  bf(&m, "\n },\n \"pack_bytes\": %llu,\n \"pack_sha256\": \"\"\n}\n", (unsigned long long)pos);
+  write_file(out, "table.bin", table, (size_t)nl * 128);
+  write_file(out, "manifest.json", m.p, m.n);
+  printf("sidecar %s: manifest.json + table.bin for %s (qwen35moe, %d layers, %lld experts top %lld, expert ff %lld,"
+         " shared ff %lld, %zu trunk tensors, pack_bytes %llu)\n", out, src, nl, (long long)ne,
+         (long long)cfg_int(&cfg, "n_experts_used"), (long long)F, (long long)FS, nt, (unsigned long long)pos);
+  free(ts), free(table), free(m.p);
+  return 0;
+}
+
 // ---------------------------------------------------------------- main
 
 static void usage(void) {
   fputs("usage: gguf2pack MODEL.gguf OUT_DIR [--format q8|quant] [--head-only]\n"
         "       gguf2pack MODEL.gguf --verify-against PACK_DIR [--format q8|quant]\n"
-        "       gguf2pack MODEL.gguf --sidecar-only OUT_DIR [--sha] [--format q8|quant]\n"
+        "       gguf2pack MODEL.gguf --sidecar-only OUT_DIR [--sha] [--format q8|quant] [--target cuda|metal]\n"
         "       gguf2pack MODEL.gguf --probe\n", stderr);
   exit(2);
 }
@@ -1358,7 +1556,8 @@ int main(int argc, char **argv) {
   uint16_t one = 1;
   if (*(uint8_t *)&one != 1) die("big-endian host: GGUF and the pack are little-endian; unsupported");
   const char *src = NULL, *out = NULL, *vdir = NULL, *fmtarg = NULL;
-  int probe = 0, head_only = 0, sidecar = 0, shas = 0;
+  int probe = 0, head_only = 0, sidecar = 0, shas = 0, metal = 0;
+  const char *target = NULL;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe")) probe = 1;
     else if (!strcmp(argv[i], "--head-only")) head_only = 1;
@@ -1366,6 +1565,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--sha")) shas = 1;
     else if (!strcmp(argv[i], "--verify-against") && i + 1 < argc) vdir = argv[++i];
     else if (!strcmp(argv[i], "--format") && i + 1 < argc) fmtarg = argv[++i];
+    else if (!strcmp(argv[i], "--target") && i + 1 < argc) target = argv[++i];
     else if (argv[i][0] == '-' && argv[i][1] == '-') usage();
     else if (!src) src = argv[i];
     else if (!out) out = argv[i];
@@ -1373,6 +1573,9 @@ int main(int argc, char **argv) {
   }
   if (!src || (probe + !!vdir + !!out) != 1 || (head_only && !out) || (sidecar && (!out || head_only)) || (shas && !sidecar)) usage();
   if (fmtarg && strcmp(fmtarg, "q8") && strcmp(fmtarg, "quant")) usage();
+  // --target: whose qwen35moe sidecar (cuda, the default, or metal); a dense sidecar is the same for both
+  if (target && (!sidecar || (strcmp(target, "cuda") && strcmp(target, "metal")))) usage();
+  metal = target && !strcmp(target, "metal");
 
   int fd = open(src, O_RDONLY);
   if (fd < 0) die("open %s: %s", src, strerror(errno));
@@ -1395,8 +1598,9 @@ int main(int argc, char **argv) {
 
   Val arch = kvv(&g, "general.architecture", 1);
   if (arch.k == VS && !strcmp(arch.s, "qwen35moe")) {
-    // --sidecar-only: the CUDA engine's direct GGUF load, any qwen35moe shape (moe_sidecar)
-    if (sidecar && !shas && !fmtarg) return moe_sidecar(&g, src, out);
+    // --sidecar-only: the CUDA engine's direct GGUF load, any qwen35moe shape (moe_sidecar_cuda); with
+    // --target metal the Metal engine's (moe_sidecar_metal: experts left out of the layout, MoE words 24 .. 29)
+    if (sidecar && !shas && !fmtarg) return metal ? moe_sidecar_metal(&g, src, out) : moe_sidecar_cuda(&g, src, out);
     if (sidecar || head_only || vdir || (fmtarg && strcmp(fmtarg, "quant")))
       die("qwen35moe: use MODEL.gguf OUT_DIR [--format quant], or MODEL.gguf --sidecar-only OUT_DIR; other dense flags are unsupported");
     return moe_pack(&g, fd, src, out);
