@@ -378,9 +378,11 @@ Catalogue: the app repository's `docs/MODES.md` and `catalogue/modes.json`.
 
 ## Concurrency, logging, and shutdown
 
-- One engine slot. Each connection runs on its own thread. Requests reach the
-  engine one at a time under one lock, and the others wait. There is no batching
-  across requests. That is N-slot work for a later release.
+- Each connection runs on its own thread. With the default single slot,
+  requests reach the engine one at a time under one lock. `--parallel N` adds
+  slots, and `--native-batch N` (with `--native-cont`) batches decide tasks
+  inside a slot. See [Native batch](#native-batch) and
+  [Continuous batch](#continuous-batch).
 - A batch request is one request that holds the slot for all its items. See
   [Batch requests](#batch-requests).
 - The engine-side session and continuation machinery is not used. The server

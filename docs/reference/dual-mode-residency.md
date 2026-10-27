@@ -33,24 +33,40 @@ processes.
 
 ## Queue policy
 
-This is version 1 of the queue policy.
+Version 1 of this policy (2026-10-07) served one request at a time in FIFO
+order, with no batching. The server has since gained the features below. Each
+item is byte-identical to the same request served alone unless a row says
+otherwise.
 
-- The engine serves requests one at a time, in FIFO order. Requests wait in
-  the stdin pipe. There is no batching and no preemption.
-- The KV need of a request must fit the capacity fixed at launch. The need is
-  prompt + n - 1 tokens, or n for decide. An oversized request gets an error
-  line. The engine does not truncate it.
-- Malformed JSON, missing fields, and over-capacity requests get an error
-  line, and the request loop continues.
+| Feature | Flag | What it does | Measured |
+|---|---|---|---|
+| One task, many questions | (default) | Every question about one state is answered from one prefill. | One prefill instead of N. |
+| Batch requests | `{"batch":[...]}` | N items in one HTTP request, one queue ticket, back to back on one slot. | Saves the per-request HTTP time. |
+| Native batch | `--native-batch N` (2..8) | N decide sequences run in one forward per step. Each weight is read once for all rows. | 9B clef-flash, RTX 3090: 24 items 113.4 s → 75.0 s (≈1.5×). |
+| Continuous batch | `--native-batch N --native-cont` | A task joins a free row at a step boundary instead of waiting for its group. | First item at 10.2 s, against 18.7 s grouped and 21.8 s in order (N = 8). |
+| Swappable heads | `--heads name=GGUF[,...]` | Up to 6 more decide heads beside head0. A decide picks one with `"head"`. The trunk pass never sees the head, so rows in one batch can use different heads. | Mixed-head batch 74.9 s against 75.2 s for one head. ≈0.46 GB host RAM a head, no device memory. |
+| Engine slots | `--parallel N` | N engine slots; `GET /slots` lists them. A batch stays on one slot. | — |
+| Prefix cache | `LLB_PREFIX_CACHE=1` | Reuses the shared system and state prefix across requests. | — |
+| Fast decide prefill | `--decide-path` / `LLB_PREFILL=fast` | int8 prefill for decide where the head allows it (the 4B signed path). Heads that read every position, such as Clef on the 9B, take the exact pass. | 4B: labels 22/22, median \|Δp\| 0.003 against llama.cpp CPU. |
+
+Details and gates: [HTTP API](http-api.md#batch-requests),
+[Native batch](http-api.md#native-batch),
+[Continuous batch](http-api.md#continuous-batch),
+[Multi-head batch](http-api.md#multi-head-batch), and
+[Decide configuration](decide-configuration.md).
+
+Still true of every slot:
+
+- The KV need of a request must fit the capacity fixed at launch: prompt + n - 1
+  tokens, or n for decide. An oversized request gets an error line. The engine
+  does not truncate it.
+- Malformed JSON, missing fields, and over-capacity requests get an error line,
+  and the request loop continues. A decide the engine cannot encode returns 400,
+  and the engine stays up.
 
 ## Limitations
 
-- Requests block each other at the head of the line. Decide uses the exact
-  prefill, at about 12.8 ms per prompt token. A 3020-token decide holds the
-  engine for about 47 s, and a generate request queued behind it waits that
-  long.
-- If mixed traffic matters, the planned next step is a priority lane, with
-  generate first, or splitting long decides. Both need the request loop to
-  see more than one pending request at a time.
-- Inputs that `clef_encode` rejects still call `clef_fail` and end the
-  process. To return error lines for them, the encoder must not exit.
+- Within one slot, a long exact-tier decide still holds that slot until it
+  ends. Native and continuous batching share the slot's forward among decides,
+  and `--parallel` adds slots, but generate requests are not batched.
+- The residency figures above were measured on 2026-10-07 with one slot.
