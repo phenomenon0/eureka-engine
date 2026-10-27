@@ -1,14 +1,15 @@
 --- a/bend2/comp.ts
 +++ b/bend2/comp.ts
-@@ -4984,6 +4984,7 @@
+@@ -4984,6 +4984,8 @@
  static CUfunction gpu_amax;
  static CUfunction gpu_amaxp;
  static CUfunction gpu_embed, gpu_embedk, gpu_embed6;
 +static CUfunction gpu_embt;  // tools/payload-catchup.patch: the decode run's embedding
++static CUfunction gpu_ganyk;  // tools/payload-catchup.patch: llb_gemv_any's K-quant rows on moe_dotn
  static CUfunction gpu_attn4;
  static CUfunction gpu_mid;
  static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc, gpu_warpqc11;
-@@ -8409,7 +8410,7 @@
+@@ -8409,7 +8411,7 @@
    const u32 R = 2;
    __shared__ float pvs[NP];
    const u32 l = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -17,7 +18,7 @@
    for (u32 p = npr + w; p < NP; p += blockDim.x >> 5) {
      bool nf = false, ps = false;
      #pragma unroll
-@@ -8450,13 +8451,21 @@
+@@ -8450,13 +8452,21 @@
            xh[t] = kp_x(x, xb + 16 * shi + 4 * t);
          }
          typename F::Raw rw[R];
@@ -42,7 +43,7 @@
            v[j] = kp_tlo<F::KIN>(kp_span(wl, xl), kp_span(wh, xh));
          }
          u = kp_thi<F::KIN>(l & 1 ? v[1] : v[0]);
-@@ -8547,7 +8556,7 @@
+@@ -8547,7 +8557,7 @@
    u32* __restrict__ y, u32 n, u32 d) {
    // the pair body where it applies (K0b m4r2: no_allocate loads); the tile
    // body (d <= 11) for rows not a whole number of superblock quads
@@ -51,7 +52,7 @@
      kp_warp<4, 1>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
    } else {
      warp_dq4k(W, rb, cg, x, y, n, d);
-@@ -8656,7 +8665,7 @@
+@@ -8656,7 +8666,7 @@
    u32* __restrict__ y, u32 n, u32 d) {
    // the pair body where it applies (K0b p6r2: default loads, the second
    // aligned uint4 is the next lane's first); else the tile body (d <= 11)
@@ -60,7 +61,7 @@
      kp_warp<6, 0>(W, rb, cg, x, y, n, d, blockIdx.x, gridDim.x, nullptr);
    } else {
      warp_dq6k(W, rb, cg, x, y, n, d);
-@@ -9683,7 +9692,8 @@
+@@ -9683,7 +9693,8 @@
    u32  c = (u32)H[a + 44], rgw = (u32)H[a + 45], rdw = (u32)H[a + 46];
    // word 47 bit 30: the fast prefill tier's defer bit (tools/payload-pf.patch), then s = 0,
    // bit 29 a batch of the count (bits 0..15) of ids in x; o->bsn 0, 1 deferred, 2 + count
@@ -70,7 +71,7 @@
    bool rgt = rgw >> 30 & 1, rdt = rdw >> 30 & 1;
    u32  rg = rgw & (rgt ? 0x0fffffffu : 0x7fffffffu);
    u32  rd = rdw & (rdt ? 0x0fffffffu : 0x7fffffffu);
-@@ -9898,7 +9908,8 @@
+@@ -9898,7 +9909,8 @@
    o->y = (u64)(H + blk_loc(H, y));
    o->c = c; o->brg = rg; o->rb = rd; o->n = s; o->d = k; o->fm = 1;
    o->bro = ro;
@@ -80,7 +81,30 @@
    M->sh = sh;
    M->cfg[0] = cf[0]; M->cfg[1] = cf[1]; M->cfg[2] = cf[2]; M->cfg[3] = cf[3];
  }
-@@ -11996,6 +12007,41 @@
+@@ -10327,6 +10339,22 @@
+   }
+ }
+ 
++extern "C" __global__ void __launch_bounds__(128) llb_gemv_anyk(
++  const u8* __restrict__ W, u32 rb, u32 fm, u32 cg, const float* __restrict__ x,
++  float* __restrict__ y, u32 n) {
++  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
++  for (u32 r0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2; r0 < n; r0 += nw * 2) {
++    const u8* rw[2] = { W + (u64)r0 * rb, W + (u64)(r0 + 1 < n ? r0 + 1 : r0) * rb };
++    const float* xs[1] = { x };
++    float v[2];
++    if (fm == 3) moe_dotn<3, 2, true, 2>(rw, xs, cg, v);
++    else if (fm == 4) moe_dotn<4, 2, true, 2>(rw, xs, cg, v);
++    else moe_dotn<9, 2, true, 2>(rw, xs, cg, v);
++    if (l == 0) y[r0] = v[0];
++    if (l == 1 && r0 + 1 < n) y[r0 + 1] = v[1];
++  }
++}
++
+ // one block of 1024: lg the ne router logits, sg the shared expert's gate logit, pv ne floats of
+ // scratch (the probabilities). Out: ids[k] / wt[k] the chosen experts by descending probability
+ // (ties to the lower index: argsort's order on distinct values), sgo[0] = sigmoid(sg).
+@@ -11996,6 +12024,41 @@
    }
  }
  
@@ -122,11 +146,12 @@
  // flat.bend's argmax twice over z[0 .. n), y := [v, i, w, j] (ids as exact
  // F32), the head bang's tail (tools/payload-head.patch). K.amax.pick (the
  // first NaN, else the first max) is the least by (not NaN, value, index), so
-@@ -13156,6 +13202,7 @@
+@@ -13156,6 +13219,8 @@
      || cuModuleGetFunction(&gpu_embed, gpu_lib, "llb_embed") != CUDA_SUCCESS
      || cuModuleGetFunction(&gpu_embedk, gpu_lib, "llb_embedk") != CUDA_SUCCESS
      || cuModuleGetFunction(&gpu_embed6, gpu_lib, "llb_embed6") != CUDA_SUCCESS
 +    || cuModuleGetFunction(&gpu_embt, gpu_lib, "llb_embt") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_ganyk, gpu_lib, "llb_gemv_anyk") != CUDA_SUCCESS
      || cuModuleGetFunction(&gpu_attn4, gpu_lib, "llb_attn4") != CUDA_SUCCESS
      || cuModuleGetFunction(&gpu_mid, gpu_lib, "llb_mid32") != CUDA_SUCCESS
      || cuModuleGetFunction(&gpu_rnadd, gpu_lib, "llb_rmsnorm_add") != CUDA_SUCCESS

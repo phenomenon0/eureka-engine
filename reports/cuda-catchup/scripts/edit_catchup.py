@@ -118,4 +118,33 @@ rep('''  if (cg % 256 == 0 && d >= 8 && d <= 13) {
   } else {
     warp_dq6k(W, rb, cg, x, y, n, d);
   }''')
+
+
+# 4. llb_gemv_anyk: llb_gemv_any's K-quant rows (Q4_K, Q6_K, Q5_K) on moe_dotn (reports/cuda-moe-speed:
+# moe_dot's bits, which are llb_gemv_any's leaf and order: lane l sums groups l, l + 32, .. then the
+# xor butterfly), two rows a warp sharing x, loads first; llb_gany takes it for those formats
+rep('''// one block of 1024: lg the ne router logits, sg the shared expert's gate logit, pv ne floats of''',
+'''extern "C" __global__ void __launch_bounds__(128) llb_gemv_anyk(
+  const u8* __restrict__ W, u32 rb, u32 fm, u32 cg, const float* __restrict__ x,
+  float* __restrict__ y, u32 n) {
+  const u32 l = threadIdx.x & 31, nw = gridDim.x * (blockDim.x >> 5);
+  for (u32 r0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 2; r0 < n; r0 += nw * 2) {
+    const u8* rw[2] = { W + (u64)r0 * rb, W + (u64)(r0 + 1 < n ? r0 + 1 : r0) * rb };
+    const float* xs[1] = { x };
+    float v[2];
+    if (fm == 3) moe_dotn<3, 2, true, 2>(rw, xs, cg, v);
+    else if (fm == 4) moe_dotn<4, 2, true, 2>(rw, xs, cg, v);
+    else moe_dotn<9, 2, true, 2>(rw, xs, cg, v);
+    if (l == 0) y[r0] = v[0];
+    if (l == 1 && r0 + 1 < n) y[r0 + 1] = v[1];
+  }
+}
+
+// one block of 1024: lg the ne router logits, sg the shared expert's gate logit, pv ne floats of''')
+rep('''static CUfunction gpu_embt;  // tools/payload-catchup.patch: the decode run's embedding''',
+'''static CUfunction gpu_embt;  // tools/payload-catchup.patch: the decode run's embedding
+static CUfunction gpu_ganyk;  // tools/payload-catchup.patch: llb_gemv_any's K-quant rows on moe_dotn''')
+rep('''    || cuModuleGetFunction(&gpu_embt, gpu_lib, "llb_embt") != CUDA_SUCCESS''',
+'''    || cuModuleGetFunction(&gpu_embt, gpu_lib, "llb_embt") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_ganyk, gpu_lib, "llb_gemv_anyk") != CUDA_SUCCESS''')
 open(p, 'w').write(s)

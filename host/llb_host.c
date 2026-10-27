@@ -62,7 +62,14 @@ static void llb_gany(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n) {
   if (fm != LLB_FM_F32 && fm != LLB_FM_Q8_0 && fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K && fm != LLB_FM_Q5_K) {
     err_fail("warp pass: no GEMV body for a table format");
   }
-  if (!LLB_LAUNCH(gpu_gany, g, 1, 128, &w, &rb, &fm, &cg, &x, &y, &n)) {
+  // reports/cuda-catchup: K-quant rows on llb_gemv_anyk (moe_dotn: the same leaf and order, two rows a
+  // warp, loads first)
+  bool kq = fm == LLB_FM_Q4_K || fm == LLB_FM_Q6_K || fm == LLB_FM_Q5_K;
+  if (kq) {
+    g = (n + 7) / 8;
+    g = g < 4096 ? g : 4096;
+  }
+  if (!LLB_LAUNCH(kq ? gpu_ganyk : gpu_gany, g, 1, 128, &w, &rb, &fm, &cg, &x, &y, &n)) {
     err_fail("device launch failed");
   }
 }
