@@ -27,7 +27,9 @@ Machines: RTX 3090 with Chrome (Vulkan/ANGLE), and an M3 Ultra with Chrome
 | `old-vs-new-ids.txt` | The engine before this change vs after, on the four sizes it already ran: same ids 16/16. |
 | `ab-decode.txt` | Decode speed, old vs new, interleaved, 3 runs each: 0.8B 105.5 vs 104.1 tok/s, 2B 54.5 vs 54.0 tok/s (medians). `ab-decode-before-direct-dispatch.txt` is the same A/B before attention chunks were dispatched directly at small capacities (an 11% loss on the 0.8B). |
 | `ctx-scaling-3090-0.8b.txt` | `[position, ms/token in prefill, ms for one decode step]` every 8,192 tokens of a 160k-capacity 0.8B: 6.1 ms/token at 8k, 9.7 at 74k. |
-| `long-context.txt` | Needle prompts on the 0.8B: found at 20,973 and 153,352 tokens. |
+| `long-context.txt` | Needle prompts on the 0.8B, RTX 3090: found at 20,973 and 153,352 tokens. |
+| `mac-chrome.txt` | Chrome on the M3 Ultra (Metal): 0.8B 168.7 tok/s, 2B 106.7, 4B 56.4, clef-flash 9B 36.1; IQ1_M, IQ2_XXS, IQ3_S, Q5_1, BF16; the synthetic dense and MoE files. Needles found at 20,973 tokens on the 2B (95.5 tok/s decode after) and 153,352 tokens on the 0.8B (115.9 tok/s prefill, 59 tok/s decode after). |
+| `ctx-scaling-m3-2b.txt` | The same scaling run on the M3 Ultra, 2B: 7.4 ms/token at 4k, 8.1 at 33k. |
 
 ## Reading the llama.cpp comparison
 
@@ -46,11 +48,13 @@ rounding, not the kernels.
 - The 27B was not run in the browser.
 - Safari: WebDriver automation is off on the test Mac. Chrome on Metal was run.
 - Prefill is one decode-graph pass a token (in 64-token submissions), so long
-  prompts take minutes: 26 minutes for 153k tokens on the 0.8B.
+  prompts take minutes: 153k tokens on the 0.8B took 26 minutes on the RTX 3090
+  and 22 minutes on the M3 Ultra.
 
 ## SUMMARY
 
 The WebGPU trunk runs any Qwen3.5 shape (dense or MoE), 21 GGUF formats, and
 contexts bounded by the GPU's binding limit. The kernels equal the reference
 dequantizers, real models agree with llama.cpp up to near ties, the old shapes
-produce the same ids at the same speed, and a 153k-token needle was found.
+produce the same ids at the same speed, and a 153k-token needle was found on
+both the RTX 3090 and the M3 Ultra.

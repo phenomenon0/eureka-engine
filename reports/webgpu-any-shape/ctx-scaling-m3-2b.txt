@@ -1,0 +1,9 @@
+# Chrome 155 (Metal), M3 Ultra, 2B Q4_K_M, ctxbench: [position, ms/token in prefill, ms for one decode step] every 4,096 tokens
+[4097,7.356,11.3]
+[8194,7.419,10.6]
+[12291,7.518,10.7]
+[16388,7.631,10.9]
+[20485,7.716,10.9]
+[24582,7.818,11.3]
+[28679,7.926,13]
+[32776,8.095,11.3]

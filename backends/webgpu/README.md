@@ -59,7 +59,7 @@ Receipts are in [`reports/webgpu-any-shape/`](../../reports/webgpu-any-shape/REP
 | Random-weight files in shapes no release has: head 128, state 64, conv 3, 2 KV heads; MoE with 16 experts / 4 used and a shared expert, separate and fused | 24/24 greedy tokens equal to llama.cpp |
 | Old engine vs this one on the shapes the old one ran (0.8B, 2B, 4B, 9B) | Same ids 16/16; decode speed within 1.3% (interleaved medians) |
 | Needle in a long prompt, 0.8B, RTX 3090 | Found at 20,973 tokens (129 s prefill) and 153,352 tokens (1,586 s prefill, 49 tok/s decode after) |
-| Chrome on an M3 Ultra (Metal) | 0.8B, 2B, 4B, 9B, five formats, and the synthetic dense and MoE files run; 0.8B 169 tok/s, 9B 36 tok/s |
+| Chrome on an M3 Ultra (Metal) | 0.8B, 2B, 4B, 9B, five formats, and the synthetic dense and MoE files run; 0.8B 169 tok/s, 9B 36 tok/s. Needle found at 20,973 tokens on the 2B and 153,352 tokens on the 0.8B (59 tok/s decode after) |
 
 ## Layout
 

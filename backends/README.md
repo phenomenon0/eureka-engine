@@ -16,3 +16,7 @@ downloaded or built separately; each page lists them.
 All five passed `chat`, `decide`, `see`, `hear`, and `speak` in the
 backend-parity battery (2026-10-21). Conditions and gaps:
 [docs/backends.md](../docs/backends.md).
+
+Every backend reads the model shape from the file, so it is not tied to the
+model in the table above. Models, formats, and context per backend:
+[docs/limits.md](../docs/limits.md).

@@ -41,6 +41,24 @@ All five backends pass all five verbs in the backend-parity battery (2026-10-21)
 Windows runs a CPU build of the engine today. Devices, conditions, and gaps:
 [docs/backends.md](docs/backends.md).
 
+## Models
+
+<div align="center">
+
+| Backend | Qwen3.5 models | Context |
+| :---: | :--- | :--- |
+| **CUDA** | Any dense size, 0.8B to 27B | VRAM-bound; 145k-token prompt tested |
+| **Metal** | Any dense size, plus 35B-A3B MoE | Buffer-bound; 153k-token prompt tested |
+| **iOS** | Same engine as Metal (new sizes compiled, not yet run on a phone) | Buffer-bound |
+| **Android** | Any dense size | Set at launch |
+| **WebGPU** | Any size, dense or MoE, in 21 GGUF formats (F16 to IQ1_S) | About 2M tokens on the 0.8B; 153k-token prompt tested |
+
+</div>
+
+Each engine reads the shape from the model file and refuses, with the reason,
+anything it can't run. Sizes, formats, and limits per engine:
+[docs/limits.md](docs/limits.md).
+
 ## What it does
 
 <p align="center">
@@ -148,6 +166,7 @@ eureka-engine/
 | Page | Description |
 | :---: | :--- |
 | [Backends](docs/backends.md) | Status, devices, and gaps for each backend |
+| [Model and hardware limits](docs/limits.md) | Model sizes, formats, and context per engine |
 | [Run on CUDA](docs/guides/run-on-cuda.md) | Full build and run guide |
 | [HTTP API](docs/reference/http-api.md) | Endpoints, fields, streaming, errors |
 | [Multimodal content](docs/reference/multimodal-content.md) | Images, audio, and video in requests |

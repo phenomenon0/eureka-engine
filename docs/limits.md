@@ -2,8 +2,9 @@
 
 What each engine accepts today, what stops it from running other model sizes
 or smaller hardware, and how hard each limit is to lift. Every engine runs the
-Qwen3.5 dense hybrid architecture only (linear-attention layers plus a
-full-attention layer every fourth layer).
+Qwen3.5 hybrid architecture (linear-attention layers plus a full-attention
+layer every fourth layer). The dense sizes run on every engine; the MoE
+models (`qwen35moe`) run on the WebGPU trunk, and the 35B-A3B on Metal.
 
 Classes:
 
@@ -101,7 +102,9 @@ lines inside the patch.
   (`-march=armv8.2-a+dotprod`); ARMv8.0 phones get SIGILL. The app pins
   CPUs 4–7 with 4 threads (`taskset f0`), which suits the Pixel 6a's
   Tensor G1 layout only.
-- **WebGPU:** no preflight against device memory before uploading the model;
+- **WebGPU trunk:** the whole model is resident (no offload);
+  `trunk_resident(check, ctx)` estimates it before loading. KV is f16.
+- **WebGPU shipped:** no preflight against device memory before uploading the model;
   `kvput` and `gdn` use exactly 8 storage buffers, the default per-stage
   limit.
 
@@ -129,6 +132,12 @@ lines inside the patch.
   tokens in `kev.c`.
 - **WebGPU shipped:** 4,096 (canonical kernels are emitted per context
   length); the turbo decode path rewrites the whole KV cache each token.
+- **WebGPU trunk:** f16 KV, split-KV attention over 256-token chunks; the
+  bound is the binding limit for one full-attention layer's KV
+  (`e.max_ctx`: 2,096,896 for the 0.8B and 2B, 1,048,320 for the 4B and 9B
+  on an M3 Ultra). Needles were found at 153,352 tokens on the 0.8B on an
+  RTX 3090 and an M3 Ultra. Prefill is one decode pass a token, so a 153k
+  prompt takes 22 to 26 minutes.
 
 ## Cheapest wins, by engine
 

@@ -42,6 +42,25 @@ The CUDA 27B row is from the `unify1` release
 ([`reports/llb-unify1-final.md`](../reports/llb-unify1-final.md)). The other
 rows are from the backend-parity receipts.
 
+## Models and context
+
+Every backend reads the model's shape from the file instead of matching a
+list of known models. Each one was checked against llama.cpp on sizes it did
+not run before, and against its own earlier build on the sizes it did.
+
+| Backend | Qwen3.5 models | Weight formats | Longest prompt tested | Context bound |
+|---|---|---|---|---|
+| CUDA | Any dense size (0.8B, 2B, 4B, 9B, 27B, clef, Kev) | GGUF K-quants (Q4_K, Q5_K, Q6_K) and Q8_0 | 145,115 tokens, 0.8B, RTX 3090 | VRAM (f32 KV allocated by position, up to 2^26) |
+| Metal, macOS | Any dense size from a quant pack; 35B-A3B MoE | Quant pack (K-quants) | 153,031 tokens, 0.8B and 2B, M3 Ultra | Largest Metal buffer (f32 KV, up to 2^27 slots) |
+| Metal, iOS | Same engine as macOS | Quant pack | Compiled, not run at new sizes | Device's largest buffer |
+| Android | Any dense pack | Pack (F32, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K) | Launch-time capacity; prompts up to 16,384 | `--decide CTX` |
+| WebGPU | Any size, dense or MoE (35B-A3B, 122B-A10B, 397B-A17B), any head, state, and conv size | 21 GGUF formats, F32 to IQ1_S | 153,352 tokens, 0.8B, on an RTX 3090 and an M3 Ultra | GPU binding limit for one layer's f16 KV (about 2 million tokens for the 0.8B) |
+
+A model must still fit in memory: no backend offloads weights. Details,
+remaining refusals, and the cheapest next fixes:
+[Model and hardware limits](limits.md). WebGPU receipts:
+[reports/webgpu-any-shape](../reports/webgpu-any-shape/REPORT.md).
+
 ## Cross-backend agreement
 
 For `decide`, the CUDA, Metal macOS, and WebGPU backends return the same
