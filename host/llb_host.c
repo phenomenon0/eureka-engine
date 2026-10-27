@@ -537,6 +537,40 @@ static void llb_moe_load(LlbShape sh) {
   (void)path;
 }
 
+// reports/cuda-catchup: the int8 expert kernels (host/llb_pf.cuh llb_mx_*), shared by the dp4a
+// decode tier (LLB_MOE_DP4A=1, default off) and the fast MoE prefill (LLB_PREFILL=fast); loaded on
+// first use
+static CUfunction mx_fgu, mx_fdn, mx_fcomb, mx_froute, mx_ftopk, mx_fgroup, mx_fgather, mx_frg;
+static CUfunction pfx_q4g, pfx_q4m, pfx_q5g, pfx_q5m, pfx_q6m;  // the grouped pfmm leaves (fast prefill)
+static void mx_load(void) {
+  if (mx_fgu != NULL) {
+    return;
+  }
+  const char* nm[13] = { "llb_mx_gu", "llb_mx_dn", "llb_mx_comb", "llb_mx_route", "llb_mx_topk", "llb_mx_group",
+    "llb_mx_gather", "llb_mx_rgemm", "pfx_q4k_g", "pfx_q4k_m", "pfx_q5k_g", "pfx_q5k_m", "pfx_q6k_m" };
+  CUfunction* fp[13] = { &mx_fgu, &mx_fdn, &mx_fcomb, &mx_froute, &mx_ftopk, &mx_fgroup, &mx_fgather, &mx_frg,
+    &pfx_q4g, &pfx_q4m, &pfx_q5g, &pfx_q5m, &pfx_q6m };
+  for (u32 i = 0; i < 13; i += 1) {
+    if (cuModuleGetFunction(fp[i], gpu_lib, nm[i]) != CUDA_SUCCESS
+      || (i >= 8 && cuFuncSetAttribute(*fp[i], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 99 * 1024) != CUDA_SUCCESS)) {
+      err_fail("moe: cannot load the int8 expert kernels");
+    }
+  }
+}
+static bool moe_dp4a(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("LLB_MOE_DP4A");
+    v = e != NULL && atoi(e) == 1;
+    if (v) {
+      fprintf(stderr, "moe: LLB_MOE_DP4A=1 -- routed experts on int8 activations (dp4a tier, not exact)\n");
+    }
+  }
+  return v;
+}
+static llb_dptr mx_dq;
+static size_t mx_dq_have;
+
 static void llb_moe_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32* tw, u32 li) {
   u64 postp = o->w, fgp = o->k, fup = o->v, fdp = o->wn, xp = o->x, ap = o->r, base = o->qk;  // qk: the layer base
   u32 dm = llb_sh.d, ne = tw[26], nk = tw[29], ef = tw[27], sf = tw[28], fx = tw[25];
@@ -583,7 +617,8 @@ static void llb_moe_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
   // the shared expert's down inside llb_moe_dn where llb_kgemv would take llb_gemv_any for it (the
   // same leaf and order: no tuned body for sf columns, a K-quant, not LLB_Q4_DP4A's Q6_K planes);
   // else its own GEMV into shd
-  bool sfold = !llb_tuned(sd, sf) && (sd == LLB_FM_Q4_K || sd == LLB_FM_Q5_K || (sd == LLB_FM_Q6_K && !(llb_q4dp & 32)));
+  bool dq = moe_dp4a();
+  bool sfold = !dq && !llb_tuned(sd, sf) && (sd == LLB_FM_Q4_K || sd == LLB_FM_Q5_K || (sd == LLB_FM_Q6_K && !(llb_q4dp & 32)));
   u64 SDp = sfold ? fdp : 0;
   u32 rbs = LLB_FM_RB(sd, sf), cgs = sf / 4;
   if (!sfold) {
@@ -612,6 +647,26 @@ static void llb_moe_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
       }
     }
     Gp = moe_stg, Up = fz ? moe_stg + (u64)ef * rbg : moe_stu, Dp = moe_std, ids = moe_slot;
+  }
+  if (dq) {
+    // the dp4a tier: h and the k experts' act rows to q8_1, the int8 gate / up / down, then the
+    // weighted rank-order sum + the gated shared expert + the residual (llb_mx_comb)
+    mx_load();
+    size_t qn = (size_t)dm + dm / 32 * 8 + (size_t)nk * ef + (size_t)nk * ef / 32 * 8 + (size_t)nk * dm * 4 + 256;
+    llb_scratch(&mx_dq, &mx_dq_have, qn, "moe dp4a");
+    llb_dptr hq = mx_dq, hd = hq + dm, aq = hd + dm / 32 * 8, ad = aq + (u64)nk * ef, out = ad + (u64)nk * ef / 32 * 8;
+    out = (out + 15) & ~(llb_dptr)15;
+    u64 nul = 0;
+    u32 one = 1, gq = dm / 256, ga = nk * ef / 256, gu = (ef + 3) / 4, gd = ef / 32 <= 16 ? (dm + 7) / 8 : (dm + 3) / 4;
+    u32 gc = (dm + 255) / 256;
+    if (!LLB_LAUNCH(gpu_pfq8x, gq, 1, 256, &h2b, &hq, &hd)
+      || !LLB_LAUNCH(mx_fgu, gu, nk, 128, &Gp, &Up, &esg, &rbg, &rbu, &fg, &fu, &dm, &hq, &hd, &ids, &nul, &nul, &act, &ef)
+      || !LLB_LAUNCH(gpu_pfq8x, ga, 1, 256, &act, &aq, &ad)
+      || !LLB_LAUNCH(mx_fdn, gd, nk, 128, &Dp, &esd, &rbd, &fd, &ef, &aq, &ad, &ids, &nul, &out, &dm)
+      || !LLB_LAUNCH(mx_fcomb, gc, one, 256, &out, &wtp, &nul, &nk, &shd, &sgo, &x1b, &yp, &dm)) {
+      err_fail("device launch failed");
+    }
+    return;
   }
   if (!LLB_LAUNCH(gpu_moegu, (ef + 3) / 4, nk, 128, &Gp, &Up, &esg, &rbg, &rbu, &fg, &fu, &cgd, &h2b, &ids, &act, &ef)
     || !LLB_LAUNCH(gpu_moedn, (dm + 3) / 4, 1, 128, &Dp, &esd, &rbd, &fd, &cge, &act, &ids, &wtp, &nk, &ef,
@@ -2767,6 +2822,18 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
     o->bsn = 0;
   }
   u32 c = o->c, dT = c & 31, pos = c >> 5, s = o->n, k = o->d;
+  // LLB_STEP_US (reports/cuda-catchup amendment 1): `pfus US` at each prompt's first folded step,
+  // the microseconds since the previous prompt's (a multi-prompt run's per-prompt period: its
+  // prefill in either tier, the last step and the reset); timing only
+  if (o->w != 0 && pos == 0 && getenv("LLB_STEP_US") != NULL) {
+    static struct timespec pp;
+    struct timespec tn;
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    if (pp.tv_sec != 0) {
+      fprintf(stderr, "pfus %lld\n", (long long)(tn.tv_sec - pp.tv_sec) * 1000000 + (tn.tv_nsec - pp.tv_nsec) / 1000);
+    }
+    pp = tn;
+  }
   volatile LlbShape* ms = &gpu_mail->sh;
   LlbShape sh = { ms->d, ms->f, ms->nh, ms->nkv, ms->hd, ms->lkh, ms->lvh, ms->sd };
   if (pass_x[0] == 0) {
@@ -2906,6 +2973,17 @@ static void pass_fold(WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos,
   // format, pass_mail admits Q8_0 and Q4_K; Q6_K the 0.8B's, tools/payload-w1024.patch)
   u64 er = o->w, x0 = pass_x[0], cur;
   u32 c4 = sh.d;
+#if CUDA_VERSION >= 13000
+  // reports/cuda-catchup: the embedding table lives in the corpus (unified memory) and a table
+  // under 16 MiB is read in by a host memcpy, so each token's row first faulted its page over
+  // (~40 us a new token): move the whole table to the device once (a hint; no bytes change)
+  static u64 epf;
+  if (epf != o->r) {
+    epf = o->r;
+    CUmemLocation lc = { CU_MEM_LOCATION_TYPE_DEVICE, gpu_dev };
+    cuMemPrefetchAsync((CUdeviceptr)o->r, (size_t)o->gm * LLB_FM_RB(o->bb, sh.d), lc, 0, NULL);
+  }
+#endif
   if (dev) {
     u64 eb = o->r, ty = yp;
     u32 rb = LLB_FM_RB(o->bb, sh.d), fm = o->bb;
@@ -3032,8 +3110,12 @@ static void gen_line(FILE* f, const char* t, u64 n) {
 static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, u32 n) {
   static float* tp;  // pinned: two steps' four words
   static CUevent ev[2];
+  // the run's four words on the device, not in y: y is the corpus's (unified memory), which the
+  // host's Bend evaluation reads, so each touch there would move its page back (a ~40 us fault)
+  static llb_dptr gy;
   if (tp == NULL) {
-    if (cuMemHostAlloc((void**)&tp, 8 * sizeof(float), 0) != CUDA_SUCCESS
+    gy = llb_alloc_zero(64);
+    if (!gy || cuMemHostAlloc((void**)&tp, 8 * sizeof(float), 0) != CUDA_SUCCESS
       || cuEventCreate(&ev[0], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS
       || cuEventCreate(&ev[1], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
       err_fail("decode run: cannot set up");
@@ -3052,9 +3134,9 @@ static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u
         step_us(pos + s);
       }
       llb_gforce = 1;
-      pass_fold(&op, yp, grid, sh, dT, pos + s, s > 0);
+      pass_fold(&op, gy, grid, sh, dT, pos + s, s > 0);
       llb_gforce = 0;
-      if (cuMemcpyDtoHAsync(tp + 4 * (s & 1), yp, 16, NULL) != CUDA_SUCCESS
+      if (cuMemcpyDtoHAsync(tp + 4 * (s & 1), gy, 16, NULL) != CUDA_SUCCESS
         || cuEventRecord(ev[s & 1], NULL) != CUDA_SUCCESS) {
         err_fail("decode run: cannot queue the pick's copy");
       }
@@ -3071,12 +3153,14 @@ static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u
     union { float f; u32 u; } v = { t[0] }, w = { t[2] };
     bool fin = (v.u & 0x7f800000u) != 0x7f800000u && (w.u & 0x7f800000u) != 0x7f800000u;
     if (q + 1 == cnt || !fin) {
-      // the last step (or a nonfinite one, which gen's check then reports): its words in y.
-      // A nonfinite step q < cnt - 1 has step q + 1 queued behind it; y gets q's words back
+      // the last step (or a nonfinite one, which gen's check then reports): its words into y
+      // (a nonfinite step q < cnt - 1 has step q + 1 queued behind it: y gets q's words)
       if (q + 1 != cnt) {
         if (cuCtxSynchronize() != CUDA_SUCCESS || cuMemcpyHtoD(yp, t, 16) != CUDA_SUCCESS) {
           err_fail("device fault");
         }
+      } else if (cuMemcpyDtoDAsync(yp, gy, 16, NULL) != CUDA_SUCCESS) {
+        err_fail("device fault");
       }
       union { float f; u32 u; } cf = { (float)(q + 1) };
       if (cuMemsetD32Async(yp + 16, cf.u, 1, NULL) != CUDA_SUCCESS) {

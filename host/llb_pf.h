@@ -114,10 +114,18 @@ static bool pf_formats(u32 k, LlbShape sh) {
   static const unsigned char gs[2][8] = { { 2, 3, 4, 5, 6, 7, 8, 13 }, { 2, 3, 4, 14, 15, 16, 19, 19 } };
   static const char* nm[10] = { "F32", "Q8_0", "F16", "Q4_K", "Q6_K", "Q3_K", "Q2_0", "PQ2_0", "IQ4_XS", "Q5_K" };
   u32 lv = sh.lvh * sh.sd, qa = sh.nh * sh.hd;
+  // reports/cuda-catchup: routed-expert layers run pf_moe (the experts on the int8 kernels, grouped
+  // by expert); their residency must be on the device or in mapped host RAM (stream copies each
+  // token's experts in, so a chunk would need all of them: the tier stays off there)
   for (u32 i = 0; i < k; i += 1) {
-    if (gpu_mail->pt[i][26] != 0) {  // tools/payload-moeany.patch: the fast tier has no expert path
-      fprintf(stderr, "fast prefill: off for this model (layer %u has routed experts; the fast tier is dense only): every step exact\n", i);
-      return false;
+    if (gpu_mail->pt[i][26] != 0) {
+      if (moe_mode < 0) {
+        llb_moe_load(sh);
+      }
+      if (moe_mode == 2) {
+        fprintf(stderr, "fast prefill: off for this model (its experts stream from the GGUF): every step exact\n");
+        return false;
+      }
     }
   }
   for (u32 i = 0; i < k; i += 1) {
@@ -154,6 +162,11 @@ static bool pf_fast(u32 k, LlbShape sh) {
       pf_lim = pf_T;
       size_t T = pf_T, d = sh.d, f = sh.f, lk = sh.lkh * sh.sd, lv = sh.lvh * sh.sd;
       size_t cv = 2 * lk + lv, qa = sh.nh * sh.hd, kv = sh.nkv * sh.hd;
+      // (reports/cuda-catchup: a MoE file's d_ff is the expert / shared width, which can be under
+      // d_model, lv or qa; pf_qx / pf_xd and pf_g / pf_u hold any of those rows)
+      f = f > d ? f : d;
+      f = f > lv ? f : lv;
+      f = f > qa ? f : qa;
       size_t wq = cv > 2 * qa ? cv : 2 * qa;
       pf_x[0] = pf_alloc(T * d * 4); pf_x[1] = pf_alloc(T * d * 4);
       pf_x1 = pf_alloc(T * d * 4); pf_h = pf_alloc(T * d * 4);
@@ -251,6 +264,126 @@ static void pf_catq(u32 m, const u32* fm, const u64* w, const u32* n, const llb_
   }
 }
 
+// reports/cuda-catchup: a routed-expert layer's FFN for the chunk's T tokens (not exact; the
+// tolerance gate is reports/cuda-catchup G-PF): h = rms(x1, post); the router (F32) and the top k
+// per token (llb_moe_topk's math); the T k (token, rank) slots grouped by expert (llb_mx_group);
+// each expert's gate / up / silu over its slots and its down over theirs (llb_mx_gu / llb_mx_dn,
+// int8 q8_1 x, each expert's rows read once a chunk); the shared expert on the pfmm GEMMs; then
+// y = (rank-order weighted sum + sigmoid(shared gate) shared) + x1 (llb_mx_comb)
+static llb_dptr pfm_buf;
+static size_t pfm_have;
+// the grouped leaves' shared memory: pfmm's PfT<TY, 4, 2, EP, 1>::SM (16-token tiles; ROWS 128)
+static u32 pfx_sm(u32 fm) {
+  u32 ty = fm == LLB_FM_Q4_K ? 3 : 5, tk = 16, qh = ty == 5 ? 128 * 32 : 0;
+  return 2 * (128 * 160 + tk * (256 + 32) + tk * 80 + qh) + 128 * 8 * 8;
+}
+// a grid with z (the expert): straight to the driver (the fast tier is never graph-recorded)
+#define PFX_GO(f, gx, gy, gz, sm, ...) ({ void* a_[] = { __VA_ARGS__ }; \
+  llb_graph_bail(); cuLaunchKernel((f), (gx), (gy), (gz), 256, 1, 1, (sm), NULL, a_, NULL) == CUDA_SUCCESS; })
+static void pf_moe(u32 i, u32 T, LlbShape sh, u64 base, const u32* fm, u64 post, llb_dptr nxt) {
+  const volatile u32* tw = gpu_mail->pt[i];
+  u32 dm = sh.d, ne = tw[26], nk = tw[29], ef = tw[27], sf = tw[28], fx = tw[25];
+  u32 fg = fx & 15, fu = fx >> 4 & 15, fd = fx >> 8 & 15, fz = fx >> 12 & 1;
+  u64 rp = base + (tw[20] & 0x0fffffffu), gp = base + (tw[21] & 0x0fffffffu);
+  u64 wg = base + (tw[2] & 0x0fffffffu), wu = base + (tw[3] & 0x0fffffffu), wd = base + (tw[4] & 0x0fffffffu);
+  u32 rbg = LLB_FM_RB(fg, dm), rbu = LLB_FM_RB(fu, dm), rbd = LLB_FM_RB(fd, ef);
+  const MoeL* m = &moe_l[i];
+  u64 esg = (u64)(fz ? 2 : 1) * ef * rbg, esd = (u64)dm * rbd;
+  u64 Gp = m->g, Up = fz ? m->g + (u64)ef * rbg : m->u, Dp = m->d;
+  u32 nr = gp == rp + (u64)ne * dm * 4 ? ne + 1 : ne, ns = T * nk;
+  mx_load();
+  // scratch: lg T nr, sg T, pv T ne, ids / wt / inv ns, off ne + 1, xmap ns, sgo T, act ns ef,
+  // aq ns ef, ad ns ef / 32 float2, out ns dm, shd T dm
+  // (aq / ad hold the gathered x rows (dm wide) first, then act's q8 (ef wide))
+  size_t a4 = (size_t)T * nr + T + (size_t)T * ne + 3 * (size_t)ns + ne + 1 + ns + T, cw = dm > ef ? dm : ef;
+  size_t need = a4 * 4 + 256 + (size_t)ns * ef * 4 + (size_t)ns * cw + (size_t)ns * cw / 32 * 8 + (size_t)ns * dm * 4
+    + (size_t)T * dm * 4 + 1024;
+  llb_scratch(&pfm_buf, &pfm_have, need, "fast prefill moe");
+  llb_dptr lg = pfm_buf, sgl = lg + (u64)T * nr * 4, pv = sgl + (u64)T * 4, ids = pv + (u64)T * ne * 4;
+  llb_dptr wt = ids + (u64)ns * 4, inv = wt + (u64)ns * 4, off = inv + (u64)ns * 4, xmap = off + (u64)(ne + 1) * 4;
+  llb_dptr sgo = xmap + (u64)ns * 4, act = (sgo + (u64)T * 4 + 255) & ~(llb_dptr)255;
+  llb_dptr aq = act + (u64)ns * ef * 4, ad = (aq + (u64)ns * cw + 255) & ~(llb_dptr)255;
+  llb_dptr out = (ad + (u64)ns * cw / 32 * 8 + 255) & ~(llb_dptr)255, shd = out + (u64)ns * dm * 4;
+  u64 nul = 0;
+  u32 one = 1, gr = (nr + 3) / 4, gu = (ef + 3) / 4, gd = ef / 32 <= 16 ? (dm + 7) / 8 : (dm + 3) / 4;
+  u32 gc = (dm + 255) / 256, ga = ns * ef / 256;
+  if (!LLB_LAUNCH(gpu_pfrms, T, 1, 1024, &pf_x1, &post, &pf_h, &dm)
+    || !LLB_LAUNCH(mx_frg, (T + 63) / 64, (nr + 63) / 64, 256, &rp, &nr, &dm, &pf_h, &T, &lg)
+    || (nr == ne && !LLB_LAUNCH(mx_froute, one, T, 128, &gp, &one, &dm, &pf_h, &sgl))
+    || !LLB_LAUNCH(mx_ftopk, one, T, 256, &lg, &nr, &ne, &nk, &sgl, &pv, &ids, &wt, &sgo)
+    || !LLB_LAUNCH(mx_fgroup, ne, 1, 256, &ids, &ns, &nk, &ne, &off, &xmap, &inv)) {
+    err_fail("fast prefill: launch failed");
+  }
+  pf_q8(pf_h, dm, T);
+  // the most slots any expert has (one read of off a layer: the grouped grids' x is its tiles,
+  // so the experts' empty tiles do not each take an SM's shared memory)
+  static u32* hoff;
+  static u32 hoff_n;
+  if (hoff_n < ne + 1) {
+    free(hoff);
+    hoff = malloc((size_t)(ne + 1) * 4);
+    hoff_n = ne + 1;
+    if (!hoff) {
+      err_fail("fast prefill: out of host memory");
+    }
+  }
+  if (!llb_read(hoff, off, (size_t)(ne + 1) * 4)) {
+    err_fail("fast prefill: cannot read the expert groups");
+  }
+  u32 maxm = 1;
+  for (u32 e = 0; e < ne; e += 1) {
+    maxm = hoff[e + 1] - hoff[e] > maxm ? hoff[e + 1] - hoff[e] : maxm;
+  }
+  // gate / up: Q4_K or Q5_K pairs on the grouped pfmm leaves (the slots' x gathered in slot order
+  // into aq / ad first, then reused for act's q8), else the int8 GEMV kernels over the slots
+  bool kg = fg == fu && (fg == LLB_FM_Q4_K || fg == LLB_FM_Q5_K);
+  bool kd = fd == LLB_FM_Q4_K || fd == LLB_FM_Q5_K || fd == LLB_FM_Q6_K;
+  if (kg) {
+    u32 tk = 16, gy = (ef + 63) / 64;
+    if (!LLB_LAUNCH(mx_fgather, ns, 1, 256, &pf_qx, &pf_xd, &xmap, &dm, &aq, &ad)
+      || !PFX_GO(fg == LLB_FM_Q4_K ? pfx_q4g : pfx_q5g, (maxm + tk - 1) / tk, gy, ne,
+        pfx_sm(fg), &Gp, &Up, &esg, &ef, &dm, &aq, &ad, &off, &act)) {
+      err_fail("fast prefill: launch failed");
+    }
+  } else if (!LLB_LAUNCH(mx_fgu, gu, ne, 128, &Gp, &Up, &esg, &rbg, &rbu, &fg, &fu, &dm, &pf_qx, &pf_xd, &nul, &off,
+      &xmap, &act, &ef)) {
+    err_fail("fast prefill: launch failed");
+  }
+  if (!LLB_LAUNCH(gpu_pfq8x, ga, 1, 256, &act, &aq, &ad)) {
+    err_fail("fast prefill: launch failed");
+  }
+  if (kd) {
+    u32 tk = fd == LLB_FM_Q6_K ? 64 : 16, gy = (dm + 127) / 128;
+    CUfunction f = fd == LLB_FM_Q4_K ? pfx_q4m : fd == LLB_FM_Q5_K ? pfx_q5m : pfx_q6m;
+    if (!PFX_GO(f, (maxm + tk - 1) / tk, gy, ne, fd == LLB_FM_Q6_K ? 90112 : pfx_sm(fd),
+        &Dp, &Dp, &esd, &dm, &ef, &aq, &ad, &off, &out)) {
+      err_fail("fast prefill: launch failed");
+    }
+  } else if (!LLB_LAUNCH(mx_fdn, gd, ne, 128, &Dp, &esd, &rbd, &fd, &ef, &aq, &ad, &nul, &off, &out, &dm)) {
+    err_fail("fast prefill: launch failed");
+  }
+  // the shared expert (gate / up / silu into pf_g, then its down into shd) on h's q8 (pf_qx)
+  if (fm[2] == LLB_FM_Q4_K && fm[3] == LLB_FM_Q4_K) {
+    u32 zero = 0;
+    if (!LLB_LAUNCH_SM(gpu_pfq4mg, (T + 63) / 64, (sf + 63) / 64, 256, pf_sm(3),
+      &wg, &wu, &sf, &dm, &pf_qx, &pf_xd, &T, &pf_g, &zero)) {
+      err_fail("fast prefill: GEMM launch failed");
+    }
+  } else {
+    u32 tf = T * sf;
+    pf_mm(fm[2], wg, sf, dm, T, pf_g, 0);
+    pf_mm(fm[3], wu, sf, dm, T, pf_u, 0);
+    if (!LLB_LAUNCH(gpu_silu, (tf + 255) / 256, 1, 256, &pf_g, &pf_u, &pf_g, &tf)) {
+      err_fail("fast prefill: launch failed");
+    }
+  }
+  pf_q8(pf_g, sf, T);
+  pf_mm(fm[4], wd, dm, sf, T, shd, 0);
+  if (!LLB_LAUNCH(mx_fcomb, gc, T, 256, &out, &wt, &inv, &nk, &shd, &sgo, &pf_x1, &nxt, &dm)) {
+    err_fail("fast prefill: launch failed");
+  }
+}
+
 // the queued tokens pf_pos0 .. + T - 1 through all k layers (layer bases and table from the Mail)
 static void pf_chunk(u32 T, u32 k, u32 dT, LlbShape sh) {
   u32 d = sh.d, f = sh.f, lk = sh.lkh * sh.sd, lv = sh.lvh * sh.sd, cv = 2 * lk + lv;
@@ -330,6 +463,11 @@ static void pf_chunk(u32 T, u32 k, u32 dT, LlbShape sh) {
     // fbn: h = rms(x1, post), gate / up (silu(g) u), down + x1 into the other x
     llb_dptr nxt = pf_x[cur == pf_x[0] ? 1 : 0];
     u64 post = base + p[1];
+    if (llb_moe(i)) {
+      pf_moe(i, T, sh, base, fm, post, nxt);
+      cur = nxt;
+      continue;
+    }
     if (!LLB_LAUNCH(gpu_pfrms, T, 1, 1024, &pf_x1, &post, &pf_h, &d)) {
       err_fail("fast prefill: launch failed");
     }

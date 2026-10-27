@@ -443,3 +443,418 @@ extern "C" __global__ void __launch_bounds__(128) pf_attn(const float* __restric
 extern "C" __global__ void pf_mark(float* y) {
   y[1] = 1.0e9f;
 }
+
+// ---- reports/cuda-catchup: the routed experts on int8 activations (not exact) ----
+// One family for both new MoE tiers: the dp4a decode tier (LLB_MOE_DP4A=1, one token, the k chosen
+// experts) and the fast MoE prefill (LLB_PREFILL=fast, T tokens grouped by expert). x is pf_q8x's
+// q8_1 (per 32 values d = amax / 127, q = round(x / d), s = sum x), llama.cpp's mmvq numerics:
+// a 32-block's dot is (weight scale) d (sum of int8 products) [- (weight min) s for Q4_K / Q5_K].
+// The weights are the GGUF's own blocks (the expert stacks load from the GGUF): Q8_0 34 B / 32,
+// Q4_K 144 B / 256, Q5_K 176 B / 256, Q6_K 210 B / 256 (format codes 1, 3, 9, 4).
+// A group g is one expert E (gid[g], or g) over the slots off[g] .. off[g + 1] (or g .. g + 1):
+// slot s reads x row xmap[s] (or 0) and writes output row s.
+INLINE u32 mx_u32(const u8* p) {  // 2-aligned
+  const unsigned short* h = (const unsigned short*)p;
+  return (u32)h[0] | (u32)h[1] << 16;
+}
+INLINE void mx_scmin(const u8* q, u32 j, u32* sc, u32* m) {  // ggml get_scale_min_k4
+  if (j < 4) {
+    *sc = q[j] & 63; *m = q[j + 4] & 63;
+  } else {
+    *sc = (q[j + 4] & 15) | ((q[j - 4] >> 6) << 4); *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+  }
+}
+// block b (32 values) of a row in format f against x block (qx 32 int8, e = {d, s})
+INLINE float mx_blk(const u8* __restrict__ row, u32 f, u32 b, const int* __restrict__ qx, float2 e) {
+  if (f == 3 || f == 9) {
+    const u32 sb = b >> 3, j = b & 7, sh = 4 * (j & 1);
+    const u8* B = row + (u64)sb * (f == 3 ? 144 : 176);
+    const uint4* qs = (const uint4*)(B + (f == 3 ? 16 : 48) + 32 * (j >> 1));
+    u32 sc, m;
+    mx_scmin(B + 4, j, &sc, &m);
+    const uint4 a0 = qs[0], a1 = qs[1];
+    const u32 w[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+    uint4 h0 = make_uint4(0, 0, 0, 0), h1 = h0;
+    if (f == 9) {
+      h0 = ((const uint4*)(B + 16))[0]; h1 = ((const uint4*)(B + 16))[1];
+    }
+    const u32 hw[8] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+    int acc = 0;
+    #pragma unroll
+    for (u32 i = 0; i < 8; i++) {
+      u32 v = (w[i] >> sh) & 0x0F0F0F0Fu;
+      if (f == 9) v |= ((hw[i] >> j) & 0x01010101u) << 4;
+      acc = __dp4a((int)v, qx[i], acc);
+    }
+    const float d = llb_f16(B[0] | B[1] << 8), dm = llb_f16(B[2] | B[3] << 8);
+    return d * (float)sc * e.x * (float)acc - dm * (float)m * e.y;
+  }
+  if (f == 4) {
+    const u32 sb = b >> 3, bb = b & 7, n = bb >> 2, quad = bb & 3;
+    const u8* B = row + (u64)sb * 210;
+    const u8* ql = B + 64 * n + 32 * (quad & 1);
+    const u8* qh = B + 128 + 32 * n;
+    const u32 nsh = quad >= 2 ? 4 : 0, qsh = 2 * quad;
+    int a0 = 0, a1 = 0;
+    #pragma unroll
+    for (u32 i = 0; i < 8; i++) {
+      const u32 lo = (mx_u32(ql + 4 * i) >> nsh) & 0x0F0F0F0Fu, hi = ((mx_u32(qh + 4 * i) >> qsh) & 0x03030303u) << 4;
+      const int v = (int)__vsub4(lo | hi, 0x20202020u);
+      if (i < 4) a0 = __dp4a(v, qx[i], a0); else a1 = __dp4a(v, qx[i], a1);
+    }
+    const signed char* sc = (const signed char*)(B + 192 + 8 * n + 2 * quad);
+    const float d = llb_f16(B[208] | B[209] << 8);
+    return d * e.x * ((float)sc[0] * (float)a0 + (float)sc[1] * (float)a1);
+  }
+  // Q8_0
+  const u8* B = row + (u64)b * 34;
+  int acc = 0;
+  #pragma unroll
+  for (u32 i = 0; i < 8; i++) acc = __dp4a((int)mx_u32(B + 2 + 4 * i), qx[i], acc);
+  return llb_f16(B[0] | B[1] << 8) * e.x * (float)acc;
+}
+// a row's dot over nb blocks, the warp's lanes each a block in turn, then the xor tree
+INLINE float mx_dot(const u8* __restrict__ row, u32 f, u32 nb, const signed char* __restrict__ qx,
+  const float2* __restrict__ xd) {
+  const u32 l = threadIdx.x & 31;
+  float s = 0.0f;
+  for (u32 b = l; b < nb; b += 32) {
+    const int4 q0 = ((const int4*)(qx + 32 * b))[0], q1 = ((const int4*)(qx + 32 * b))[1];
+    const int q[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+    s += mx_blk(row, f, b, q, xd[b]);
+  }
+  #pragma unroll
+  for (u32 m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+  return s;
+}
+// gate + up + silu: act[s ef + r] = silu(G_E row r . x) (U_E row r . x); a warp a row, the group's
+// slots in turn (the row stays in L1). G / U the stacks (U = G + ef rows when fused), es the stride
+extern "C" __global__ void __launch_bounds__(128) llb_mx_gu(const u8* __restrict__ G, const u8* __restrict__ U,
+  u64 es, u32 rbg, u32 rbu, u32 fg, u32 fu, u32 c, const signed char* __restrict__ qx,
+  const float2* __restrict__ xd, const u32* __restrict__ gid, const u32* __restrict__ off,
+  const u32* __restrict__ xmap, float* __restrict__ act, u32 ef) {
+  const u32 g = blockIdx.y, s0 = off ? off[g] : g, s1 = off ? off[g + 1] : g + 1;
+  if (s0 == s1) {
+    return;
+  }
+  const u64 e = gid ? gid[g] : g;
+  const u32 nb = c / 32;
+  for (u32 r = blockIdx.x * 4 + (threadIdx.x >> 5); r < ef; r += gridDim.x * 4) {
+    const u8* gr = G + e * es + (u64)r * rbg;
+    const u8* ur = U + e * es + (u64)r * rbu;
+    for (u32 s = s0; s < s1; s++) {
+      const u64 t = xmap ? xmap[s] : 0;
+      const float gv = mx_dot(gr, fg, nb, qx + t * c, xd + t * nb);
+      const float uv = mx_dot(ur, fu, nb, qx + t * c, xd + t * nb);
+      if ((threadIdx.x & 31) == 0) {
+        act[(u64)s * ef + r] = gv / (1.0f + expf(-gv)) * uv;
+      }
+    }
+  }
+}
+// a row's dot on a half warp (nb <= 16 blocks): lanes 0..15 and 16..31 each take their own row
+INLINE float mx_dot16(const u8* __restrict__ row, u32 f, u32 nb, const signed char* __restrict__ qx,
+  const float2* __restrict__ xd) {
+  const u32 l = threadIdx.x & 15;
+  float s = 0.0f;
+  if (l < nb) {
+    const int4 q0 = ((const int4*)(qx + 32 * l))[0], q1 = ((const int4*)(qx + 32 * l))[1];
+    const int q[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+    s = mx_blk(row, f, l, q, xd[l]);
+  }
+  #pragma unroll
+  for (u32 m = 8; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+  return s;
+}
+// down: out[s dm + r] = D_E row r . act_s (act q8_1: aq [slots][ef], ad)
+extern "C" __global__ void __launch_bounds__(128) llb_mx_dn(const u8* __restrict__ D, u64 es, u32 rbd, u32 fd,
+  u32 ef, const signed char* __restrict__ aq, const float2* __restrict__ ad, const u32* __restrict__ gid,
+  const u32* __restrict__ off, float* __restrict__ out, u32 dm) {
+  const u32 g = blockIdx.y, s0 = off ? off[g] : g, s1 = off ? off[g + 1] : g + 1;
+  if (s0 == s1) {
+    return;
+  }
+  const u64 e = gid ? gid[g] : g;
+  const u32 nb = ef / 32;
+  if (nb <= 16) {
+    // two rows a warp, a half warp each (the grid covers dm / 8 blocks of 8 rows)
+    const u32 h = (threadIdx.x >> 4) & 1;
+    for (u32 r0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * 2; r0 < dm; r0 += gridDim.x * 8) {
+      const u32 r = r0 + h < dm ? r0 + h : dm - 1;
+      const u8* dr = D + e * es + (u64)r * rbd;
+      for (u32 s = s0; s < s1; s++) {
+        const float v = mx_dot16(dr, fd, nb, aq + (u64)s * ef, ad + (u64)s * nb);
+        if ((threadIdx.x & 15) == 0 && r0 + h < dm) {
+          out[(u64)s * dm + r] = v;
+        }
+      }
+    }
+    return;
+  }
+  for (u32 r = blockIdx.x * 4 + (threadIdx.x >> 5); r < dm; r += gridDim.x * 4) {
+    const u8* dr = D + e * es + (u64)r * rbd;
+    for (u32 s = s0; s < s1; s++) {
+      const float v = mx_dot(dr, fd, nb, aq + (u64)s * ef, ad + (u64)s * nb);
+      if ((threadIdx.x & 31) == 0) {
+        out[(u64)s * dm + r] = v;
+      }
+    }
+  }
+}
+// y[t][r] = (sum over ranks j (in order) wt[t nk + j] out[slot(t, j)][r] + shd[t][r] sgo[t]) + x1[t][r];
+// slot(t, j) = inv[t nk + j] (or j: one token). Token blockIdx.y
+extern "C" __global__ void __launch_bounds__(256) llb_mx_comb(const float* __restrict__ out,
+  const float* __restrict__ wt, const u32* __restrict__ inv, u32 nk, const float* __restrict__ shd,
+  const float* __restrict__ sgo, const float* __restrict__ x1, float* __restrict__ y, u32 dm) {
+  const u32 t = blockIdx.y, r = blockIdx.x * 256 + threadIdx.x;
+  if (r >= dm) {
+    return;
+  }
+  float mo = 0.0f;
+  for (u32 j = 0; j < nk; j++) {
+    const u64 s = inv ? inv[(u64)t * nk + j] : j;
+    mo = j == 0 ? out[s * dm + r] * wt[(u64)t * nk] : mo + out[s * dm + r] * wt[(u64)t * nk + j];
+  }
+  const u64 o = (u64)t * dm + r;
+  y[o] = (mo + shd[o] * sgo[t]) + x1[o];
+}
+// the router (F32 rows: ne experts, + the shared gate row when nr = ne + 1) for T tokens:
+// lg[t nr + r] = W row r . h_t; a warp a (row, token)
+extern "C" __global__ void __launch_bounds__(128) llb_mx_route(const float* __restrict__ W, u32 nr, u32 c,
+  const float* __restrict__ h, float* __restrict__ lg) {
+  const u32 t = blockIdx.y, r = blockIdx.x * 4 + (threadIdx.x >> 5), l = threadIdx.x & 31;
+  if (r >= nr) {
+    return;
+  }
+  const float4* w = (const float4*)(W + (u64)r * c);
+  const float4* x = (const float4*)(h + (u64)t * c);
+  float s = 0.0f;
+  for (u32 i = l; i < c / 4; i += 32) {
+    const float4 a = w[i], b = x[i];
+    s += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+  }
+  #pragma unroll
+  for (u32 m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+  if (l == 0) {
+    lg[(u64)t * nr + r] = s;
+  }
+}
+// the router for T tokens as a tiled F32 GEMM (the fast prefill): lg[t nr + r] = W row r . h_t;
+// a block 64 rows x 64 tokens, k steps of 32 through shared memory, a thread 4 x 4
+extern "C" __global__ void __launch_bounds__(256) llb_mx_rgemm(const float* __restrict__ W, u32 nr, u32 c,
+  const float* __restrict__ h, u32 T, float* __restrict__ lg) {
+  __shared__ float ws[32][65], xs[32][65];
+  const u32 tx = threadIdx.x & 15, ty = threadIdx.x >> 4, r0 = blockIdx.y * 64, t0 = blockIdx.x * 64;
+  float acc[4][4];
+  #pragma unroll
+  for (u32 i = 0; i < 4; i++)
+    #pragma unroll
+    for (u32 j = 0; j < 4; j++) acc[i][j] = 0.0f;
+  for (u32 k0 = 0; k0 < c; k0 += 32) {
+    for (u32 i = threadIdx.x; i < 64 * 32; i += 256) {
+      const u32 rr = i >> 5, kk = i & 31;
+      ws[kk][rr] = r0 + rr < nr ? W[(u64)(r0 + rr) * c + k0 + kk] : 0.0f;
+      xs[kk][rr] = t0 + rr < T ? h[(u64)(t0 + rr) * c + k0 + kk] : 0.0f;
+    }
+    __syncthreads();
+    #pragma unroll 8
+    for (u32 kk = 0; kk < 32; kk++) {
+      float a[4], b[4];
+      #pragma unroll
+      for (u32 i = 0; i < 4; i++) {
+        a[i] = ws[kk][ty * 4 + i];
+        b[i] = xs[kk][tx * 4 + i];
+      }
+      #pragma unroll
+      for (u32 i = 0; i < 4; i++)
+        #pragma unroll
+        for (u32 j = 0; j < 4; j++) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (u32 i = 0; i < 4; i++)
+    #pragma unroll
+    for (u32 j = 0; j < 4; j++) {
+      const u32 r = r0 + ty * 4 + i, t = t0 + tx * 4 + j;
+      if (r < nr && t < T) lg[(u64)t * nr + r] = acc[i][j];
+    }
+}
+// the top k of token blockIdx.y (llb_moe_topk's math: softmax with the exp through F64, the k
+// largest p, ties to the lower index, renormalized with the 6.1e-5 clamp); sgo[t] = sigmoid of
+// the shared gate logit (lg[t nr + ne] when nr > ne, else sg[t]). pv: T ne scratch
+extern "C" __global__ void __launch_bounds__(256) llb_mx_topk(const float* __restrict__ lg, u32 nr, u32 ne,
+  u32 nk, const float* __restrict__ sg, float* __restrict__ pv0, u32* __restrict__ ids0, float* __restrict__ wt0,
+  float* __restrict__ sgo) {
+  __shared__ float rv[8];
+  __shared__ u32 ri[8];
+  __shared__ float bc;
+  const u32 t = threadIdx.x, l = t & 31, w = t >> 5, tk = blockIdx.y;
+  const float* x = lg + (u64)tk * nr;
+  float* pv = pv0 + (u64)tk * ne;
+  u32* ids = ids0 + (u64)tk * nk;
+  float* wt = wt0 + (u64)tk * nk;
+  float mx = __uint_as_float(0xFF800000u);
+  for (u32 e = t; e < ne; e += 256) mx = fmaxf(mx, x[e]);
+  #pragma unroll
+  for (u32 m = 16; m > 0; m >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, m));
+  if (l == 0) rv[w] = mx;
+  __syncthreads();
+  if (t == 0) {
+    float v = rv[0];
+    for (u32 k = 1; k < 8; k++) v = fmaxf(v, rv[k]);
+    bc = v;
+  }
+  __syncthreads();
+  mx = bc;
+  float sm = 0.0f;
+  for (u32 e = t; e < ne; e += 256) {
+    const float v = attn_exp(x[e] - mx);
+    pv[e] = v;
+    sm += v;
+  }
+  #pragma unroll
+  for (u32 m = 16; m > 0; m >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, m);
+  __syncthreads();
+  if (l == 0) rv[w] = sm;
+  __syncthreads();
+  if (t == 0) {
+    float v = 0.0f;
+    for (u32 k = 0; k < 8; k++) v += rv[k];
+    bc = v;
+  }
+  __syncthreads();
+  const float inv = 1.0f / bc;
+  for (u32 e = t; e < ne; e += 256) pv[e] *= inv;
+  __syncthreads();
+  for (u32 j = 0; j < nk; j++) {
+    float bv = -1.0f;
+    u32 bix = 0xffffffffu;
+    for (u32 e = t; e < ne; e += 256) {
+      const float v = pv[e];
+      if (v > bv) {
+        bv = v; bix = e;
+      }
+    }
+    #pragma unroll
+    for (u32 m = 16; m > 0; m >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, m);
+      const u32 oi = __shfl_xor_sync(0xffffffffu, bix, m);
+      if (ov > bv || (ov == bv && oi < bix)) {
+        bv = ov; bix = oi;
+      }
+    }
+    if (l == 0) {
+      rv[w] = bv; ri[w] = bix;
+    }
+    __syncthreads();
+    if (t == 0) {
+      float v = rv[0];
+      u32 q = ri[0];
+      for (u32 k = 1; k < 8; k++) {
+        if (rv[k] > v || (rv[k] == v && ri[k] < q)) {
+          v = rv[k]; q = ri[k];
+        }
+      }
+      ids[j] = q;
+      wt[j] = v;
+      pv[q] = -2.0f;
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    float s = 0.0f;
+    for (u32 j = 0; j < nk; j++) s += wt[j];
+    s = s < 6.103515625e-5f ? 6.103515625e-5f : s;
+    for (u32 j = 0; j < nk; j++) wt[j] = wt[j] / s;
+    const float g = nr > ne ? x[ne] : sg[tk];
+    sgo[tk] = 1.0f / (1.0f + attn_exp(-g));
+  }
+}
+// group the T nk (token, rank) slots by expert, in (token, rank) order within an expert: block e
+// counts the slots of experts < e (its offset) and writes its own; off[e] (off[ne] = T nk), xmap
+// [slot] = token, inv[t nk + j] = slot
+extern "C" __global__ void __launch_bounds__(256) llb_mx_group(const u32* __restrict__ ids, u32 n, u32 nk,
+  u32 ne, u32* __restrict__ off, u32* __restrict__ xmap, u32* __restrict__ inv) {
+  __shared__ u32 wc[8];
+  __shared__ u32 base;
+  const u32 e = blockIdx.x, t = threadIdx.x, l = t & 31, w = t >> 5;
+  u32 lt = 0;
+  for (u32 i = t; i < n; i += 256) lt += ids[i] < e;
+  #pragma unroll
+  for (u32 m = 16; m > 0; m >>= 1) lt += __shfl_xor_sync(0xffffffffu, lt, m);
+  if (l == 0) wc[w] = lt;
+  __syncthreads();
+  if (t == 0) {
+    u32 v = 0;
+    for (u32 k = 0; k < 8; k++) v += wc[k];
+    base = v;
+    off[e] = v;
+    if (e + 1 == ne) off[ne] = n;
+  }
+  __syncthreads();
+  for (u32 i0 = 0; i0 < n; i0 += 256) {
+    const u32 i = i0 + t;
+    const bool hit = i < n && ids[i] == e;
+    const u32 bal = __ballot_sync(0xffffffffu, hit);
+    __syncthreads();
+    if (l == 0) wc[w] = __popc(bal);
+    __syncthreads();
+    u32 before = base;
+    for (u32 k = 0; k < w; k++) before += wc[k];
+    const u32 at = before + __popc(bal & ((1u << l) - 1));
+    if (hit) {
+      xmap[at] = i / nk;
+      inv[i] = at;
+    }
+    __syncthreads();
+    if (t == 0) {
+      u32 v = 0;
+      for (u32 k = 0; k < 8; k++) v += wc[k];
+      base += v;
+    }
+    __syncthreads();
+  }
+}
+// the fast MoE prefill's grouped GEMMs: expert blockIdx.z over its slots off[z] .. off[z + 1]
+// (rows of the slot-ordered q8_1 x, qx / xd, and of y), one pfmm leaf call per expert on its
+// own weights; blocks past an expert's slots return. Q4_K / Q5_K / Q6_K experts (the GGUF's
+// blocks are the pack's); gate / up pairs on EP 2 (y = silu(g) u), down on EP 0
+#define PFX_HEAD(c) \
+  const u32 z = blockIdx.z, o = off[z], m = off[z + 1] - o; \
+  if (blockIdx.x * TK >= m) return; \
+  const signed char* q = qx + (u64)o * (c); const float2* d = xd + (u64)o * ((c) / 32)
+template <int TY, int NT, int EP>
+INLINE void pfx_wide(const u8* G, const u8* U, u64 es, u32 n, u32 c, const signed char* __restrict__ qx,
+  const float2* __restrict__ xd, const u32* __restrict__ off, float* __restrict__ y) {
+  constexpr u32 TK = 8 * NT * 2;
+  PFX_HEAD(c);
+  pf_wide<TY, 4, 2, NT, EP>(G + z * es, U + z * es, n, c, q, d, m, y + (u64)o * n, nullptr, blockIdx.y);
+}
+#define PFX_K(nm, TY, NT, EP) \
+  extern "C" __global__ void __launch_bounds__(256, 1) nm(const u8* __restrict__ G, const u8* __restrict__ U, \
+    u64 es, u32 n, u32 c, const signed char* __restrict__ qx, const float2* __restrict__ xd, \
+    const u32* __restrict__ off, float* __restrict__ y) { pfx_wide<TY, NT, EP>(G, U, es, n, c, qx, xd, off, y); }
+PFX_K(pfx_q4k_g, 3, 1, 2)
+PFX_K(pfx_q4k_m, 3, 1, 0)
+PFX_K(pfx_q5k_g, 5, 1, 2)
+PFX_K(pfx_q5k_m, 5, 1, 0)
+extern "C" __global__ void __launch_bounds__(256, 1) pfx_q6k_m(const u8* __restrict__ G, const u8* __restrict__ U,
+  u64 es, u32 n, u32 c, const signed char* __restrict__ qx, const float2* __restrict__ xd,
+  const u32* __restrict__ off, float* __restrict__ y) {
+  constexpr u32 TK = 64;
+  PFX_HEAD(c);
+  pf_wide6<0>(G + z * es, n, c, q, d, m, y + (u64)o * n, nullptr);
+}
+// the slots' x rows in slot order: q8_1 row xmap[s] of qx / xd into row s of qg / dg (c columns)
+extern "C" __global__ void __launch_bounds__(256) llb_mx_gather(const signed char* __restrict__ qx,
+  const float2* __restrict__ xd, const u32* __restrict__ xmap, u32 c, signed char* __restrict__ qg,
+  float2* __restrict__ dg) {
+  const u64 s = blockIdx.x, t = xmap[s];
+  for (u32 i = threadIdx.x; i < c / 16; i += 256) {
+    ((int4*)(qg + s * c))[i] = ((const int4*)(qx + t * c))[i];
+  }
+  for (u32 i = threadIdx.x; i < c / 32; i += 256) {
+    dg[s * (c / 32) + i] = xd[t * (c / 32) + i];
+  }
+}
