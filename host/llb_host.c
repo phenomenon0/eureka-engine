@@ -7,6 +7,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdint.h>
 // The fbn / linb / fulb chains (tools/payload-fbn, -linb, -fulb.patch) as
 // functions of the op, its output y and the GEMV grid: their warp_serve
 // branches and the pass bang (tools/payload-pass.patch) run the same launches
@@ -315,7 +317,55 @@ static int moe_mode = -1;  // 0 device, 1 host, 2 stream
 static const unsigned char* moe_map;
 static llb_dptr moe_stg, moe_stu, moe_std, moe_slot;
 static u32* moe_hid;
-static llb_dptr gpu_moe;  // lg[ne] pv[ne] sg sgo pad pad ids[k] wt[k] shd[d] act[k ef]
+// reports/cuda-moe-speed: the stream residency's copies. The k experts' bytes go from the mmapped
+// GGUF into pinned host slots by MOE_NT threads (each a slice of every piece), and each slot is sent
+// to the device staging area by an async copy on the null stream while the next is filled; the
+// expert kernels queue behind the copies. The bytes are the same, so are the results
+#define MOE_NT 8
+static unsigned char* moe_pin;
+static struct { unsigned char* d[3]; const unsigned char* s[3]; u64 n[3]; } moe_job;
+static pthread_mutex_t moe_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t moe_go = PTHREAD_COND_INITIALIZER, moe_done = PTHREAD_COND_INITIALIZER;
+static u32 moe_gen, moe_left;
+static void* moe_worker(void* a) {
+  u32 i = (u32)(uintptr_t)a, seen = 0;
+  for (;;) {
+    pthread_mutex_lock(&moe_mx);
+    while (moe_gen == seen) {
+      pthread_cond_wait(&moe_go, &moe_mx);
+    }
+    seen = moe_gen;
+    pthread_mutex_unlock(&moe_mx);
+    for (u32 k = 0; k < 3; k += 1) {
+      u64 n = moe_job.n[k], a0 = n * i / MOE_NT, a1 = n * (i + 1) / MOE_NT;
+      if (a1 > a0) {
+        memcpy(moe_job.d[k] + a0, moe_job.s[k] + a0, (size_t)(a1 - a0));
+      }
+    }
+    pthread_mutex_lock(&moe_mx);
+    if (--moe_left == 0) {
+      pthread_cond_signal(&moe_done);
+    }
+    pthread_mutex_unlock(&moe_mx);
+  }
+  return NULL;
+}
+// up to three pieces (n 0: none) copied by the pool; returns when all are in place
+static void moe_pcopy(unsigned char* d0, const unsigned char* s0, u64 n0, unsigned char* d1, const unsigned char* s1,
+  u64 n1, unsigned char* d2, const unsigned char* s2, u64 n2) {
+  pthread_mutex_lock(&moe_mx);
+  moe_job.d[0] = d0; moe_job.s[0] = s0; moe_job.n[0] = n0;
+  moe_job.d[1] = d1; moe_job.s[1] = s1; moe_job.n[1] = n1;
+  moe_job.d[2] = d2; moe_job.s[2] = s2; moe_job.n[2] = n2;
+  moe_left = MOE_NT;
+  moe_gen += 1;
+  pthread_cond_broadcast(&moe_go);
+  while (moe_left != 0) {
+    pthread_cond_wait(&moe_done, &moe_mx);
+  }
+  pthread_mutex_unlock(&moe_mx);
+}
+static llb_dptr gpu_moe;  // lg[ne] sg pv[ne] sgo pad pad ids[k] wt[k] shd[d] act[k ef]
 static size_t gpu_moe_have;
 static bool llb_moe(u32 i) {
   return gpu_mail->pt[i][26] != 0;
@@ -453,6 +503,16 @@ static void llb_moe_load(LlbShape sh) {
     moe_std = llb_alloc_zero(std_ * nkmax);
     moe_slot = llb_alloc_zero((size_t)nkmax * 4);
     moe_hid = malloc((size_t)nkmax * 4);
+    if (cuMemHostAlloc((void**)&moe_pin, (size_t)(2 * stg + std_) * nkmax, 0) != CUDA_SUCCESS) {
+      err_fail("moe: cannot pin the stream copy slots");
+    }
+    for (u32 t = 0; t < MOE_NT; t += 1) {
+      pthread_t th;
+      if (pthread_create(&th, NULL, moe_worker, (void*)(uintptr_t)t) != 0) {
+        err_fail("moe: cannot start the stream copy threads");
+      }
+      pthread_detach(th);
+    }
     u32* sl = malloc((size_t)nkmax * 4);
     for (u32 j = 0; sl != NULL && j < nkmax; j += 1) {
       sl[j] = j;
@@ -489,24 +549,44 @@ static void llb_moe_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
   u64 esg = (u64)(fz ? 2 : 1) * ef * rbg, esd = (u64)dm * rbd;
   size_t need = ((size_t)2 * ne + 4 + 2 * (size_t)nk + dm + (size_t)nk * ef) * 4;
   llb_scratch(&gpu_moe, &gpu_moe_have, need, "gpu_moe");
-  llb_dptr lg = gpu_moe, pvp = lg + (u64)ne * 4, sgl = pvp + (u64)ne * 4, sgo = sgl + 4, idp = sgl + 4 * 4;
+  // reports/cuda-moe-speed: the router's logits and the shared gate's next to each other (lg, sg), so
+  // the two F32 GEMVs are one launch where their rows are adjacent in the layer (gguf2pack's name
+  // order puts ffn_gate_inp_shexp right after ffn_gate_inp); the shared gate and up likewise (ggb, uub)
+  llb_dptr lg = gpu_moe, sgl = lg + (u64)ne * 4, pvp = sgl + 4, sgo = pvp + (u64)ne * 4, idp = sgo + 3 * 4;
   llb_dptr wtp = idp + (u64)nk * 4, shd = wtp + (u64)nk * 4, act = shd + (u64)dm * 4;
   llb_dptr x1b = gpu_blk, h2b = x1b + dm * 4, ggb = h2b + dm * 4, uub = ggb + (u64)sf * 4, aab = uub + (u64)sf * 4;
-  u32 n4 = dm, nsf = sf, siluG = (sf + 255) / 256, cgd = dm / 4, cge = ef / 4;
+  u32 n4 = dm, nsf = sf, cgd = dm / 4, cge = ef / 4, tkG = 1 + (sf + 1023) / 1024;
+  // a GEMV's rows are independent of the grid (it moves rows between warps only): the F32 ones take
+  // a warp a row, not the default grid's idle warps
+  u32 gr1 = (ne + 4) / 4 < grid ? (ne + 4) / 4 : grid;
   if (!LLB_LAUNCH(gpu_rnadd, 1, 1, 1024, &xp, &ap, &postp, &x1b, &h2b, &n4)) {
     err_fail("device launch failed");
   }
-  llb_kgemv(LLB_FM_F32, rp, dm, h2b, lg, ne, grid);
-  llb_kgemv(LLB_FM_F32, gp, dm, h2b, sgl, 1, grid);
-  if (!LLB_LAUNCH(gpu_moetk, 1, 1, 1024, &lg, &ne, &nk, &sgl, &pvp, &idp, &wtp, &sgo)) {
+  if (gp == rp + (u64)ne * dm * 4) {
+    llb_kgemv(LLB_FM_F32, rp, dm, h2b, lg, ne + 1, gr1);
+  } else {
+    llb_kgemv(LLB_FM_F32, rp, dm, h2b, lg, ne, gr1);
+    llb_kgemv(LLB_FM_F32, gp, dm, h2b, sgl, 1, 1);
+  }
+  if (su == sg && fup == fgp + (u64)sf * LLB_FM_RB(sg, dm)) {
+    llb_kgemv(sg, fgp, dm, h2b, ggb, 2 * sf, grid);
+  } else {
+    llb_kgemv(sg, fgp, dm, h2b, ggb, sf, grid);
+    llb_kgemv(su, fup, dm, h2b, uub, sf, grid);
+  }
+  // the top k, and the shared expert's silu in the same launch (blocks 1..)
+  if (!LLB_LAUNCH(gpu_moetk, tkG, 1, 1024, &lg, &ne, &nk, &sgl, &pvp, &idp, &wtp, &sgo, &ggb, &uub, &aab, &nsf)) {
     err_fail("device launch failed");
   }
-  llb_kgemv(sg, fgp, dm, h2b, ggb, sf, grid);
-  llb_kgemv(su, fup, dm, h2b, uub, sf, grid);
-  if (!LLB_LAUNCH(gpu_silu, siluG, 1, 256, &ggb, &uub, &aab, &nsf)) {
-    err_fail("device launch failed");
+  // the shared expert's down inside llb_moe_dn where llb_kgemv would take llb_gemv_any for it (the
+  // same leaf and order: no tuned body for sf columns, a K-quant, not LLB_Q4_DP4A's Q6_K planes);
+  // else its own GEMV into shd
+  bool sfold = !llb_tuned(sd, sf) && (sd == LLB_FM_Q4_K || sd == LLB_FM_Q5_K || (sd == LLB_FM_Q6_K && !(llb_q4dp & 32)));
+  u64 SDp = sfold ? fdp : 0;
+  u32 rbs = LLB_FM_RB(sd, sf), cgs = sf / 4;
+  if (!sfold) {
+    llb_kgemv(sd, fdp, sf, aab, shd, dm, grid);
   }
-  llb_kgemv(sd, fdp, sf, aab, shd, dm, grid);
   u64 Gp = m->g, Up = fz ? m->g + (u64)ef * rbg : m->u, Dp = m->d;
   llb_dptr ids = idp;
   if (moe_mode == 2) {
@@ -514,11 +594,18 @@ static void llb_moe_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
     if (!llb_read(moe_hid, idp, (size_t)nk * 4)) {
       err_fail("moe: cannot read the chosen experts back");
     }
+    u64 eu = fz ? 0 : esg, sl = esg + eu + esd;
     for (u32 j = 0; j < nk; j += 1) {
       u64 e = moe_hid[j];
-      if (e >= ne || !llb_write(moe_stg + j * esg, moe_map + m->sg + e * esg, esg)
-        || (!fz && !llb_write(moe_stu + j * esg, moe_map + m->su + e * esg, esg))
-        || !llb_write(moe_std + j * esd, moe_map + m->sd + e * esd, esd)) {
+      unsigned char* hp = moe_pin + j * sl;
+      if (e >= ne) {
+        err_fail("moe: cannot stage an expert");
+      }
+      moe_pcopy(hp, moe_map + m->sg + e * esg, esg, hp + esg, fz ? NULL : moe_map + m->su + e * esg, eu,
+        hp + esg + eu, moe_map + m->sd + e * esd, esd);
+      if (cuMemcpyHtoDAsync(moe_stg + j * esg, hp, esg, NULL) != CUDA_SUCCESS
+        || (!fz && cuMemcpyHtoDAsync(moe_stu + j * esg, hp + esg, esg, NULL) != CUDA_SUCCESS)
+        || cuMemcpyHtoDAsync(moe_std + j * esd, hp + esg + eu, esd, NULL) != CUDA_SUCCESS) {
         err_fail("moe: cannot stage an expert");
       }
     }
@@ -526,7 +613,7 @@ static void llb_moe_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
   }
   if (!LLB_LAUNCH(gpu_moegu, (ef + 3) / 4, nk, 128, &Gp, &Up, &esg, &rbg, &rbu, &fg, &fu, &cgd, &h2b, &ids, &act, &ef)
     || !LLB_LAUNCH(gpu_moedn, (dm + 3) / 4, 1, 128, &Dp, &esd, &rbd, &fd, &cge, &act, &ids, &wtp, &nk, &ef,
-      &x1b, &shd, &sgo, &yp, &n4)) {
+      &x1b, &shd, &sgo, &yp, &n4, &SDp, &rbs, &sd, &cgs, &aab)) {
     err_fail("device launch failed");
   }
 }
@@ -2657,6 +2744,13 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
     }
     pass_dT = dT;
     llb_pass_init(sh, dT, s + k);
+    // reports/cuda-moe-speed: a MoE file records each folded step as a CUDA graph (LLB_GRAPH's
+    // replay: the same kernels, args and order) unless LLB_GRAPH is set; dense files unchanged
+    for (u32 i = 0; i < s + k && getenv("LLB_GRAPH") == NULL; i += 1) {
+      if (llb_moe(i)) {
+        setenv("LLB_GRAPH", "1", 0);
+      }
+    }
   }
   if (dT != pass_dT) {
     err_fail("warp pass: dT changed");
@@ -2701,6 +2795,19 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
   }
   if (fold && pf_take(o, pos, dT, sh, yp)) {
     return;
+  }
+  if (fold && getenv("LLB_STEP_US") != NULL) {
+    // LLB_STEP_US (reports/cuda-moe-speed): `stepus POS US` on stderr, the microseconds since the
+    // previous folded step began (the whole token period: the Bend loop, the pass and the head);
+    // timing only, nothing else changes
+    static struct timespec sp;
+    struct timespec tn;
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    if (sp.tv_sec != 0) {
+      fprintf(stderr, "stepus %u %lld\n", pos,
+        (long long)(tn.tv_sec - sp.tv_sec) * 1000000 + (tn.tv_nsec - sp.tv_nsec) / 1000);
+    }
+    sp = tn;
   }
   if (fold) {
     llb_graph_begin();
