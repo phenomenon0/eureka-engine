@@ -54,7 +54,17 @@ static size_t capn;
 static char *text;
 static jv *req;
 static Record *rec;
-static int mode,steps,seq,prompt_n,prompt_ids[CLEF_MAX_T];
+static int mode,steps,seq,prompt_n,*prompt_ids,prompt_cap;
+/* tools/payload-anyshape.patch: a generate prompt is bounded by the engine's KV capacity
+ * (ctx, prompt + steps fixed at launch), not CLEF_MAX_T (16384, the decide head's budget);
+ * the id buffers grow to the request */
+static int *ids_fit(int *p,int *cap,int n) {
+    if (n<=*cap) return p;
+    int *q=realloc(p,sizeof *q*(size_t)n);
+    if (!q) clef_fail("out of memory for the request ids");
+    *cap=n;
+    return q;
+}
 static double t_req;
 
 /* S2 twoheads: retained session. The last request that carried "session":S and
@@ -64,7 +74,7 @@ static double t_req;
  * the retained one is refused (never truncated). A request with a new/absent
  * session resets the record (state resets at pos 0 as before). */
 static char rt_session[256];
-static int  rt_valid,rt_mode,rt_gen_n,rt_req_n,rt_req_ids[CLEF_MAX_T];
+static int  rt_valid,rt_mode,rt_gen_n,rt_req_n,*rt_req_ids,rt_req_cap;
 static char *rt_response;
 static char cur_session[256];
 
@@ -222,7 +232,7 @@ static const char *tower_stamp_check(const char *rows, unsigned nx, unsigned ny)
     json_free(st);
     return why;
 }
-static int nohead,ro_n,ro_ids[8];
+static int nohead,glue_ok,ro_n,ro_ids[8];
 /* ENGINE-HEAD27: the trunk's hidden width (LLB_GGUF <arch>.embedding_length); every head must read it. */
 static int trunk_d;
 static int rt_head;  /* sel_head recorded with the retained record (identity) */
@@ -394,9 +404,13 @@ static void init(const char *dir) {
     const char *nh=getenv("LLB_SYS1_NOHEAD");
     nohead=nh && *nh && strcmp(nh,"0");
     if (getenv("LLB_VIS_EMBD")) clef_fail("sys1: the image is per request (\"image\"), unset LLB_VIS_EMBD");
-    if (nohead) glue_out_open(gguf),fprintf(stderr,"sys1: NOHEAD (no clef head; decide refused; readout from output.weight)\n");
+    /* tools/payload-anyshape.patch: glue_out (the NOHEAD readout rows) is 4096-only; any other
+       width serves generate requests and refuses readout (was: refused at start) */
+    trunk_d=clef_gguf_width(gguf);
+    glue_ok=nohead && trunk_d==4096;
+    if (glue_ok) glue_out_open(gguf);
+    if (nohead) fprintf(stderr,"sys1: NOHEAD (no clef head; decide refused; readout %s)\n",glue_ok?"from output.weight":"off: glue_out reads 4096-wide rows only");
     else clef_head_open(&head,gguf);
-    trunk_d=nohead ? 4096 : clef_gguf_width(gguf); /* glue_out is 4096-only (it refuses other widths) */
     if (!nohead) head_width(&head,gguf);
     const char *gguf2=getenv("LLB_HEAD2_GGUF");
     if (gguf2 && *gguf2) {
@@ -486,6 +500,7 @@ static int sess_check(const char *id,int m,const int *ids,int n,int gen_n) {
              * count minus one is the true engine position (decide records
              * process all their tokens: no -1). S5 V2 measured. */
             cont_pos=rt_req_n+(rt_gen_n?rt_gen_n-1:0);
+            rt_req_ids=ids_fit(rt_req_ids,&rt_req_cap,n);
             memcpy(rt_req_ids,ids,sizeof *ids*n);
             rt_req_n=n;
             rt_gen_n=gen_n;
@@ -501,6 +516,7 @@ static int sess_check(const char *id,int m,const int *ids,int n,int gen_n) {
         return 0;
     }
     memset(rt_session,0,sizeof rt_session);
+    rt_req_ids=ids_fit(rt_req_ids,&rt_req_cap,n);
     memcpy(rt_req_ids,ids,sizeof *ids*n);
     rt_req_n=n;
     rt_mode=m;
@@ -591,6 +607,7 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         if (img && trunk_d!=4096) return refuse("image rows are 4096 wide (the 9B tower); this trunk is not"),0;
         if (ro) {
             if (ro->type!=J_ARR || ro->n<1 || ro->n>8) return refuse("readout must be an array of 1..8 token ids"),0;
+            if (nohead && !glue_ok) return refuse("readout needs a 4096-wide model under LLB_SYS1_NOHEAD (glue_out)"),0;
             for (size_t i=0; i<ro->n; i++) {
                 jv *v=ro->items[i];
                 if (v->type!=J_NUM || v->num<0 || v->num>=248320 || v->num!=floor(v->num)) return refuse("readout ids must be integers 0..248319"),0;
@@ -641,12 +658,13 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
             const char *why=stamp_check(ir->str,(unsigned)in->num);
             if (why) return refuse(why),0;
         }
-        int cap_ids=CLEF_MAX_T,*ids=malloc(sizeof *ids*cap_ids);
+        int cap_ids=ctx>0 && ctx<(1u<<30)?(int)ctx:CLEF_MAX_T,*ids=malloc(sizeof *ids*(size_t)cap_ids);
+        if (!ids) return refuse("out of memory for the prompt ids"),0;
         jv *spc=json_get(req,"special");
         int c=q35_tok_encode(&tok,p->str,img || ims || (spc && spc->type==J_BOOL && spc->b),ids,cap_ids);
         /* C1A-LAND: q35_tok_encode returns the full count (and copies nothing) when it exceeds cap_ids; c>cap_ids
            used to fall through, overrun ids/prompt_ids and send garbage ids -> "sys1: bad request command", rc 2 */
-        if (c<1 || c>cap_ids) return free(ids),refuse("prompt must tokenize to 1..16384 tokens"),0;
+        if (c<1 || c>cap_ids) return free(ids),refuse("prompt must tokenize to 1 .. the KV capacity fixed at launch (--steps)"),0;
         if ((unsigned)c+(unsigned)k->num-1>ctx) return free(ids),refuse("prompt + n exceeds the KV capacity fixed at launch"),0;
         if (json_get(req,"head")) return free(ids),refuse("head applies to decide requests only"),0;
         if (img) {
@@ -689,6 +707,7 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         mode=2;
         steps=(int)k->num;
         prompt_n=c;
+        prompt_ids=ids_fit(prompt_ids,&prompt_cap,c);
         memcpy(prompt_ids,ids,sizeof *ids*c);
         *n=(unsigned)c;
         *hidden=NULL;
@@ -924,10 +943,12 @@ void dual_done(void) {
     }
     fflush(cap);
     stdout=out;
-    // gen's prints: one id per line
-    static int ids[65536];
+    // gen's prints: one id per line (up to the request's steps, any count since
+    // tools/payload-anyshape.patch; was a 65536-id buffer)
+    static int *ids,ids_cap;
+    ids=ids_fit(ids,&ids_cap,(steps>1?steps:1)+1);
     int k=0;
-    for (char *s=capp,*e; k<65536; s=e) {
+    for (char *s=capp,*e; k<ids_cap; s=e) {
         long v=strtol(s,&e,10);
         if (e==s) break;
         ids[k++]=(int)v;

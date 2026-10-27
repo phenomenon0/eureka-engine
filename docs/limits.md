@@ -21,7 +21,7 @@ lines inside the patch.
 | Engine | Model shapes accepted | Max context | Memory model |
 |---|---|---|---|
 | CPU (Android, `backends/android/engine`) | Any dense Qwen3.5 pack (shape read from `index.tsv`) | KV capacity set at launch (`--decide CTX`) | Pack mmapped; f32 KV for full-attention layers only |
-| CUDA (root) | 9B (d 4096), 27B (d 5120), 0.8B (d 1024) | 131,072 (2^17) | Whole model in VRAM; f32 KV for 2^dT slots |
+| CUDA (root) | Any dense Qwen3.5 shape with head_dim 256 and SSM state 128 (structural check; tested 0.8B, 2B, 4B, 9B) | prompt + steps, up to 2^26 positions; in practice VRAM | Whole model in VRAM; f32 KV for full-attention layers, allocated by position up to prompt + steps |
 | Metal, macOS (`backends/metal`) | Any dense Qwen3.5 quant pack (shape read from the manifest; tested 0.8B, 2B, 4B, 9B), 35B MoE | 2^27 slots, bounded by the largest Metal buffer (35B MoE: 131,072) | Weights in one heap span (`--gpu`); f32 KV and attention planes in the engine's own buffer, sized from the context |
 | Metal, iOS (`backends/ios`) | Same engine as macOS; shipped with 4B and Kev-4B | 2^27 (`llb_open` cap), bounded by the device's largest buffer | One span: GGUF + GGUF/2 + 1 GiB; KV outside it |
 | WebGPU, shipped (`backends/webgpu/engine`) | 4B only | 4,096 | Whole model on the GPU, split into ≤128 MiB buffers |
@@ -33,13 +33,19 @@ lines inside the patch.
 
 - **CPU:** runs them. Qwen3.5-2B Q4_K_M was tested (see
   [backends/android](../backends/android/README.md#models)).
-- **CUDA:** `mf.validate` in `engine_qwen35_gpu.bend` (lines 277–289) allows
-  only three shapes. Behind it, the device envelope in
-  `tools/payload-27b.patch` (lines 169–175) accepts d_model 4096 or 5120
-  (1024 by a special case), and the rmsnorm reduction trees
-  (`payload-27b.patch` 199–223) handle only 1024, 2048, 4096, and ≥8-leaf
-  widths, so d 2560 or 3072 would read out of bounds. Below d 2048, spec,
-  batch, and fast prefill are refused (`host/llb_host.c` 2244).
+- **CUDA:** runs them (`tools/payload-anyshape.patch`). The whitelist is a
+  structural check (`mf.validate` / `mf.shape` in `engine_qwen35_gpu.bend`,
+  backed by `pass_mail`'s envelope): head_dim 256 and ssm_state_size 128
+  (kernel instantiations), n_heads a multiple of n_kv_heads, value heads a
+  multiple of key heads (at most 256), every width a multiple of 256,
+  d_model at most 32,768, at most 256 layers, vocab at most 261,632. A
+  failed check names the field. Rmsnorm handles any width (8-leaf tree to
+  8,192, `rms_wide` past it). Rows that no tuned GEMV body covers (for
+  example the 4B's 2,560-column Q5_K `attn_qkv`) run `llb_gemv_any`. Fast
+  prefill runs on any shape. Speculative decoding and native batch stay
+  refused outside the 9B and 27B shapes: `llb_t_attn4` has a 1,024-float
+  KV stride and the spec embed and `bx_*` scratch are sized for those
+  shapes.
 - **Metal:** runs them since `cc/metal-anyshape-cc.patch` and
   `engine/metal-anyshape-engine.patch` (applied by default; `LLB_METAL_BASE=1`
   builds the old product). `mf.dense` checks the quant pack's manifest
@@ -67,20 +73,22 @@ lines inside the patch.
   most 64 query heads (the fixed 81,920-float block scratch is checked
   against the shape, with a message). Head region ≤ 2 GiB and 32-bit offsets
   remain.
-- **CUDA:** layer arrays sized 64; d_model ≤ 8192 (head scratch);
-  d_ff ≤ 17,408 and GQA 4 or 6; ≤ 24 query heads (attention score planes);
-  fixed scratch sized for the 27B. Head region ≤ 2 GiB and 32-bit offsets.
-  On CUDA, `gpu_q8b`/`gpu_q8c` (`payload-dp4a.patch` 182,
-  `payload-dp4b.patch` 386) and `gpu_atts` overflow silently past those
-  sizes.
+- **CUDA:** layer tables hold 256 layers (`LLB_MAXL`); scratch (`gpu_blk`,
+  `gpu_q8b`, `gpu_q8c`, `gpu_headh`, `gpu_atts`) is sized from the shape at
+  the first pass. Remaining limits: d_model ≤ 32,768, the head region
+  (output + norm) ≤ 2 GiB, 32-bit layer offsets, vocab ≤ 261,632 (the
+  logit buffer). The 27B was not re-run for this change (it needs 19 GB of
+  VRAM).
 - **CPU:** no shape cap. Memory is the limit: the pack is mmapped and must be
   mostly resident for speed.
 
 ### Less memory (8–12 GB GPUs, 8 GB Macs, 6–8 GB phones)
 
-- **CUDA:** the whole model must fit in VRAM (no offload). KV is f32 and
-  allocated for the full power-of-two capacity at launch. Turing and older
-  cards are out (sm_80 floor, a hardware class).
+- **CUDA:** the whole model must fit in VRAM (no offload). KV is f32,
+  allocated by position (doubling, up to prompt + steps); a failed
+  allocation stops with the slot count and MiB. With LLB_SPEC, LLB_MTP, or
+  LLB_BATCH the full capacity is allocated at the first step. Turing and
+  older cards are out (sm_80 floor, a hardware class).
 - **Metal and iOS:** one no-copy `MTLBuffer` holds weights and tables; the
   KV, attention planes and fast-chunk area are a second buffer sized from the
   context, checked against `maxBufferLength` (58.3 GiB on the 96 GB M3
@@ -99,9 +107,13 @@ lines inside the patch.
 
 ### Long context
 
-- **CUDA:** hard ceiling 2^17 = 131,072 tokens. The served prompt is
-  capped at 16,384 tokens (`CLEF_MAX_T`) even when the KV holds more. f32 KV
-  is fixed at launch.
+- **CUDA:** prompt + steps ≤ 2^26 positions (`c` carries the position in
+  27 bits); the practical bound is VRAM for the f32 KV. Attention score
+  planes are 2^max(dT, 17) floats a head. The served generate prompt is
+  bounded by the KV capacity fixed at launch (`--steps`), not `CLEF_MAX_T`;
+  `decide` keeps its 16,384-token budget. Decode attention is one block a
+  head, so a token at 100k+ positions is slow; use `LLB_PREFILL=fast` for
+  long prompts.
 - **Metal:** up to 2^27 slots (the step word's 27 position bits), bounded by
   the largest Metal buffer: f32 KV is 2 × n_kv_heads × 256 × 4 bytes a slot
   per full-attention layer (0.8B: 24 KiB a slot, so 2^21 slots fit 58 GiB).
@@ -120,15 +132,10 @@ lines inside the patch.
 
 | Engine | Change | Class |
 |---|---|---|
-| CUDA | Read vocab size, full-attention interval, KV heads, rope base and dims, and eps from the model, not literals | Cap |
-| CUDA | Size scratch (`gpu_blk`, `gpu_atts`, `gpu_q8b`) from the shape; turn silent overflows into refusals | Cap |
-| CUDA | Heap-allocate the 64-entry layer arrays | Cap |
-| CUDA | Make the padded 8-leaf rmsnorm tree the default for any width | Kernel |
 | Metal | Fast chunk attention for GQA other than 4 and 6, or more than 4 KV heads | Kernel |
 | CUDA, Metal | Instantiate head_dim 128 and SSM state 64; rope base, eps as kernel arguments | Kernel |
-| CUDA, Metal | f16 KV, allocated by position | Kernel |
+| CUDA, Metal | f16 KV (CUDA now allocates f32 KV by position) | Kernel |
 | WebGPU shipped | Use the in-place KV write for decode | Cap |
-| CUDA servers | Replace the 16,384-token prompt arrays with buffers sized by the KV capacity | Cap |
 | Android app | Choose the thread count and CPU mask from `/sys/devices/system/cpu/*/cpu_capacity` | Cap |
 
 ## Done
@@ -150,3 +157,11 @@ lines inside the patch.
   2^27 slots with a buffer-limit refusal, `--ctx C`, `@FILE` prompts, served
   prompts up to the KV capacity, and an iOS span sized from the model.
   4B and 9B greedy ids and logits are unchanged against the base build.
+- **CUDA engine, `tools/payload-anyshape.patch`:** structural shape check
+  instead of the 9B / 27B / 0.8B whitelist; vocab, full-attention layers
+  (from the table), rope base and dims, and eps read from the model
+  (`llb_cfg` on the device; the defaults are the old literals, so the
+  supported models keep their bits); rmsnorm for any width; scratch sized
+  from the shape; `llb_gemv_any` for rows outside the tuned GEMV bodies;
+  KV allocated by position; context up to 2^26 positions; fast prefill on
+  any shape; the SYS1 generate prompt bounded by the KV capacity.

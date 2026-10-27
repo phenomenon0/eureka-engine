@@ -3,7 +3,7 @@
 import Base
 
 # the next request as engine argv words "id" ... "--steps" "N" ([] at EOF);
-# ctx = the KV capacity 2^dT fixed at launch
+# ctx = the KV capacity fixed at launch (prompt + steps positions; was 2^dT)
 def Sys1.next(dir: String, ctx: U32) -> IO(List<String>):
   import "./sys1.c"
   import "./sys1.js"

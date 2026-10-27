@@ -1220,7 +1220,8 @@ def srv.go(q: List<String>, +m: Model, +b: Nat, +em: U32, +dT: Nat, k: Unit -> I
 @unsafe
 def srv(+dir: String, +m: Model, +b: Nat, +em: U32, +dT: Nat) -> IO(Unit):
   do IO<Unit>:
-    q : List<String> <- S.sys1.next(dir, (1 << dT : U32))
+    # the KV capacity in positions (prompt + steps; was 2^dT, tools/payload-anyshape.patch)
+    q : List<String> <- S.sys1.next(dir, cf.cap(m.cf(m)))
     srv.go(q, m, b, em, dT, u => srv(dir, m, b, em, dT))
 
 @unsafe
