@@ -82,3 +82,23 @@ expert_count 5000, `--emit` on a MoE file. `LLB_PREFILL=fast` on a MoE file must
 
 Decode speed on S35 Q4_K_M: median step ms over the 64 greedy steps (engine stderr `step` lines past the
 prompt), and llama.cpp CUDA `llama-bench -p 0 -n 64 -r 3` on the same file.
+
+## Amendment 1 — 2026-10-26, after the first gate file (S512 Q8_0), before any other gate file
+
+Disclosed as post-hoc: written after S512 Q8_0 scored FAIL as frozen (G-A 38 disagreements, 5 high-margin;
+V-T1 D -7.29 pt, CI90 [-12.50, -2.08]). A diagnostic run on that file, X = llama.cpp CPU (op offload off) on
+the same GGUF dequantized to F32 (`deq_gguf.py`, exact dequantization, so llama.cpp computes without
+quantizing activations), gave: C top-1 = X 192/192 with rms(C - X) 0.0002 on X's top-1 logit, while R = X
+154/192 (rms 0.343) and F = X 151/192 (rms 0.366). The frozen gate scored llama.cpp's 8-bit activation
+rounding (shared by R and F, which makes F track R) as candidate error. The brief names this arm ("also compare
+against the same weights dequantized to F32 if needed"); the frozen file omitted it. The frozen gates stay and
+are reported for every file. Added:
+
+- **G-X** (where the F32 copy fits on disk: S512 and S60, both formats; S35 and S128F need 6 to 13.5 GB of F32
+  and are not run): PASS iff (i) rms_p(C - X) <= rms_p(R - X) on X's top-1 logit (error vs fp32 no worse than
+  the oracle's own, the v2 class-3 criterion) and (ii) every C != X top-1 disagreement has marg_X < 0.05 and
+  C's pick in X's top-3.
+- **File verdict:** PASS iff the frozen verdict passes, or G-X passes. Where X is not run, the frozen verdict
+  stands alone.
+- **Controls:** the garbage mutant must also FAIL G-X (on S512 Q8_0, where X exists), in addition to the
+  frozen control on S35 Q4_K_M.
