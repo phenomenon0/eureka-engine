@@ -35,22 +35,38 @@ tools/run27b.sh --gguf MODEL.gguf --gpu 40GB --threads 16 -- SIDECAR 760 6511 31
   MemAvailable allow; `LLB_MOE_EXPERTS=device|host|stream` forces one. All
   three give the same bits. Checked against llama.cpp on synthetic files only
   (no real MoE checkpoint was loaded): [reports/cuda-moe](../../reports/cuda-moe/REPORT.md).
-  MoE runs the exact tier (fast prefill, spec, batch, MTP are dense only)
-  and the folded step (no `--emit`). Each step runs as a CUDA graph unless
-  `LLB_GRAPH` is set.
-- **MoE speed:** these are 4-layer synthetic Q4_K_M files, decode tok/s, medians of 3 interleaved rounds. The MoE
-  kernels are bit-exact with the earlier build.
+  MoE runs the exact tier by default (spec, batch, MTP are dense only) and
+  the folded step (no `--emit`). Two opt-in tiers change the numerics and are
+  gated against llama.cpp ([reports/cuda-catchup](../../reports/cuda-catchup/REPORT.md)):
+  `LLB_MOE_DP4A=1` (the routed experts on int8 activations, dp4a) and
+  `LLB_PREFILL=fast` (the prompt's tokens grouped by expert, each expert's rows
+  a GEMM on the fast prefill's int8 tensor-core leaves; not with streamed
+  experts).
+- **Decode loop:** gen hands the host up to n greedy steps in one bang; the
+  host runs them back to back as CUDA graphs (the next step's token read from
+  the device's pick), so the Bend loop runs once a run, not once a token. Same
+  bits as before; off for the sampler, grammar, spec, MTP, batch, images,
+  dumps and the prefix cache, or with `LLB_GEN=0`.
+- **Speed** (RTX 3090, decode tok/s, medians of 3 interleaved rounds against
+  llama.cpp CUDA, build 9d57ce45; exact tier unless noted):
 
-  | file | device | host | stream | llama.cpp CUDA |
-  |---|---|---|---|---|
-  | 35B-A3B-like (256 experts, top-8) | 807 | 252 | 207 | 1772 |
-  | 128 experts, top-8, fused gate/up | 917 | 324 | 308 | 2196 |
+  | model | engine | llama.cpp | ratio |
+  |---|---|---|---|
+  | Qwen3.5-0.8B Q4_K_M | 483 | 463 | 1.04x |
+  | Qwen3.5-2B Q4_K_M | 300 | 329 | 0.91x |
+  | Qwen3.5-4B Q4_K_M | 135 | 175 | 0.78x |
+  | Qwen3.5-9B Q4_K_M | 92 | 115 | 0.80x |
+  | MoE 35B-A3B-like, 4 layers (synthetic) | 1733 (dp4a 1787) | 1687 | 1.03x (1.06x) |
+  | MoE 128 experts, fused gate/up, 4 layers (synthetic) | 2410 (dp4a 2564) | 2096 | 1.15x (1.22x) |
+  | MoE 35B-A3B-like, 8 layers (synthetic) | 904 (dp4a 933) | 912 | 0.99x (1.02x) |
 
-  - Device is 0.46x llama.cpp on the 35B-like file. About 0.8 ms of each 1.24 ms token is the engine's fixed
-    per-token loop, which the dense models share.
-  - Per added MoE layer the cost is 154 us, against 122 us for llama.cpp (1.26x).
-  - Prompts run one token at a time.
-  - Details: [reports/cuda-moe-speed](../../reports/cuda-moe-speed/REPORT.md).
+  - Each added MoE layer costs about 132 us (dp4a 128), against llama.cpp's 126.
+  - MoE prefill, 512 tokens on the 35B-like file: `LLB_PREFILL=fast` 31,900
+    tok/s against llama.cpp's 25,000 (1.28x); the exact tier still goes one
+    token at a time (704 tok/s).
+  - Experts in host RAM: 305 tok/s; streamed from the GGUF in the page cache: 271.
+  - Details: [reports/cuda-catchup](../../reports/cuda-catchup/REPORT.md),
+    [reports/cuda-moe-speed](../../reports/cuda-moe-speed/REPORT.md).
 - **Not on every shape:** `LLB_SPEC`, `LLB_MTP`, and `LLB_BATCH` run on the
   9B and 27B shapes only (d_model 4096 / 5120, 4 KV heads, context up to
   131,072); elsewhere they are refused.

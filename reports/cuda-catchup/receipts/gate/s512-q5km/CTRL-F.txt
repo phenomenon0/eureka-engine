@@ -1,0 +1,46 @@
+TF s512-q5km F vs ref X: a_C 149/192, a_F 149/192, b (C wrong, F right) 0, c (C right, F wrong) 0, McNemar one-sided p 1.0000 -> PASS
+  rms(C - ref at ref's top-1) 0.4856 over 192
+  disagreements with ref: 43 (1 near-tie: ref margin < 0.05, C's pick in ref top 3)
+    p1 pos 0: ref margin 0.0441, C pick = ref rank >5
+    p1 pos 1: ref margin 0.0359, C pick = ref rank 4
+    p1 pos 2: ref margin 0.0573, C pick = ref rank 2
+    p1 pos 4: ref margin 0.1268, C pick = ref rank 2
+    p1 pos 9: ref margin 0.2295, C pick = ref rank 2
+    p1 pos 11: ref margin 0.8085, C pick = ref rank 2
+    p1 pos 14: ref margin 0.1685, C pick = ref rank 3
+    p1 pos 15: ref margin 0.1850, C pick = ref rank 2
+    p1 pos 18: ref margin 0.1176, C pick = ref rank 2
+    p1 pos 21: ref margin 0.5340, C pick = ref rank >5
+    p1 pos 23: ref margin 0.3349, C pick = ref rank 2
+    p1 pos 26: ref margin 0.9085, C pick = ref rank 4
+    p1 pos 29: ref margin 0.2377, C pick = ref rank 4
+    p1 pos 30: ref margin 0.2536, C pick = ref rank >5
+    p1 pos 35: ref margin 0.3575, C pick = ref rank 2
+    p1 pos 36: ref margin 0.0914, C pick = ref rank 3
+    p1 pos 42: ref margin 0.2791, C pick = ref rank 2
+    p1 pos 44: ref margin 0.0591, C pick = ref rank 3
+    p1 pos 45: ref margin 0.1268, C pick = ref rank 3
+    p1 pos 54: ref margin 0.0051, C pick = ref rank 2 near-tie
+    p1 pos 61: ref margin 0.0823, C pick = ref rank >5
+    p2 pos 0: ref margin 0.8825, C pick = ref rank 3
+    p2 pos 6: ref margin 0.1252, C pick = ref rank 2
+    p2 pos 22: ref margin 0.6831, C pick = ref rank 2
+    p2 pos 23: ref margin 0.3504, C pick = ref rank 2
+    p2 pos 36: ref margin 0.1232, C pick = ref rank 3
+    p2 pos 38: ref margin 0.7652, C pick = ref rank >5
+    p2 pos 53: ref margin 0.2525, C pick = ref rank 2
+    p2 pos 61: ref margin 0.2337, C pick = ref rank 3
+    p3 pos 2: ref margin 0.1703, C pick = ref rank 2
+    p3 pos 5: ref margin 0.0467, C pick = ref rank 5
+    p3 pos 16: ref margin 0.0671, C pick = ref rank 2
+    p3 pos 19: ref margin 0.2413, C pick = ref rank 2
+    p3 pos 25: ref margin 0.6665, C pick = ref rank 2
+    p3 pos 27: ref margin 0.4047, C pick = ref rank 2
+    p3 pos 30: ref margin 0.4666, C pick = ref rank 2
+    p3 pos 32: ref margin 0.0775, C pick = ref rank >5
+    p3 pos 43: ref margin 0.2656, C pick = ref rank 3
+    p3 pos 50: ref margin 0.7239, C pick = ref rank 4
+    p3 pos 56: ref margin 0.1214, C pick = ref rank 2
+    p3 pos 58: ref margin 0.6175, C pick = ref rank 3
+    p3 pos 59: ref margin 0.1716, C pick = ref rank 2
+    p3 pos 60: ref margin 0.8285, C pick = ref rank 5

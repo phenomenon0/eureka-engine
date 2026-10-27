@@ -92,23 +92,25 @@ skipped; checked on synthetic random-weight files against llama.cpp
   a k-slot VRAM staging area each token; disk and page-cache speed).
   `LLB_MOE_EXPERTS` forces a residency; `LLB_MOE_VRAM` / `LLB_MOE_RAM` stand
   in for the free amounts. One GPU only.
-- **Speed** ([reports/cuda-moe-speed](../reports/cuda-moe-speed/REPORT.md); synthetic 4-layer 35B-A3B-like
-  Q4_K_M; decode tok/s):
+- **Speed** ([reports/cuda-catchup](../reports/cuda-catchup/REPORT.md); synthetic 4-layer 35B-A3B-like
+  Q4_K_M; RTX 3090; medians of 3 interleaved rounds):
 
-  | residency | engine | llama.cpp |
+  | | engine | llama.cpp |
   |---|---|---|
-  | device | 807 | 1772 (CUDA), 0.46x |
-  | host | 252 | 536 (experts on CPU, `-ot exps=CPU`) |
-  | stream | 207 | — |
+  | decode, experts in VRAM | 1733 tok/s (exact), 1787 (`LLB_MOE_DP4A=1`) | 1687 (CUDA): 1.03x, 1.06x |
+  | decode, experts in host RAM | 305 | — |
+  | decode, experts streamed (page cache) | 271 | — |
+  | prefill, 512 tokens | 31,900 (`LLB_PREFILL=fast`); 704 (exact) | 25,000: 1.28x |
 
-  - Each added MoE layer costs 154 us, against llama.cpp's 122 us.
-  - What bounds the device figure is the engine's fixed per-token loop, about 0.8 ms. The dense models pay it
-    too.
-  - The host residency runs at the PCIe read rate: about 60 MB of chosen experts per token over the bus.
-  - Prefill goes one token at a time: 755 tok/s, against llama.cpp's batched 26,596.
-- **Refused:** fast prefill (the MoE file runs the exact tier, with a stderr
-  note), `LLB_SPEC`, `LLB_MTP`, `LLB_BATCH`, the split path (`--emit`,
+  - Each added MoE layer costs about 132 us (dp4a 128), against llama.cpp's 126.
+  - The engine's per-token Bend loop (about 0.8 ms) is gone from greedy decode: gen hands the host its steps in
+    one bang. The sampler, grammar, spec, MTP, batch, images and the prefix cache still go one step a bang.
+  - The host residency reads about 60 MB of chosen experts per token over PCIe; that is its bound.
+  - The exact tier's prompt still runs one token at a time through the Bend loop.
+- **Refused:** `LLB_SPEC`, `LLB_MTP`, `LLB_BATCH`, the split path (`--emit`,
   `--lpb` < layers), and the pack path (the experts load from `LLB_GGUF`).
+  `LLB_PREFILL=fast` runs the exact tier, with a stderr note, when the experts
+  stream from the GGUF.
 
 ### MoE (`qwen35moe`) on Metal
 
@@ -270,6 +272,16 @@ bounds it:
   - Decode on the device: 589 → 807 tok/s.
   - Stream: 128 → 207 tok/s.
   - The bits are identical to the earlier build.
+- **CUDA catch-up** ([report](../reports/cuda-catchup/REPORT.md)):
+  - The decode run: greedy decode no longer pays the Bend loop per token. The 0.8B goes 289 → 483 tok/s
+    (1.04x llama.cpp), the 35B-A3B-like synthetic MoE 774 → 1733 (1.03x).
+  - The tile body's rows (K-quant widths that are whole superblocks but not whole 1024-column quads, such as the
+    0.8B's 3584-column down and the 4B's 2560-column rows) run the pair body with a partial last quad, and
+    `llb_gemv_any`'s K-quant rows run two to a warp: the 4B goes 48 → 135 tok/s.
+  - Bits identical to the earlier build on every exact path (dense 0.8B / 2B / 4B / 9B / clef-flash, all 8
+    synthetic MoE files, every residency).
+  - New opt-in tiers, gated against llama.cpp's own CUDA run: `LLB_MOE_DP4A=1` and `LLB_PREFILL=fast` on MoE
+    files (31,900 tok/s prefill against llama.cpp's 25,000).
 - **Metal any-shape** (`backends/metal/cc/metal-anyshape-cc.patch`,
   `engine/metal-anyshape-engine.patch`, `link/dual-anyshape.patch`): any
   dense Qwen3.5 quant-pack shape (structural manifest check), any KV-head

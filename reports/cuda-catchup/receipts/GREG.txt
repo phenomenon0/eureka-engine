@@ -1,0 +1,5 @@
+G-REG: 28/28 runs byte-identical (stdout ids + every logits line), base 89dba9dde vs candidate (7f84d5a82)
+G-REG4: 3/3 identical
+G-MULTI 0.8B: identical
+G-MULTI S35 Q4_K_M: identical
+G-OFF 0.8B: identical

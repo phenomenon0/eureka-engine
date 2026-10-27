@@ -1,0 +1,28 @@
+TF s60-q4km D vs ref X: a_C 167/192, a_F 114/192, b (C wrong, F right) 9, c (C right, F wrong) 62, McNemar one-sided p 1.0000 -> PASS
+  rms(C - ref at ref's top-1) 0.1551 over 192
+  disagreements with ref: 25 (10 near-tie: ref margin < 0.05, C's pick in ref top 3)
+    p1 pos 4: ref margin 0.0867, C pick = ref rank 2
+    p1 pos 10: ref margin 0.4570, C pick = ref rank 2
+    p1 pos 31: ref margin 0.2903, C pick = ref rank 4
+    p1 pos 35: ref margin 0.2044, C pick = ref rank 2
+    p1 pos 38: ref margin 0.1244, C pick = ref rank 2
+    p1 pos 49: ref margin 0.2367, C pick = ref rank 2
+    p1 pos 55: ref margin 0.0034, C pick = ref rank 2 near-tie
+    p1 pos 58: ref margin 0.3098, C pick = ref rank >5
+    p2 pos 3: ref margin 0.0204, C pick = ref rank 3 near-tie
+    p2 pos 36: ref margin 0.0000, C pick = ref rank 2 near-tie
+    p2 pos 42: ref margin 0.3027, C pick = ref rank 2
+    p2 pos 48: ref margin 0.0093, C pick = ref rank 2 near-tie
+    p2 pos 52: ref margin 0.0756, C pick = ref rank 2
+    p2 pos 58: ref margin 0.0539, C pick = ref rank 3
+    p2 pos 59: ref margin 0.2026, C pick = ref rank 2
+    p2 pos 61: ref margin 0.0461, C pick = ref rank 2 near-tie
+    p3 pos 0: ref margin 0.0162, C pick = ref rank 2 near-tie
+    p3 pos 4: ref margin 0.0393, C pick = ref rank 2 near-tie
+    p3 pos 6: ref margin 0.0414, C pick = ref rank 2 near-tie
+    p3 pos 18: ref margin 0.1103, C pick = ref rank 3
+    p3 pos 40: ref margin 0.2377, C pick = ref rank 4
+    p3 pos 41: ref margin 0.0576, C pick = ref rank 2
+    p3 pos 43: ref margin 0.0582, C pick = ref rank 3
+    p3 pos 48: ref margin 0.0491, C pick = ref rank 2 near-tie
+    p3 pos 58: ref margin 0.0192, C pick = ref rank 2 near-tie

@@ -1,0 +1,3 @@
+TF s512-q8 C vs ref X: a_C 192/192, a_F 151/192, b (C wrong, F right) 0, c (C right, F wrong) 41, McNemar one-sided p 1.0000 -> PASS
+  rms(C - ref at ref's top-1) 0.0002 over 192
+  disagreements with ref: 0 (0 near-tie: ref margin < 0.05, C's pick in ref top 3)

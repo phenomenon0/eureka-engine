@@ -1,0 +1,19 @@
+TF s128f-q4km D vs ref X: a_C 176/192, a_F 123/192, b (C wrong, F right) 8, c (C right, F wrong) 61, McNemar one-sided p 1.0000 -> PASS
+  rms(C - ref at ref's top-1) 0.1338 over 192
+  disagreements with ref: 16 (4 near-tie: ref margin < 0.05, C's pick in ref top 3)
+    p1 pos 19: ref margin 0.0784, C pick = ref rank 2
+    p1 pos 23: ref margin 0.2460, C pick = ref rank 2
+    p1 pos 24: ref margin 0.0971, C pick = ref rank 2
+    p1 pos 30: ref margin 0.0176, C pick = ref rank 2 near-tie
+    p1 pos 39: ref margin 0.1879, C pick = ref rank 2
+    p1 pos 42: ref margin 0.0568, C pick = ref rank 2
+    p1 pos 51: ref margin 0.0273, C pick = ref rank 2 near-tie
+    p1 pos 54: ref margin 0.1262, C pick = ref rank 2
+    p2 pos 0: ref margin 0.0438, C pick = ref rank 5
+    p2 pos 36: ref margin 0.1290, C pick = ref rank 2
+    p2 pos 45: ref margin 0.0022, C pick = ref rank 2 near-tie
+    p2 pos 47: ref margin 0.4642, C pick = ref rank 2
+    p3 pos 0: ref margin 0.0487, C pick = ref rank 3 near-tie
+    p3 pos 27: ref margin 0.1339, C pick = ref rank 2
+    p3 pos 30: ref margin 0.1426, C pick = ref rank 2
+    p3 pos 31: ref margin 0.0021, C pick = ref rank 4

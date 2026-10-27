@@ -1,0 +1,1 @@
+PF s35-q4km E vs ref B: a_C 192/192, a_F 114/192, b (C wrong, F right) 0, c (C right, F wrong) 78, McNemar one-sided p 1.0000 -> PASS

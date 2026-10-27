@@ -1,0 +1,11 @@
+s35-q8: B vs C: 6/6 identical
+s35-q8: C vs Chost: 6/6 identical
+s35-q8: C vs Cstream: 6/6 identical
+s35-q8: C vs Csmall: 6/6 identical
+  DIFF s35-q8 C vs D greedy p1
+  DIFF s35-q8 C vs D greedy p2
+  DIFF s35-q8 C vs D greedy p3
+  DIFF s35-q8 C vs D tf p1
+  DIFF s35-q8 C vs D tf p2
+  DIFF s35-q8 C vs D tf p3
+s35-q8: C vs D: 0/6 identical

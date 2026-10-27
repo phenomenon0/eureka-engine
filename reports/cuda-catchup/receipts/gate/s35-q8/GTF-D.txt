@@ -1,0 +1,14 @@
+TF s35-q8 D vs ref X: a_C 181/192, a_F 131/192, b (C wrong, F right) 3, c (C right, F wrong) 53, McNemar one-sided p 1.0000 -> PASS
+  rms(C - ref at ref's top-1) 0.1211 over 192
+  disagreements with ref: 11 (8 near-tie: ref margin < 0.05, C's pick in ref top 3)
+    p1 pos 42: ref margin 0.0153, C pick = ref rank 2 near-tie
+    p1 pos 63: ref margin 0.0397, C pick = ref rank 2 near-tie
+    p2 pos 16: ref margin 0.0000, C pick = ref rank 2 near-tie
+    p2 pos 33: ref margin 0.4627, C pick = ref rank 2
+    p2 pos 50: ref margin 0.2644, C pick = ref rank 5
+    p2 pos 54: ref margin 0.0169, C pick = ref rank 2 near-tie
+    p2 pos 57: ref margin 0.0402, C pick = ref rank 2 near-tie
+    p3 pos 6: ref margin 0.0277, C pick = ref rank 2 near-tie
+    p3 pos 17: ref margin 0.0210, C pick = ref rank 2 near-tie
+    p3 pos 25: ref margin 0.0380, C pick = ref rank 3 near-tie
+    p3 pos 60: ref margin 0.0896, C pick = ref rank 2

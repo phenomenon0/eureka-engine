@@ -1,0 +1,20 @@
+steps 56: median period 630.8 us, GPU busy 614.8 us, launches/step 70
+  llb_warp_q4k                    211.0 us/step x21
+  llb_moe_gu                       99.4 us/step x4
+  llb_moe_dn                       71.1 us/step x4
+  llb_warp_q6k                     55.5 us/step x3
+  llb_moe_topk                     36.9 us/step x4
+  llb_warp                         24.3 us/step x4
+  llb_rmsnorm_add                  16.9 us/step x4
+  llb_rmsnorm                      16.1 us/step x5
+  llb_attn4                        14.9 us/step x1
+  llb_gated_delta                  12.6 us/step x3
+  llb_qkr                          12.1 us/step x2
+  llb_midconv                      12.1 us/step x3
+  llb_gated_rmsnorm                 9.0 us/step x3
+  llb_outputgate                    6.9 us/step x1
+  llb_l2norm_qk                     5.4 us/step x3
+  llb_amax_part                     3.3 us/step x1
+  llb_amax                          2.6 us/step x1
+  llb_slot                          2.3 us/step x2
+  llb_embt                          2.0 us/step x1

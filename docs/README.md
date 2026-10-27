@@ -70,4 +70,5 @@ repository.
 | [`cuda-moe/REPORT.md`](../reports/cuda-moe/REPORT.md) | CUDA on any Qwen3.5 MoE, with experts in VRAM, host RAM, or streamed. |
 | [`cuda-moe-speed/REPORT.md`](../reports/cuda-moe-speed/REPORT.md) | CUDA MoE speed pass: bit-exact kernels, fused launches, CUDA graphs. |
 | [`metal-catchup/REPORT.md`](../reports/metal-catchup/REPORT.md) | Metal MoE speed: 35B-A3B decode 1.14x llama.cpp Metal, fast MoE prefill. |
+| [`cuda-catchup/REPORT.md`](../reports/cuda-catchup/REPORT.md) | CUDA catch-up to llama.cpp: the decode run, exact GEMV bodies, dp4a MoE and fast MoE prefill tiers. |
 | [`metal-moe/REPORT.md`](../reports/metal-moe/REPORT.md) | Metal on any Qwen3.5 MoE, with experts mapped from the file or streamed; 35B-A3B against llama.cpp. |
