@@ -1,0 +1,4 @@
+G-SIDE 08b: manifest.json same, table.bin same (786bfcc3f4a6764d)
+G-SIDE 2b: manifest.json same, table.bin same (1758414d2a823780)
+G-SIDE 9b: manifest.json same, table.bin same (0bf1e8376aba1753)
+G-SIDE flash: manifest.json same, table.bin same (4a0f108d39ba54ad)

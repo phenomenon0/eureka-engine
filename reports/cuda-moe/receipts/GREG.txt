@@ -1,0 +1,1 @@
+G-REG: 28/28 runs byte-identical (stdout ids + every logits line), base 61a673aa3 vs candidate

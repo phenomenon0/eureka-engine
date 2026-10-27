@@ -1,0 +1,4 @@
+~/worktrees/.scratch-cuda-moe/receipts/gate/s35-q8: n 125  rms(C-R) top1 logit 0.3331  rms(F-R) 0.1803  mean(C-R) +0.0015
+~/worktrees/.scratch-cuda-moe/receipts/gate/s128f-q8: n 139  rms(C-R) top1 logit 0.2414  rms(F-R) 0.2238  mean(C-R) -0.0223
+~/worktrees/.scratch-cuda-moe/receipts/gate/s512-q8: n 143  rms(C-R) top1 logit 0.3287  rms(F-R) 0.1508  mean(C-R) -0.0126
+~/worktrees/.scratch-cuda-moe/receipts/gate/s60-q8: n 140  rms(C-R) top1 logit 0.2681  rms(F-R) 0.1726  mean(C-R) -0.0363

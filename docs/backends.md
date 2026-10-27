@@ -50,13 +50,16 @@ not run before, and against its own earlier build on the sizes it did.
 
 | Backend | Qwen3.5 models | Weight formats | Longest prompt tested | Context bound |
 |---|---|---|---|---|
-| CUDA | Any dense size (0.8B, 2B, 4B, 9B, 27B, clef, Kev) | GGUF K-quants (Q4_K, Q5_K, Q6_K) and Q8_0 | 145,115 tokens, 0.8B, RTX 3090 | VRAM (f32 KV allocated by position, up to 2^26) |
+| CUDA | Any dense size (0.8B, 2B, 4B, 9B, 27B, clef, Kev); any MoE (`qwen35moe`: any expert count, top-k and expert widths), checked on synthetic files only | GGUF K-quants (Q4_K, Q5_K, Q6_K) and Q8_0; MoE router F32 | 145,115 tokens, 0.8B, RTX 3090 | VRAM (f32 KV allocated by position, up to 2^26) |
 | Metal, macOS | Any dense size from a quant pack; 35B-A3B MoE | Quant pack (K-quants) | 153,031 tokens, 0.8B and 2B, M3 Ultra | Largest Metal buffer (f32 KV, up to 2^27 slots) |
 | Metal, iOS | Same engine as macOS | Quant pack | Compiled, not run at new sizes | Device's largest buffer |
 | Android | Any dense pack | Pack (F32, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K) | Launch-time capacity; prompts up to 16,384 | `--decide CTX` |
 | WebGPU | Any size, dense or MoE (35B-A3B, 122B-A10B, 397B-A17B), any head, state, and conv size | 21 GGUF formats, F32 to IQ1_S | 153,352 tokens, 0.8B, on an RTX 3090 and an M3 Ultra | GPU binding limit for one layer's f16 KV (about 2 million tokens for the 0.8B) |
 
-A model must still fit in memory: no backend offloads weights. Details,
+A model must still fit in memory: no backend offloads dense weights. The CUDA
+MoE path keeps the routed experts in VRAM, in pinned host RAM, or streams the
+chosen experts from the mmapped GGUF, picked from the free memory
+([reports/cuda-moe](../reports/cuda-moe/REPORT.md)). Details,
 remaining refusals, and the cheapest next fixes:
 [Model and hardware limits](limits.md). WebGPU receipts:
 [reports/webgpu-any-shape](../reports/webgpu-any-shape/REPORT.md).

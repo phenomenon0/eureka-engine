@@ -1,0 +1,10 @@
+device: 127 decode steps, median 2 ms/step -> 500.0 tok/s (min 1, max 5)
+host: 127 decode steps, median 4 ms/step -> 250.0 tok/s (min 4, max 5)
+stream: 127 decode steps, median 8 ms/step -> 125.0 tok/s (min 7, max 11)
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| qwen35moe ?B Q4_K - Medium     |   1.92 GiB |     3.40 B | CUDA       |  99 |            tg64 |      1641.26 ± 76.02 |
+
+build: 9d57ce45 (2251)
+device: mean 1.71 ms/step over 127 decode steps (1 ms step-line resolution) -> 585 tok/s
+host: mean 4.41 ms/step over 127 decode steps (1 ms step-line resolution) -> 227 tok/s
+stream: mean 8.18 ms/step over 127 decode steps (1 ms step-line resolution) -> 122 tok/s

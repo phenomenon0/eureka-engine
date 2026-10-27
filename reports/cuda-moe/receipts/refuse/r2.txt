@@ -1,0 +1,4 @@
+## r2 expert ff 128
+2026-10-26T23:20:42-05:00
+rc=1
+unsupported/invalid qwen3.5 pack: expert_feed_forward_length (a multiple of 256: the expert rows in whole superblocks)

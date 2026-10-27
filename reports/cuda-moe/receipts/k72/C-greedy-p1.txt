@@ -1,0 +1,72 @@
+# eng=~/worktrees/.scratch-cuda-moe/new-out gguf=~/worktrees/.scratch-cuda-moe/models/k72.gguf side=~/worktrees/.scratch-cuda-moe/side2/k72 steps=64 env: 
+2026-10-26T23:21:59-05:00
+rc=0
+1950
+3871
+2426
+715
+3571
+1453
+576
+3997
+1328
+1848
+4019
+1756
+80
+1915
+439
+3644
+2473
+2596
+286
+290
+3268
+713
+1098
+1725
+3322
+967
+2451
+2633
+555
+1289
+2725
+2177
+3391
+3836
+3134
+1755
+2632
+3465
+1057
+2255
+3447
+377
+2801
+4010
+1836
+2565
+992
+599
+1723
+107
+3860
+2677
+2707
+1362
+3547
+2800
+538
+395
+2199
+2252
+198
+1783
+3360
+3881
+wall_ms 160
+gguf: weights from ~/worktrees/.scratch-cuda-moe/models/k72.gguf (38 tensors, 2 layers, pack_bytes 218746624)
+resident head 3343360 bytes + layers in 4 ms
+shape d_model 256 d_ff 256 heads 2 kv 1 layers 2 lin 2/4 sd 128 eps 1e-06 rope 1e+07/64 kv_cap 68 (dT 7) [generic shape: spec / batch off]
+moe: 2 layers, experts 0.20 GiB -> device (VRAM) [free VRAM 8.74 GiB, MemAvailable 17.43 GiB]

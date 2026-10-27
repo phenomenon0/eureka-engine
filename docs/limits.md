@@ -4,7 +4,8 @@ What each engine accepts today, what stops it from running other model sizes
 or smaller hardware, and how hard each limit is to lift. Every engine runs the
 Qwen3.5 hybrid architecture (linear-attention layers plus a full-attention
 layer every fourth layer). The dense sizes run on every engine; the MoE
-models (`qwen35moe`) run on the WebGPU trunk, and the 35B-A3B on Metal.
+models (`qwen35moe`) run on the WebGPU trunk and on CUDA (any shape; synthetic
+files only so far), and the 35B-A3B on Metal.
 
 Classes:
 
@@ -22,7 +23,7 @@ lines inside the patch.
 | Engine | Model shapes accepted | Max context | Memory model |
 |---|---|---|---|
 | CPU (Android, `backends/android/engine`) | Any dense Qwen3.5 pack (shape read from `index.tsv`) | KV capacity set at launch (`--decide CTX`) | Pack mmapped; f32 KV for full-attention layers only |
-| CUDA (root) | Any dense Qwen3.5 shape with head_dim 256 and SSM state 128 (structural check; tested 0.8B, 2B, 4B, 9B) | prompt + steps, up to 2^26 positions; in practice VRAM | Whole model in VRAM; f32 KV for full-attention layers, allocated by position up to prompt + steps |
+| CUDA (root) | Any dense Qwen3.5 shape with head_dim 256 and SSM state 128 (structural check; tested 0.8B, 2B, 4B, 9B); any `qwen35moe` with those rules (synthetic files) | prompt + steps, up to 2^26 positions; in practice VRAM | Dense: whole model in VRAM. MoE: trunk in VRAM; routed experts in VRAM, pinned host RAM, or streamed from the mmapped GGUF. f32 KV for full-attention layers, allocated by position up to prompt + steps |
 | Metal, macOS (`backends/metal`) | Any dense Qwen3.5 quant pack (shape read from the manifest; tested 0.8B, 2B, 4B, 9B), 35B MoE | 2^27 slots, bounded by the largest Metal buffer (35B MoE: 131,072) | Weights in one heap span (`--gpu`); f32 KV and attention planes in the engine's own buffer, sized from the context |
 | Metal, iOS (`backends/ios`) | Same engine as macOS; shipped with 4B and Kev-4B | 2^27 (`llb_open` cap), bounded by the device's largest buffer | One span: GGUF + GGUF/2 + 1 GiB; KV outside it |
 | WebGPU, shipped (`backends/webgpu/engine`) | 4B only | 4,096 | Whole model on the GPU, split into ≤128 MiB buffers |
@@ -67,6 +68,33 @@ lines inside the patch.
   head counts, and vocabulary.
 - **WebGPU trunk:** runs them (0.8B and 2B tested against llama.cpp; see
   [reports/webgpu-any-shape](../reports/webgpu-any-shape/REPORT.md)).
+
+### MoE (`qwen35moe`) on CUDA
+
+`tools/payload-moeany.patch` + `host/llb_host.c` (`llb_moe_run`,
+`llb_moe_load`), with `gguf2pack --sidecar-only` writing the MoE sidecar.
+Any expert count and top-k, any expert and shared width, MTP blocks
+skipped; checked on synthetic random-weight files against llama.cpp
+([reports/cuda-moe](../reports/cuda-moe/REPORT.md)). What still bounds it:
+
+- **Kernel:** expert and shared widths are whole 256-column superblocks;
+  experts Q8_0 / Q4_K / Q5_K / Q6_K; router and shared-expert gate F32;
+  head_dim 256, SSM state 128 and the other dense rules above.
+- **Cap:** the trunk of one layer (everything but its expert stacks) is one
+  Bytes of at most 2 GiB with tensor offsets below 2^28 (table.bin's 28-bit
+  field); the head region at most 2 GiB; 256 layers. A 397B-A17B trunk layer
+  is far below these. The expert stacks are outside them: loaded by name
+  with 64-bit offsets and sizes, one allocation a stack.
+- **Hardware:** the trunk, head, KV and scratch must fit in VRAM. The experts
+  go to VRAM when they fit the free VRAM less 1 GiB, else to pinned
+  device-mapped host RAM when they fit MemAvailable less 4 GiB, else they
+  stream from the mmapped GGUF (the k chosen experts of each layer copied to
+  a k-slot VRAM staging area each token; disk and page-cache speed).
+  `LLB_MOE_EXPERTS` forces a residency; `LLB_MOE_VRAM` / `LLB_MOE_RAM` stand
+  in for the free amounts. One GPU only.
+- **Refused:** fast prefill (the MoE file runs the exact tier, with a stderr
+  note), `LLB_SPEC`, `LLB_MTP`, `LLB_BATCH`, the split path (`--emit`,
+  `--lpb` < layers), and the pack path (the experts load from `LLB_GGUF`).
 
 ### Bigger models (above 27B)
 
@@ -160,6 +188,9 @@ lines inside the patch.
   with split-KV attention (context bounded by the binding limit), batched
   prompt submissions; the old 16,384-token tokenizer cap is gone
   ([report](../reports/webgpu-any-shape/REPORT.md)).
+- **CUDA MoE, `tools/payload-moeany.patch`:** any `qwen35moe` shape; experts
+  in VRAM, pinned host RAM, or streamed from the GGUF; dense outputs
+  byte-identical to the base build ([report](../reports/cuda-moe/REPORT.md)).
 - **Metal any-shape** (`backends/metal/cc/metal-anyshape-cc.patch`,
   `engine/metal-anyshape-engine.patch`, `link/dual-anyshape.patch`): any
   dense Qwen3.5 quant-pack shape (structural manifest check), any KV-head

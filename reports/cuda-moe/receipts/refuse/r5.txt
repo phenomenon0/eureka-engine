@@ -1,0 +1,2 @@
+## r5 no LLB_GGUF (pack path) on a MoE sidecar
+unsupported/invalid qwen3.5 pack: a MoE model loads its experts from the GGUF: set LLB_GGUF=MODEL.gguf (the dir is its gguf2pack --sidecar-only)

@@ -1,0 +1,3 @@
+s512-q8 R: top-1 = X 154/192, rms(logit - X) on X top-1 0.3433 (n 190)
+s512-q8 F: top-1 = X 151/192, rms(logit - X) on X top-1 0.3664 (n 191)
+s512-q8 C: top-1 = X 192/192, rms(logit - X) on X top-1 0.0002 (n 192)

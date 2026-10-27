@@ -1,0 +1,72 @@
+# eng=~/worktrees/.scratch-cuda-moe/new-out gguf=~/worktrees/.scratch-cuda-moe/models/minif-q4km.gguf side=~/worktrees/.scratch-cuda-moe/side2/minif-q4km steps=64 env: 
+2026-10-26T23:16:21-05:00
+rc=0
+6869
+3675
+315
+7602
+7023
+3137
+2113
+4473
+2810
+4431
+7396
+3781
+461
+1130
+6519
+2044
+3837
+2400
+7803
+7356
+8119
+6642
+5065
+523
+6571
+2960
+1715
+225
+7245
+6578
+6779
+7482
+750
+5072
+7242
+7827
+6147
+2182
+5911
+2816
+7051
+756
+4150
+701
+2673
+1503
+7127
+3962
+4482
+3177
+3141
+2342
+1299
+6380
+4017
+4442
+3826
+3785
+469
+8176
+4201
+1439
+4609
+2424
+wall_ms 94
+gguf: weights from ~/worktrees/.scratch-cuda-moe/models/minif-q4km.gguf (91 tensors, 5 layers, pack_bytes 51212672)
+resident head 5801984 bytes + layers in 5 ms
+shape d_model 512 d_ff 256 heads 4 kv 1 layers 4 lin 4/8 sd 128 eps 1e-06 rope 1e+07/64 kv_cap 68 (dT 7) [generic shape: spec / batch off]
+moe: 4 layers, experts 0.03 GiB -> device (VRAM) [free VRAM 8.75 GiB, MemAvailable 17.48 GiB]

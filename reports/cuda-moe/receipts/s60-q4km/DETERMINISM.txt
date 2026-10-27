@@ -1,0 +1,2 @@
+determinism s60-q4km: R p1 identical to the first run
+20b879afc628a48103d0ec37c9b8cacfa1ddc84ec02691948784aa5812750b81  ~/worktrees/.scratch-cuda-moe/models/s60-q4km.gguf

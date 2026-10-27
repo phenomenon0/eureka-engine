@@ -1,0 +1,72 @@
+# eng=~/worktrees/.scratch-cuda-moe/new-out gguf=~/worktrees/.scratch-cuda-moe/models/big-k.gguf side=~/worktrees/.scratch-cuda-moe/side2/bigk steps=64 env: 
+2026-10-26T23:21:19-05:00
+rc=0
+3766
+1453
+2673
+1151
+2404
+2450
+392
+1804
+89
+850
+3356
+2404
+3516
+589
+954
+27
+4074
+3340
+2981
+1250
+4030
+1636
+2442
+2132
+2263
+1578
+226
+1410
+2495
+640
+2310
+2251
+4043
+2321
+2026
+1863
+996
+176
+2329
+1891
+414
+2971
+3766
+245
+3669
+2442
+2118
+3189
+644
+4029
+3161
+2063
+1327
+2288
+1313
+2500
+3563
+3603
+1530
+749
+2410
+669
+1264
+1396
+wall_ms 457
+gguf: weights from ~/worktrees/.scratch-cuda-moe/models/big-k.gguf (38 tensors, 2 layers, pack_bytes 1767116544)
+resident head 3343360 bytes + layers in 7 ms
+shape d_model 256 d_ff 256 heads 2 kv 1 layers 2 lin 2/4 sd 128 eps 1e-06 rope 1e+07/64 kv_cap 68 (dT 7) [generic shape: spec / batch off]
+moe: 2 layers, experts 1.63 GiB -> device (VRAM) [free VRAM 8.75 GiB, MemAvailable 16.01 GiB]

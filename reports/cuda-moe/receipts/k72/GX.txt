@@ -1,0 +1,2 @@
+G-X k72 candidate C: top-1 = X 192/192; rms(C - X) 0.0004 vs rms(R - X) 0.0757 -> (i) PASS
+G-X VERDICT PASS

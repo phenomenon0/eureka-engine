@@ -1,0 +1,4 @@
+## r4 --emit on a MoE file
+2026-10-26T23:20:53-05:00
+rc=1
+unsupported/invalid qwen3.5 pack: a MoE model needs the folded step (no --emit, --lpb >= layers)

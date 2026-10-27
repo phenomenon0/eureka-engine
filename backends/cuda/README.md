@@ -24,6 +24,19 @@ tools/run27b.sh --gguf MODEL.gguf --gpu 40GB --threads 16 -- SIDECAR 760 6511 31
 - **Context:** prompt + `--steps` up to 2^26 positions. The f32 KV of the
   full-attention layers is allocated by position, up to prompt + steps, so
   VRAM is the bound. Use `LLB_PREFILL=fast` for long prompts.
+- **MoE (`qwen35moe`):** any expert count, top-k (at most the expert count),
+  expert and shared-expert width (multiples of 256), with the dense shape
+  rules above for the rest; MTP blocks (`nextn_predict_layers`) are skipped.
+  Experts in Q8_0, Q4_K, Q5_K or Q6_K, router and shared-expert gate F32.
+  Load it from the GGUF: `gguf2pack MODEL.gguf --sidecar-only SIDE`, then
+  `LLB_GGUF=MODEL.gguf llb-engine SIDE ...`. The expert stacks are held in
+  VRAM, in pinned device-mapped host RAM, or streamed from the mmapped GGUF
+  (the chosen experts copied each token), whichever the free VRAM and
+  MemAvailable allow; `LLB_MOE_EXPERTS=device|host|stream` forces one. All
+  three give the same bits. Checked against llama.cpp on synthetic files only
+  (no real MoE checkpoint was loaded): [reports/cuda-moe](../../reports/cuda-moe/REPORT.md).
+  MoE runs the exact tier (fast prefill, spec, batch, MTP are dense only)
+  and the folded step (no `--emit`).
 - **Not on every shape:** `LLB_SPEC`, `LLB_MTP`, and `LLB_BATCH` run on the
   9B and 27B shapes only (d_model 4096 / 5120, 4 KV heads, context up to
   131,072); elsewhere they are refused.

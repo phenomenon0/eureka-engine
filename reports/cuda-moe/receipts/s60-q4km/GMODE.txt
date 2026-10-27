@@ -1,0 +1,3 @@
+G-MODE s60-q4km Chost vs device: byte-identical (stdout ids + logits, 3 prompts, greedy + TF) [host (pinned, device-mapped RAM) [free VRAM 8.44 GiB, MemAvailable 17.76 GiB]]
+G-MODE s60-q4km Cstream vs device: byte-identical (stdout ids + logits, 3 prompts, greedy + TF) [stream (mmapped GGUF, the k experts copied per token) [free VRAM 8.46 GiB, MemAvailable 17.85 GiB]]
+G-MODE s60-q4km Csmall vs device: byte-identical (stdout ids + logits, 3 prompts, greedy + TF) [stream (mmapped GGUF, the k experts copied per token) [free VRAM 0.93 GiB (LLB_MOE_VRAM), MemAvailable 0.93 GiB (LLB_MOE_RAM)]]

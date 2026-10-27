@@ -1,0 +1,1 @@
+wrote models/big-k.gguf {'d': 256, 'L': 2, 'ne': 4200, 'k': 72, 'ef': 256, 'sf': 256, 'nh': 2, 'nkv': 1, 'lkh': 2, 'lvh': 4, 'hd': 256, 'S': 128, 'V': 4096, 'iv': 2, 'fused': 0, 'mtp': 0, 'seed': 1234, 'rope': 64, 'convk': 4} V 4096

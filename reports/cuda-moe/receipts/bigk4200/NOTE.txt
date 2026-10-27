@@ -1,0 +1,1 @@
+llama.cpp refuses n_expert 4200 (GGML_ASSERT n_expert <= LLAMA_MAX_EXPERTS): no oracle; engine ran device and stream, byte-identical logits (GMODE.txt)

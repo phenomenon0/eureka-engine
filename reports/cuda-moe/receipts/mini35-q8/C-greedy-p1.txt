@@ -1,0 +1,72 @@
+# eng=~/worktrees/.scratch-cuda-moe/new-out gguf=~/worktrees/.scratch-cuda-moe/models/mini35-q8.gguf side=~/worktrees/.scratch-cuda-moe/side2/mini35-q8 steps=64 env: 
+2026-10-26T23:16:36-05:00
+rc=0
+7907
+8026
+4709
+2005
+3095
+1548
+2227
+4330
+296
+3167
+1770
+2138
+2313
+1459
+5985
+4519
+4820
+7447
+2224
+5136
+6612
+262
+6163
+6438
+1833
+2775
+4318
+5916
+964
+2055
+6828
+8026
+7068
+4941
+288
+5849
+70
+596
+7240
+7326
+3831
+2108
+5908
+2869
+1818
+2094
+5909
+1952
+7392
+637
+7345
+5250
+4706
+4215
+1316
+3918
+6641
+5724
+4153
+6795
+1307
+7887
+4027
+8053
+wall_ms 294
+gguf: weights from ~/worktrees/.scratch-cuda-moe/models/mini35-q8.gguf (76 tensors, 4 layers, pack_bytes 614732032)
+resident head 53485568 bytes + layers in 97 ms
+shape d_model 2048 d_ff 512 heads 16 kv 2 layers 4 lin 16/32 sd 128 eps 1e-06 rope 1e+07/64 kv_cap 68 (dT 7) [generic shape: spec / batch off]
+moe: 4 layers, experts 0.40 GiB -> device (VRAM) [free VRAM 8.60 GiB, MemAvailable 17.59 GiB]

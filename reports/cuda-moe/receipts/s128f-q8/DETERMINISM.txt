@@ -1,0 +1,2 @@
+determinism s128f-q8: R p1 identical to the first run
+430531c5d84f369a64174088d0275fc882546672f006a3c69e972b952cface7b  ~/worktrees/.scratch-cuda-moe/models/s128f-q8.gguf

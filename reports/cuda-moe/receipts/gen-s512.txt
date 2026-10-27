@@ -1,0 +1,1 @@
+wrote models/s512-q8.gguf {'d': 512, 'L': 4, 'ne': 512, 'k': 10, 'ef': 256, 'sf': 256, 'nh': 4, 'nkv': 1, 'lkh': 4, 'lvh': 8, 'hd': 256, 'S': 128, 'V': 8192, 'iv': 4, 'fused': 0, 'mtp': 0, 'seed': 1234, 'rope': 64, 'convk': 4} V 8192

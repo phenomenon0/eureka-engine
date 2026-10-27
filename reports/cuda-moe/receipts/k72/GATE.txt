@@ -1,0 +1,9 @@
+file k72 candidate C
+positions 192  m 0.1282 (2 x rms(marg_F - marg_R) over 192)  TF agree C 179/192  F 187/192
+  greedy p1: 20/64 equal; first divergence step 20: R margin 0.0258, C picked 3268 (R rank 2) -> near-tie
+  greedy p2: 3/64 equal; first divergence step 3: R margin 0.0494, C picked 2240 (R rank 2) -> near-tie
+  greedy p3: 6/64 equal; first divergence step 6: R margin 0.1684, C picked 3084 (R rank 2) -> NOT near-tie
+G-A (every disagreement a near-tie): FAIL (13 disagreements, 12 near-ties)
+G-B V-T1: D = -4.17 pt, CI90 [-6.77, -1.56] -> FAIL
+G-B V-FLIP: b 1 c 0 p 0.5000 -> not FAIL
+VERDICT FAIL

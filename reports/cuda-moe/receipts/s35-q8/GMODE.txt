@@ -1,0 +1,3 @@
+G-MODE s35-q8 Chost vs device: byte-identical (stdout ids + logits, 3 prompts, greedy + TF) [host (pinned, device-mapped RAM) [free VRAM 8.56 GiB, MemAvailable 17.24 GiB]]
+G-MODE s35-q8 Cstream vs device: byte-identical (stdout ids + logits, 3 prompts, greedy + TF) [stream (mmapped GGUF, the k experts copied per token) [free VRAM 8.54 GiB, MemAvailable 17.45 GiB]]
+G-MODE s35-q8 Csmall vs device: byte-identical (stdout ids + logits, 3 prompts, greedy + TF) [stream (mmapped GGUF, the k experts copied per token) [free VRAM 0.93 GiB (LLB_MOE_VRAM), MemAvailable 0.93 GiB (LLB_MOE_RAM)]]

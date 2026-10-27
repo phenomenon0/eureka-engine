@@ -1,0 +1,1 @@
+wrote models/s60-q8.gguf {'d': 1024, 'L': 4, 'ne': 60, 'k': 6, 'ef': 768, 'sf': 512, 'nh': 8, 'nkv': 2, 'lkh': 8, 'lvh': 16, 'hd': 256, 'S': 128, 'V': 0, 'iv': 4, 'fused': 0, 'mtp': 0, 'seed': 1234, 'rope': 64, 'convk': 4} V 248320

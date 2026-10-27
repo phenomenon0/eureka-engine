@@ -1,0 +1,7 @@
+== built (sha256) ==
+bend commit   240ecef4b52a1efcc2151df689cca9a2a769aac6
+patch stack   c21af8247b5ce637562bab9f4872c7c6481f7d417eafe26cdcc12e9c89725c06 (64 patches)
+compiler      da94d7412715442b9d4e823cf0ec64261ff884b212c913c3a95502662a2497e6
+ed40a76ee779a89294efd71154f45c8fd457786037fb883d597bbe23a4e3e9e2  ~/worktrees/.scratch-cuda-moe/new-out/llb-engine.c
+680e48dd76199782cb630e93fb30e11f42c156e15ce57231c666ae1800cda61f  ~/worktrees/.scratch-cuda-moe/new-out/llb-engine
+860461c22e54b4d554a20c75b112676b6df04c4ffbb1c7f5ab376205f58eac81  ~/worktrees/.scratch-cuda-moe/new-out/gguf2pack

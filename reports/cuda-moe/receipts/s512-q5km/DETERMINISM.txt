@@ -1,0 +1,2 @@
+determinism s512-q5km: R p1 identical to the first run
+90723713f979fe203525088f5ab6b6fdcab821b71c32efe66ea13a2abe443a29  ~/worktrees/.scratch-cuda-moe/models/s512-q5km.gguf

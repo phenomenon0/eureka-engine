@@ -1,0 +1,1 @@
+wrote models/s128f-q8.gguf {'d': 1024, 'L': 4, 'ne': 128, 'k': 8, 'ef': 768, 'sf': 768, 'nh': 8, 'nkv': 2, 'lkh': 8, 'lvh': 16, 'hd': 256, 'S': 128, 'V': 8192, 'iv': 4, 'fused': 1, 'mtp': 1, 'seed': 1234, 'rope': 64, 'convk': 4} V 8192

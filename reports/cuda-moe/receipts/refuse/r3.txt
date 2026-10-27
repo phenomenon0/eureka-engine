@@ -1,0 +1,2 @@
+## r3 expert_used_count 17 > expert_count 16
+gguf2pack: qwen35moe: expert_used_count 17 (1..expert_count)

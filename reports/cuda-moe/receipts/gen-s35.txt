@@ -1,0 +1,6 @@
+
+real	0m31.473s
+user	0m11.463s
+sys	0m12.908s
+gen_moe.py q08b.gguf s35-q8.gguf d=2048 L=4 ne=256 k=8 ef=512 sf=512 nh=16 nkv=2 lkh=16 lvh=32 V=8192 (seed 1234)
+268d1a011e0d959dfd44da055a2922372e1b91b32e513eb94cf2b5526a0e1f8c  models/s35-q8.gguf

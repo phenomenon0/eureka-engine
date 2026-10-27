@@ -1,0 +1,2 @@
+determinism s60-q8: R p1 identical to the first run
+6cb9e03f18567a9e927dc084a9fdb6e35b0fcc7706f51aa9874fce230c0e9874  ~/worktrees/.scratch-cuda-moe/models/s60-q8.gguf

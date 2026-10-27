@@ -1,0 +1,2 @@
+G-X s512-q8 candidate Mlow: top-1 = X 2/192; rms(C - X) 1.3872 vs rms(R - X) 0.3433 -> (i) FAIL
+G-X VERDICT FAIL

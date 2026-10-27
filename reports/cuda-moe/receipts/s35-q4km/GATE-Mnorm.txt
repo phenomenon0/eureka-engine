@@ -1,0 +1,159 @@
+file s35-q4km candidate Mnorm
+positions 192  m 1.7793 (2 x rms(marg_F - marg_R) over 144)  TF agree C 42/192  F 106/192
+  greedy p1: 0/64 equal; first divergence step 0: R margin 0.1791, C picked 5618 (R rank >5) -> NOT near-tie
+  greedy p2: 1/64 equal; first divergence step 1: R margin 0.5038, C picked 5469 (R rank >5) -> NOT near-tie
+  greedy p3: 1/64 equal; first divergence step 1: R margin 1.0018, C picked 7178 (R rank 2) -> near-tie
+  TF disagreement p1 pos 0: R margin 0.1791 (m 1.7793), C top1 5618 = R rank >5, C margin 1.6094, F top1 5466 -> HIGH-MARGIN
+  TF disagreement p1 pos 1: R margin 0.1973 (m 1.7793), C top1 4658 = R rank >5, C margin 1.2944, F top1 307 -> HIGH-MARGIN
+  TF disagreement p1 pos 2: R margin 0.4338 (m 1.7793), C top1 298 = R rank >5, C margin 0.4874, F top1 1805 -> HIGH-MARGIN
+  TF disagreement p1 pos 4: R margin 2.1600 (m 1.7793), C top1 6399 = R rank >5, C margin 1.5292, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 5: R margin 0.4272 (m 1.7793), C top1 4929 = R rank >5, C margin 0.1173, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 6: R margin 1.0664 (m 1.7793), C top1 155 = R rank >5, C margin 0.0688, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 7: R margin 0.1099 (m 1.7793), C top1 1519 = R rank >5, C margin 0.0796, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 8: R margin 0.4518 (m 1.7793), C top1 1020 = R rank >5, C margin 1.1990, F top1 5303 -> HIGH-MARGIN
+  TF disagreement p1 pos 9: R margin 2.3348 (m 1.7793), C top1 3810 = R rank 2, C margin 0.2589, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 10: R margin 2.2392 (m 1.7793), C top1 7646 = R rank 2, C margin 0.3175, F top1 7646 -> HIGH-MARGIN
+  TF disagreement p1 pos 11: R margin 0.2153 (m 1.7793), C top1 4959 = R rank 3, C margin 0.4206, F top1 = R -> near-tie
+  TF disagreement p1 pos 12: R margin 0.3497 (m 1.7793), C top1 6823 = R rank 5, C margin 0.9755, F top1 3384 -> HIGH-MARGIN
+  TF disagreement p1 pos 13: R margin 0.5380 (m 1.7793), C top1 7284 = R rank >5, C margin 0.1892, F top1 962 -> HIGH-MARGIN
+  TF disagreement p1 pos 14: R margin 0.1363 (m 1.7793), C top1 7676 = R rank >5, C margin 0.5804, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 15: R margin 0.3836 (m 1.7793), C top1 1450 = R rank 4, C margin 0.8867, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 16: R margin 0.2479 (m 1.7793), C top1 1315 = R rank >5, C margin 1.1835, F top1 1204 -> HIGH-MARGIN
+  TF disagreement p1 pos 17: R margin 0.6363 (m 1.7793), C top1 1860 = R rank >5, C margin 0.3862, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 18: R margin 1.3739 (m 1.7793), C top1 552 = R rank >5, C margin 1.1644, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 19: R margin 0.9163 (m 1.7793), C top1 7359 = R rank 5, C margin 0.0571, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 21: R margin 0.3992 (m 1.7793), C top1 4780 = R rank >5, C margin 0.1383, F top1 762 -> HIGH-MARGIN
+  TF disagreement p1 pos 22: R margin 0.0130 (m 1.7793), C top1 5940 = R rank >5, C margin 0.4344, F top1 3360 -> HIGH-MARGIN
+  TF disagreement p1 pos 23: R margin 0.0848 (m 1.7793), C top1 4294 = R rank 5, C margin 0.4238, F top1 7907 -> HIGH-MARGIN
+  TF disagreement p1 pos 24: R margin 0.9106 (m 1.7793), C top1 7283 = R rank 2, C margin 3.0133, F top1 7283 -> near-tie
+  TF disagreement p1 pos 25: R margin 0.0850 (m 1.7793), C top1 868 = R rank 2, C margin 0.2689, F top1 6614 -> near-tie
+  TF disagreement p1 pos 26: R margin 0.1313 (m 1.7793), C top1 2724 = R rank >5, C margin 0.0407, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 27: R margin 0.5166 (m 1.7793), C top1 4775 = R rank >5, C margin 0.4429, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 28: R margin 1.9999 (m 1.7793), C top1 5756 = R rank >5, C margin 0.8212, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 30: R margin 0.2467 (m 1.7793), C top1 4296 = R rank >5, C margin 0.7080, F top1 4178 -> HIGH-MARGIN
+  TF disagreement p1 pos 31: R margin 0.1291 (m 1.7793), C top1 3910 = R rank >5, C margin 0.3430, F top1 2488 -> HIGH-MARGIN
+  TF disagreement p1 pos 32: R margin 1.6869 (m 1.7793), C top1 3297 = R rank 4, C margin 0.4401, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 33: R margin 0.8376 (m 1.7793), C top1 7510 = R rank >5, C margin 0.0338, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 34: R margin 1.5381 (m 1.7793), C top1 2450 = R rank 2, C margin 0.4849, F top1 = R -> near-tie
+  TF disagreement p1 pos 35: R margin 0.1574 (m 1.7793), C top1 4516 = R rank >5, C margin 0.2878, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 36: R margin 0.2532 (m 1.7793), C top1 2270 = R rank 3, C margin 1.1591, F top1 = R -> near-tie
+  TF disagreement p1 pos 41: R margin 1.1772 (m 1.7793), C top1 3266 = R rank >5, C margin 0.9944, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 42: R margin 0.1718 (m 1.7793), C top1 7905 = R rank >5, C margin 0.2394, F top1 4910 -> HIGH-MARGIN
+  TF disagreement p1 pos 44: R margin 0.0929 (m 1.7793), C top1 2961 = R rank >5, C margin 1.0145, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 46: R margin 0.2606 (m 1.7793), C top1 7056 = R rank 5, C margin 0.3055, F top1 7571 -> HIGH-MARGIN
+  TF disagreement p1 pos 47: R margin 0.1928 (m 1.7793), C top1 4694 = R rank 3, C margin 0.1967, F top1 = R -> near-tie
+  TF disagreement p1 pos 48: R margin 1.2945 (m 1.7793), C top1 3217 = R rank >5, C margin 1.0503, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 49: R margin 1.2530 (m 1.7793), C top1 952 = R rank >5, C margin 0.0579, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 51: R margin 0.4309 (m 1.7793), C top1 2165 = R rank >5, C margin 1.0771, F top1 1251 -> HIGH-MARGIN
+  TF disagreement p1 pos 53: R margin 0.0034 (m 1.7793), C top1 5539 = R rank >5, C margin 0.1278, F top1 63 -> HIGH-MARGIN
+  TF disagreement p1 pos 54: R margin 0.2289 (m 1.7793), C top1 3208 = R rank >5, C margin 0.2588, F top1 6279 -> HIGH-MARGIN
+  TF disagreement p1 pos 56: R margin 1.4665 (m 1.7793), C top1 257 = R rank 5, C margin 0.6358, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 58: R margin 2.7031 (m 1.7793), C top1 2329 = R rank >5, C margin 0.4103, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 59: R margin 1.7843 (m 1.7793), C top1 6586 = R rank >5, C margin 0.7903, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 60: R margin 0.2019 (m 1.7793), C top1 3095 = R rank >5, C margin 0.4751, F top1 3726 -> HIGH-MARGIN
+  TF disagreement p1 pos 61: R margin 2.5359 (m 1.7793), C top1 3634 = R rank >5, C margin 1.5152, F top1 = R -> HIGH-MARGIN
+  TF disagreement p1 pos 62: R margin 0.0643 (m 1.7793), C top1 88 = R rank >5, C margin 1.2266, F top1 4519 -> HIGH-MARGIN
+  TF disagreement p2 pos 1: R margin 0.5038 (m 1.7793), C top1 5469 = R rank >5, C margin 0.1270, F top1 6944 -> HIGH-MARGIN
+  TF disagreement p2 pos 4: R margin 0.7253 (m 1.7793), C top1 5614 = R rank >5, C margin 0.6444, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 5: R margin 0.1374 (m 1.7793), C top1 2019 = R rank >5, C margin 0.4655, F top1 5203 -> HIGH-MARGIN
+  TF disagreement p2 pos 6: R margin 0.2549 (m 1.7793), C top1 6220 = R rank >5, C margin 0.5585, F top1 6241 -> HIGH-MARGIN
+  TF disagreement p2 pos 7: R margin 0.3369 (m 1.7793), C top1 5032 = R rank 3, C margin 1.2925, F top1 = R -> near-tie
+  TF disagreement p2 pos 9: R margin 0.5010 (m 1.7793), C top1 2934 = R rank >5, C margin 0.4183, F top1 7245 -> HIGH-MARGIN
+  TF disagreement p2 pos 10: R margin 1.9198 (m 1.7793), C top1 1083 = R rank >5, C margin 0.2641, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 11: R margin 0.6748 (m 1.7793), C top1 901 = R rank 4, C margin 0.0865, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 12: R margin 0.8583 (m 1.7793), C top1 2739 = R rank >5, C margin 0.6096, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 15: R margin 2.1590 (m 1.7793), C top1 457 = R rank >5, C margin 0.9463, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 16: R margin 0.2266 (m 1.7793), C top1 6673 = R rank >5, C margin 0.2320, F top1 6603 -> HIGH-MARGIN
+  TF disagreement p2 pos 17: R margin 0.6481 (m 1.7793), C top1 5625 = R rank >5, C margin 1.3917, F top1 6858 -> HIGH-MARGIN
+  TF disagreement p2 pos 18: R margin 0.2363 (m 1.7793), C top1 5957 = R rank >5, C margin 1.3030, F top1 6500 -> HIGH-MARGIN
+  TF disagreement p2 pos 19: R margin 0.0259 (m 1.7793), C top1 6172 = R rank >5, C margin 1.1004, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 20: R margin 0.0848 (m 1.7793), C top1 6227 = R rank >5, C margin 0.5201, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 21: R margin 0.2269 (m 1.7793), C top1 2833 = R rank >5, C margin 2.4904, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 22: R margin 1.0216 (m 1.7793), C top1 7929 = R rank >5, C margin 0.0209, F top1 4708 -> HIGH-MARGIN
+  TF disagreement p2 pos 23: R margin 0.2532 (m 1.7793), C top1 4749 = R rank 4, C margin 1.4045, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 25: R margin 1.6800 (m 1.7793), C top1 3825 = R rank >5, C margin 0.1528, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 26: R margin 0.4205 (m 1.7793), C top1 1583 = R rank 4, C margin 0.4759, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 27: R margin 0.8063 (m 1.7793), C top1 2726 = R rank 3, C margin 0.5412, F top1 = R -> near-tie
+  TF disagreement p2 pos 29: R margin 0.7087 (m 1.7793), C top1 4606 = R rank >5, C margin 0.1056, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 30: R margin 1.7771 (m 1.7793), C top1 7679 = R rank >5, C margin 0.2766, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 31: R margin 0.3225 (m 1.7793), C top1 6046 = R rank >5, C margin 0.2702, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 32: R margin 0.0098 (m 1.7793), C top1 5974 = R rank >5, C margin 0.4539, F top1 5974 -> HIGH-MARGIN
+  TF disagreement p2 pos 33: R margin 0.0924 (m 1.7793), C top1 296 = R rank >5, C margin 0.8570, F top1 4078 -> HIGH-MARGIN
+  TF disagreement p2 pos 34: R margin 1.2799 (m 1.7793), C top1 3727 = R rank 4, C margin 0.6356, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 35: R margin 0.5477 (m 1.7793), C top1 80 = R rank >5, C margin 0.7744, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 36: R margin 0.7860 (m 1.7793), C top1 5601 = R rank >5, C margin 0.0864, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 38: R margin 1.2625 (m 1.7793), C top1 5341 = R rank >5, C margin 0.8669, F top1 3908 -> HIGH-MARGIN
+  TF disagreement p2 pos 39: R margin 0.1489 (m 1.7793), C top1 2675 = R rank >5, C margin 0.6583, F top1 2663 -> HIGH-MARGIN
+  TF disagreement p2 pos 41: R margin 0.1703 (m 1.7793), C top1 85 = R rank >5, C margin 0.6886, F top1 6315 -> HIGH-MARGIN
+  TF disagreement p2 pos 42: R margin 0.3438 (m 1.7793), C top1 4844 = R rank >5, C margin 0.3253, F top1 1599 -> HIGH-MARGIN
+  TF disagreement p2 pos 43: R margin 0.7244 (m 1.7793), C top1 288 = R rank >5, C margin 0.5082, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 44: R margin 0.3598 (m 1.7793), C top1 422 = R rank 3, C margin 3.2207, F top1 = R -> near-tie
+  TF disagreement p2 pos 46: R margin 1.3737 (m 1.7793), C top1 6152 = R rank 2, C margin 1.0486, F top1 6152 -> near-tie
+  TF disagreement p2 pos 47: R margin 0.0432 (m 1.7793), C top1 1858 = R rank >5, C margin 0.2625, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 48: R margin 0.3558 (m 1.7793), C top1 2742 = R rank 5, C margin 1.4274, F top1 1709 -> HIGH-MARGIN
+  TF disagreement p2 pos 49: R margin 0.1220 (m 1.7793), C top1 3348 = R rank 5, C margin 1.0369, F top1 3664 -> HIGH-MARGIN
+  TF disagreement p2 pos 50: R margin 0.2525 (m 1.7793), C top1 885 = R rank >5, C margin 0.1877, F top1 116 -> HIGH-MARGIN
+  TF disagreement p2 pos 51: R margin 0.1620 (m 1.7793), C top1 4611 = R rank 2, C margin 0.2690, F top1 4611 -> near-tie
+  TF disagreement p2 pos 52: R margin 0.6672 (m 1.7793), C top1 2996 = R rank 2, C margin 0.2137, F top1 = R -> near-tie
+  TF disagreement p2 pos 53: R margin 0.6025 (m 1.7793), C top1 3452 = R rank >5, C margin 0.5043, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 54: R margin 0.1909 (m 1.7793), C top1 3844 = R rank >5, C margin 0.2323, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 55: R margin 0.2765 (m 1.7793), C top1 981 = R rank >5, C margin 0.3308, F top1 8117 -> HIGH-MARGIN
+  TF disagreement p2 pos 56: R margin 0.0557 (m 1.7793), C top1 6913 = R rank >5, C margin 0.0851, F top1 = R -> HIGH-MARGIN
+  TF disagreement p2 pos 57: R margin 0.7996 (m 1.7793), C top1 2082 = R rank >5, C margin 0.3049, F top1 6807 -> HIGH-MARGIN
+  TF disagreement p2 pos 59: R margin 0.3316 (m 1.7793), C top1 1062 = R rank 3, C margin 0.5050, F top1 = R -> near-tie
+  TF disagreement p2 pos 61: R margin 0.3980 (m 1.7793), C top1 7325 = R rank 3, C margin 0.0146, F top1 = R -> near-tie
+  TF disagreement p2 pos 62: R margin 0.6608 (m 1.7793), C top1 556 = R rank >5, C margin 1.2038, F top1 5547 -> HIGH-MARGIN
+  TF disagreement p2 pos 63: R margin 0.1298 (m 1.7793), C top1 126 = R rank >5, C margin 0.9017, F top1 7249 -> HIGH-MARGIN
+  TF disagreement p3 pos 1: R margin 1.0018 (m 1.7793), C top1 7178 = R rank 2, C margin 5.0856, F top1 = R -> near-tie
+  TF disagreement p3 pos 2: R margin 0.2341 (m 1.7793), C top1 8020 = R rank >5, C margin 1.6392, F top1 4526 -> HIGH-MARGIN
+  TF disagreement p3 pos 4: R margin 0.0173 (m 1.7793), C top1 6068 = R rank 3, C margin 0.2792, F top1 2328 -> near-tie
+  TF disagreement p3 pos 6: R margin 1.8093 (m 1.7793), C top1 3260 = R rank 2, C margin 0.4065, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 7: R margin 0.4817 (m 1.7793), C top1 1467 = R rank >5, C margin 0.6177, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 9: R margin 0.8216 (m 1.7793), C top1 7627 = R rank >5, C margin 0.0218, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 10: R margin 0.1131 (m 1.7793), C top1 5622 = R rank 5, C margin 0.8400, F top1 4858 -> HIGH-MARGIN
+  TF disagreement p3 pos 12: R margin 0.0645 (m 1.7793), C top1 6618 = R rank 2, C margin 0.8778, F top1 6618 -> near-tie
+  TF disagreement p3 pos 13: R margin 0.1188 (m 1.7793), C top1 5311 = R rank >5, C margin 0.9068, F top1 4584 -> HIGH-MARGIN
+  TF disagreement p3 pos 14: R margin 0.0052 (m 1.7793), C top1 6881 = R rank 2, C margin 1.8719, F top1 2799 -> near-tie
+  TF disagreement p3 pos 15: R margin 0.2589 (m 1.7793), C top1 6974 = R rank >5, C margin 0.1304, F top1 6675 -> HIGH-MARGIN
+  TF disagreement p3 pos 16: R margin 0.8567 (m 1.7793), C top1 2057 = R rank >5, C margin 0.3828, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 17: R margin 0.5564 (m 1.7793), C top1 6204 = R rank >5, C margin 0.0061, F top1 4427 -> HIGH-MARGIN
+  TF disagreement p3 pos 18: R margin 1.0895 (m 1.7793), C top1 7069 = R rank >5, C margin 0.3171, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 19: R margin 0.3144 (m 1.7793), C top1 1132 = R rank 2, C margin 0.0519, F top1 1132 -> near-tie
+  TF disagreement p3 pos 20: R margin 0.4197 (m 1.7793), C top1 2946 = R rank >5, C margin 0.0746, F top1 4102 -> HIGH-MARGIN
+  TF disagreement p3 pos 21: R margin 0.0792 (m 1.7793), C top1 5128 = R rank >5, C margin 0.3268, F top1 560 -> HIGH-MARGIN
+  TF disagreement p3 pos 23: R margin 0.4968 (m 1.7793), C top1 7198 = R rank >5, C margin 0.3857, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 24: R margin 0.2760 (m 1.7793), C top1 1628 = R rank >5, C margin 0.0290, F top1 4560 -> HIGH-MARGIN
+  TF disagreement p3 pos 25: R margin 0.8411 (m 1.7793), C top1 7820 = R rank >5, C margin 0.4046, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 26: R margin 3.0093 (m 1.7793), C top1 1012 = R rank >5, C margin 0.7265, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 27: R margin 0.0276 (m 1.7793), C top1 2921 = R rank >5, C margin 0.8373, F top1 2096 -> HIGH-MARGIN
+  TF disagreement p3 pos 29: R margin 0.5421 (m 1.7793), C top1 1908 = R rank 5, C margin 0.3522, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 31: R margin 0.7679 (m 1.7793), C top1 4955 = R rank 3, C margin 2.1890, F top1 = R -> near-tie
+  TF disagreement p3 pos 32: R margin 0.4729 (m 1.7793), C top1 445 = R rank >5, C margin 1.6995, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 35: R margin 0.8054 (m 1.7793), C top1 2814 = R rank >5, C margin 0.3686, F top1 1776 -> HIGH-MARGIN
+  TF disagreement p3 pos 37: R margin 0.2963 (m 1.7793), C top1 4829 = R rank >5, C margin 1.2761, F top1 510 -> HIGH-MARGIN
+  TF disagreement p3 pos 38: R margin 0.0064 (m 1.7793), C top1 1219 = R rank >5, C margin 1.1724, F top1 3187 -> HIGH-MARGIN
+  TF disagreement p3 pos 39: R margin 2.0583 (m 1.7793), C top1 5780 = R rank 3, C margin 0.4437, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 41: R margin 0.2362 (m 1.7793), C top1 2327 = R rank >5, C margin 0.4680, F top1 2460 -> HIGH-MARGIN
+  TF disagreement p3 pos 42: R margin 0.8697 (m 1.7793), C top1 4925 = R rank >5, C margin 0.3014, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 43: R margin 0.3123 (m 1.7793), C top1 2462 = R rank >5, C margin 0.4146, F top1 2260 -> HIGH-MARGIN
+  TF disagreement p3 pos 44: R margin 0.0501 (m 1.7793), C top1 3778 = R rank >5, C margin 0.0624, F top1 1925 -> HIGH-MARGIN
+  TF disagreement p3 pos 45: R margin 0.5521 (m 1.7793), C top1 1435 = R rank >5, C margin 0.0897, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 47: R margin 0.4032 (m 1.7793), C top1 3120 = R rank 3, C margin 2.1720, F top1 = R -> near-tie
+  TF disagreement p3 pos 49: R margin 0.0911 (m 1.7793), C top1 197 = R rank 5, C margin 0.8278, F top1 2484 -> HIGH-MARGIN
+  TF disagreement p3 pos 50: R margin 0.0598 (m 1.7793), C top1 220 = R rank >5, C margin 0.4545, F top1 7984 -> HIGH-MARGIN
+  TF disagreement p3 pos 51: R margin 0.1683 (m 1.7793), C top1 938 = R rank 5, C margin 0.4383, F top1 3595 -> HIGH-MARGIN
+  TF disagreement p3 pos 52: R margin 0.7209 (m 1.7793), C top1 2805 = R rank 5, C margin 0.4177, F top1 5938 -> HIGH-MARGIN
+  TF disagreement p3 pos 53: R margin 0.6558 (m 1.7793), C top1 1308 = R rank >5, C margin 0.3018, F top1 1839 -> HIGH-MARGIN
+  TF disagreement p3 pos 54: R margin 0.1749 (m 1.7793), C top1 3285 = R rank 2, C margin 1.2468, F top1 688 -> near-tie
+  TF disagreement p3 pos 55: R margin 0.5575 (m 1.7793), C top1 2853 = R rank >5, C margin 0.7611, F top1 4925 -> HIGH-MARGIN
+  TF disagreement p3 pos 57: R margin 1.4722 (m 1.7793), C top1 6746 = R rank 2, C margin 1.7199, F top1 6746 -> near-tie
+  TF disagreement p3 pos 58: R margin 1.0065 (m 1.7793), C top1 1348 = R rank >5, C margin 1.5433, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 59: R margin 0.3105 (m 1.7793), C top1 1322 = R rank >5, C margin 0.2384, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 60: R margin 1.3839 (m 1.7793), C top1 2849 = R rank >5, C margin 0.4355, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 61: R margin 1.5173 (m 1.7793), C top1 914 = R rank >5, C margin 0.2920, F top1 = R -> HIGH-MARGIN
+  TF disagreement p3 pos 62: R margin 0.2530 (m 1.7793), C top1 6941 = R rank 5, C margin 0.4863, F top1 7524 -> HIGH-MARGIN
+  TF disagreement p3 pos 63: R margin 0.2713 (m 1.7793), C top1 1683 = R rank >5, C margin 0.1784, F top1 4688 -> HIGH-MARGIN
+G-A (every disagreement a near-tie): FAIL (150 disagreements, 23 near-ties)
+G-B V-T1: D = -33.33 pt, CI90 [-40.62, -26.04] -> FAIL
+G-B V-FLIP: b 11 c 0 p 0.0005 -> FAIL
+VERDICT FAIL

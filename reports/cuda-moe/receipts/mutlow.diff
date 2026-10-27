@@ -1,0 +1,4 @@
+179c179
+< +      const float v = pv[e];
+---
+> +      const float v = pv[e] < 0.0f ? -2.0f : 1.0f - pv[e];

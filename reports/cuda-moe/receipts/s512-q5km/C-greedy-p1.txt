@@ -1,0 +1,72 @@
+# eng=~/worktrees/.scratch-cuda-moe/new-out gguf=~/worktrees/.scratch-cuda-moe/models/s512-q5km.gguf side=~/worktrees/.scratch-cuda-moe/side2/s512-q5km steps=64 env: LLB_MOE_EXPERTS=device 
+2026-10-26T23:13:04-05:00
+rc=0
+5406
+7470
+8077
+1988
+2092
+7816
+790
+2320
+6531
+5835
+5104
+1124
+187
+6996
+4239
+7190
+8012
+830
+2672
+8070
+1409
+4607
+6643
+7161
+6831
+7516
+6263
+5111
+4649
+6065
+2359
+4266
+4194
+584
+1167
+1064
+6553
+7398
+963
+2402
+7467
+2326
+5959
+7657
+1727
+2367
+2861
+6005
+1407
+1775
+7657
+1860
+4146
+2131
+2930
+5304
+6563
+1863
+3311
+1862
+3755
+7155
+5238
+4489
+wall_ms 235
+gguf: weights from ~/worktrees/.scratch-cuda-moe/models/s512-q5km.gguf (76 tensors, 4 layers, pack_bytes 589555072)
+resident head 6883328 bytes + layers in 7 ms
+shape d_model 512 d_ff 256 heads 4 kv 1 layers 4 lin 4/8 sd 128 eps 1e-06 rope 1e+07/64 kv_cap 68 (dT 7) [generic shape: spec / batch off]
+moe: 4 layers, experts 0.53 GiB -> device (VRAM) [free VRAM 8.76 GiB, MemAvailable 17.13 GiB]
