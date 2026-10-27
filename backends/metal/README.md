@@ -295,7 +295,44 @@ them. They run any `qwen35moe` GGUF on the generic pass:
 
 Checked on the M3 Ultra, 2026-10-26 (receipts: `reports/metal-moe/`):
 
-@@RESULTS@@
+- **35B-A3B** (unsloth `Qwen3.5-35B-A3B-Q4_K_S.gguf`: 256 experts, top 8,
+  expert and shared ff 512, Q4_K experts, Q8_0 trunk) against llama.cpp
+  `e70802a01` on the CPU (greedy, no template, three prompts x 64 tokens):
+  first token equal on 3/3; teacher-forced top-1 187/192. The five
+  disagreements are at llama.cpp margins 0.03–0.10 logit, and llama.cpp's own
+  Metal path disagrees with its CPU at the same five positions (187/192).
+  Mean top-1 logit difference 0.13–0.21 (llama.cpp Metal vs CPU: 0.12–0.22).
+- **MoE FFN oracle.** Every layer's FFN output against a float64 recomputation
+  from the GGUF's bytes (`LLB_MX_DUMP`, `mx_ref.py`): the chosen experts equal
+  on every record, relative error at most 7.1e-7 (35B, 120 records) and
+  1.6e-6 (synthetic shapes). A broken router (`LLB_MX_MUT=no_renorm`)
+  gives 0.88.
+- **Synthetic shapes** (random weights, `gen_moe.py`): 128 experts / 8 used
+  with expert ff 768 and shared ff 1024; 60 / 6 with 768 / 512; 40 / 5 with a
+  fused `ffn_gate_up_exps`, 512 / 1536; Q4_K_M and Q8_0. Against llama.cpp on
+  Metal: teacher-forced top-1 0.92–1.00. Against llama.cpp on the CPU the
+  random networks are too chaotic to score (llama.cpp's own Metal path gets
+  0.13–0.67 there, as does this engine).
+- **Forced paths.** `LLB_MX_SPLIT` (3 or 16 experts a buffer, up to 1,920
+  buffers) and `LLB_MX_STREAM=1` give the resident path's ids and logits on
+  every model.
+- **Dense regression.** 4B and 9B Q4_K_M: the same 64 greedy ids as the
+  any-shape build on three prompts, exact and default prefill (12/12), and
+  byte-identical logits lines.
+- **Long context.** A needle (`PELICAN-7342` at 45% of `hay140k`, chat
+  template) found by the 35B-A3B at 153,352 tokens (KV 2^18 slots; 14,908 s,
+  exact prefill: about 22 ms a token at the start, 110 ms past 65k, 195 ms past
+  131k, the generic attention's cost doubling with each power of two). With
+  `--ctx 1048576` the first 16 ids equal the default capacity's; `--ctx
+  16777216` is refused (642.19 GiB needed, the largest buffer is 58.32 GiB).
+- **Speed.** 35B decode 21.6 ms a token at short context (resident experts;
+  streamed about 15% slower); llama.cpp `e70802a01` on Metal: 86.3 tok/s
+  (11.6 ms, `llama-bench -n 64`). Prefill is one token at a time.
+
+Not done: a MoE fast prefill chunk; a 122B-A10B or 397B-A17B run (no file on
+the test Mac; the split and streamed paths that such a model takes were
+forced on small ones); BF16 or IQ-format trunk tensors; the served
+`generate` route (`llb-serve`) on a MoE model.
 
 ## Gaps
 

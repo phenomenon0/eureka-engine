@@ -1,0 +1,1 @@
+{"model": "models/Qwen3.5-35B-A3B-Q4_K_S.gguf", "records": 120, "ids_equal": 120, "rel_max": 0.8813887892345286, "rel_mean": 0.5140401887328022, "w_err_max": 0.45698007710793276, "gs_err_max": 3.738535125918929e-08}

@@ -1,0 +1,12 @@
+s40x5f-Q4_K_M LLB_MX_RES=1 ids dd31455ca0fbcbb4 logits 439447ec768e7951 | resident (8 chunk buffers, 40 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.00 s
+s40x5f-Q4_K_M LLB_MX_SPLIT=3 ids dd31455ca0fbcbb4 logits 439447ec768e7951 | resident (112 chunk buffers, 3 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.01 s
+s40x5f-Q4_K_M LLB_MX_STREAM=1 ids dd31455ca0fbcbb4 logits 439447ec768e7951 | streamed: the chosen experts copied each token (0 chunk buffers, 5 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.00 s
+s60x6-Q4_K_M LLB_MX_RES=1 ids cbf78fa562e8753b logits eb57e4958c242f3a | resident (24 chunk buffers, 60 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.01 s
+s60x6-Q4_K_M LLB_MX_SPLIT=3 ids cbf78fa562e8753b logits eb57e4958c242f3a | resident (480 chunk buffers, 3 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.02 s
+s60x6-Q4_K_M LLB_MX_STREAM=1 ids cbf78fa562e8753b logits eb57e4958c242f3a | streamed: the chosen experts copied each token (0 chunk buffers, 6 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.00 s
+s128x8b-Q4_K_M LLB_MX_RES=1 ids a4dc992a048da43d logits 4570b7a8623cabac | resident (12 chunk buffers, 128 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.02 s
+s128x8b-Q4_K_M LLB_MX_SPLIT=3 ids a4dc992a048da43d logits 4570b7a8623cabac | resident (516 chunk buffers, 3 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.02 s
+s128x8b-Q4_K_M LLB_MX_STREAM=1 ids a4dc992a048da43d logits 4570b7a8623cabac | streamed: the chosen experts copied each token (0 chunk buffers, 8 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.00 s
+s40x5f-Q8_0 LLB_MX_RES=1 ids 589b00c9307ebc2d logits 3130a7565a8cc9fc | resident (8 chunk buffers, 40 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.01 s
+s40x5f-Q8_0 LLB_MX_SPLIT=3 ids 589b00c9307ebc2d logits 3130a7565a8cc9fc | resident (112 chunk buffers, 3 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.01 s
+s40x5f-Q8_0 LLB_MX_STREAM=1 ids 589b00c9307ebc2d logits 3130a7565a8cc9fc | streamed: the chosen experts copied each token (0 chunk buffers, 5 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.00 s

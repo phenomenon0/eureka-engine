@@ -1,0 +1,4 @@
+needle prompt: hay140k.txt in the Qwen3.5 chat template (user turn, assistant turn with an empty think block), 153,352 ids (llama-tokenize, 0.8B tokenizer = the 35B's); engine: 35B-A3B Q4_K_S, general MoE path, exact per-token prefill, --steps 24
+rc=0 secs=14908
+decoded: PELICAN-7342<|im_end|>
+<|endoftext|><|im_start|><|im_start|>

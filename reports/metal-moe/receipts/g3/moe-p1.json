@@ -1,0 +1,1 @@
+{"variant": "moe", "model": "Qwen3.5-35B-A3B-Q4_K_S", "prompt": "runs/p1.ids", "n": 64, "rc": 0, "first_equal": true, "free_prefix": 64, "tf_agree": 64, "tf_rate": 1.0, "max_dis_margin": 0, "dlogit_mean": 0.205, "dlogit_max": 2.0942, "disagreements": [], "wall": ["wall_ms 3197"]}

@@ -1,8 +1,8 @@
-G2 structural form: emitted C of the any-shape build vs the any-shape + MoE build
-009794484c3860bd111eb131a9fc1d73f995a031ee81114847ecfc221b93fb55 emit-any2
-ffc5df24477ad1067f10a2d33fdd38759a9cd475d9c0edfcd77813a11ac42784 emit-moe
-functions with changed or removed lines: 84
+G2 structural form: emitted C of the any-shape build (LLB_METAL_ANY=1) vs the default build (any-shape + MoE)
+009794484c3860bd111eb131a9fc1d73f995a031ee81114847ecfc221b93fb55 any-shape
+a20c8ee2c4fcf772ad4ae9b8d3130d6f40054b697695fd5a87f3deb2e17e550e any-shape + MoE
+functions with changed or removed lines: 85
   of them in the 35B arm (moe_* f35_* m24_* m29_* attn8 f32ab): none
-  host functions: ['__attribute__', 'gg_moe_layout', 'm9_pass_run', 'm9_serve', 'root_take', 'work_loop']
+  host functions: ['__attribute__', 'gg_moe_layout', 'gg_open', 'm9_pass_run', 'm9_serve', 'root_take', 'work_loop']
   Bend-emitted spin_* bodies (FID renumbering after the engine edits): 78
 insertion points: ['bend_close', 'gg_moe_layout', 'gg_open', 'gg_sha_hex', 'gg_threads', 'gguf_close', 'llb_f27_copy', 'm30_split', 'm9_bad', 'm9_pass_run', 'm9_serve', 'm9_shape', 'spin_145', 'spin_146', 'spin_149', 'spin_172', 'spin_204', 'spin_215', 'work_loop']

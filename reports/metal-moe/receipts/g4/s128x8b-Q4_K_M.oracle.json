@@ -1,0 +1,1 @@
+{"model": "models/s128x8b-Q4_K_M.gguf", "records": 24, "ids_equal": 24, "rel_max": 9.74040834850521e-07, "rel_mean": 6.072479377769054e-07, "w_err_max": 9.058122250049649e-07, "gs_err_max": 2.2408407174268063e-07}

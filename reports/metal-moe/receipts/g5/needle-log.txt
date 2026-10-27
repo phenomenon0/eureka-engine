@@ -1,0 +1,20 @@
+bend: compiling the GPU program (SCRATCH/out-moe/sys1mac.gpu is missing or stale)
+gguf: weights from SCRATCH/models/Qwen3.5-35B-A3B-Q4_K_S.gguf (613 tensors, 40 layers, pack_bytes 2543462912)
+resident 10244667392 bytes in 358 ms (table formats, emitted cpu)
+mx pool: 40 layers, 256 experts top 8, expert ff 512 (gate, up), 18119393280 bytes of experts mapped from SCRATCH/models/Qwen3.5-35B-A3B-Q4_K_S.gguf; resident (120 chunk buffers, 256 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 1.46 s
+0 2275
+10000 32
+20000 41
+30000 43
+40000 62
+50000 63
+60000 64
+70000 106
+80000 108
+90000 110
+100000 110
+110000 110
+120000 112
+130000 114
+140000 192
+150000 193

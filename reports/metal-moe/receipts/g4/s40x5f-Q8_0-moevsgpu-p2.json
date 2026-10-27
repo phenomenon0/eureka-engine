@@ -1,0 +1,1 @@
+{"variant": "moe2", "ref": "llama.cpp Metal", "model": "s40x5f-Q8_0", "prompt": "runs/p2.ids", "n": 32, "rc": 0, "first_equal": true, "free_prefix": 32, "tf_agree": 32, "tf_rate": 1.0, "max_dis_margin": 0, "dlogit_mean": 0.0032, "dlogit_max": 0.0302, "disagreements": [], "wall": ["wall_ms 670"]}

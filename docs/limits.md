@@ -4,8 +4,8 @@ What each engine accepts today, what stops it from running other model sizes
 or smaller hardware, and how hard each limit is to lift. Every engine runs the
 Qwen3.5 hybrid architecture (linear-attention layers plus a full-attention
 layer every fourth layer). The dense sizes run on every engine; the MoE
-models (`qwen35moe`) run on the WebGPU trunk and on CUDA (any shape; synthetic
-files only so far), and the 35B-A3B on Metal.
+models (`qwen35moe`) run on the WebGPU trunk, on CUDA (any shape; synthetic
+files only so far) and on Metal (any shape; the 35B-A3B and synthetic files).
 
 Classes:
 
@@ -24,7 +24,7 @@ lines inside the patch.
 |---|---|---|---|
 | CPU (Android, `backends/android/engine`) | Any dense Qwen3.5 pack (shape read from `index.tsv`) | KV capacity set at launch (`--decide CTX`) | Pack mmapped; f32 KV for full-attention layers only |
 | CUDA (root) | Any dense Qwen3.5 shape with head_dim 256 and SSM state 128 (structural check; tested 0.8B, 2B, 4B, 9B); any `qwen35moe` with those rules (synthetic files) | prompt + steps, up to 2^26 positions; in practice VRAM | Dense: whole model in VRAM. MoE: trunk in VRAM; routed experts in VRAM, pinned host RAM, or streamed from the mmapped GGUF. f32 KV for full-attention layers, allocated by position up to prompt + steps |
-| Metal, macOS (`backends/metal`) | Any dense Qwen3.5 quant pack (shape read from the manifest; tested 0.8B, 2B, 4B, 9B), 35B MoE | 2^27 slots, bounded by the largest Metal buffer (35B MoE: 131,072) | Weights in one heap span (`--gpu`); f32 KV and attention planes in the engine's own buffer, sized from the context |
+| Metal, macOS (`backends/metal`) | Any dense Qwen3.5 quant pack (shape read from the manifest; tested 0.8B, 2B, 4B, 9B); any `qwen35moe` GGUF (expert count, top-k, widths from the file; tested 35B-A3B and four synthetic shapes) | 2^27 slots, bounded by the largest Metal buffer (the registered 35B pack's own arm: 131,072) | Trunk weights in one heap span (`--gpu`); routed experts mapped from the GGUF (no-copy chunks, or streamed when they exceed the GPU working set); f32 KV and attention planes in the engine's own buffer, sized from the context |
 | Metal, iOS (`backends/ios`) | Same engine as macOS; shipped with 4B and Kev-4B | 2^27 (`llb_open` cap), bounded by the device's largest buffer | One span: GGUF + GGUF/2 + 1 GiB; KV outside it |
 | WebGPU, shipped (`backends/webgpu/engine`) | 4B only | 4,096 | Whole model on the GPU, split into ≤128 MiB buffers |
 | WebGPU, trunk (`backends/webgpu/trunk`) | Any Qwen3.5 shape, dense or MoE (head, state, conv read from the file); 21 GGUF formats | Bounded by the GPU's binding limit for one layer's f16 KV (about 2M tokens for the 0.8B on an RTX 3090) | Weights split by rows (or experts) to fit the device |
@@ -101,7 +101,26 @@ skipped; checked on synthetic random-weight files against llama.cpp
 - **Metal:** layer arrays sized 1,024; d_model ≤ 8192; d_ff ≤ 17,408; at
   most 64 query heads (the fixed 81,920-float block scratch is checked
   against the shape, with a message). Head region ≤ 2 GiB and 32-bit offsets
-  remain.
+  remain for the trunk.
+- **Metal MoE** (`cc/metal-moe-cc.patch`, `engine/metal-moe-engine.patch`):
+  no cap on the expert count, top-k or the expert / shared widths. The MoE
+  scratch is its own buffer sized from them; the routing kernel loops over
+  the experts. The routed experts never enter the heap: each expert tensor
+  is cut into no-copy chunks of the mapped GGUF, each within
+  `maxBufferLength`, reached through a table of 64-bit GPU addresses; when the
+  experts plus the heap exceed `recommendedMaxWorkingSetSize`, the engine
+  streams them (only the k chosen experts of a layer are copied, each token).
+  What still bounds a MoE: the trunk (every non-expert weight and the heads)
+  must fit the heap span, one Metal buffer; one expert must fit one buffer
+  (k of them when streamed); the dense trunk limits above (d_model ≤ 8192,
+  64 q / 16 kv heads, 1,024 layers, vocab ≤ 250,048, head region ≤ 2 GiB,
+  a layer's trunk < 2^28 bytes: the table's offset field); expert and shared
+  widths whole blocks of their format (32 columns; 256 for a K-quant);
+  formats: experts F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K / Q6_K, trunk Q8_0
+  and K-quants (BF16 or IQ trunk tensors are refused by name, requantize).
+  A 122B-A10B or 397B-A17B file was not run (none on the test Mac); the split
+  and streamed paths were forced on smaller models (`LLB_MX_SPLIT`,
+  `LLB_MX_STREAM`) and gave the resident path's bits.
 - **CUDA:** layer tables hold 256 layers (`LLB_MAXL`); scratch (`gpu_blk`,
   `gpu_q8b`, `gpu_q8c`, `gpu_headh`, `gpu_atts`) is sized from the shape at
   the first pass. Remaining limits: d_model ≤ 32,768, the head region
@@ -154,8 +173,10 @@ skipped; checked on synthetic random-weight files against llama.cpp
   the bytes it needs. A 153,031-token prompt ran on the 0.8B (needle found).
   The CLI takes `@FILE` for prompts past the OS argument limit; the
   `generate` request of `link/dual.c` and `server/src/dualm.c` takes prompts
-  up to the KV capacity. `decide` keeps CLEF's 16,384 budget. The 35B MoE
-  arm stays at 2^17.
+  up to the KV capacity. `decide` keeps CLEF's 16,384 budget. MoE models on
+  the general path have the same range (the 35B-A3B found a needle at 153,352 tokens; `--ctx 1048576` runs, `--ctx 16777216` is refused with the 642 GiB it needs); their prefill is exact,
+  one token at a time (no MoE fast chunk). The registered 35B pack's own arm
+  stays at 2^17.
 - **CPU:** KV capacity is fixed at launch; prompts are capped at 16,384
   tokens in `kev.c`.
 - **WebGPU shipped:** 4,096 (canonical kernels are emitted per context
@@ -172,6 +193,7 @@ skipped; checked on synthetic random-weight files against llama.cpp
 | Engine | Change | Class |
 |---|---|---|
 | Metal | Fast chunk attention for GQA other than 4 and 6, or more than 4 KV heads | Kernel |
+| Metal | A fast prefill chunk for the general MoE path (grouped expert GEMM); faster MoE decode kernels | Kernel |
 | CUDA, Metal | Instantiate head_dim 128 and SSM state 64; rope base, eps as kernel arguments | Kernel |
 | CUDA, Metal | f16 KV (CUDA now allocates f32 KV by position) | Kernel |
 | WebGPU shipped | Use the in-place KV write for decode | Cap |
@@ -191,6 +213,15 @@ skipped; checked on synthetic random-weight files against llama.cpp
 - **CUDA MoE, `tools/payload-moeany.patch`:** any `qwen35moe` shape; experts
   in VRAM, pinned host RAM, or streamed from the GGUF; dense outputs
   byte-identical to the base build ([report](../reports/cuda-moe/REPORT.md)).
+- **Metal any MoE** (`backends/metal/cc/metal-moe-cc.patch`,
+  `engine/metal-moe-engine.patch`, `gguf2pack --sidecar-only --target metal` for
+  `qwen35moe`): any expert count, top-k, expert and shared width, fused or
+  separate gate/up, NextN blocks dropped; experts mapped from the GGUF in
+  buffer-sized chunks or streamed past the GPU working set; context to 2^27
+  slots. The 35B-A3B Q4_K_S matches llama.cpp's own Metal-vs-CPU agreement
+  (teacher-forced top-1 187/192 for both); the MoE FFN matches a float64
+  oracle to 1e-6. Dense 4B / 9B ids and logits unchanged
+  ([report](../reports/metal-moe/REPORT.md)).
 - **Metal any-shape** (`backends/metal/cc/metal-anyshape-cc.patch`,
   `engine/metal-anyshape-engine.patch`, `link/dual-anyshape.patch`): any
   dense Qwen3.5 quant-pack shape (structural manifest check), any KV-head

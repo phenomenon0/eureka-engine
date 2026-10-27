@@ -1,0 +1,5 @@
+model | engine vs CPU (G4) | llama.cpp Metal vs CPU (floor) | engine vs llama.cpp Metal (G4c) | FFN oracle (G4b)
+s128x8b-Q4_K_M | 32/64 = 0.500 (max disagreement margin 0.442) | 34/64 = 0.531 (max disagreement margin 0.959) | 63/64 = 0.984 (max disagreement margin 0.045) | ids 24/24, rel max 9.74e-07
+s40x5f-Q4_K_M | 38/64 = 0.594 (max disagreement margin 0.601) | 41/64 = 0.641 (max disagreement margin 1.749) | 61/64 = 0.953 (max disagreement margin 0.285) | ids 24/24, rel max 8.89e-07
+s40x5f-Q8_0 | 43/64 = 0.672 (max disagreement margin 2.170) | 43/64 = 0.672 (max disagreement margin 2.170) | 64/64 = 1.000 (max disagreement margin 0.000) | ids 24/24, rel max 5.61e-07
+s60x6-Q4_K_M | 7/64 = 0.109 (max disagreement margin 1.504) | 8/64 = 0.125 (max disagreement margin 1.469) | 59/64 = 0.922 (max disagreement margin 0.294) | ids 48/48, rel max 1.59e-06

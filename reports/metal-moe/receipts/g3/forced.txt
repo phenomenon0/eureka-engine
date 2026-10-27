@@ -1,0 +1,3 @@
+LLB_MX_RES=1 ids 4067c8491eafb08a logits 34a9b967b3d6c077 wall_ms 3397 | resident (120 chunk buffers, 256 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 1.34 s
+LLB_MX_SPLIT=16 ids 4067c8491eafb08a logits 34a9b967b3d6c077 wall_ms 3422 | resident (1920 chunk buffers, 16 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 1.36 s
+LLB_MX_STREAM=1 ids 4067c8491eafb08a logits 34a9b967b3d6c077 wall_ms 3918 | streamed: the chosen experts copied each token (0 chunk buffers, 8 experts a chunk in layer 0's gate; working set 77.8 GiB, heap 8.0 GiB), 0.00 s
