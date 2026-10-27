@@ -90,6 +90,7 @@ chosen ones each token. Sizes, formats, and limits per engine:
 | :---: | :---: |
 | **Decode speed vs llama.cpp (↑)**, 27B Q4_K_M | `1.011x` |
 | **Prefill speed vs llama.cpp (↑)**, 3,011-token prompt | `0.953x` |
+| **MoE decode vs llama.cpp Metal (↑)**, 35B-A3B Q4_K_S, M3 Ultra | `1.14x` |
 | **Speculative decoding (↑)**, same tokens as greedy | `65.4 tok/s` |
 | **Cold load from GGUF (↓)**, 27B | `17.9 s` |
 | **Same `decide` answer on CUDA, Metal, WebGPU (↑)** | `30 / 30` |
