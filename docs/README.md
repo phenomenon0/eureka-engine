@@ -69,5 +69,6 @@ repository.
 | [`webgpu-any-shape/REPORT.md`](../reports/webgpu-any-shape/REPORT.md) | WebGPU trunk on any Qwen3.5 model, format, and context length. |
 | [`cuda-moe/REPORT.md`](../reports/cuda-moe/REPORT.md) | CUDA on any Qwen3.5 MoE, with experts in VRAM, host RAM, or streamed. |
 | [`cuda-moe-speed/REPORT.md`](../reports/cuda-moe-speed/REPORT.md) | CUDA MoE speed pass: bit-exact kernels, fused launches, CUDA graphs. |
+| [`metal-moe/REPORT.md`](../reports/metal-moe/REPORT.md) | Metal on any Qwen3.5 MoE, experts resident or streamed. |
 | [`metal-catchup/REPORT.md`](../reports/metal-catchup/REPORT.md) | Metal MoE speed: 35B-A3B decode 1.14x llama.cpp Metal, fast MoE prefill. |
 | [`metal-moe/REPORT.md`](../reports/metal-moe/REPORT.md) | Metal on any Qwen3.5 MoE, with experts mapped from the file or streamed; 35B-A3B against llama.cpp. |
