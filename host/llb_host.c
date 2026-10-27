@@ -2,6 +2,11 @@
 #include "llb_backend.h"
 #include "llb_formats.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 // The fbn / linb / fulb chains (tools/payload-fbn, -linb, -fulb.patch) as
 // functions of the op, its output y and the GEMV grid: their warp_serve
 // branches and the pass bang (tools/payload-pass.patch) run the same launches
@@ -277,6 +282,252 @@ static void llb_fbn_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32
     if (!LLB_LAUNCH(gpu_vadd, vaddG, 1, 1024, &x1b, &ggb, &yp, &n4)) {
       err_fail("device launch failed");
     }
+  }
+}
+
+// tools/payload-moeany.patch: a routed-expert layer's FFN (the table row's words 21..30, pt[20..29]:
+// gguf2pack.c moe_sidecar; pass_mail checked them). rms(post, x + a) as fbn; the router and the
+// shared expert's gate (F32 GEMVs); llb_moe_topk (softmax over all experts, the top k, weights
+// renormalized); the shared expert (gate / up / silu / down on llb_kgemv's bodies, sf rows, into
+// shd); llb_moe_gu (the k experts' gate + up + silu); llb_moe_dn (their down, weighted, + the gated
+// shared expert + the residual) into y. Expert ids and weights stay on the device except in the
+// stream residency, which reads the k ids back to copy those experts in.
+//
+// The expert stacks are not in the layer's Bytes: llb_moe_load reads them from the GGUF by name
+// (llb_gg_tensor, 64-bit offsets and sizes) into one of three residencies, picked from the device
+// actually present and the file (LLB_MOE_EXPERTS=auto, the default, or device / host / stream):
+//   device  every stack in VRAM (cuMemAlloc per stack) when they fit the free VRAM less a reserve;
+//   host    every stack in pinned, device-mapped host RAM (the kernels read the k experts' rows
+//           over the bus, nothing else) when they fit MemAvailable less a reserve;
+//   stream  the GGUF mmapped; per layer and token the k chosen experts are copied into a device
+//           staging area (k slots), so a model larger than RAM runs at disk / page-cache speed.
+// LLB_MOE_VRAM / LLB_MOE_RAM (bytes) stand in for the free VRAM / MemAvailable the auto choice reads
+// (tests force the host and stream paths on a small file with them).
+int llb_gg_tensor(const char* name, uint64_t* src, uint64_t* bytes, uint32_t* ty, int* fd, const char** path);
+static void llb_scratch(llb_dptr* p, size_t* have, size_t n, const char* what);
+typedef struct {
+  llb_dptr g, u, d;  // device-visible bases (device / host); stream: 0
+  u64 sg, su, sd;    // file offsets (stream)
+  u64 bg, bu, bd;    // bytes
+} MoeL;
+static MoeL moe_l[LLB_MAXL];
+static int moe_mode = -1;  // 0 device, 1 host, 2 stream
+static const unsigned char* moe_map;
+static llb_dptr moe_stg, moe_stu, moe_std, moe_slot;
+static u32* moe_hid;
+static llb_dptr gpu_moe;  // lg[ne] pv[ne] sg sgo pad pad ids[k] wt[k] shd[d] act[k ef]
+static size_t gpu_moe_have;
+static bool llb_moe(u32 i) {
+  return gpu_mail->pt[i][26] != 0;
+}
+
+static u32 moe_fm(u32 ty) {  // a ggml type id as the registry's format (llb_formats.h)
+  return ty == 8 ? LLB_FM_Q8_0 : ty == 12 ? LLB_FM_Q4_K : ty == 13 ? LLB_FM_Q5_K : ty == 14 ? LLB_FM_Q6_K : 99;
+}
+
+static u64 moe_env(const char* k, u64 dflt) {
+  const char* e = getenv(k);
+  return e != NULL && *e ? strtoull(e, NULL, 10) : dflt;
+}
+
+static u64 moe_memavail(void) {
+  FILE* f = fopen("/proc/meminfo", "r");
+  char ln[256];
+  u64 kb = 0;
+  while (f != NULL && fgets(ln, sizeof ln, f) != NULL) {
+    if (strncmp(ln, "MemAvailable:", 13) == 0) {
+      kb = strtoull(ln + 13, NULL, 10);
+    }
+  }
+  if (f != NULL) {
+    fclose(f);
+  }
+  return kb * 1024;
+}
+
+// one stack: device (cuMemAlloc + pread in 64 MiB pieces) or host (pinned, mapped, pread in place)
+static llb_dptr moe_fill(int fd, u64 src, u64 n, int mode, const char* name) {
+  if (mode == 1) {
+    void* h = NULL;
+    CUdeviceptr dp = 0;
+    if (cuMemHostAlloc(&h, n, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE) != CUDA_SUCCESS
+      || cuMemHostGetDevicePointer(&dp, h, 0) != CUDA_SUCCESS) {
+      fprintf(stderr, "moe: cannot pin %llu bytes of host RAM for %s\n", (unsigned long long)n, name);
+      err_fail("moe: pinned host allocation failed (LLB_MOE_EXPERTS=stream needs no pinned RAM)");
+    }
+    for (u64 k = 0; k < n;) {
+      ssize_t r = pread(fd, (unsigned char*)h + k, n - k > (1u << 30) ? (1u << 30) : (size_t)(n - k), (off_t)(src + k));
+      if (r <= 0) {
+        err_fail("moe: GGUF read failed");
+      }
+      k += (u64)r;
+    }
+    return dp;
+  }
+  llb_dptr d = 0;
+  llb_graph_bail();
+  if (cuMemAlloc(&d, n) != CUDA_SUCCESS) {
+    fprintf(stderr, "moe: cannot allocate %llu bytes of VRAM for %s\n", (unsigned long long)n, name);
+    err_fail("moe: out of device memory for the experts (LLB_MOE_EXPERTS=host or stream keeps them off the GPU)");
+  }
+  static unsigned char* buf;
+  const u64 CH = 64u << 20;
+  if (buf == NULL && (buf = malloc(CH)) == NULL) {
+    err_fail("moe: out of host memory");
+  }
+  for (u64 k = 0; k < n; k += CH) {
+    size_t c = n - k < CH ? (size_t)(n - k) : (size_t)CH;
+    for (size_t q = 0; q < c;) {
+      ssize_t r = pread(fd, buf + q, c - q, (off_t)(src + k + q));
+      if (r <= 0) {
+        err_fail("moe: GGUF read failed");
+      }
+      q += (size_t)r;
+    }
+    if (!llb_write(d + k, buf, c)) {
+      err_fail("moe: cannot upload an expert stack");
+    }
+  }
+  return d;
+}
+
+// the stacks of every MoE layer, once: names, sizes and formats against the table, then the
+// residency, then the bytes
+static void llb_moe_load(LlbShape sh) {
+  int fd = -1;
+  const char* path = NULL;
+  u64 tot = 0, stg = 0, std_ = 0;
+  u32 nkmax = 0, nmoe = 0;
+  for (u32 i = 0; i < LLB_MAXL; i += 1) {
+    const volatile u32* tw = gpu_mail->pt[i];
+    if (tw[26] == 0) {
+      continue;
+    }
+    u32 fx = tw[25], fz = fx >> 12 & 1, ne = tw[26], ef = tw[27], nk = tw[29];
+    const char* nm[3] = { fz ? "ffn_gate_up_exps" : "ffn_gate_exps", fz ? NULL : "ffn_up_exps", "ffn_down_exps" };
+    u64 want[3] = { (u64)ne * (fz ? 2 : 1) * ef * LLB_FM_RB(fx & 15, sh.d), fz ? 0 : (u64)ne * ef * LLB_FM_RB(fx >> 4 & 15, sh.d),
+      (u64)ne * sh.d * LLB_FM_RB(fx >> 8 & 15, ef) };
+    u64 src[3] = { 0, 0, 0 }, by[3] = { 0, 0, 0 };
+    for (u32 j = 0; j < 3; j += 1) {
+      if (nm[j] == NULL) {
+        continue;
+      }
+      char name[96];
+      uint32_t ty = 0;
+      snprintf(name, sizeof name, "blk.%u.%s.weight", i, nm[j]);
+      if (llb_gg_tensor(name, &src[j], &by[j], &ty, &fd, &path) != 0) {
+        fprintf(stderr, "moe: %s not found\n", name);
+        err_fail("moe: the routed experts load from the GGUF: run with LLB_GGUF=MODEL.gguf and its gguf2pack --sidecar-only dir");
+      }
+      if (moe_fm(ty) != (fx >> (4 * j) & 15) || by[j] != want[j]) {
+        fprintf(stderr, "moe: %s: type %u, %llu bytes; the sidecar says format %u, %llu bytes\n", name, ty,
+          (unsigned long long)by[j], fx >> (4 * j) & 15, (unsigned long long)want[j]);
+        err_fail("moe: the sidecar is for another GGUF (rebuild it with gguf2pack --sidecar-only)");
+      }
+    }
+    moe_l[i] = (MoeL){ 0, 0, 0, src[0], src[1], src[2], by[0], by[1], by[2] };
+    tot += by[0] + by[1] + by[2];
+    stg = stg > by[0] / ne ? stg : by[0] / ne;
+    std_ = std_ > by[2] / ne ? std_ : by[2] / ne;
+    nkmax = nkmax > nk ? nkmax : nk;
+    nmoe += 1;
+  }
+  size_t fr = 0, tv = 0;
+  cuMemGetInfo(&fr, &tv);
+  u64 vram = moe_env("LLB_MOE_VRAM", fr), ram = moe_env("LLB_MOE_RAM", moe_memavail());
+  u64 rv = (u64)1 << 30, rr = (u64)4 << 30;  // the reserves: KV growth and scratch / the rest of the system
+  const char* e = getenv("LLB_MOE_EXPERTS");
+  moe_mode = e != NULL && strcmp(e, "device") == 0 ? 0 : e != NULL && strcmp(e, "host") == 0 ? 1
+    : e != NULL && strcmp(e, "stream") == 0 ? 2 : tot + rv <= vram ? 0 : tot + rr <= ram ? 1 : 2;
+  static const char* mn[3] = { "device (VRAM)", "host (pinned, device-mapped RAM)", "stream (mmapped GGUF, the k experts copied per token)" };
+  fprintf(stderr, "moe: %u layers, experts %.2f GiB -> %s [free VRAM %.2f GiB%s, MemAvailable %.2f GiB%s]\n", nmoe,
+    tot / 1073741824.0, mn[moe_mode], vram / 1073741824.0, getenv("LLB_MOE_VRAM") ? " (LLB_MOE_VRAM)" : "",
+    ram / 1073741824.0, getenv("LLB_MOE_RAM") ? " (LLB_MOE_RAM)" : "");
+  if (moe_mode == 2) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || (moe_map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0)) == MAP_FAILED) {
+      err_fail("moe: cannot mmap the GGUF");
+    }
+    moe_stg = llb_alloc_zero(stg * nkmax);
+    moe_stu = llb_alloc_zero(stg * nkmax);
+    moe_std = llb_alloc_zero(std_ * nkmax);
+    moe_slot = llb_alloc_zero((size_t)nkmax * 4);
+    moe_hid = malloc((size_t)nkmax * 4);
+    u32* sl = malloc((size_t)nkmax * 4);
+    for (u32 j = 0; sl != NULL && j < nkmax; j += 1) {
+      sl[j] = j;
+    }
+    if (!moe_stg || !moe_stu || !moe_std || !moe_slot || !moe_hid || !sl || !llb_write(moe_slot, sl, (size_t)nkmax * 4)) {
+      err_fail("moe: cannot allocate the stream staging area");
+    }
+    free(sl);
+    return;
+  }
+  for (u32 i = 0; i < LLB_MAXL; i += 1) {
+    MoeL* m = &moe_l[i];
+    if (gpu_mail->pt[i][26] == 0) {
+      continue;
+    }
+    m->g = moe_fill(fd, m->sg, m->bg, moe_mode, "a gate stack");
+    m->u = m->bu ? moe_fill(fd, m->su, m->bu, moe_mode, "an up stack") : 0;
+    m->d = moe_fill(fd, m->sd, m->bd, moe_mode, "a down stack");
+  }
+  (void)path;
+}
+
+static void llb_moe_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32* tw, u32 li) {
+  u64 postp = o->w, fgp = o->k, fup = o->v, fdp = o->wn, xp = o->x, ap = o->r, base = o->qk;  // qk: the layer base
+  u32 dm = llb_sh.d, ne = tw[26], nk = tw[29], ef = tw[27], sf = tw[28], fx = tw[25];
+  u32 fg = fx & 15, fu = fx >> 4 & 15, fd = fx >> 8 & 15, fz = fx >> 12 & 1;
+  u32 sg = tw[2] >> 28, su = tw[3] >> 28, sd = tw[4] >> 28;
+  u64 rp = base + (tw[20] & 0x0fffffffu), gp = base + (tw[21] & 0x0fffffffu);
+  u32 rbg = LLB_FM_RB(fg, dm), rbu = LLB_FM_RB(fu, dm), rbd = LLB_FM_RB(fd, ef);
+  if (moe_mode < 0) {
+    llb_moe_load(llb_sh);
+  }
+  const MoeL* m = &moe_l[li];
+  u64 esg = (u64)(fz ? 2 : 1) * ef * rbg, esd = (u64)dm * rbd;
+  size_t need = ((size_t)2 * ne + 4 + 2 * (size_t)nk + dm + (size_t)nk * ef) * 4;
+  llb_scratch(&gpu_moe, &gpu_moe_have, need, "gpu_moe");
+  llb_dptr lg = gpu_moe, pvp = lg + (u64)ne * 4, sgl = pvp + (u64)ne * 4, sgo = sgl + 4, idp = sgl + 4 * 4;
+  llb_dptr wtp = idp + (u64)nk * 4, shd = wtp + (u64)nk * 4, act = shd + (u64)dm * 4;
+  llb_dptr x1b = gpu_blk, h2b = x1b + dm * 4, ggb = h2b + dm * 4, uub = ggb + (u64)sf * 4, aab = uub + (u64)sf * 4;
+  u32 n4 = dm, nsf = sf, siluG = (sf + 255) / 256, cgd = dm / 4, cge = ef / 4;
+  if (!LLB_LAUNCH(gpu_rnadd, 1, 1, 1024, &xp, &ap, &postp, &x1b, &h2b, &n4)) {
+    err_fail("device launch failed");
+  }
+  llb_kgemv(LLB_FM_F32, rp, dm, h2b, lg, ne, grid);
+  llb_kgemv(LLB_FM_F32, gp, dm, h2b, sgl, 1, grid);
+  if (!LLB_LAUNCH(gpu_moetk, 1, 1, 1024, &lg, &ne, &nk, &sgl, &pvp, &idp, &wtp, &sgo)) {
+    err_fail("device launch failed");
+  }
+  llb_kgemv(sg, fgp, dm, h2b, ggb, sf, grid);
+  llb_kgemv(su, fup, dm, h2b, uub, sf, grid);
+  if (!LLB_LAUNCH(gpu_silu, siluG, 1, 256, &ggb, &uub, &aab, &nsf)) {
+    err_fail("device launch failed");
+  }
+  llb_kgemv(sd, fdp, sf, aab, shd, dm, grid);
+  u64 Gp = m->g, Up = fz ? m->g + (u64)ef * rbg : m->u, Dp = m->d;
+  llb_dptr ids = idp;
+  if (moe_mode == 2) {
+    // the k chosen experts into the staging slots (gate (+ up), down), then slot j is expert j
+    if (!llb_read(moe_hid, idp, (size_t)nk * 4)) {
+      err_fail("moe: cannot read the chosen experts back");
+    }
+    for (u32 j = 0; j < nk; j += 1) {
+      u64 e = moe_hid[j];
+      if (e >= ne || !llb_write(moe_stg + j * esg, moe_map + m->sg + e * esg, esg)
+        || (!fz && !llb_write(moe_stu + j * esg, moe_map + m->su + e * esg, esg))
+        || !llb_write(moe_std + j * esd, moe_map + m->sd + e * esd, esd)) {
+        err_fail("moe: cannot stage an expert");
+      }
+    }
+    Gp = moe_stg, Up = fz ? moe_stg + (u64)ef * rbg : moe_stu, Dp = moe_std, ids = moe_slot;
+  }
+  if (!LLB_LAUNCH(gpu_moegu, (ef + 3) / 4, nk, 128, &Gp, &Up, &esg, &rbg, &rbu, &fg, &fu, &cgd, &h2b, &ids, &act, &ef)
+    || !LLB_LAUNCH(gpu_moedn, (dm + 3) / 4, 1, 128, &Dp, &esd, &rbd, &fd, &cge, &act, &ids, &wtp, &nk, &ef,
+      &x1b, &shd, &sgo, &yp, &n4)) {
+    err_fail("device launch failed");
   }
 }
 
@@ -2352,7 +2603,7 @@ static bool llb_legacy(LlbShape sh, u32 dT, u32 nl) {
     && (sh.nh == 4 * sh.nkv || sh.nh == 6 * sh.nkv) && sh.nkv == 4 && sh.lkh * sh.sd == 2048
     && (sh.lvh == 2 * sh.lkh || sh.lvh == 3 * sh.lkh) && qa == lv && dT <= 17 && nl <= 64;
   for (u32 i = 0; ok && i < nl; i += 1) {
-    ok = llb_full(i) == ((i + 1) % 4 == 0);
+    ok = llb_full(i) == ((i + 1) % 4 == 0) && gpu_mail->pt[i][26] == 0;  // a MoE layer (payload-moeany): not these shapes
   }
   return ok;
 }
@@ -2499,7 +2750,12 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
     ff.w = base + p[1]; ff.k = base + p[2]; ff.v = base + p[3]; ff.wn = base + p[4];
     ff.x = cur; ff.r = pass_x[2]; ff.n = sh.d; ff.rb = o->brg; ff.d = o->rb; ff.fm = 1;
     u64 nxt = j + 1 == k && !fold ? yp : pass_x[cur == pass_x[0] ? 1 : 0];
-    llb_fbn_run(&ff, nxt, grid, gpu_mail->pt[i]);
+    if (llb_moe(i)) {  // tools/payload-moeany.patch
+      ff.qk = base;
+      llb_moe_run(&ff, nxt, grid, gpu_mail->pt[i], i);
+    } else {
+      llb_fbn_run(&ff, nxt, grid, gpu_mail->pt[i]);
+    }
     // the per-layer h's only with LLB_DUMP_POS set (K3's logit-only runs skip them)
     if (llb_dump && llb_dump_pos >= 0) {
       llb_dptr hp[2] = { pass_x[2], nxt };
@@ -2561,6 +2817,9 @@ static bool warp_serve(Corpus H) {
         "ssm_state_size 128, n_heads a multiple of n_kv_heads, ssm_time_step_rank a multiple of ssm_group_count "
         "and <= 256, d_model <= 32768, every width a multiple of 256)"
       : gpu_mail->bad == 6 ? "warp pass: bad config words or a position past the KV capacity (prompt + steps)"
+      : gpu_mail->bad == 8 ? "warp pass: a MoE layer's table is outside the CUDA expert kernels (expert_used_count "
+        "<= expert_count, expert and shared widths multiples of 256, router and shared-expert gate F32, experts Q8_0 / "
+        "Q4_K / Q5_K / Q6_K; rebuild the sidecar with this gguf2pack)"
       : gpu_mail->bad == 2 ? "warp attention: unsupported operands"
       : gpu_mail->bad == 3 ? "warp rms: unsupported operands"
       : gpu_mail->bad == 4 ? "warp GEMV: row format refused (untagged"

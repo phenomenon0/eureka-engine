@@ -115,6 +115,7 @@ typedef struct {
   uint64_t bytes;    // same in both layouts
   uint64_t rb;       // row bytes (Q8_0 only)
   int layer;         // blk.N -> N, else -1
+  uint32_t ty;       // the ggml type (tools/payload-moeany.patch: llb_gg_tensor)
 } GgT;
 
 typedef struct {
@@ -200,6 +201,12 @@ static int gg_fail(char *err, const char *fmt, ...) {
   return -1;
 }
 
+// a routed-expert stack: "<...>_exps.weight" (gguf2pack.c is_exps)
+static int gg_exps(const char *name) {
+  size_t n = strlen(name);
+  return n > 12 && !strcmp(name + n - 12, "_exps.weight");
+}
+
 // Parse the header of `path` into g: tensor table, pack offsets, layer
 // ranges. Reads the header only. 0, or -1 with err (256 bytes) set.
 static int gg_open(GgFile *g, const char *path, char *err) {
@@ -242,8 +249,10 @@ static int gg_open(GgFile *g, const char *path, char *err) {
     if (n % (uint64_t)el) { free(r.buf); return gg_fail(err, "%s: not a whole number of blocks", t->name); }
     t->bytes = n / (uint64_t)el * (uint64_t)bb;
     t->q8 = ty == 8;
+    t->ty = ty;
     if (t->q8) {
-      if (nd != 2 || ne[0] % 32) { free(r.buf); return gg_fail(err, "%s: Q8_0 needs 2-D, cols %% 32", t->name); }
+      // 2-D, or a 3-D expert stack (tools/payload-moeany.patch): row-split per ne[0]-wide row
+      if (nd < 2 || nd > 3 || ne[0] % 32) { free(r.buf); return gg_fail(err, "%s: Q8_0 needs 2-D or 3-D, cols %% 32", t->name); }
       t->rb = ne[0] / 32 * 34;  // ne[0] = cols (GGUF ne is reversed)
     }
     unsigned L;
@@ -261,17 +270,52 @@ static int gg_open(GgFile *g, const char *path, char *err) {
   if (!g->lo || !g->hi) return gg_fail(err, "out of memory");
   for (int L = 0; L < g->nl; L++) g->lo[L] = UINT64_MAX, g->hi[L] = 0;
   uint64_t pos = 0;
+  // A file with routed experts (a blk.N.*_exps.weight tensor, qwen35moe; tools/payload-moeany.patch)
+  // takes gguf2pack.c moe_sidecar's virtual order: the non-layer tensors, each layer's trunk, then
+  // every *_exps stack, file order within each group. A layer's range is its trunk only: the engine
+  // never asks for the stacks (llb_host.c llb_moe_load reads them by name, llb_gg_tensor). Any
+  // other file keeps file order, the layout before.
+  size_t *ord = malloc((g->nt ? g->nt : 1) * sizeof *ord);
+  if (!ord) return gg_fail(err, "out of memory");
+  int moe = 0;
+  for (size_t i = 0; i < g->nt; i++) {
+    ord[i] = i;
+    moe |= g->t[i].layer >= 0 && gg_exps(g->t[i].name);
+  }
+  if (moe) {
+    for (size_t i = 1; i < g->nt; i++) {  // stable insertion sort by (layer, is_exps); -1 (heads) first
+      size_t v = ord[i], j = i;
+      int lv = g->t[v].layer, ev = lv >= 0 && gg_exps(g->t[v].name);
+      while (j > 0) {
+        const GgT *u = &g->t[ord[j - 1]];
+        int lu = u->layer, eu = lu >= 0 && gg_exps(u->name);
+        if (eu < ev || (eu == ev && lu <= lv)) break;
+        ord[j] = ord[j - 1], j--;
+      }
+      ord[j] = v;
+    }
+  }
   for (size_t i = 0; i < g->nt; i++) {
     GgT *t = &g->t[i];
     t->src += data;
-    if (t->src + t->bytes > (uint64_t)st.st_size) return gg_fail(err, "%s: data past the end of %s (truncated)", t->name, path);
+    if (t->src + t->bytes > (uint64_t)st.st_size) { free(ord); return gg_fail(err, "%s: data past the end of %s (truncated)", t->name, path); }
+  }
+  for (size_t k = 0; k < g->nt; k++) {
+    GgT *t = &g->t[ord[k]];
     pos += (GG_ALIGN - pos % GG_ALIGN) % GG_ALIGN;
     t->off = pos, pos += t->bytes;
-    if (t->layer >= 0) {
+    if (t->layer >= 0 && !(moe && gg_exps(t->name))) {
       if (t->off < g->lo[t->layer]) g->lo[t->layer] = t->off;
       if (t->off + t->bytes > g->hi[t->layer]) g->hi[t->layer] = t->off + t->bytes;
     }
   }
+  if (moe) {  // the table in virtual order: gg_fill walks it with ascending offsets
+    GgT *v = malloc((g->nt ? g->nt : 1) * sizeof *v);
+    if (!v) { free(ord); return gg_fail(err, "out of memory"); }
+    for (size_t k = 0; k < g->nt; k++) v[k] = g->t[ord[k]];
+    free(g->t), g->t = v;
+  }
+  free(ord);
   g->pack_bytes = pos;
   for (int L = 0; L < g->nl; L++)
     if (g->lo[L] == UINT64_MAX) return gg_fail(err, "layer %d has no tensors", L);
@@ -767,6 +811,19 @@ static void gguf_read_call(IoWork* w) {
     w->code = EIO;
     w->text = strdup(err);
   }
+}
+
+// tools/payload-moeany.patch: a tensor of the open LLB_GGUF by name, for llb_host.c's expert
+// loader: its absolute file offset, bytes and ggml type, and the file's descriptor. 0 found.
+int llb_gg_tensor(const char* name, uint64_t* src, uint64_t* bytes, uint32_t* ty, int* fd, const char** path) {
+  if (gg_state <= 0) return -1;
+  for (size_t i = 0; i < gg_file.nt; i++)
+    if (!strcmp(gg_file.t[i].name, name)) {
+      *src = gg_file.t[i].src, *bytes = gg_file.t[i].bytes, *ty = gg_file.t[i].ty, *fd = gg_file.fd;
+      *path = getenv("LLB_GGUF");
+      return 0;
+    }
+  return -1;
 }
 
 // LLB_GGUF_VERIFY: the block read back, every whole tensor in [lo, lo + n)

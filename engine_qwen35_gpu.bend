@@ -317,12 +317,19 @@ def mf.config(+s: String, +key: String, want: String) -> IO(Unit):
 def mf.q8(+s: String) -> Bool:
   String.eq(mf.scalar(s, "format"), "\"llama-bend-pack-q8/v0\"")
 
+# a routed-expert model (tools/payload-moeany.patch): the shared expert takes the dense FFN's
+# table words (ffn_gate / ffn_up / ffn_down = ffn_*_shexp); the router and the experts are
+# table.bin words 21..29, read on the device (comp.ts pass_mail) and by llb_host.c llb_moe_run
+def mf.moe(+s: String) -> Bool:
+  String.eq(mf.value(s, "config", "architecture"), "\"qwen3_5_moe\"")
+
 def mf.validate(+s: String) -> IO(Unit):
   do IO<Unit>:
     mf.check(Bool.or(Bool.and(mf.q8(s), String.eq(mf.scalar(s, "dtype"), "\"q8_0-rowsplit\"")),
       Bool.and(String.eq(mf.scalar(s, "format"), "\"llama-bend-pack-q35-quant/v0\""),
         String.eq(mf.scalar(s, "dtype"), "\"mixed-quant\""))), "format/dtype")
-    mf.config(s, "architecture", "\"qwen3_5\"")
+    # qwen3_5_moe: the sidecar of a qwen35moe GGUF (gguf2pack --sidecar-only; tools/payload-moeany.patch)
+    mf.check(Bool.or(mf.cv(s, "architecture", "\"qwen3_5\""), mf.moe(s)), "architecture (qwen3_5 or qwen3_5_moe)")
     # tools/payload-anyshape.patch: any dense Qwen3.5 shape the CUDA kernels instantiate (was a
     # whitelist of the 9B, 27B and 0.8B); the widths are checked in mf.shape once read. These
     # two are kernel instantiations: llb_attn4 / llb_qkr run a 256-thread head, l2norm_qk /
@@ -375,13 +382,13 @@ def mf.text(r: File & Result<&1, &1, U32 & String, String>) -> IO(String):
     IO.pass(String, t)
 
 # the linear (gated-delta-net) layer layout
-def mf.offl.lin(+s: String, +p: String) -> IO(Offs):
+def mf.offl.lin(+s: String, +p: String, +x: String) -> IO(Offs):
   do IO<Offs>:
     +an : Nat <- mf.off_nat(s, p ++ "attn_norm.weight")
     +post : Nat <- mf.off_nat(s, p ++ "post_attention_norm.weight")
-    +fg : Nat <- mf.off_nat(s, p ++ "ffn_gate.weight")
-    +fu : Nat <- mf.off_nat(s, p ++ "ffn_up.weight")
-    +fd : Nat <- mf.off_nat(s, p ++ "ffn_down.weight")
+    +fg : Nat <- mf.off_nat(s, p ++ "ffn_gate" ++ x ++ ".weight")
+    +fu : Nat <- mf.off_nat(s, p ++ "ffn_up" ++ x ++ ".weight")
+    +fd : Nat <- mf.off_nat(s, p ++ "ffn_down" ++ x ++ ".weight")
     +qkv : Nat <- mf.off_nat(s, p ++ "attn_qkv.weight")
     +gate : Nat <- mf.off_nat(s, p ++ "attn_gate.weight")
     +sb : Nat <- mf.off_nat(s, p ++ "ssm_beta.weight")
@@ -411,13 +418,13 @@ def mf.offl.lin(+s: String, +p: String) -> IO(Offs):
       0, 0, 0, 0, 0, 0}
 
 # the full-attention layer layout
-def mf.offl.ful(+s: String, +p: String) -> IO(Offs):
+def mf.offl.ful(+s: String, +p: String, +x: String) -> IO(Offs):
   do IO<Offs>:
     +an : Nat <- mf.off_nat(s, p ++ "attn_norm.weight")
     +post : Nat <- mf.off_nat(s, p ++ "post_attention_norm.weight")
-    +fg : Nat <- mf.off_nat(s, p ++ "ffn_gate.weight")
-    +fu : Nat <- mf.off_nat(s, p ++ "ffn_up.weight")
-    +fd : Nat <- mf.off_nat(s, p ++ "ffn_down.weight")
+    +fg : Nat <- mf.off_nat(s, p ++ "ffn_gate" ++ x ++ ".weight")
+    +fu : Nat <- mf.off_nat(s, p ++ "ffn_up" ++ x ++ ".weight")
+    +fd : Nat <- mf.off_nat(s, p ++ "ffn_down" ++ x ++ ".weight")
     +aq : Nat <- mf.off_nat(s, p ++ "attn_q.weight")
     +ak : Nat <- mf.off_nat(s, p ++ "attn_k.weight")
     +av : Nat <- mf.off_nat(s, p ++ "attn_v.weight")
@@ -459,6 +466,28 @@ def mf.f32bits.of(m: Maybe<&2, F64>, +dflt: U32) -> U32:
 def mf.f32bits(s: String, +dflt: U32) -> U32:
   mf.f32bits.of(F64.read(s), dflt)
 
+# the routed-expert shape (tools/payload-moeany.patch): what llb_moe_topk / llb_moe_gu / llb_moe_dn
+# take -- any expert count and top-k (k <= the count), expert and shared widths in whole 256-col
+# superblocks (the K-quant rows); the per-layer formats are checked by gguf2pack's sidecar and
+# pass_mail. The stacks load from the GGUF (llb_host.c llb_moe_load), so LLB_GGUF is needed
+def mf.moechk(moe: Bool, +s: String, +g: Bool) -> IO(Unit):
+  match moe:
+    case False{}:
+      IO.pure(Unit, Unit{})
+    case True{}:
+      do IO<Unit>:
+        +ne : U32 <- mf.need("n_experts", mf.num(s, "config", "n_experts"))
+        +nk : U32 <- mf.need("n_experts_used", mf.num(s, "config", "n_experts_used"))
+        +ef : U32 <- mf.need("expert_ff", mf.num(s, "config", "expert_ff"))
+        +sf : U32 <- mf.need("shared_ff", mf.num(s, "config", "shared_ff"))
+        mf.check(g, "a MoE model loads its experts from the GGUF: set LLB_GGUF=MODEL.gguf (the dir is its gguf2pack --sidecar-only)")
+        mf.check((ne >= 1 : U32), "expert_count (>= 1)")
+        mf.check(Bool.and((nk >= 1 : U32), (nk <= ne : U32)), "expert_used_count (1..expert_count)")
+        mf.check(Bool.and(Bool.and((ef >= 256 : U32), (ef <= 65536 : U32)), U32.is_eq(U32.mod(ef, 256), 0)),
+          "expert_feed_forward_length (a multiple of 256: the expert rows in whole superblocks)")
+        mf.check(Bool.and(Bool.and((sf >= 256 : U32), (sf <= 65536 : U32)), U32.is_eq(U32.mod(sf, 256), 0)),
+          "expert_shared_feed_forward_length (a multiple of 256)")
+
 # the structural shape check (tools/payload-anyshape.patch; comp.ts pass_mail's envelope
 # backs it on the device): what the CUDA kernels instantiate, the rest any value
 def mf.shape(+nl: U32, +dm: U32, +dff: U32, +nh: U32, +nkv: U32, +lkh: U32, +lvh: U32, +iv: U32) -> IO(Unit):
@@ -476,7 +505,7 @@ def mf.shape(+nl: U32, +dm: U32, +dff: U32, +nh: U32, +nkv: U32, +lkh: U32, +lvh
     mf.check(Bool.and((iv >= 2 : U32), (iv <= nl : U32)),
       "full_attention_interval (2..n_layers: a hybrid with a linear layer first)")
 
-def mf.model(+dir: String, +ly: U32) -> IO(Model):
+def mf.model(+dir: String, +ly: U32, +em: U32, +lb: U32) -> IO(Model):
   do IO<Model>:
     f : File <- IO.try(File, File.open(dir ++ "/manifest.json", "r"))
     r : File & Result<&1, &1, U32 & String, String> <- File.read(f, 16777216)
@@ -513,6 +542,9 @@ def mf.model(+dir: String, +ly: U32) -> IO(Model):
     +rd : U32 = mf.u32or(mf.num(s, "config", "rope_dim"), 64)
     +eps : U32 = mf.f32bits(mf.value(s, "config", "rms_norm_eps"), 897988541)
     +rbase : U32 = mf.f32bits(mf.value(s, "config", "rope_freq_base"), 1259902592)
+    +moe : Bool = mf.moe(s)
+    gm : Result<&1, &1, U32 & String, String> <- IO.get_env("LLB_GGUF")
+    mf.moechk(moe, s, G.gguf.on(gm))
     mf.shape(nl, dm, dff, nhd, nkv, lkh, lvh, iv)
     mf.check(Bool.and(Bool.and((rd >= 2 : U32), (rd <= 256 : U32)), U32.is_eq(U32.and(rd, 1), 0)),
       "rope_dim (even, 2..256)")
@@ -523,10 +555,15 @@ def mf.model(+dir: String, +ly: U32) -> IO(Model):
     mf.check(U32.is_eq((ob / orb : U32), voc), "output.weight rows != vocab_size")
     mf.check(Bool.and((emb <= 3225419776 : U32), Bool.and((out <= 3225419776 : U32),
       (onorm <= 4294959104 : U32))), "head offset exceeds U32")
-    lin : Offs <- mf.offl.lin(s, "blk.0.")
+    +fx : String = Bool.pick(String, moe, "_shexp", "")
+    lin : Offs <- mf.offl.lin(s, "blk.0.", fx)
     # the first full-attention layer: blk.(interval - 1) (was blk.3)
-    ful : Offs <- mf.offl.ful(s, "blk." ++ U32.show((iv - 1 : U32)) ++ ".")
+    ful : Offs <- mf.offl.ful(s, "blk." ++ U32.show((iv - 1 : U32)) ++ ".", fx)
     +n : Nat = U32.to_nat(Bool.pick(U32, U32.is_eq(ly, 0), nl, ly))
+    # the experts run in the folded pass only (llb_host.c llb_moe_run): the split path's
+    # ffn_block bang is the dense FFN
+    mf.check(Bool.or(Bool.not(moe), Bool.and(U32.is_eq(em, 4294967295), (lb >= U32.from_nat(n) : U32))),
+      "a MoE model needs the folded step (no --emit, --lpb >= layers)")
     # output.weight and output_norm sit contiguously at the front of pack.bin;
     # token_embd follows. Bytes are capped at 2^31, so read the head region in
     # two parts (pk: output+norm from 0, ep: token_embd after a skip).
@@ -1246,7 +1283,7 @@ def run.go(ok: Bool, +dir: String, +ts: List<&2, U32>, +st: U32, +ly: U32, +em: 
     case True{}:
       do IO<Unit>:
         t0 : Nat <- IO.now()
-        +m0 : Model <- mf.model(dir, ly)
+        +m0 : Model <- mf.model(dir, ly, em, lb)
         mf.check(ok_ids(ts, m.voc(m0)), "a prompt id >= vocab_size")
         # the KV capacity: the longest prompt + steps - 1 positions (2^dT rounds it up; the
         # host allocates the slots by position up to it, tools/payload-anyshape.patch)

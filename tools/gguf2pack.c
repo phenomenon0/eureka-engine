@@ -542,19 +542,29 @@ static Val backbone_val(Gguf *g, const char *suffix, int need) {
 static Cfg build_config(Gguf *g) {
   Cfg c = {.n = 0};
   Val arch = kvv(g, "general.architecture", 1);
-  if (arch.k != VS || (strcmp(arch.s, "qwen35") && strcmp(arch.s, "clef")))
+  if (arch.k != VS || (strcmp(arch.s, "qwen35") && strcmp(arch.s, "clef") && strcmp(arch.s, "qwen35moe")))
     die("architecture %s: only qwen35 or clef (Qwen3.5 hybrid backbone) is packed", arch.k == VS ? arch.s : "?");
+  // qwen35moe (--sidecar-only, moe_sidecar): the same backbone keys; d_ff is the wider of the
+  // routed and the shared expert widths (the dense scratch the shared expert runs in)
+  int moe = !strcmp(arch.s, "qwen35moe");
   static const int64_t zero4[4] = {0, 0, 0, 0};
   KV *tok = kv_get(g, "tokenizer.ggml.tokens");
   if (!tok || tok->t != 9) die("GGUF has no tokenizer.ggml.tokens array");
   Val hd = backbone_val(g, "attention.key_length", 1), v;
-  cfg_put(&c, "architecture", (Val){VS, 0, 0, "qwen3_5", NULL, 0});
+  cfg_put(&c, "architecture", (Val){VS, 0, 0, moe ? "qwen3_5_moe" : "qwen3_5", NULL, 0});
   cfg_put(&c, "n_layers", backbone_val(g, "block_count", 1));
   cfg_put(&c, "n_heads", backbone_val(g, "attention.head_count", 1));
   cfg_put(&c, "n_kv_heads", backbone_val(g, "attention.head_count_kv", 1));
   cfg_put(&c, "d_model", backbone_val(g, "embedding_length", 1));
   cfg_put(&c, "head_dim", hd);
-  cfg_put(&c, "d_ff", backbone_val(g, "feed_forward_length", 1));
+  if (moe) {
+    Val ef = backbone_val(g, "expert_feed_forward_length", 1), sf = backbone_val(g, "expert_shared_feed_forward_length", 1);
+    if ((ef.k != VI && ef.k != VU) || (sf.k != VI && sf.k != VU))
+      die("qwen35moe: expert_feed_forward_length / expert_shared_feed_forward_length are not integers");
+    cfg_put(&c, "d_ff", vint(ef.i > sf.i ? ef.i : sf.i));
+  } else {
+    cfg_put(&c, "d_ff", backbone_val(g, "feed_forward_length", 1));
+  }
   v = backbone_val(g, "vocab_size", 0);
   cfg_put(&c, "vocab_size", v.k == VN && !backbone_kv(g, "vocab_size") ? vint((int64_t)tok->an) : v);
   cfg_put(&c, "context_length", backbone_val(g, "context_length", 1));
@@ -1121,6 +1131,219 @@ static int moe_pack(Gguf *g, int fd, const char *src, const char *out) {
   return 0;
 }
 
+// ---------------------------------------------------------------- qwen35moe sidecar (CUDA GGUF load)
+// The CUDA engine's direct GGUF load of any qwen35moe shape (tools/payload-moeany.patch): the
+// sidecar only (manifest.json + table.bin), the weights stay in the GGUF. The virtual pack layout
+// is host/llb_gguf.c gg_open's rule for a file with routed experts: the non-layer tensors, then
+// each layer's trunk (every tensor but the *_exps stacks), file order within each, then every
+// *_exps stack (layer order). A layer's range, the Bytes the engine keeps on the device, is its
+// trunk only; the host loads the expert stacks itself (llb_host.c llb_moe_load: device, pinned
+// host or streamed from the mmapped GGUF), by name and 64-bit file offset. table.bin rows:
+// words 1..20 as dense with ffn_gate / ffn_up / ffn_down = the shared expert, then
+//   21 ffn_gate_inp (router)   offset | fm << 28   (F32)
+//   22 ffn_gate_inp_shexp      offset | fm << 28   (F32)
+//   26 the expert formats: gate | up << 4 | down << 8, bit 12 fused gate+up, bit 13 set
+//   27 expert_count, 28 expert ff, 29 shared ff, 30 expert_used_count
+static int is_exps(const char *name) {
+  size_t n = strlen(name);
+  return n > 12 && !strcmp(name + n - 12, "_exps.weight");
+}
+
+// host/llb_gguf.c gg_open's order: a stable sort of the file order by (is_exps, layer), heads first
+static void moe_order(T *t, size_t n) {
+  for (size_t i = 1; i < n; i++) {
+    T v = t[i];
+    size_t j = i;
+    int lv = v.layer, ev = lv >= 0 && is_exps(v.name);
+    while (j > 0) {
+      int lu = t[j - 1].layer, eu = lu >= 0 && is_exps(t[j - 1].name);
+      if (eu < ev || (eu == ev && lu <= lv)) break;
+      t[j] = t[j - 1], j--;
+    }
+    t[j] = v;
+  }
+}
+
+static int moe_sidecar(Gguf *g, const char *src, const char *out) {
+  static const char *fmn[] = {"Q8_0", "Q4_K", "Q5_K", "Q6_K"};
+  Cfg cfg = build_config(g);
+  int64_t L0 = cfg_int(&cfg, "n_layers"), D = cfg_int(&cfg, "d_model");
+  Val vne = backbone_val(g, "expert_count", 1), vk = backbone_val(g, "expert_used_count", 1);
+  Val vef = backbone_val(g, "expert_feed_forward_length", 1), vsf = backbone_val(g, "expert_shared_feed_forward_length", 1);
+  Val vmt = backbone_val(g, "nextn_predict_layers", 0);
+  int64_t ne = vne.i, nk = vk.i, EF = vef.i, SF = vsf.i, mtp = vmt.k == VN ? 0 : vmt.i;
+  if (ne < 1 || ne > UINT32_MAX) die("qwen35moe: expert_count %lld", (long long)ne);
+  if (nk < 1 || nk > ne) die("qwen35moe: expert_used_count %lld (1..expert_count)", (long long)nk);
+  if (EF < 1 || SF < 1) die("qwen35moe: expert_feed_forward_length %lld / expert_shared_feed_forward_length %lld (> 0)",
+                           (long long)EF, (long long)SF);
+  if (mtp < 0 || mtp >= L0) die("qwen35moe: nextn_predict_layers %lld (0..block_count - 1)", (long long)mtp);
+  cfg_put(&cfg, "n_experts", vint(ne));
+  cfg_put(&cfg, "n_experts_used", vint(nk));
+  cfg_put(&cfg, "expert_ff", vint(EF));
+  cfg_put(&cfg, "shared_ff", vint(SF));
+  cfg_put(&cfg, "nextn_predict_layers", vint(mtp));
+  int nl = (int)(L0 - mtp);
+  for (int i = 0; i < cfg.n; i++)
+    if (!strcmp(cfg.e[i].k, "n_layers")) cfg.e[i].v = vint(nl);
+  if (mtp) fprintf(stderr, "gguf2pack: qwen35moe: nextn_predict_layers %lld: blk.%d..%lld (MTP) skipped (plain decode)\n",
+                   (long long)mtp, nl, (long long)L0 - 1);
+  for (size_t i = 0; i < g->nt; i++)
+    for (size_t j = 0; j < i; j++)
+      if (!strcmp(g->t[i].name, g->t[j].name)) die("%s: duplicate tensor", g->t[i].name);
+  // the virtual layout over every tensor (the MTP blocks too: gg_open sees them), then the plan
+  T *ts = xmalloc(g->nt * sizeof(T));
+  memcpy(ts, g->t, g->nt * sizeof(T));
+  moe_order(ts, g->nt);
+  uint64_t pos = 0;
+  for (size_t i = 0; i < g->nt; i++) {
+    pos += (ALIGN - pos % ALIGN) % ALIGN;
+    ts[i].off = pos, pos += ts[i].bytes;
+    if (ts[i].f && strcmp(ts[i].tn, "F32")) {
+      int64_t cols = ts[i].sh[ts[i].nd - 1];
+      if (cols % ts[i].f->elems) die("%s: cols %lld not a multiple of %d", ts[i].name, (long long)cols, ts[i].f->elems);
+      ts[i].rb = (uint64_t)cols / (uint64_t)ts[i].f->elems * (uint64_t)ts[i].f->bytes;
+    }
+  }
+  uint64_t pack_bytes = pos;
+  // the trunk + shared expert under the dense names, for check_shapes at d_ff = shared ff
+  Gguf tr = *g;
+  tr.t = xmalloc(g->nt * sizeof(T)), tr.nt = 0;
+  Cfg sc = cfg;
+  for (int i = 0; i < sc.n; i++)
+    if (!strcmp(sc.e[i].k, "d_ff")) sc.e[i].v = vint(SF);
+  static const char *shn[3] = {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
+  // per layer: router, shexp gate, gate_exps, up_exps, gate_up_exps, down_exps
+  T *(*rt)[6] = xmalloc((size_t)nl * sizeof *rt);
+  memset(rt, 0, (size_t)nl * sizeof *rt);
+  for (size_t i = 0; i < g->nt; i++) {
+    T *t = &ts[i];
+    if (t->layer >= nl) continue;
+    if (t->layer < 0) { tr.t[tr.nt++] = *t; continue; }
+    const char *s = strchr(t->name + 4, '.') + 1;
+    static const char *mo[6] = {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight", "ffn_gate_exps.weight",
+                                "ffn_up_exps.weight", "ffn_gate_up_exps.weight", "ffn_down_exps.weight"};
+    int j = 0;
+    while (j < 6 && strcmp(s, mo[j])) j++;
+    if (j < 6) { rt[t->layer][j] = t; continue; }
+    T c = *t;
+    for (int k = 0; k < 3; k++)
+      if (!strcmp(s, shn[k])) {
+        c.name = xmalloc(96);
+        snprintf(c.name, 96, "blk.%d.%s", t->layer, OFFS[2 + k]);
+      }
+    tr.t[tr.nt++] = c;
+  }
+  if (check_shapes(&tr, &sc)) die("qwen35moe shape check failed (above; ffn_gate/up/down = the *_shexp tensors)");
+  // the routed experts and the two gates, refused by name
+  for (int L = 0; L < nl; L++) {
+    T **r = rt[L];
+    char nm[128];
+#define NEED(j, what) do { if (!r[j]) { snprintf(nm, sizeof nm, "blk.%d.%s", L, what); die("qwen35moe: missing %s", nm); } } while (0)
+    NEED(0, "ffn_gate_inp.weight");
+    NEED(1, "ffn_gate_inp_shexp.weight");
+    NEED(5, "ffn_down_exps.weight");
+    if (!r[4]) {
+      NEED(2, "ffn_gate_exps.weight (or ffn_gate_up_exps.weight)");
+      NEED(3, "ffn_up_exps.weight");
+    }
+    if (r[4] && (r[2] || r[3])) die("blk.%d: both ffn_gate_up_exps and ffn_gate_exps / ffn_up_exps", L);
+#undef NEED
+    if (strcmp(r[0]->tn, "F32") || r[0]->nd != 2 || r[0]->sh[0] != ne || r[0]->sh[1] != D)
+      die("%s: %s [%lld x %lld]: the CUDA router needs F32 [expert_count %lld x d_model %lld]", r[0]->name, r[0]->tn,
+          (long long)r[0]->sh[0], (long long)(r[0]->nd > 1 ? r[0]->sh[1] : 0), (long long)ne, (long long)D);
+    if (strcmp(r[1]->tn, "F32") || !((r[1]->nd == 1 && r[1]->sh[0] == D) || (r[1]->nd == 2 && r[1]->sh[0] == 1 && r[1]->sh[1] == D)))
+      die("%s: %s: the CUDA shared-expert gate needs F32 [d_model %lld]", r[1]->name, r[1]->tn, (long long)D);
+    for (int j = 2; j < 6; j++) {
+      T *t = r[j];
+      if (!t) continue;
+      int64_t rows = j == 5 ? D : j == 4 ? 2 * EF : EF, cols = j == 5 ? EF : D;
+      if (t->nd != 3 || t->sh[0] != ne || t->sh[1] != rows || t->sh[2] != cols)
+        die("%s: shape [%lld, %lld, %lld], want [expert_count %lld, %lld, %lld]", t->name, (long long)t->sh[0],
+            (long long)(t->nd > 1 ? t->sh[1] : 0), (long long)(t->nd > 2 ? t->sh[2] : 0), (long long)ne, (long long)rows, (long long)cols);
+      int ok = 0;
+      for (int k = 0; k < 4; k++) ok |= !strcmp(t->tn, fmn[k]);
+      if (!ok) die("%s: type %s: the CUDA expert kernels take Q8_0, Q4_K, Q5_K, Q6_K", t->name, t->tn);
+    }
+  }
+  // layer ranges and table rows
+  Layer *ly = xmalloc((size_t)nl * sizeof *ly);
+  for (int i = 0; i < nl; i++) ly[i].lo = UINT64_MAX, ly[i].hi = 0, ly[i].fd = -1;
+  for (size_t i = 0; i < g->nt; i++) {
+    T *t = &ts[i];
+    if (t->layer < 0 || t->layer >= nl || is_exps(t->name)) continue;
+    Layer *l = &ly[t->layer];
+    if (t->off < l->lo) l->lo = t->off;
+    if (t->off + t->bytes > l->hi) l->hi = t->off + t->bytes;
+  }
+  uint32_t *table = xmalloc((size_t)nl * 128);
+  memset(table, 0, (size_t)nl * 128);
+  for (int L = 0; L < nl; L++) {
+    uint64_t n = ly[L].hi - ly[L].lo;
+    if (n > (1ull << 31))
+      die("layer %d: trunk %llu bytes > 2 GiB (the engine's per-layer Bytes)", L, (unsigned long long)n);
+    table[L * 32] = (uint32_t)n;
+  }
+  for (size_t i = 0; i < g->nt; i++) {
+    T *t = &ts[i];
+    if (t->layer < 0 || t->layer >= nl) continue;
+    const char *s = strchr(t->name + 4, '.') + 1;
+    uint64_t rel = t->off - ly[t->layer].lo;
+    uint32_t *w = table + t->layer * 32;
+    int j = 0;
+    while (j < 20 && strcmp(OFFS[j], s)) j++;
+    for (int k = 0; k < 3 && j == 20; k++)
+      if (!strcmp(s, shn[k])) j = 2 + k;
+    if (j < 20 || !strcmp(s, "ffn_gate_inp.weight") || !strcmp(s, "ffn_gate_inp_shexp.weight")) {
+      if (j == 20) j = !strcmp(s, "ffn_gate_inp.weight") ? 20 : 21;
+      if (rel >= 1u << 28) die("%s: offset %llu in layer >= 2^28", t->name, (unsigned long long)rel);
+      w[1 + j] = (uint32_t)rel | (uint32_t)t->f->fm << 28;
+      continue;
+    }
+    int x = !strcmp(s, "ffn_gate_exps.weight") || !strcmp(s, "ffn_gate_up_exps.weight") ? 0
+      : !strcmp(s, "ffn_up_exps.weight") ? 1 : !strcmp(s, "ffn_down_exps.weight") ? 2 : -1;
+    if (x < 0) die("%s: tensor outside the MoE table", t->name);
+    (void)rel;  // the stacks are outside the layer's range: the host finds them by name
+    w[26] |= (uint32_t)t->f->fm << (4 * x) | (!strcmp(s, "ffn_gate_up_exps.weight") ? 1u << 12 : 0) | 1u << 13;
+  }
+  for (int L = 0; L < nl; L++) {
+    uint32_t *w = table + L * 32;
+    if (w[26] >> 12 & 1) w[26] |= (w[26] & 15) << 4;  // fused: up has gate's format
+    w[27] = (uint32_t)ne, w[28] = (uint32_t)EF, w[29] = (uint32_t)SF, w[30] = (uint32_t)nk;
+  }
+  // outputs: manifest.json (the dense sidecar's format; the tensors in virtual order) + table.bin
+  int allq8 = 1;
+  for (size_t i = 0; i < g->nt; i++) allq8 &= !strcmp(ts[i].tn, "Q8_0") || !strcmp(ts[i].tn, "F32");
+  char p[4096];
+  if (mkdir(out, 0755) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
+  snprintf(p, sizeof p, "%s/manifest.json", out);
+  if (!access(p, F_OK)) die("%s exists; refusing to overwrite a pack", p);
+  Buf m = {0};
+  bf(&m, "{\n \"format\": \"%s\",\n \"alignment\": %d,\n \"dtype\": \"%s\",\n \"source\": {\n  \"file\": ",
+     allq8 ? "llama-bend-pack-q8/v0" : "llama-bend-pack-q35-quant/v0", ALIGN, allq8 ? "q8_0-rowsplit" : "mixed-quant");
+  bjstr(&m, src, 1);
+  bs(&m, "\n },\n \"config\": {");
+  for (int i = 0; i < cfg.n; i++) {
+    bs(&m, i ? ",\n  " : "\n  "), bjstr(&m, cfg.e[i].k, 0), bs(&m, ": ");
+    bjval(&m, cfg.e[i].v, 2, 1);
+  }
+  bs(&m, "\n },\n \"tensors\": {\n");
+  T *embd = NULL;
+  for (size_t i = 0; i < g->nt; i++) {
+    if (i) bs(&m, ",\n");
+    manifest_tensor(&m, &ts[i], 0, NULL, NULL);
+    if (!strcmp(ts[i].name, "token_embd.weight")) embd = &ts[i];
+  }
+  if (cfg_get(&cfg, "tied_embeddings").i) bs(&m, ",\n"), manifest_tensor(&m, embd, 0, "token_embd.weight", "output.weight");
+  bf(&m, "\n },\n \"pack_bytes\": %llu,\n \"pack_sha256\": \"\"\n}\n", (unsigned long long)pack_bytes);
+  write_file(out, "table.bin", table, (size_t)nl * 128);
+  write_file(out, "manifest.json", m.p, m.n);
+  printf("sidecar %s: manifest.json + table.bin for %s (qwen35moe, %d layers, %lld experts / %lld used, expert ff %lld, "
+         "shared ff %lld, pack_bytes %llu)\n", out, src, nl, (long long)ne, (long long)nk, (long long)EF, (long long)SF,
+         (unsigned long long)pack_bytes);
+  free(ts), free(tr.t), free(rt), free(ly), free(table), free(m.p);
+  return 0;
+}
+
 // ---------------------------------------------------------------- main
 
 static void usage(void) {
@@ -1172,8 +1395,10 @@ int main(int argc, char **argv) {
 
   Val arch = kvv(&g, "general.architecture", 1);
   if (arch.k == VS && !strcmp(arch.s, "qwen35moe")) {
+    // --sidecar-only: the CUDA engine's direct GGUF load, any qwen35moe shape (moe_sidecar)
+    if (sidecar && !shas && !fmtarg) return moe_sidecar(&g, src, out);
     if (sidecar || head_only || vdir || (fmtarg && strcmp(fmtarg, "quant")))
-      die("qwen35moe: use MODEL.gguf OUT_DIR [--format quant]; dense-only flags are unsupported");
+      die("qwen35moe: use MODEL.gguf OUT_DIR [--format quant], or MODEL.gguf --sidecar-only OUT_DIR; other dense flags are unsupported");
     return moe_pack(&g, fd, src, out);
   }
   Cfg cfg = build_config(&g);

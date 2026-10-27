@@ -1,0 +1,274 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -4988,6 +4988,7 @@
+ static CUfunction gpu_mid;
+ static CUfunction gpu_rnadd, gpu_l2qk, gpu_midconv, gpu_warpqr, gpu_warpqt, gpu_warpqc, gpu_warpqc11;
+ static CUfunction gpu_gany;  // tools/payload-anyshape.patch: llb_gemv_any
++static CUfunction gpu_moetk, gpu_moegu, gpu_moedn;  // tools/payload-moeany.patch: the routed experts
+ // tools/payload-pf.patch: the fast prefill tier (pfmm.cuh's wide leaves take dynamic shared memory)
+ static CUfunction gpu_pfq8x, gpu_pfq4m, gpu_pfq4mr, gpu_pfq4mg, gpu_pfq8m, gpu_pfq8mr, gpu_pfq8mc, gpu_pfq5m, gpu_pfq5mr, gpu_pfq6w, gpu_pfq6wr;
+ static CUfunction gpu_pfrms, gpu_pfmc, gpu_pfring, gpu_pfl2qk, gpu_pfgdl, gpu_pfgrn, gpu_pfqkr, gpu_pfslot, gpu_pfog, gpu_pfattn, gpu_pfmark;
+@@ -7158,7 +7159,8 @@
+   // pass (table address, layer list, s | k << 16)
+   u64    pw[LLB_MAXL];
+   u64    tbk, wlk, skk;
+-  u32    pt[LLB_MAXL][20];
++  // tools/payload-moeany.patch: words 1..31 (was 1..20): 21..29 the routed experts
++  u32    pt[LLB_MAXL][31];
+   LlbShape sh;
+   // the pass bang's config words 66..69 (tools/payload-anyshape.patch): rms eps (F32 bits),
+   // rope base (F32 bits), rope dims, the KV capacity in positions
+@@ -9814,13 +9816,38 @@
+     // the 0.8B's 3584-col down: 14 superblocks on the K-quant tile body (tools/payload-w1024.patch)
+     // any K-quant width: llb_kgemv takes llb_gemv_any where no pair / tile body applies
+     ok = ok && df % 256 == 0;
+-    // fbn: post, fg, fu, fd at Offs words 1..4
++    // tools/payload-moeany.patch: a routed-expert layer (table word 27 = expert_count, gguf2pack.c
++    // moe_sidecar): fg / fu / fd are the shared expert, sf (word 29) rows wide; the router (21) and
++    // the shared expert's gate (22) F32 in the layer's Bytes; the expert stacks are outside them
++    // (llb_host.c llb_moe_load reads them from the GGUF): their formats in word 26 (gate | up << 4 |
++    // down << 8, bit 12 fused gate+up, bit 13 set) Q8_0 / Q4_K / Q5_K / Q6_K, expert ff word 28,
++    // top-k word 30. No count or width cap past the formats' whole superblocks
++    const u32* mw = tw + i * 32;
++    bool moe = mw[27] != 0;
++    u64  fw = moe ? (u64)mw[29] : df;
++    if (moe) {
++      u32  ne = mw[27], nk = mw[30], ef = mw[28], sf = mw[29], fx = mw[26];
++      u32  fg = fx & 15, fu = fx >> 4 & 15, fd = fx >> 8 & 15, fz = fx >> 12 & 1;
++      u32  ro = mw[21] & 0x0fffffffu, go = mw[22] & 0x0fffffffu;
++#define MOEFM(f) ((f) == LLB_FM_Q8_0 || (f) == LLB_FM_Q4_K || (f) == LLB_FM_Q5_K || (f) == LLB_FM_Q6_K)
++      bool mok = ne >= 1 && nk >= 1 && nk <= ne
++        && ef >= 256 && ef % 256 == 0 && ef <= df && sf >= 256 && sf % 256 == 0 && sf <= df
++        && (fx >> 13 & 1) && MOEFM(fg) && MOEFM(fu) && MOEFM(fd) && (!fz || fu == fg)
++        && mw[21] >> 28 == LLB_FM_F32 && mw[22] >> 28 == LLB_FM_F32 && ro % 4 == 0 && go % 4 == 0
++        && (u64)ro + (u64)ne * dm * 4 <= q.len && (u64)go + dm * 4 <= q.len;
++#undef MOEFM
++      if (!mok) {
++        *bad = *bad != 0 ? *bad : 8;
++        ok = false;
++      }
++    }
++    // fbn: post, fg, fu, fd at Offs words 1..4 (fw rows: d_ff, or the shared expert's width)
+     ok = ok && p[1] % 4 == 0 && ((u64)(base + p[2]) & 15) == 0
+       && ((u64)(base + p[3]) & 15) == 0 && ((u64)(base + p[4]) & 15) == 0
+       && (u64)p[1] + dm * 4 <= q.len
+-      && (u64)p[2] + df * PRB(2, dm) <= q.len
+-      && (u64)p[3] + df * PRB(3, dm) <= q.len
+-      && (u64)p[4] + dm * PRB(4, df) <= q.len;
++      && (u64)p[2] + fw * PRB(2, dm) <= q.len
++      && (u64)p[3] + fw * PRB(3, dm) <= q.len
++      && (u64)p[4] + dm * PRB(4, fw) <= q.len;
+     if (full) {
+       // fulb: an 0, q 14, k 15, v 16, q-norm 17, k-norm 18, o 19
+       ok = ok && p[0] % 4 == 0 && p[17] % 4 == 0 && p[18] % 4 == 0
+@@ -9860,6 +9887,9 @@
+       for (u32 f = 0; f < 20; f += 1) {
+         M->pt[i][f] = tw[i * 32 + 1 + f];
+       }
++      for (u32 f = 20; f < 31; f += 1) {
++        M->pt[i][f] = tw[i * 32 + 1 + f];
++      }
+     }
+     M->tbk = (u64)tw; M->wlk = (u64)wl; M->skk = skk;
+   }
+@@ -10070,6 +10100,190 @@
+   y[2 * p + 1] = __fadd_rn(__fmul_rn(x0, si), __fmul_rn(x1, co));
+ }
+ 
++// tools/payload-moeany.patch: the routed experts (llb_host.c llb_moe_run), any expert count / top-k /
++// width, the reference semantics of llama.cpp's build_moe_ffn for qwen35moe: softmax over every
++// expert's router logit, the top k, their weights renormalized to sum 1 (the sum clamped at
++// 6.103515625e-5 as ggml_clamp), each chosen expert down(silu(gate x) * (up x)), the weighted sum
++// in rank order, plus the shared expert times sigmoid(its gate), plus the residual.
++// The expert stacks keep the GGUF's bytes (llb_moe_load copies or maps them as they are), so Q8_0 is
++// ggml's block layout here ([f16 d][32 q] x cols / 32), not the trunk's row-split.
++INLINE float4 q8g_w(const u8* __restrict__ row, u32 g) {
++  const u8* B = row + (u64)(g >> 3) * 34;
++  float s = llb_f16((unsigned short)(B[0] | (u32)B[1] << 8));
++  const signed char* q = (const signed char*)(B + 2 + 4 * (g & 7));
++  return make_float4(__fmul_rn((float)q[0], s), __fmul_rn((float)q[1], s), __fmul_rn((float)q[2], s),
++    __fmul_rn((float)q[3], s));
++}
++
++// A row's dot: lane l sums the groups l, l + 32, .. of cg = cols / 4 (llb_gemv_any's leaf), then
++// the xor butterfly; formats 1 Q8_0 (GGUF blocks, q8g_w), 3 Q4_K, 4 Q6_K, 9 Q5_K
++__device__ __forceinline__ float moe_dot(const u8* __restrict__ row, u32 fm, u32 cg, const float* __restrict__ x) {
++  const u32 l = threadIdx.x & 31;
++  float acc = 0.0f;
++  for (u32 g = l; g < cg; g += 32) {
++    float4 w = fm == 1 ? q8g_w(row, g) : fm == 3 ? q4k_w(row, g) : fm == 4 ? q6k_w(row, g) : q5k_w(row, g);
++    const float* xv = x + 4 * (u64)g;
++    acc = __fadd_rn(acc, __fadd_rn(__fadd_rn(__fmul_rn(w.x, xv[0]), __fmul_rn(w.y, xv[1])),
++      __fadd_rn(__fmul_rn(w.z, xv[2]), __fmul_rn(w.w, xv[3]))));
++  }
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) {
++    acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, m));
++  }
++  return acc;
++}
++
++// one block of 1024: lg the ne router logits, sg the shared expert's gate logit, pv ne floats of
++// scratch (the probabilities). Out: ids[k] / wt[k] the chosen experts by descending probability
++// (ties to the lower index: argsort's order on distinct values), sgo[0] = sigmoid(sg).
++// p = exp(l - max) / sum, the exp through F64 (attn_exp). Any ne and k (k <= ne)
++extern "C" __global__ void __launch_bounds__(1024) llb_moe_topk(const float* __restrict__ lg, u32 ne, u32 nk,
++  const float* __restrict__ sg, float* __restrict__ pv, u32* __restrict__ ids, float* __restrict__ wt,
++  float* __restrict__ sgo) {
++  __shared__ float rv[32];
++  __shared__ u32 ri[32];
++  __shared__ float bc;
++  const u32 t = threadIdx.x, l = t & 31, w = t >> 5;
++  // the max logit
++  float mx = __uint_as_float(0xFF800000u);
++  for (u32 e = t; e < ne; e += 1024) {
++    mx = fmaxf(mx, lg[e]);
++  }
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) {
++    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, m));
++  }
++  if (l == 0) {
++    rv[w] = mx;
++  }
++  __syncthreads();
++  if (t == 0) {
++    float v = rv[0];
++    for (u32 k = 1; k < 32; k++) {
++      v = fmaxf(v, rv[k]);
++    }
++    bc = v;
++  }
++  __syncthreads();
++  mx = bc;
++  // exp and the sum (ascending expert order within a thread, then the fixed trees)
++  float sm = 0.0f;
++  for (u32 e = t; e < ne; e += 1024) {
++    const float v = attn_exp(__fsub_rn(lg[e], mx));
++    pv[e] = v;
++    sm = __fadd_rn(sm, v);
++  }
++  #pragma unroll
++  for (u32 m = 16; m > 0; m >>= 1) {
++    sm = __fadd_rn(sm, __shfl_xor_sync(0xffffffffu, sm, m));
++  }
++  __syncthreads();
++  if (l == 0) {
++    rv[w] = sm;
++  }
++  __syncthreads();
++  if (t == 0) {
++    float v = 0.0f;
++    for (u32 k = 0; k < 32; k++) {
++      v = __fadd_rn(v, rv[k]);
++    }
++    bc = v;
++  }
++  __syncthreads();
++  const float inv = __fdiv_rn(1.0f, bc);
++  for (u32 e = t; e < ne; e += 1024) {
++    pv[e] = __fmul_rn(pv[e], inv);
++  }
++  __syncthreads();
++  // k rounds of a block argmax over the probabilities (first index on equal values); a chosen
++  // expert's slot is set to -2 (p >= 0), the chosen p kept in wt[j] until the renormalization
++  for (u32 j = 0; j < nk; j++) {
++    float bv = -1.0f;
++    u32 bix = 0xffffffffu;
++    for (u32 e = t; e < ne; e += 1024) {
++      const float v = pv[e];
++      if (v > bv) {
++        bv = v; bix = e;
++      }
++    }
++    #pragma unroll
++    for (u32 m = 16; m > 0; m >>= 1) {
++      const float ov = __shfl_xor_sync(0xffffffffu, bv, m);
++      const u32 oi = __shfl_xor_sync(0xffffffffu, bix, m);
++      if (ov > bv || (ov == bv && oi < bix)) {
++        bv = ov; bix = oi;
++      }
++    }
++    if (l == 0) {
++      rv[w] = bv; ri[w] = bix;
++    }
++    __syncthreads();
++    if (t == 0) {
++      float v = rv[0];
++      u32 x = ri[0];
++      for (u32 k = 1; k < 32; k++) {
++        if (rv[k] > v || (rv[k] == v && ri[k] < x)) {
++          v = rv[k]; x = ri[k];
++        }
++      }
++      ids[j] = x;
++      wt[j] = v;
++      pv[x] = -2.0f;
++    }
++    __syncthreads();
++  }
++  if (t == 0) {
++    float s = 0.0f;
++    for (u32 j = 0; j < nk; j++) {
++      s = __fadd_rn(s, wt[j]);
++    }
++    s = s < 6.103515625e-5f ? 6.103515625e-5f : s;
++    for (u32 j = 0; j < nk; j++) {
++      wt[j] = __fdiv_rn(wt[j], s);
++    }
++    sgo[0] = __fdiv_rn(1.0f, __fadd_rn(1.0f, attn_exp(-sg[0])));
++  }
++}
++
++// gate + up + silu for the k chosen experts: block (bx, j) = rows 4 bx .. 4 bx + 3 of expert ids[j],
++// a warp a row; act[j ef + r] = silu(gate . x) * (up . x) (llb_silu's formula). G / U the stacks'
++// bases, es the expert stride (bytes), rbg / rbu the row bytes (fused: U = G + ef rows, the same es)
++extern "C" __global__ void __launch_bounds__(128) llb_moe_gu(const u8* __restrict__ G, const u8* __restrict__ U,
++  u64 es, u32 rbg, u32 rbu, u32 fg, u32 fu, u32 cg, const float* __restrict__ x, const u32* __restrict__ ids,
++  float* __restrict__ act, u32 ef) {
++  const u32 r = blockIdx.x * 4 + (threadIdx.x >> 5), j = blockIdx.y;
++  if (r >= ef) {
++    return;
++  }
++  const u64 e = ids[j];
++  const float g = moe_dot(G + e * es + (u64)r * rbg, fg, cg, x);
++  const float u = moe_dot(U + e * es + (u64)r * rbu, fu, cg, x);
++  if ((threadIdx.x & 31) == 0) {
++    act[(u64)j * ef + r] = __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, attn_exp(-g))), u);
++  }
++}
++
++// down for the k experts, weighted and summed in rank order, then + the gated shared expert, then
++// + the residual: y[r] = (sum_j wt[j] (down_ids[j] row r . act_j) + shd[r] sgo[0]) + x1[r]
++// (llama.cpp's order: moe_out + ffn_shexp, then + ffn_inp). A warp a row of dm
++extern "C" __global__ void __launch_bounds__(128) llb_moe_dn(const u8* __restrict__ D, u64 es, u32 rbd, u32 fd,
++  u32 cg, const float* __restrict__ act, const u32* __restrict__ ids, const float* __restrict__ wt, u32 nk, u32 ef,
++  const float* __restrict__ x1, const float* __restrict__ shd, const float* __restrict__ sgo,
++  float* __restrict__ y, u32 dm) {
++  const u32 r = blockIdx.x * 4 + (threadIdx.x >> 5);
++  if (r >= dm) {
++    return;
++  }
++  float mo = 0.0f;
++  for (u32 j = 0; j < nk; j++) {
++    const float v = moe_dot(D + (u64)ids[j] * es + (u64)r * rbd, fd, cg, act + (u64)j * ef);
++    mo = j == 0 ? __fmul_rn(v, wt[0]) : __fadd_rn(mo, __fmul_rn(v, wt[j]));
++  }
++  if ((threadIdx.x & 31) == 0) {
++    y[r] = __fadd_rn(__fadd_rn(mo, __fmul_rn(shd[r], sgo[0])), x1[r]);
++  }
++}
++
+ // flat.bend's k.silu: a[i] = K.silu1(g[i]) * u[i], silu1(v) = v / (1 +
+ // K.exp32(-v)), the exp through F64 (attn_exp); a thread an element of n
+ // (tools/payload-silu.patch's kernel, tools/interiors-ffn.patch)
+@@ -12618,6 +12832,9 @@
+     || cuModuleGetFunction(&gpu_warpqc, gpu_lib, "llb_warp_q8_cat") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_warpqc11, gpu_lib, "llb_warp_q8_cat11") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_gany, gpu_lib, "llb_gemv_any") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_moetk, gpu_lib, "llb_moe_topk") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_moegu, gpu_lib, "llb_moe_gu") != CUDA_SUCCESS
++    || cuModuleGetFunction(&gpu_moedn, gpu_lib, "llb_moe_dn") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_pfq8x, gpu_lib, "pf_q8x") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_pfq4m, gpu_lib, "pf_q4k_m") != CUDA_SUCCESS
+     || cuModuleGetFunction(&gpu_pfq4mr, gpu_lib, "pf_q4k_mr") != CUDA_SUCCESS

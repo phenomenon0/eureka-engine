@@ -115,6 +115,12 @@ static bool pf_formats(u32 k, LlbShape sh) {
   static const char* nm[10] = { "F32", "Q8_0", "F16", "Q4_K", "Q6_K", "Q3_K", "Q2_0", "PQ2_0", "IQ4_XS", "Q5_K" };
   u32 lv = sh.lvh * sh.sd, qa = sh.nh * sh.hd;
   for (u32 i = 0; i < k; i += 1) {
+    if (gpu_mail->pt[i][26] != 0) {  // tools/payload-moeany.patch: the fast tier has no expert path
+      fprintf(stderr, "fast prefill: off for this model (layer %u has routed experts; the fast tier is dense only): every step exact\n", i);
+      return false;
+    }
+  }
+  for (u32 i = 0; i < k; i += 1) {
     bool full = llb_full(i);
     for (u32 j = 0; j < 8; j += 1) {
       u32 q = gs[full][j];
