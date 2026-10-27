@@ -1,0 +1,13 @@
+# CUDA sidecar byte identity: gguf2pack at 4c7c24c10 (before) vs x/metal-moe-on-cuda (after), Linux, 2026-10-27
+# per input: plain --sidecar-only, and --sidecar-only --target cuda, diff -r against the before output
+s40x5f-Q8_0: before==after YES, before==--target cuda YES; table.bin 5a95ffea1c8eeb46 manifest.json 3603cbbcdda9a9a9
+s40x5f-Q8_0 metal: x/metal-moe gguf2pack == --target metal: YES
+s60x6-Q4_K_M: before==after YES, before==--target cuda YES; table.bin 34adeebcd20cc9f4 manifest.json 6e321be10419fee1
+s60x6-Q4_K_M metal: x/metal-moe gguf2pack == --target metal: YES
+s128x8b-Q4_K_M: before==after YES, before==--target cuda YES; table.bin 812f9bcc0a51b91a manifest.json 9819f45b2db6ea2e
+s128x8b-Q4_K_M metal: x/metal-moe gguf2pack == --target metal: YES
+s40x5f-Q4_K_M: before==after YES, before==--target cuda YES; table.bin 83eaca81985203fb manifest.json 1eebbce95e178951
+s40x5f-Q4_K_M metal: x/metal-moe gguf2pack == --target metal: YES
+cuda-moe gen_moe.py d-512_L-4_ne-16_k-4_ef-256_sf-512_V-4096_fused-0_mtp-0: before==after YES; table.bin 86a849017a80bf68
+cuda-moe gen_moe.py d-512_L-8_ne-60_k-6_ef-768_sf-256_V-4096_fused-1_mtp-1: before==after YES; table.bin d990716aae07c31b
+synth-moe.gguf (F32 experts): before and after refuse with the same line: YES

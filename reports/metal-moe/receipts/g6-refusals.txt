@@ -1,7 +1,7 @@
-# G6 refusals by name (gguf2pack --sidecar-only, Linux, 2026-10-26)
-$ gguf2pack s40x5f-Q3_K_M.gguf --sidecar-only OUT
+# G6 refusals by name (gguf2pack --sidecar-only --target metal, Linux, re-run after the rebase onto the CUDA MoE lane, 2026-10-27)
+$ gguf2pack s40x5f-Q3_K_M.gguf --sidecar-only OUT --target metal
 rc=1 gguf2pack: blk.0.ffn_gate_up_exps.weight: expert type Q3_K (the general MoE path reads F32 F16 BF16 Q8_0 Q4_K Q5_K Q6_K experts)
-$ gguf2pack Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf --sidecar-only OUT
+$ gguf2pack Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf --sidecar-only OUT --target metal
 rc=1 gguf2pack: blk.0.ffn_down.weight: BF16 outside the trunk formats (F32 Q8_0 Q4_K Q5_K Q6_K; requantize, e.g. BF16 -> Q8_0)
-$ gguf2pack noshexp-F32.gguf --sidecar-only OUT
+$ gguf2pack noshexp-F32.gguf --sidecar-only OUT --target metal
 rc=1 gguf2pack: qwen35moe: blk.0.ffn_gate_shexp.weight missing (the general MoE path needs the shared expert)

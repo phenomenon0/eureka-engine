@@ -260,8 +260,10 @@ The default build also applies `cc/metal-moe-cc.patch` and
 stops before them (the any-shape build, `00979448`); `VISION=1` does not take
 them. They run any `qwen35moe` GGUF on the generic pass:
 
-- **Sidecar.** `gguf2pack MODEL.gguf --sidecar-only DIR` takes a `qwen35moe`
-  GGUF: `manifest.json` (config `"experts": "gguf"`, the expert and shared
+- **Sidecar.** `gguf2pack MODEL.gguf --sidecar-only DIR --target metal`
+  takes a `qwen35moe` GGUF (without `--target metal` it writes the CUDA
+  engine's MoE sidecar, another layout; the Metal engine refuses it at the
+  manifest check, "unsupported/invalid qwen3.5 pack: architecture"): `manifest.json` (config `"experts": "gguf"`, the expert and shared
   widths) and `table.bin`, whose rows also carry the router and shared gate
   (words 21, 22) and the MoE words (24–29: a magic, `expert_count`,
   `expert_used_count`, `expert_feed_forward_length`,

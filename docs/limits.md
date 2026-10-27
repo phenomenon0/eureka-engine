@@ -96,31 +96,47 @@ skipped; checked on synthetic random-weight files against llama.cpp
   note), `LLB_SPEC`, `LLB_MTP`, `LLB_BATCH`, the split path (`--emit`,
   `--lpb` < layers), and the pack path (the experts load from `LLB_GGUF`).
 
+### MoE (`qwen35moe`) on Metal
+
+`backends/metal/cc/metal-moe-cc.patch` + `engine/metal-moe-engine.patch`
+(`mx_ffn_run`, `llb_mx_*`), with `gguf2pack --sidecar-only --target metal`
+writing the Metal MoE sidecar (the two engines' sidecars differ: CUDA's
+virtual pack carries the expert stacks, Metal's leaves them out). Any expert
+count and top-k, any expert and shared width, fused or separate gate/up,
+NextN blocks dropped; checked on the 35B-A3B and synthetic files against
+llama.cpp ([reports/metal-moe](../reports/metal-moe/REPORT.md)). What still
+bounds it:
+
+- **Kernel:** expert and shared widths are whole blocks of their format (32
+  columns; 256 for a K-quant); experts F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K /
+  Q6_K; trunk Q8_0 and K-quants, router and shared-expert gate F32 (BF16 or
+  IQ trunk tensors are refused by name); head_dim 256, SSM state 128 and the
+  other dense rules above.
+- **Cap:** the dense trunk's: d_model ≤ 8192, 64 q / 16 kv heads, 1,024
+  layers, vocab ≤ 250,048, head region ≤ 2 GiB, a layer's trunk below 2^28
+  bytes (table.bin's offset field). No cap on the expert count, top-k or
+  widths: the MoE scratch is its own buffer sized from them and the routing
+  kernel loops over the experts.
+- **Hardware:** the trunk (every non-expert weight and the heads) must fit the
+  heap span, one Metal buffer (`maxBufferLength`, 58.3 GiB on the M3 Ultra).
+  The routed experts never enter the heap: each expert tensor is cut into
+  no-copy chunks of the mapped GGUF, each within `maxBufferLength`, reached
+  through 64-bit GPU addresses; when experts plus heap exceed
+  `recommendedMaxWorkingSetSize` the engine streams them (the k chosen
+  experts of each layer copied to staging each token). `LLB_MX_SPLIT=N` and
+  `LLB_MX_STREAM=1` force the split and streamed paths (same bits as
+  resident). One expert must fit one buffer (k of them when streamed).
+- **Refused / not done:** fast prefill (exact per-token prefill; `--fastpf`
+  is ignored for these files), the split path (`--emit`, `--lpb` < layers),
+  `VISION=1` builds. No 122B-A10B or 397B-A17B file was run.
+
 ### Bigger models (above 27B)
 
 - **Metal:** layer arrays sized 1,024; d_model ≤ 8192; d_ff ≤ 17,408; at
   most 64 query heads (the fixed 81,920-float block scratch is checked
   against the shape, with a message). Head region ≤ 2 GiB and 32-bit offsets
   remain for the trunk.
-- **Metal MoE** (`cc/metal-moe-cc.patch`, `engine/metal-moe-engine.patch`):
-  no cap on the expert count, top-k or the expert / shared widths. The MoE
-  scratch is its own buffer sized from them; the routing kernel loops over
-  the experts. The routed experts never enter the heap: each expert tensor
-  is cut into no-copy chunks of the mapped GGUF, each within
-  `maxBufferLength`, reached through a table of 64-bit GPU addresses; when the
-  experts plus the heap exceed `recommendedMaxWorkingSetSize`, the engine
-  streams them (only the k chosen experts of a layer are copied, each token).
-  What still bounds a MoE: the trunk (every non-expert weight and the heads)
-  must fit the heap span, one Metal buffer; one expert must fit one buffer
-  (k of them when streamed); the dense trunk limits above (d_model ≤ 8192,
-  64 q / 16 kv heads, 1,024 layers, vocab ≤ 250,048, head region ≤ 2 GiB,
-  a layer's trunk < 2^28 bytes: the table's offset field); expert and shared
-  widths whole blocks of their format (32 columns; 256 for a K-quant);
-  formats: experts F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K / Q6_K, trunk Q8_0
-  and K-quants (BF16 or IQ trunk tensors are refused by name, requantize).
-  A 122B-A10B or 397B-A17B file was not run (none on the test Mac); the split
-  and streamed paths were forced on smaller models (`LLB_MX_SPLIT`,
-  `LLB_MX_STREAM`) and gave the resident path's bits.
+- **Metal MoE:** see [MoE on Metal](#moe-qwen35moe-on-metal).
 - **CUDA:** layer tables hold 256 layers (`LLB_MAXL`); scratch (`gpu_blk`,
   `gpu_q8b`, `gpu_q8c`, `gpu_headh`, `gpu_atts`) is sized from the shape at
   the first pass. Remaining limits: d_model ≤ 32,768, the head region

@@ -7,7 +7,8 @@ appended there.
 
 ## What changed
 
-- `tools/gguf2pack.c`: `--sidecar-only` takes a `qwen35moe` GGUF (`moe_sidecar`): `manifest.json` (config
+- `tools/gguf2pack.c`: `--sidecar-only --target metal` takes a `qwen35moe` GGUF (`moe_sidecar_metal`; after the
+  rebase onto the CUDA MoE lane, plain `--sidecar-only` writes the CUDA sidecar, `moe_sidecar_cuda`): `manifest.json` (config
   `"experts": "gguf"`, `d_ff` the expert ff, `d_ff_shared`) and `table.bin`, whose rows carry the router and the
   shared gate (words 21, 22) and the MoE words (24 magic, 25 `expert_count`, 26 `expert_used_count`, 27 expert ff,
   28 shared ff, 29 fused gate_up). Any expert count, top-k and widths; separate or fused `ffn_gate_up_exps`;
@@ -94,11 +95,35 @@ No expert-count, top-k or width cap remains in the engine; table words are 32-bi
   rule says never pkill; noted here.
 - `python3 tools/check_no_gpl_tts.py`: PASS. Committed files carry no hostnames, IPs or home paths.
 
+## Rebase onto the CUDA MoE lane (2026-10-27)
+
+The work was cherry-picked onto `4c7c24c10` (the CUDA MoE lane, tree = published main) as branch
+`x/metal-moe-on-cuda`. Both lanes had added a `qwen35moe --sidecar-only` writer with incompatible layouts (CUDA:
+the expert stacks in the virtual pack, table words 26–30; Metal: experts left out, words 24–29). Resolution in
+`tools/gguf2pack.c`: CUDA's writer is renamed `moe_sidecar_cuda` and stays the default; the Metal writer is
+`moe_sidecar_metal`, selected by `--sidecar-only OUT --target metal` (`--target cuda` names the default; a dense
+sidecar is the same for both). Neither engine's bytes change:
+
+- CUDA sidecar: byte-identical before / after (plain and `--target cuda`) on six qwen35moe files, two of them made
+  by `reports/cuda-moe/scripts/gen_moe.py` (one fused with an MTP block); the F32-expert refusal line is the same.
+  The branch touches no CUDA build input (`tools/build_gpu.sh`, the payload patches, `engine_qwen35_gpu.bend`,
+  `host/`); only `tools/gguf2pack.c` is shared, and the CUDA build compiles it as a separate tool.
+  `receipts/rebase/cuda-sidecar-identity.txt`.
+- Metal sidecar: `--target metal` writes the same bytes as the pre-rebase tool on the same inputs.
+- The Metal build does not read the root `host/llb_gguf.c`, `host/llb_host.c` or `host/llb_pf.h` that the CUDA
+  lane changed: `backends/metal/build.sh` overlays its pinned copies from `backends/metal/base/` (still
+  `llb_gguf.c` at `14d69135`, SHA256SUMS unchanged for them). Re-emitted on Linux and on the Mac: default
+  `a20c8ee2` (hash-checked), `LLB_METAL_ANY=1` `00979448`, `LLB_METAL_BASE=1` `c13b9e28`.
+- On the Mac (rebuilt from this branch): G1 short (4B, three prompts, exact and default) 6/6 ids and the P2
+  logits identical to the any-shape build; s40x5f-Q8_0 against llama.cpp Metal 32/32 and 32/32 (as before);
+  resident = `LLB_MX_SPLIT=3` = `LLB_MX_STREAM=1`, the same ids / logits hashes as before the rebase. G6 re-run with
+  `--target metal`: the same three refusals. `receipts/rebase/metal-reverify.txt`, `receipts/g6-refusals.txt`.
+
 ## SUMMARY
 
 - **Commits** on `x/metal-moe` (not pushed): `102e8f987` prereg; `58836d4bc` the general MoE path; `7141b82ba` 3-D
   Q8_0 experts + build hash; the docs/receipts commit that carries this report.
-- **What runs:** any `qwen35moe` GGUF on Metal through `gguf2pack --sidecar-only` + `LLB_GGUF`: any expert count,
+- **What runs:** any `qwen35moe` GGUF on Metal through `gguf2pack --sidecar-only --target metal` + `LLB_GGUF`: any expert count,
   top-k, expert / shared width, fused or separate gate/up, NextN dropped; experts F32 / F16 / BF16 / Q8_0 / Q4_K /
   Q5_K / Q6_K mapped from the file (resident no-copy chunks within `maxBufferLength`, or streamed: only the k
   chosen experts copied when experts + heap exceed the GPU working set); context to 2^27 slots, buffer-bounded.

@@ -48,7 +48,7 @@ Windows runs a CPU build of the engine today. Devices, conditions, and gaps:
 | Backend | Qwen3.5 models | Context |
 | :---: | :--- | :--- |
 | **CUDA** | Any dense size, 0.8B to 27B, and any MoE (experts in VRAM, host RAM, or streamed from disk) | VRAM-bound; 145k-token prompt tested |
-| **Metal** | Any dense size, plus 35B-A3B MoE | Buffer-bound; 153k-token prompt tested |
+| **Metal** | Any dense size, and any MoE (experts resident or streamed from the file) | Buffer-bound; 153k-token prompt tested (0.8B, 2B, 35B-A3B) |
 | **iOS** | Same engine as Metal (new sizes compiled, not yet run on a phone) | Buffer-bound |
 | **Android** | Any dense size | Set at launch |
 | **WebGPU** | Any size, dense or MoE, in 21 GGUF formats (F16 to IQ1_S) | About 2M tokens on the 0.8B; 153k-token prompt tested |
@@ -58,7 +58,8 @@ Windows runs a CPU build of the engine today. Devices, conditions, and gaps:
 Each engine reads the shape from the model file and refuses, with the reason,
 anything it can't run. MoE models bigger than the GPU run on CUDA by keeping
 the experts in host RAM or reading only the chosen ones from the file each
-token. Sizes, formats, and limits per engine:
+token, and on Metal by mapping the experts from the file or copying only the
+chosen ones each token. Sizes, formats, and limits per engine:
 [docs/limits.md](docs/limits.md).
 
 ## What it does
