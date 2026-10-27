@@ -30,7 +30,7 @@ EXPECT_C_VISION=fbdefec75fe9f02a1f85e5bc8b7a3f1f461a8501c47db51dd8e0f454cd25f10a
 EXPECT_C_ANY=009794484c3860bd111eb131a9fc1d73f995a031ee81114847ecfc221b93fb55
 EXPECT_C_ANY_VISION=85c8d3c489dda683d5bbd12b8928e2645a6268efdec6871d3e755fd1d6c56447
 # the same with the general MoE patches too (the default build; VISION=1 does not take them)
-EXPECT_C_MOE=add7f6f6a5f3f878592b8cdd5150b7a65ad450f32cb72c9c78404927b1c7be5e
+EXPECT_C_MOE=a20c8ee2c4fcf772ad4ae9b8d3130d6f40054b697695fd5a87f3deb2e17e550e
 die() { echo "backends/metal/build.sh: $*" >&2; exit 1; }
 BUN=$(command -v bun || echo "$HOME/.bun/bin/bun"); [ -x "$BUN" ] || die "missing tool: bun"
 (cd "$here" && sha256sum -c --quiet SHA256SUMS 2>/dev/null || shasum -a 256 -c --quiet SHA256SUMS) \

@@ -135,7 +135,7 @@ index fce1b3a..5c451fb 100755
  def run.fgen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +steps: U32, +sp: List<&2, U32>,
    r: U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) -> IO(Unit):
 diff --git a/host/llb_gguf.c b/host/llb_gguf.c
-index 69b9ae5..5d38ebe 100755
+index 69b9ae5..5868c51 100755
 --- a/host/llb_gguf.c
 +++ b/host/llb_gguf.c
 @@ -121,6 +121,8 @@ typedef struct {
@@ -190,16 +190,19 @@ index 69b9ae5..5d38ebe 100755
    g->nt = kept;
    qsort(g->t, g->nt, sizeof *g->t, gg_moe_order);
    return 0;
-@@ -287,6 +299,8 @@ static int gg_open(GgFile *g, const char *path, char *err) {
+@@ -287,7 +299,10 @@ static int gg_open(GgFile *g, const char *path, char *err) {
      if (n % (uint64_t)el) { free(r.buf); return gg_fail(err, "%s: not a whole number of blocks", t->name); }
      t->bytes = n / (uint64_t)el * (uint64_t)bb;
      t->ty = ty;
+-    t->q8 = ty == 8;
 +    t->nd = nd;
 +    for (uint32_t j = 0; j < nd; j++) t->ne[j] = ne[j];
-     t->q8 = ty == 8;
++    // (METAL-MOE) a 3-D Q8_0 tensor is a routed-expert tensor: it stays in the file (no row split)
++    t->q8 = ty == 8 && nd != 3;
      if (t->q8) {
        if (nd != 2 || ne[0] % 32) { free(r.buf); return gg_fail(err, "%s: Q8_0 needs 2-D, cols %% 32", t->name); }
-@@ -320,6 +334,11 @@ static int gg_open(GgFile *g, const char *path, char *err) {
+       t->rb = ne[0] / 32 * 34;  // ne[0] = cols (GGUF ne is reversed)
+@@ -320,6 +335,11 @@ static int gg_open(GgFile *g, const char *path, char *err) {
      }
    }
    g->pack_bytes = pos;
@@ -211,7 +214,7 @@ index 69b9ae5..5d38ebe 100755
    for (int L = 0; L < g->nl; L++)
      if (g->lo[L] == UINT64_MAX) return gg_fail(err, "layer %d has no tensors", L);
    return 0;
-@@ -501,6 +520,42 @@ static int gg_threads(void) {
+@@ -501,6 +521,42 @@ static int gg_threads(void) {
    return n > 0 ? n : 8;
  }
  
@@ -254,7 +257,7 @@ index 69b9ae5..5d38ebe 100755
  // ---------------------------------------------------------------- the effect
  
  #ifdef CID_GGUF_READ
-@@ -521,7 +576,9 @@ static int gguf_close(void) {
+@@ -521,7 +577,9 @@ static int gguf_close(void) {
    pthread_mutex_lock(&gg_mu);
    if (gg_file.fd > 0) close(gg_file.fd);
    for (size_t i = 0; gg_file.t && i < gg_file.nt; i++) free(gg_file.t[i].name);

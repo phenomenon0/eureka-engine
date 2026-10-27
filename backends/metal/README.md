@@ -247,9 +247,55 @@ Checked on the M3 Ultra, 2026-10-26 (receipts are not in this repository):
 - Decode: 0.8B about 5 ms a token, 2B 6, 4B 10, 9B 14 (both builds).
 
 Not done: f16 KV; head_dim 128 or SSM state 64; rope base and eps as kernel
-arguments; the fast chunk at other GQA ratios; the 35B MoE past 2^17. The
+arguments; the fast chunk at other GQA ratios. The
 `VISION=1` image rows are placed by the legacy reserve only, so a vision run
-needs a legacy shape at 2^17 slots or fewer.
+needs a legacy shape at 2^17 slots or fewer. The registered 35B pack's own arm
+stays at 2^17; any MoE GGUF takes the general MoE path below, which has the
+dense range.
+
+## Any MoE
+
+The default build also applies `cc/metal-moe-cc.patch` and
+`engine/metal-moe-engine.patch` (emitted C `a20c8ee2…`). `LLB_METAL_ANY=1`
+stops before them (the any-shape build, `00979448`); `VISION=1` does not take
+them. They run any `qwen35moe` GGUF on the generic pass:
+
+- **Sidecar.** `gguf2pack MODEL.gguf --sidecar-only DIR` takes a `qwen35moe`
+  GGUF: `manifest.json` (config `"experts": "gguf"`, the expert and shared
+  widths) and `table.bin`, whose rows also carry the router and shared gate
+  (words 21, 22) and the MoE words (24–29: a magic, `expert_count`,
+  `expert_used_count`, `expert_feed_forward_length`,
+  `expert_shared_feed_forward_length`, a fused `ffn_gate_up_exps`). NextN
+  (MTP) blocks are dropped. Run it as a dense model: `LLB_GGUF=MODEL.gguf`.
+- **Shapes.** Any expert count, top-k, expert and shared width (multiples of
+  32; of 256 for a K-quant row), separate or fused gate/up experts, and the
+  dense trunk's range (layers, d_model, heads). The routing kernel loops over
+  the experts and the top-k; the MoE scratch is its own buffer, sized from
+  the four words. Experts: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K. Trunk:
+  Q8_0 and K-quant matrices, F32 vectors, an F32 router.
+- **Experts.** They never enter the heap. The engine maps the GGUF read-only
+  and gives each expert tensor as chunks of no-copy buffers, each within the
+  device's largest buffer; the kernels reach a chunk through a table of GPU
+  addresses (offsets are 64-bit). When the experts and the heap do not fit
+  the GPU's working set (`recommendedMaxWorkingSetSize`), the engine streams
+  instead: per layer it runs the routing, reads the k chosen ids, copies only
+  those experts from the map into a staging buffer, and goes on. Both modes
+  give the same bits. `LLB_MX_SPLIT=N` forces N experts a chunk and
+  `LLB_MX_STREAM=1` forces streaming (tests). `LLB_MX_DUMP=FILE` writes each
+  layer's FFN input, output and routing for the float64 oracle in
+  `reports/metal-moe/`.
+- **Arithmetic** (llama.cpp's order): router `ffn_gate_inp · x`, softmax over
+  every expert, top-k (ties to the lowest id), the k weights renormalized,
+  no weight scale; expert `down(silu(gate · x) * (up · x))`, summed in rank
+  order; the shared expert's SwiGLU times `sigmoid(ffn_gate_inp_shexp · x)`,
+  added last. Not byte-exact to anything: a numerics-changing path.
+- **Context.** The dense path's: up to 2^27 slots, bounded by the largest
+  buffer (`--ctx C`, `@FILE`). Prefill is exact, one token at a time: there
+  is no MoE fast chunk, and `--fastpf` is ignored for these models.
+
+Checked on the M3 Ultra, 2026-10-26 (receipts: `reports/metal-moe/`):
+
+@@RESULTS@@
 
 ## Gaps
 
