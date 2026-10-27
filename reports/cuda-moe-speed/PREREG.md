@@ -109,3 +109,16 @@ Q4_K_M. Its Q8_0 file is 6.9 GB, under the 10 GB house limit.
 - **T3:** on S35 Q4_K_M, candidate host ≥ 1.2x base host, and candidate stream ≥ 1.5x base stream.
 - **T4 (no regression):** on both 4-layer files, the candidate device, host and stream are each ≥ the base's.
 - Prefill is information only: engine vs llama.cpp pp512, base vs candidate.
+
+## Amendment 1 — 2026-10-27, after speed round 1, before rounds 2 and 3 were scored
+
+Disclosed as post-hoc. It fixes a defect in the measuring instrument; no threshold changes. In round 1, the
+`stepus` line at pos 1 holds the one-time expert load: `llb_moe_load` runs inside the first MoE step.
+- On S35 Q4_K_M that line is 0.42–0.43 s, for base and candidate alike.
+- On S35x8, read from the second disk, it is 80 s.
+
+The candidate's pos 2 also holds its one-time CUDA-graph instantiation (5.3 ms against a steady 1.4 ms). The
+frozen prefill figure, the sum over 1 ≤ pos ≤ 511, therefore measured load time, not prefill.
+
+Amended prefill figure: tok/s = 509e6 / (the sum of the `stepus` lines with 3 ≤ pos ≤ 511). The decode figure
+(pos ≥ 12) and every other definition are unchanged. Prefill was information only, so no verdict depends on it.
