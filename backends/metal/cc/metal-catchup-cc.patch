@@ -1,0 +1,1237 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -12276,6 +12276,25 @@
+   f27_attn_g<4, 512>(C, S, A, tg, sg, l, ssh, dsh);
+ }
+ 
++// (METAL-CATCHUP) GQA 8 (the 35B-A3B: 16 q heads over 2 kv heads), kv rows of 512 or 1024 floats
++kernel void llb_f8_attn_k512(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant FAttArgs& A [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
++  ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort l [[thread_index_in_simdgroup]]) {
++  threadgroup float ssh[8][8 * 32];
++  threadgroup float dsh[8][64];
++  f27_attn_g<8, 512>(C, S, A, tg, sg, l, ssh, dsh);
++}
++
++kernel void llb_f8_attn(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant FAttArgs& A [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
++  ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort l [[thread_index_in_simdgroup]]) {
++  threadgroup float ssh[8][8 * 32];
++  threadgroup float dsh[8][64];
++  f27_attn_g<8, 1024>(C, S, A, tg, sg, l, ssh, dsh);
++}
++
+ // llb_f27_conv1dt: lane m21's llb_f_conv1dt (K.conv1d 4-tap + SiLU, A.n
+ // channels) with a per-row input table (row's x / h0 / h1 / h2 = in[row + 3],
+ // in[row], in[row + 1], in[row + 2]); w a[0], y a[1] + row s[1]
+@@ -12376,6 +12395,11 @@
+   u32 f[3], fs[3];         // formats (MX_*)
+   u32 rb[3], rbs[3];       // row bytes
+   u32 d, eff, sff, ne, k, mut, mode, pad;   // pad: llb_mx_dn's staging flag
++  u64 sho;                 // (METAL-CATCHUP) W offset of the shared expert's down row values
++  // (METAL-CATCHUP) the fast chunk's MoE FFN (llb_mx_c*): the token blocks (serve address, stride, count, offsets
++  // inside a block), the MoE chunk buffer's regions (u32 / float units)
++  u64 cxb, cgu, cac, cdn;
++  u32 cxs, cnt, ch2, cx1, clg, crt, cdd, cxo, cgc, cgo, cgt, cgn, cgi, cgl, cpad0, cpad1;
+ };
+ 
+ INLINE float mx_hf(device const u8* p) {
+@@ -12658,6 +12682,617 @@
+   }
+ }
+ 
++// ---- (METAL-CATCHUP) the MoE FFN's decode kernels, v2 ---------------------------------------------------------------
++// The same arithmetic (llama.cpp's order of operations per expert; the sums' association differs: numerics-changing,
++// reports/metal-catchup). A row dot is cut into 256-column units; a unit is 8 lanes (lane l & 7), so a simdgroup
++// works 4 units at once (lane group l >> 3) and joins its lanes with one simd_sum. The K-quant units decode with the
++// dense path's fused leaves (kq_fused45 / kq_fused6: one uint4 of quants against 8 float4 of x a lane); Q8_0 (the
++// GGUF's 34-byte blocks and the heap's row-split rows) a 32-column block a lane; F32 / F16 / BF16 through mx_chunk.
++// Every x float4 a lane loads is shared by the R rows it decodes.
++#define MX_GEN 15u
++
++// the v2 kernels' exp: the hardware's precise::exp (the SHIMS #define), not attn_exp's exact float64 emulation
++INLINE float mx2_exp(float x) {
++  return exp(x);
++}
++
++// lane l's x for unit u of a row of format F (xl: the lane's first 16 columns, xh: its other 16)
++template <u32 F>
++INLINE void mx2_ldx(device const float* x, u32 u, u32 l, thread float4* xl, thread float4* xh) {
++  u32 o, oh;
++  if (F == MX_Q4K || F == MX_Q5K) {
++    o = 256 * u + 64 * ((l >> 1) & 3) + 16 * (l & 1);
++    oh = o + 32;
++  } else if (F == MX_Q6K) {
++    const u32 j = l & 7;
++    o = 256 * u + 16 * ((j & 3) + 8 * (j >> 2));
++    oh = o + 64;
++  } else {
++    o = 256 * u + 32 * (l & 7);
++    oh = o + 16;
++  }
++  for (u32 t = 0; t < 4; t++) {
++    xl[t] = *(device const float4*)(x + o + 4 * t);
++    xh[t] = *(device const float4*)(x + oh + 4 * t);
++  }
++}
++
++// lane l's part of unit u of row r (cols columns) against its x (mx2_ldx); 0 past the row's end
++template <u32 F>
++INLINE float mx2_part(device const u8* r, u32 f, u32 cols, u32 u, u32 l, thread const float4* xl,
++  thread const float4* xh) {
++  if (F == MX_Q4K) {
++    device const u8* B = r + (u64)u * 144;
++    const float2 s = kq_fused45<false>(*(device const uint4*)B,
++      *(device const uint4*)(B + 16 + 32 * ((l >> 1) & 3) + 16 * (l & 1)), uint4(0), l, xl, xh);
++    return s.x + s.y;
++  }
++  if (F == MX_Q5K) {
++    device const u8* B = r + (u64)u * 176;
++    const float2 s = kq_fused45<true>(*(device const uint4*)B,
++      *(device const uint4*)(B + 48 + 32 * ((l >> 1) & 3) + 16 * (l & 1)),
++      *(device const uint4*)(B + 16 + 16 * (l & 1)), l, xl, xh);
++    return s.x + s.y;
++  }
++  if (F == MX_Q6K) {
++    device const u8* B = r + (u64)u * 210;
++    const u32 j = l & 7, s = (j & 3) + 8 * (j >> 2);
++    const float2 v = kq_fused6(kq_ld16_a2(B + 16 * j), kq_ld16_a2(B + 128 + 32 * (j >> 2) + 16 * (j & 1)),
++      B[192 + s], B[196 + s], *(device const ushort*)(B + 208), l, xl, xh);
++    return v.x + v.y;
++  }
++  const u32 c = 8 * u + (l & 7);
++  if (c >= cols / 32) {
++    return 0.0f;
++  }
++  if (F == MX_Q8R || F == MX_Q8) {
++    uint4 q0, q1;
++    float d;
++    if (F == MX_Q8R) {
++      q0 = *(device const uint4*)(r + 32 * c);
++      q1 = *(device const uint4*)(r + 32 * c + 16);
++      d = mx_hf(r + cols + 2 * c);
++    } else {
++      q0 = kq_ld16_a2(r + 34 * (u64)c + 2);
++      q1 = kq_ld16_a2(r + 34 * (u64)c + 18);
++      d = mx_hf(r + 34 * (u64)c);
++    }
++    const uint qa[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
++    float a = 0.0f, b = 0.0f;
++    for (u32 t = 0; t < 4; t++) {
++      a += kq_leaf4(float4(as_type<char4>(qa[t])), xl[t]);
++      b += kq_leaf4(float4(as_type<char4>(qa[4 + t])), xh[t]);
++    }
++    return (a + b) * d;
++  }
++  // F32 / F16 / BF16: the generic chunk (x re-read)
++  float xs[32];
++  for (u32 t = 0; t < 4; t++) {
++    xs[4 * t] = xl[t].x; xs[4 * t + 1] = xl[t].y; xs[4 * t + 2] = xl[t].z; xs[4 * t + 3] = xl[t].w;
++    xs[16 + 4 * t] = xh[t].x; xs[17 + 4 * t] = xh[t].y; xs[18 + 4 * t] = xh[t].z; xs[19 + 4 * t] = xh[t].w;
++  }
++  return mx_chunk(r, f, cols, c, (thread const float*)xs - 32 * c);
++}
++
++// 2. the routing, one group (NT = min(1024, ne rounded up to 32) threads): the max and the sum by simd + one
++// threadgroup step each; the top k by rank (expert e's rank = the experts before it in (probability desc, id asc):
++// the k argmax rounds' order, ties to the lowest id) with no reduction rounds; renormalized in rank order (sum clamped
++// at 2^-14); the shared gate's sigmoid. W[rt ..]: ids[k], weights[k], gs. ne <= 4096 (the probabilities in
++// threadgroup memory; the host keeps llb_mx_route past that)
++INLINE void mx2_route(device const float* lg, device uint* ids, device float* wt, u32 ne, u32 k, u32 mut, uint i,
++  uint nt, ushort l, ushort sg, threadgroup float* pv, threadgroup float* red, threadgroup float* tw,
++  threadgroup uint* ti) {
++  const u32 nsg = (nt + 31) / 32;
++  float m = as_type<float>(0xFF800000u);
++  for (u32 e = i; e < ne; e += nt) {
++    m = max(m, lg[e]);
++  }
++  m = simd_max(m);
++  if (l == 0) {
++    red[sg] = m;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  m = red[0];
++  for (u32 s = 1; s < nsg; s++) {
++    m = max(m, red[s]);
++  }
++  float z = 0.0f;
++  for (u32 e = i; e < ne; e += nt) {
++    const float p = mx2_exp(lg[e] - m);
++    pv[e] = p;
++    z += p;
++  }
++  z = simd_sum(z);
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (l == 0) {
++    red[sg] = z;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  z = 0.0f;
++  for (u32 s = 0; s < nsg; s++) {
++    z += red[s];
++  }
++  // the probabilities, padded to whole float4 with -1 (below every probability: never counted)
++  const u32 n4 = (ne + 3) / 4;
++  for (u32 e = i; e < 4 * n4; e += nt) {
++    pv[e] = e < ne ? pv[e] / z : -1.0f;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  threadgroup const float4* p4 = (threadgroup const float4*)pv;
++  for (u32 e = i; e < ne; e += nt) {
++    const float v = pv[e];
++    u32 r0 = 0, r1 = 0, r2 = 0, r3 = 0;
++    for (u32 j4 = 0; j4 < n4; j4++) {
++      const float4 w = p4[j4];
++      const u32 j = 4 * j4;
++      r0 += (w.x > v || (w.x == v && j < e)) ? 1u : 0u;
++      r1 += (w.y > v || (w.y == v && j + 1 < e)) ? 1u : 0u;
++      r2 += (w.z > v || (w.z == v && j + 2 < e)) ? 1u : 0u;
++      r3 += (w.w > v || (w.w == v && j + 3 < e)) ? 1u : 0u;
++    }
++    const u32 r = (r0 + r1) + (r2 + r3);
++    if (r < k) {
++      ti[r] = e;
++      tw[r] = v;
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  float sum = 0.0f;
++  for (u32 s = 0; s < k; s += 1) {
++    sum += tw[s];
++  }
++  sum = max(sum, 6.103515625e-5f);
++  for (u32 s = i; s < k; s += nt) {
++    ids[s] = ti[s];
++    wt[s] = (mut & 1) == 0 ? tw[s] / sum : tw[s];
++  }
++  if (i == 0) {
++    wt[k] = 1.0f / (1.0f + mx2_exp(-lg[ne]));
++  }
++}
++
++kernel void llb_mx_route2(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device float* W [[buffer(4)]], uint i [[thread_position_in_threadgroup]],
++  uint nt [[threads_per_threadgroup]], ushort l [[thread_index_in_simdgroup]],
++  ushort sg [[simdgroup_index_in_threadgroup]]) {
++  threadgroup float pv[4096];
++  threadgroup float red[32];
++  threadgroup float tw[1024];
++  threadgroup uint ti[1024];
++  mx2_route(W + A.lg, (device uint*)(W + A.rt), W + A.rt + A.k, A.ne, A.k, A.mut, i, nt, l, sg, pv, red, tw, ti);
++}
++
++// 3. gate / up / SiLU, R rows a simdgroup: act[row] = silu(gate . x) * (up . x). A.mode 0: the k routed experts (task
++// t: slot t / ceil(eff / R), rows R (t % ..)), expert ids[slot] through the pointer table; mode 1: the shared expert
++// (heap tensors) into xs. Gate and up of one row share every x load.
++template <u32 F, u32 R>
++kernel void llb_mx_gu2(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device const MxPtr* T [[buffer(3)]], device float* W [[buffer(4)]],
++  uint g [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort nsg [[simdgroups_per_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
++  const u32 task = g * nsg + sg;
++  const bool sh = A.mode != 0;
++  const u32 rows = sh ? A.sff : A.eff, nr = (rows + R - 1) / R;
++  const u32 slot = sh ? 0 : task / nr, r0 = (task - slot * nr) * R;
++  if (slot >= (sh ? 1 : A.k)) {
++    return;
++  }
++  device const float* x = (device const float*)sa_f(C, S, A.x);
++  device const u8* gr[R];
++  device const u8* ur[R];
++  u32 fg, fu;
++  if (sh) {
++    fg = A.fs[0]; fu = A.fs[1];
++    for (u32 j = 0; j < R; j++) {
++      const u32 row = min(r0 + j, rows - 1);
++      gr[j] = mx_sa(C, S, A.s[0]) + (u64)row * A.rbs[0];
++      ur[j] = mx_sa(C, S, A.s[1]) + (u64)row * A.rbs[1];
++    }
++  } else {
++    fg = A.f[0]; fu = A.f[1];
++    const u64 e = ((device const uint*)(W + A.rt))[slot];
++    for (u32 j = 0; j < R; j++) {
++      const u32 row = min(r0 + j, rows - 1);
++      gr[j] = mx_row(T, A, 0, e, row);
++      ur[j] = mx_row(T, A, 1, e, row);
++    }
++  }
++  float ga[R], ua[R];
++  for (u32 j = 0; j < R; j++) {
++    ga[j] = 0.0f;
++    ua[j] = 0.0f;
++  }
++  const u32 nu = (A.d + 255) / 256;
++  for (u32 u = l >> 3; u < nu; u += 4) {
++    float4 xl[4], xh[4];
++    mx2_ldx<F>(x, u, l, xl, xh);
++    for (u32 j = 0; j < R; j++) {
++      ga[j] += mx2_part<F>(gr[j], fg, A.d, u, l, xl, xh);
++      ua[j] += mx2_part<F>(ur[j], fu, A.d, u, l, xl, xh);
++    }
++  }
++  for (u32 j = 0; j < R; j++) {
++    const float gv = simd_sum(ga[j]), uv = simd_sum(ua[j]);
++    if (l == 0 && r0 + j < rows) {
++      W[sh ? A.xs + r0 + j : A.act + (u64)slot * A.eff + r0 + j] = (gv / (1.0f + mx2_exp(-gv))) * uv;
++    }
++  }
++}
++
++// 4. down, R output rows a simdgroup. A.mode 1: the shared expert, W[sho + row] = shared down . xs. A.mode 0: out[row]
++// = sum over the k slots of w_s (down_s . act_s) + gs W[sho + row]; the k slots' units are one stream (slot s, unit
++// u), lane group l >> 3 taking every fourth
++template <u32 F, u32 R>
++kernel void llb_mx_dn2(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device const MxPtr* T [[buffer(3)]], device float* W [[buffer(4)]],
++  uint g [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort nsg [[simdgroups_per_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
++  const u32 r0 = (g * nsg + sg) * R;
++  if (r0 >= A.d) {
++    return;
++  }
++  float acc[R];
++  for (u32 j = 0; j < R; j++) {
++    acc[j] = 0.0f;
++  }
++  const u64 sho = A.sho;
++  if (A.mode != 0) {
++    const u32 nu = (A.sff + 255) / 256;
++    device const float* x = W + A.xs;
++    for (u32 u = l >> 3; u < nu; u += 4) {
++      float4 xl[4], xh[4];
++      mx2_ldx<F>(x, u, l, xl, xh);
++      for (u32 j = 0; j < R; j++) {
++        acc[j] += mx2_part<F>(mx_sa(C, S, A.s[2]) + (u64)min(r0 + j, A.d - 1) * A.rbs[2], A.fs[2], A.sff, u, l, xl, xh);
++      }
++    }
++    for (u32 j = 0; j < R; j++) {
++      const float v = simd_sum(acc[j]);
++      if (l == 0 && r0 + j < A.d) {
++        W[sho + r0 + j] = v;
++      }
++    }
++    return;
++  }
++  device const uint* ids = (device const uint*)(W + A.rt);
++  device const float* wt = W + A.rt + A.k;
++  const u32 nu = (A.eff + 255) / 256, nt = A.k * nu;
++  for (u32 t = l >> 3; t < nt; t += 4) {
++    const u32 s = t / nu, u = t - s * nu;
++    float4 xl[4], xh[4];
++    mx2_ldx<F>(W + A.act + (u64)s * A.eff, u, l, xl, xh);
++    const float w = wt[s];
++    const u64 e = ids[s];
++    for (u32 j = 0; j < R; j++) {
++      acc[j] += w * mx2_part<F>(mx_row(T, A, 2, e, min(r0 + j, A.d - 1)), A.f[2], A.eff, u, l, xl, xh);
++    }
++  }
++  for (u32 j = 0; j < R; j++) {
++    const float v = simd_sum(acc[j]);
++    if (l == 0 && r0 + j < A.d) {
++      sa_f(C, S, A.out)[r0 + j] = v + wt[A.k] * W[sho + r0 + j];
++    }
++  }
++}
++
++#define MX2_INST(F, R) \
++  template [[host_name("llb_mx_gu2_f" #F "_r" #R)]] kernel void llb_mx_gu2<F, R>(device u8*, device u8*, \
++    constant MxArgs&, device const MxPtr*, device float*, uint, ushort, ushort, ushort); \
++  template [[host_name("llb_mx_dn2_f" #F "_r" #R)]] kernel void llb_mx_dn2<F, R>(device u8*, device u8*, \
++    constant MxArgs&, device const MxPtr*, device float*, uint, ushort, ushort, ushort);
++MX2_INST(3, 2) MX2_INST(4, 2) MX2_INST(5, 2) MX2_INST(6, 2) MX2_INST(7, 2) MX2_INST(15, 2)
++
++// 5. (METAL-CATCHUP) the trunk's GEMVs of a MoE model (the dense models keep their bit-exact bodies): y = W x, R rows a
++// simdgroup on the same 256-column units and leaves (W: a heap matrix, Q8_0 row-split or a K-quant; F32 through the
++// generic chunk). Serve addresses (sa_f), as the MoE kernels.
++struct MxGv {
++  u64 w, x, y;
++  u32 rb, cols, n, f;
++};
++template <u32 F, u32 R>
++kernel void llb_mx_gv(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]], constant MxGv& A [[buffer(2)]],
++  uint g [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
++  ushort nsg [[simdgroups_per_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
++  const u32 r0 = (g * nsg + sg) * R;
++  if (r0 >= A.n) {
++    return;
++  }
++  device const float* x = (device const float*)sa_f(C, S, A.x);
++  device const u8* w = mx_sa(C, S, A.w);
++  device const u8* rw[R];
++  float acc[R];
++  for (u32 j = 0; j < R; j++) {
++    rw[j] = w + (u64)min(r0 + j, A.n - 1) * A.rb;
++    acc[j] = 0.0f;
++  }
++  const u32 nu = (A.cols + 255) / 256;
++  for (u32 u = l >> 3; u < nu; u += 4) {
++    float4 xl[4], xh[4];
++    mx2_ldx<F>(x, u, l, xl, xh);
++    for (u32 j = 0; j < R; j++) {
++      acc[j] += mx2_part<F>(rw[j], A.f, A.cols, u, l, xl, xh);
++    }
++  }
++  device float* y = sa_f(C, S, A.y);
++  for (u32 j = 0; j < R; j++) {
++    const float v = simd_sum(acc[j]);
++    if (l == 0 && r0 + j < A.n) {
++      y[r0 + j] = v;
++    }
++  }
++}
++#define MXGV_INST(F, R) \
++  template [[host_name("llb_mx_gv_f" #F "_r" #R)]] kernel void llb_mx_gv<F, R>(device u8*, device u8*, \
++    constant MxGv&, uint, ushort, ushort, ushort);
++MXGV_INST(4, 4) MXGV_INST(5, 4) MXGV_INST(6, 4) MXGV_INST(7, 4) MXGV_INST(15, 4)
++
++// ---- (METAL-CATCHUP) the MoE FFN of the fast prefill chunk (nt tokens a layer) ---------------------------------------
++// Token t's f27 block at A.cxb + t A.cxs floats holds its h2 / x1 (the FFN input and the residual), its router logits
++// (ne + 1: the shared gate's last), its route (ids k, weights k, gs) and the shared expert's output; the chunk's MoE
++// buffer (buffer 5) the grouping (counts, offsets, the tile list, the entry list) and the routed rows: GU [q][2 eff]
++// (gate | up), ACT [q][eff], DN [q][d], q = t k + slot. The routed GEMMs are f27_mm's tiles (64 weight rows x 32
++// entries, f32 operands, simdgroup MMA) over each expert's entries (gather by expert); numerics-changing.
++#define MXC_TT 32u
++
++INLINE device float* mxc_blk(device u8* C, device u8* S, constant MxArgs& A, u32 t) {
++  return sa_f(C, S, A.cxb) + (u64)t * A.cxs;
++}
++
++// 1. the router and the shared gate for 8 tokens a simdgroup row: lg[row] = w_row . h2 (F32)
++kernel void llb_mx_crdot(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], uint2 g [[threadgroup_position_in_grid]],
++  ushort sg [[simdgroup_index_in_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
++  const u32 row = g.x * 4 + sg, t0 = g.y * 8;
++  if (row > A.ne || t0 >= A.cnt) {
++    return;
++  }
++  const u32 nr = A.cnt - t0 < 8 ? A.cnt - t0 : 8;
++  device const float* w = row < A.ne ? (device const float*)mx_sa(C, S, A.wr) + (u64)row * A.d
++    : (device const float*)mx_sa(C, S, A.wrs);
++  device const float* xb = mxc_blk(C, S, A, t0) + A.ch2;
++  float acc[8];
++  for (u32 j = 0; j < 8; j++) {
++    acc[j] = 0.0f;
++  }
++  for (u32 c = 4 * l; c < A.d; c += 128) {
++    const float4 wv = *(device const float4*)(w + c);
++    for (u32 j = 0; j < 8; j++) {
++      if (j < nr) {
++        acc[j] += dot(wv, *(device const float4*)(xb + (u64)j * A.cxs + c));
++      }
++    }
++  }
++  for (u32 j = 0; j < 8; j++) {
++    const float v = simd_sum(acc[j]);
++    if (l == 0 && j < nr) {
++      mxc_blk(C, S, A, t0 + j)[A.clg + row] = v;
++    }
++  }
++}
++
++// 2. the routing of token g (llb_mx_route2's body on the token's block)
++kernel void llb_mx_croute(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], uint g [[threadgroup_position_in_grid]],
++  uint i [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]],
++  ushort l [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++  threadgroup float pv[4096];
++  threadgroup float red[32];
++  threadgroup float tw[1024];
++  threadgroup uint ti[1024];
++  device float* b = mxc_blk(C, S, A, g);
++  mx2_route(b + A.clg, (device uint*)(b + A.crt), b + A.crt + A.k, A.ne, A.k, A.mut, i, nt, l, sg, pv, red, tw, ti);
++}
++
++// 3. the grouping, one group of 1024: per expert its entries q (in q order), their offsets, and the tiles of <= MXC_TT
++// entries (expert, first position, count); G[cnt ..] counts, G[off ..] offsets, G[nti] the tile count, G[til ..] the
++// tiles, G[lst ..] the entries
++kernel void llb_mx_cgroup(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device u32* G [[buffer(5)]], uint i [[thread_position_in_threadgroup]]) {
++  threadgroup ushort ib[8192];
++  const u32 nq = A.cnt * A.k;
++  for (u32 q = i; q < nq; q += 1024) {
++    ib[q] = (ushort)((device const uint*)(mxc_blk(C, S, A, q / A.k) + A.crt))[q % A.k];
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  for (u32 e = i; e < A.ne; e += 1024) {
++    u32 c = 0;
++    for (u32 q = 0; q < nq; q++) {
++      c += ib[q] == e ? 1u : 0u;
++    }
++    G[A.cgc + e] = c;
++  }
++  threadgroup_barrier(mem_flags::mem_device);
++  if (i == 0) {
++    u32 o = 0, t = 0;
++    for (u32 e = 0; e < A.ne; e++) {
++      const u32 c = G[A.cgc + e];
++      G[A.cgo + e] = o;
++      G[A.cgt + e] = t;
++      o += c;
++      t += (c + MXC_TT - 1) / MXC_TT;
++    }
++    G[A.cgn] = t;
++  }
++  threadgroup_barrier(mem_flags::mem_device);
++  for (u32 e = i; e < A.ne; e += 1024) {
++    const u32 c = G[A.cgc + e], o = G[A.cgo + e], t0 = G[A.cgt + e];
++    u32 p = o;
++    for (u32 q = 0; q < nq && p < o + c; q++) {
++      if (ib[q] == e) {
++        G[A.cgl + p] = q;
++        p += 1;
++      }
++    }
++    for (u32 j = 0; MXC_TT * j < c; j++) {
++      device u32* tl = G + A.cgi + 3 * (t0 + j);
++      tl[0] = e;
++      tl[1] = o + MXC_TT * j;
++      tl[2] = c - MXC_TT * j < MXC_TT ? c - MXC_TT * j : MXC_TT;
++    }
++  }
++}
++
++// 4. the grouped expert GEMM (f27_mm's tile, gathered): tile tg.x of the list (expert e, entries p0 .. p0 + n), weight
++// rows 64 tg.y ..: A.mode 0: gate | up (2 eff rows: gate's, then up's) against the entries' tokens' h2 into GU[q];
++// A.mode 1: down (d rows) against ACT[q] into DN[q]. QT: 8 Q8_0 (GGUF blocks), 4 Q4_K, 5 Q5_K, 6 Q6_K
++template <short QT>
++INLINE void mxc_mm(device u8* C, device u8* S, constant MxArgs& A, device const MxPtr* T, device float* CB,
++  uint3 tg, ushort ti, ushort sg, threadgroup float* shm) {
++  device const u32* G = (device const u32*)CB;
++  if (tg.x >= G[A.cgn]) {
++    return;
++  }
++  device const u32* tl = G + A.cgi + 3 * tg.x;
++  const u32 e = tl[0], p0 = tl[1], n = tl[2];
++  threadgroup float* sa = shm;
++  threadgroup float* sb = shm + 2048;
++  const bool dn = A.mode != 0;
++  const int M = dn ? (int)A.d : 2 * (int)A.eff;
++  const u32 K = dn ? A.eff : A.d;
++  const int r0 = tg.y * 64;
++  const short nr0 = M - r0 < 64 ? (short)(M - r0) : 64;
++  const short nr1 = (short)n;
++  const short lr0 = (short)(ti / 2) < nr0 ? (short)(ti / 2) : nr0 - 1;
++  const short il0 = ti % 2;
++  const u32 rr = (u32)(r0 + lr0);
++  device const u8* wr = dn ? mx_row(T, A, 2, e, rr) : rr < A.eff ? mx_row(T, A, 0, e, rr) : mx_row(T, A, 1, e, rr - A.eff);
++  const short lr1 = (short)(ti / 4) < nr1 ? (short)(ti / 4) : nr1 - 1;
++  const short ix = 8 * (ti % 4);
++  const u32 q1 = G[A.cgl + p0 + lr1];
++  device const float* xp = (dn ? CB + A.cac + (u64)q1 * A.eff : mxc_blk(C, S, A, q1 / A.k) + A.ch2) + ix;
++  simdgroup_float8x8 ma[4];
++  simdgroup_float8x8 mb[2];
++  simdgroup_float8x8 mc[8];
++  F27_UNROLL (short i = 0; i < 8; i++) {
++    mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
++  }
++  const short sya = (ti / 2) / 8, lxa = (ti / 2) % 8;
++  const short syb = (ti / 4) / 8, lyb = (ti / 4) % 8, sxb = ti % 4;
++  for (uint k = 0; k < K; k += 32) {
++    float v[16];
++    if (QT == 8) {
++      device const u8* bk = wr + (k / 32) * 34;
++      const uint4 qq = kq_ld16_a2(bk + 2 + 16 * il0);
++      const float d = mx_hf(bk);
++      const uint qw[4] = {qq.x, qq.y, qq.z, qq.w};
++      F27_UNROLL (short i = 0; i < 16; i++) {
++        v[i] = (float)as_type<char4>(qw[i / 4])[i % 4] * d;
++      }
++    } else if (QT == 4) {
++      f27_deq4(wr + (k >> 8) * 144, (short)((k & 255) + 16 * il0), v);
++    } else if (QT == 5) {
++      f27_deq5(wr + (k >> 8) * 176, (short)((k & 255) + 16 * il0), v);
++    } else {
++      f27_deq6(wr + (k >> 8) * 210, (short)((k & 255) + 16 * il0), v);
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    F27_UNROLL (short i = 0; i < 16; i++) {
++      const short sx = 2 * il0 + i / 8, ly = i % 8;
++      sa[64 * (8 * sx + sya) + 8 * ly + lxa] = v[i];
++    }
++    *(threadgroup float2x4*)(sb + 64 * (4 * sxb + syb) + 8 * lyb) = *(device const float2x4*)xp;
++    xp += 32;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    threadgroup const float* lsma = sa + 4 * 64 * (sg % 2);
++    threadgroup const float* lsmb = sb + 2 * 64 * (sg / 2);
++    F27_UNROLL (short ik = 0; ik < 4; ik++) {
++      simdgroup_barrier(mem_flags::mem_none);
++      F27_UNROLL (short i = 0; i < 4; i++) {
++        simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
++      }
++      simdgroup_barrier(mem_flags::mem_none);
++      F27_UNROLL (short i = 0; i < 2; i++) {
++        simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
++      }
++      simdgroup_barrier(mem_flags::mem_none);
++      F27_UNROLL (short i = 0; i < 8; i++) {
++        simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
++      }
++      lsma += 8 * 64;
++      lsmb += 4 * 64;
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  threadgroup float* ts = shm + 32 * (sg & 1) + (16 * (sg >> 1)) * 64;
++  F27_UNROLL (short i = 0; i < 8; i++) {
++    simdgroup_store(mc[i], ts + 8 * (i % 4) + 8 * 64 * (i / 4), 64, 0, false);
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  const u64 ys = dn ? A.d : 2 * A.eff;
++  device float* Y = CB + (dn ? A.cdn : A.cgu);
++  for (int x = ti; x < 32 * 64; x += 128) {
++    const short t = x / 64, r = x % 64;
++    if (t < nr1 && r < nr0) {
++      Y[(u64)G[A.cgl + p0 + t] * ys + r0 + r] = shm[x];
++    }
++  }
++}
++
++#define MXC_MM(QT) \
++kernel void llb_mx_cmm##QT(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]], \
++  constant MxArgs& A [[buffer(2)]], device const MxPtr* T [[buffer(3)]], device float* CB [[buffer(5)]], \
++  uint3 tg [[threadgroup_position_in_grid]], ushort ti [[thread_index_in_threadgroup]], \
++  ushort sg [[simdgroup_index_in_threadgroup]]) { \
++  threadgroup float shm[3072]; \
++  mxc_mm<QT>(C, S, A, T, CB, tg, ti, sg, shm); \
++}
++MXC_MM(8) MXC_MM(4) MXC_MM(5) MXC_MM(6)
++
++// 5. ACT[q][j] = silu(GU[q][j]) GU[q][eff + j]
++kernel void llb_mx_csilu(constant MxArgs& A [[buffer(2)]], device float* CB [[buffer(5)]],
++  uint2 p [[thread_position_in_grid]]) {
++  const u32 j = p.x, q = p.y;
++  if (j >= A.eff || q >= A.cnt * A.k) {
++    return;
++  }
++  const float gv = CB[A.cgu + (u64)q * 2 * A.eff + j], uv = CB[A.cgu + (u64)q * 2 * A.eff + A.eff + j];
++  CB[A.cac + (u64)q * A.eff + j] = (gv / (1.0f + mx2_exp(-gv))) * uv;
++}
++
++// 6. x = x1 + sum_s w_s DN[t k + s] + gs (the shared expert's output), token p.y, column p.x
++kernel void llb_mx_ccomb(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device float* CB [[buffer(5)]], uint2 p [[thread_position_in_grid]]) {
++  const u32 r = p.x, t = p.y;
++  if (r >= A.d || t >= A.cnt) {
++    return;
++  }
++  device float* b = mxc_blk(C, S, A, t);
++  device const float* wt = b + A.crt + A.k;
++  float acc = 0.0f;
++  for (u32 s = 0; s < A.k; s++) {
++    acc += wt[s] * CB[A.cdn + ((u64)t * A.k + s) * A.d + r];
++  }
++  const float f = acc + wt[A.k] * b[A.cdd + r];
++  b[A.cxo + r] = b[A.cx1 + r] + f;
++  if (A.cpad0 != 0) {
++    CB[A.cdn + (u64)t * A.k * A.d + r] = f;
++  }
++}
++
++// 7. (LLB_MX_DUMP) layer cpad1's records of the chunk's tokens into D: per token u32 layer, d, k; h2[d]; the FFN output
++// [d]; ids[k]; weights[k], gs (mx_dump's record), token-major within the layer
++kernel void llb_mx_cdump(device u8* C [[buffer(0)]], device u8* S [[buffer(1)]],
++  constant MxArgs& A [[buffer(2)]], device float* CB [[buffer(5)]], device u32* D [[buffer(6)]],
++  uint2 p [[thread_position_in_grid]]) {
++  const u32 r = p.x, t = p.y;
++  if (t >= A.cnt) {
++    return;
++  }
++  const u64 rec = 3 + 2ull * A.d + 2ull * A.k + 1;
++  device u32* o = D + ((u64)A.cpad1 * A.cnt + t) * rec;
++  device const float* b = mxc_blk(C, S, A, t);
++  if (r == 0) {
++    o[0] = A.cpad1; o[1] = A.d; o[2] = A.k;
++  }
++  if (r < A.d) {
++    o[3 + r] = as_type<u32>(b[A.ch2 + r]);
++    o[3 + A.d + r] = as_type<u32>(CB[A.cdn + (u64)t * A.k * A.d + r]);
++  }
++  if (r < 2 * A.k + 1) {
++    o[3 + 2 * A.d + r] = as_type<u32>(b[A.crt + r]);
++  }
++}
++
+ // ---- lane m32 (f35): the 35B-A3B fast chunk's kernels -----------------------------------------------------------
+ // the host's MoeBuf row stride (F35_MBS) is the device's
+ static_assert(sizeof(MoeBuf) == F35_MBS, "f35: MoeBuf row stride");
+@@ -16278,8 +16913,13 @@
+   m28_bar(en);
+ }
+ 
++static bool mx_gv(id<MTLComputeCommandEncoder> en, u32 fm, u64 w, u32 rb, u64 x, u64 y, u32 n);
+ static void m9_gemv(id<MTLComputeCommandEncoder> en, u32 fm, u64 w, u32 rb,
+   u64 x, u64 y, u32 n, u32 d, u32 grid) {
++  // (METAL-CATCHUP) a MoE model's trunk takes the mx_gv bodies (numerics-changing; dense models never reach this)
++  if (mx_gv(en, fm, w, rb, x, y, n)) {
++    return;
++  }
+   if (LLB_FM_KQ(fm)) {
+     m9_kgemv(en, fm, w, rb, x, y, n, d);
+     return;
+@@ -17002,6 +17642,23 @@
+ #define MX_Q5K  6u
+ #define MX_Q6K  7u
+ static id<MTLComputePipelineState> gpu_mx_rdot, gpu_mx_route, gpu_mx_gu, gpu_mx_dn;
++// (METAL-CATCHUP) the v2 decode kernels: the routing, gate / up and down per row format (MX_Q8 .. MX_Q6K, MX_GEN);
++// LLB_MX_V1=1 keeps the v1 kernels and schedule (the oracle for the scheduling-only changes)
++#define MX_GEN 15u
++static id<MTLComputePipelineState> gpu_mx_route2, gpu_mx_gu2[16], gpu_mx_dn2[16];
++static bool mx_v1;
++// (METAL-CATCHUP) the trunk GEMVs of a MoE model (mx_gv): on during its layers unless LLB_MX_V1 or LLB_MX_TRUNK=0
++static id<MTLComputePipelineState> gpu_mx_gv[16];
++static bool mx_tg;
++// (METAL-CATCHUP) the fast chunk's MoE FFN (mx_cffn): pipelines, its buffer (entries a tile: MXC_TT)
++#define MXC_TT 32u
++static id<MTLComputePipelineState> gpu_mx_crdot, gpu_mx_croute, gpu_mx_cgroup, gpu_mx_cmm[9], gpu_mx_csilu,
++  gpu_mx_ccomb;
++static id<MTLBuffer> mx_cb;
++static u32 mx_cmt;
++// (LLB_MX_DUMP) the chunk's records (shared; written to the dump file once the chunk's command buffer is done)
++static id<MTLComputePipelineState> gpu_mx_cdump;
++static id<MTLBuffer> mx_cdump;
+ // per layer and routed tensor (gate or gate_up, up, down): the GGUF offset, expert stride, row bytes, format, the
+ // offset inside an expert (the fused up rows), the first pointer-table entry and experts a chunk
+ typedef struct {
+@@ -17028,6 +17685,9 @@
+   u32 f[3], fs[3];
+   u32 rb[3], rbs[3];
+   u32 d, eff, sff, ne, k, mut, mode, pad;
++  u64 sho;
++  u64 cxb, cgu, cac, cdn;
++  u32 cxs, cnt, ch2, cx1, clg, crt, cdd, cxo, cgc, cgo, cgt, cgn, cgi, cgl, cpad0, cpad1;
+ } MxArgs;
+ 
+ int llb_gg_moe_pool(const char *path, int nl, uint64_t *src, uint32_t *ty, uint64_t *bytes, uint64_t *shp,
+@@ -17094,6 +17754,7 @@
+ }
+ 
+ static FILE* mx_dumpf;
++static void mx_prof_print(void);
+ static void mx_close(void) {
+   if (mx_dumpf != NULL) {
+     fclose(mx_dumpf);
+@@ -17115,6 +17776,19 @@
+   mx_scrn = 0;
+   mx_path[0] = 0;
+   gpu_mx_rdot = nil; gpu_mx_route = nil; gpu_mx_gu = nil; gpu_mx_dn = nil;
++  gpu_mx_route2 = nil;
++  for (u32 f = 0; f < 16; f += 1) {
++    gpu_mx_gu2[f] = nil; gpu_mx_dn2[f] = nil; gpu_mx_gv[f] = nil;
++  }
++  mx_tg = false;
++  gpu_mx_crdot = nil; gpu_mx_croute = nil; gpu_mx_cgroup = nil; gpu_mx_csilu = nil; gpu_mx_ccomb = nil;
++  for (u32 f = 0; f < 9; f += 1) {
++    gpu_mx_cmm[f] = nil;
++  }
++  mx_cb = nil;
++  mx_cmt = 0;
++  gpu_mx_cdump = nil;
++  mx_cdump = nil;
+ }
+ 
+ static u64 mx_envu(const char* k) {
+@@ -17137,6 +17811,22 @@
+   gpu_mx_route = warp_pipe("llb_mx_route");
+   gpu_mx_gu    = warp_pipe("llb_mx_gu");
+   gpu_mx_dn    = warp_pipe("llb_mx_dn");
++  mx_v1 = mx_envu("LLB_MX_V1") != 0;
++  if (!mx_v1) {
++    static const u32 fs[6] = { MX_Q8, MX_Q8R, MX_Q4K, MX_Q5K, MX_Q6K, MX_GEN };
++    char nm[64];
++    gpu_mx_route2 = warp_pipe("llb_mx_route2");
++    for (u32 j = 0; j < 6; j += 1) {
++      snprintf(nm, sizeof nm, "llb_mx_gu2_f%u_r2", fs[j]);
++      gpu_mx_gu2[fs[j]] = warp_pipe(nm);
++      snprintf(nm, sizeof nm, "llb_mx_dn2_f%u_r2", fs[j]);
++      gpu_mx_dn2[fs[j]] = warp_pipe(nm);
++      if (fs[j] != MX_Q8) {
++        snprintf(nm, sizeof nm, "llb_mx_gv_f%u_r4", fs[j]);
++        gpu_mx_gv[fs[j]] = warp_pipe(nm);
++      }
++    }
++  }
+   if (gpu_mx_rdot.maxTotalThreadsPerThreadgroup < 128 || gpu_mx_route.maxTotalThreadsPerThreadgroup < 1024
+     || gpu_mx_gu.maxTotalThreadsPerThreadgroup < 256 || gpu_mx_dn.maxTotalThreadsPerThreadgroup < 256) {
+     err_fail("qwen35moe: a MoE kernel's threadgroup does not fit");
+@@ -17219,7 +17909,7 @@
+   u64 lg = 0, rt = ((u64)R->mxe + 1 + 63) & ~63ull, xs = rt + ((3ull * R->mxk + 1 + 63) & ~63ull);
+   u64 act = xs + (((u64)R->f + 63) & ~63ull), an = (u64)R->mxk * R->mxf > R->mxe ? (u64)R->mxk * R->mxf : R->mxe;
+   (void)lg;
+-  mx_scrn = act + an;
++  mx_scrn = act + ((an + 63) & ~63ull) + (((u64)R->d + 63) & ~63ull);
+   mx_scr = [gpu_dev newBufferWithLength:mx_scrn * 4 options:MTLResourceStorageModeShared];
+   if (mx_scr == nil) {
+     err_fail("qwen35moe: cannot allocate the MoE scratch");
+@@ -17346,6 +18036,36 @@
+   m28_bar(en);
+ }
+ 
++// (METAL-CATCHUP) a trunk GEMV of a MoE model on llb_mx_gv (false: not a MoE layer pass, or a format / shape it does
++// not take; the caller's bodies run then)
++typedef struct {
++  u64 w, x, y;
++  u32 rb, cols, n, f;
++} MxGv;
++static bool mx_gv(id<MTLComputeCommandEncoder> en, u32 fm, u64 w, u32 rb, u64 x, u64 y, u32 n) {
++  if (!mx_tg || n == 0) {
++    return false;
++  }
++  u32 F, cols;
++  if (fm == LLB_FM_Q8_0) {
++    F = MX_Q8R; cols = rb / 34 * 32;
++  } else if (LLB_FM_KQ(fm)) {
++    F = mx_hfmt(fm); cols = rb / LLB_FM_SB(fm) * 256;
++  } else {
++    return false;
++  }
++  if (gpu_mx_gv[F] == nil || (x & 15) != 0 || (w & 1) != 0 || (F != MX_Q6K && ((w & 15) != 0 || (rb & 15) != 0))) {
++    return false;
++  }
++  MxGv A = { w, x, y, rb, cols, n, F };
++  [en setBuffer:gpu_scr offset:0 atIndex:1];
++  [en setComputePipelineState:gpu_mx_gv[F]];
++  [en setBytes:&A length:sizeof A atIndex:2];
++  [en dispatchThreadgroups:MTLSizeMake(((n + 3) / 4 + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
++  m28_bar(en);
++  return true;
++}
++
+ // end and run the command buffer so far; a new one goes on (m30_cb / m30_en, as m30_split leaves them)
+ static id<MTLComputeCommandEncoder> mx_cut(void) {
+   [m30_en endEncoding];
+@@ -17362,6 +18082,44 @@
+   return m30_en;
+ }
+ 
++// (METAL-CATCHUP, diagnostic) LLB_MX_PROF=1: the command buffer is cut (committed and waited) after every MoE stage
++// and each piece's GPU time (GPUEndTime - GPUStartTime) summed by stage, printed at exit. The cuts cost about 5 us
++// each and the pairs that run side by side are split: a profile, not the production timing (the bits are the same)
++static int mx_prof = -1;
++static f64 mx_pt[10];
++static u32 mx_pn[10];
++static id<MTLComputeCommandEncoder> mx_pc(id<MTLComputeCommandEncoder> en, int cat) {
++  if (mx_prof < 0) {
++    mx_prof = (int)mx_envu("LLB_MX_PROF");
++    if (mx_prof > 0) {
++      atexit(mx_prof_print);
++    }
++  }
++  if (mx_prof <= 0 || en != m30_en) {
++    return en;
++  }
++  [m30_en endEncoding];
++  [m30_cb commit];
++  [m30_cb waitUntilCompleted];
++  mx_pt[cat] += [m30_cb GPUEndTime] - [m30_cb GPUStartTime];
++  mx_pn[cat] += 1;
++  m30_cb = [gpu_que commandBuffer];
++  m30_en = [m30_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:0];
++  [m30_en setBuffer:gpu_att offset:0 atIndex:1];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:3];
++  return m30_en;
++}
++static void mx_prof_print(void) {
++  static const char* nm[10] = { "trunkL", "addrms", "sgu", "sdn", "gu", "route", "dn", "tail", "trunkF", "rdot" };
++  if (mx_prof > 0) {
++    for (int c = 0; c < 10; c += 1) {
++      fprintf(stderr, "mxprof %-7s n %6u total %9.3f ms mean %8.2f us\n", nm[c], mx_pn[c], mx_pt[c] * 1e3,
++        mx_pn[c] ? mx_pt[c] * 1e6 / mx_pn[c] : 0.0);
++    }
++  }
++}
++
+ // (diagnostic) LLB_MX_DUMP=FILE: after every MoE layer the command buffer is cut and the layer's record appended:
+ // u32 layer, d, k; f32 h2[d] (the FFN input), out[d] (the FFN output before the residual); u32 ids[k]; f32 w[k], gs.
+ // reports/metal-moe's mx_ref.py recomputes each record from the GGUF in float64 (the MoE FFN's own oracle)
+@@ -17416,8 +18174,10 @@
+   const u32 dm = R->d, ne = R->mxe, k = R->mxk, ef = R->mxf, sf = R->f;
+   const u64 x1b = M9_BLK + (u64)R->mxb * 4, h2b = x1b + dm * 4, ffo = h2b + dm * 4;
+   HybArgs HA;
++  en = mx_pc(en, (i + 1) % 4 == 0 ? 8 : 0);
+   m9_args(&HA, x, at, h2b, x1b, b + p[1], 0, 0, dm, 0, 0, 0.0f);
+   m9_go(en, gpu_m_addrms, &HA, 1, 1024);
++  en = mx_pc(en, 1);
+   MxArgs A;
+   memset(&A, 0, sizeof A);
+   A.x = h2b; A.out = ffo;
+@@ -17430,8 +18190,32 @@
+     A.s[r] = b + p[2 + r]; A.fs[r] = mx_hfmt(R->fm[2 + r]); A.rbs[r] = R->rb[2 + r];
+   }
+   A.d = dm; A.eff = ef; A.sff = sf; A.ne = ne; A.k = k; A.mut = mx_mut;
+-  mx_go(en, gpu_mx_rdot, &A, (ne + 1 + 3) / 4, 1, 128);
+-  mx_go(en, gpu_mx_route, &A, 1, 1, 1024);
++  A.sho = A.act + ((((u64)k * ef > ne ? (u64)k * ef : ne) + 63) & ~63ull);
++  // (METAL-CATCHUP) v2: [router | shared gate / up] -> [routing | shared down] -> routed gate / up -> routed down +
++  // the shared down's values; the shared expert's format picks its own bodies (MX_GEN when gate and up differ)
++  u32 fsg = A.fs[0] == A.fs[1] && gpu_mx_gu2[A.fs[0]] != nil ? A.fs[0] : MX_GEN;
++  u32 fsd = gpu_mx_dn2[A.fs[2]] != nil ? A.fs[2] : MX_GEN;
++  u32 frg = A.f[0] == A.f[1] && gpu_mx_gu2[A.f[0]] != nil ? A.f[0] : MX_GEN;
++  u32 frd = gpu_mx_dn2[A.f[2]] != nil ? A.f[2] : MX_GEN;
++  bool v2 = !mx_v1 && ne <= 4096 && k <= 1024;
++  if (v2) {
++    m28_nb = true;
++    mx_go(en, gpu_mx_rdot, &A, (ne + 1 + 3) / 4, 1, 128);
++    en = mx_pc(en, 9);
++    A.mode = 1;
++    mx_go(en, gpu_mx_gu2[fsg], &A, ((sf + 1) / 2 + 3) / 4, 1, 128);
++    en = mx_pc(en, 2);
++    m28_nb = true;
++    mx_go(en, gpu_mx_route2, &A, 1, 1, ne < 1024 ? (ne + 31) / 32 * 32 : 1024);
++    en = mx_pc(en, 5);
++    mx_go(en, gpu_mx_dn2[fsd], &A, ((dm + 1) / 2 + 3) / 4, 1, 128);
++    en = mx_pc(en, 3);
++  } else {
++    mx_go(en, gpu_mx_rdot, &A, (ne + 1 + 3) / 4, 1, 128);
++    en = mx_pc(en, 9);
++    mx_go(en, gpu_mx_route, &A, 1, 1, 1024);
++    en = mx_pc(en, 5);
++  }
+   if (mx_stream) {
+     if (en != m30_en) {
+       err_fail("qwen35moe: the streamed experts need the serve's own encoder");
+@@ -17448,12 +18232,23 @@
+       [en useResource:mx_chunks[c] usage:MTLResourceUsageRead];
+     }
+   }
+-  A.mode = 0;
+-  mx_go(en, gpu_mx_gu, &A, (ef + 7) / 8, k, 256);
+-  A.mode = 1;
+-  mx_go(en, gpu_mx_gu, &A, (sf + 7) / 8, 1, 256);
+-  A.pad = (u64)k * ef + sf <= 8192 ? 1u : 0u;
+-  mx_go(en, gpu_mx_dn, &A, (dm + 7) / 8, 1, 256);
++  if (v2) {
++    A.mode = 0;
++    mx_go(en, gpu_mx_gu2[frg], &A, (k * ((ef + 1) / 2) + 3) / 4, 1, 128);
++    en = mx_pc(en, 4);
++    mx_go(en, gpu_mx_dn2[frd], &A, ((dm + 1) / 2 + 3) / 4, 1, 128);
++    en = mx_pc(en, 6);
++  } else {
++    A.mode = 0;
++    mx_go(en, gpu_mx_gu, &A, (ef + 7) / 8, k, 256);
++    en = mx_pc(en, 4);
++    A.mode = 1;
++    mx_go(en, gpu_mx_gu, &A, (sf + 7) / 8, 1, 256);
++    en = mx_pc(en, 2);
++    A.pad = (u64)k * ef + sf <= 8192 ? 1u : 0u;
++    mx_go(en, gpu_mx_dn, &A, (dm + 7) / 8, 1, 256);
++    en = mx_pc(en, 6);
++  }
+   [en setBuffer:gpu_buf offset:0 atIndex:3];
+   if (getenv("LLB_MX_DUMP") != NULL) {
+     if (en != m30_en) {
+@@ -17471,9 +18266,10 @@
+   if (nw != 0) {
+     m9_args(&HA, x1b, ffo, nh, y, nw, 0, 0, dm, 0, 0, 0.0f);
+     m9_go(en, gpu_m_addrms, &HA, 1, 1024);
+-    return en;
++    return mx_pc(en, 7);
+   }
+   m9_elem(en, 0, x1b, ffo, y, dm);
++  en = mx_pc(en, 7);
+   return en;
+ }
+ 
+@@ -17507,6 +18303,8 @@
+   if (S0->mxe != 0) {
+     mx_pool(S0);
+   }
++  const char* tgv = getenv("LLB_MX_TRUNK");
++  mx_tg = S0->mxe != 0 && !mx_v1 && !(tgv != NULL && strcmp(tgv, "0") == 0);
+   if (dT != pass_dT) {
+     err_fail("warp pass: dT changed");
+   }
+@@ -17580,6 +18378,7 @@
+       en = m30_split();
+     }
+   }
++  mx_tg = false;
+ }
+ 
+ 
+@@ -17596,6 +18395,8 @@
+ static id<MTLComputePipelineState> gpu_f27_mm[4], gpu_f27_gdl, gpu_f27_attn, gpu_f9_attn;
+ // (METAL-ANYSHAPE) the chunk attention over kv rows of 512 floats (2 kv heads): GQA 6 / 4
+ static id<MTLComputePipelineState> gpu_f27_attn2, gpu_f9_attn2;
++// (METAL-CATCHUP) GQA 8 over kv rows of 512 / 1024 floats
++static id<MTLComputePipelineState> gpu_f8_attn2, gpu_f8_attn;
+ static id<MTLComputePipelineState> gpu_f27_conv, gpu_f27_copy, gpu_f27_embt;
+ static id<MTLComputePipelineState> gpu_t27_rnorm, gpu_t27_addrms, gpu_t27_elem;
+ static id<MTLComputePipelineState> gpu_t27_grn, gpu_t27_mida, gpu_t27_midb;
+@@ -17613,6 +18414,8 @@
+   gpu_f27_gdl   = warp_pipe("llb_f27_gdl");
+   gpu_f27_attn  = warp_pipe("llb_f27_attn");
+   gpu_f27_attn2 = warp_pipe("llb_f27_attn_k512");
++  gpu_f8_attn2 = warp_pipe("llb_f8_attn_k512");
++  gpu_f8_attn = warp_pipe("llb_f8_attn");
+   gpu_f9_attn2  = warp_pipe("llb_f9_attn_k512");
+   gpu_f27_conv  = warp_pipe("llb_f27_conv1dt");
+   gpu_f27_copy  = warp_pipe("llb_f27_copy");
+@@ -17822,7 +18625,7 @@
+   const u64 h = F27_W0, qgn = h + d, qg = qgn + 2 * qa, kb = qg + 2 * qa;
+   const u64 kn = kb + kvd, vb = kn + kvd, attn = vb + kvd, gated = attn + qa;
+   HybTArgs T;
+-  if ((R->gen ? (G != 4 && G != 6) || (kvd != 512 && kvd != 1024)
++  if ((R->gen ? (G != 4 && G != 6 && G != 8) || (kvd != 512 && kvd != 1024)
+       : R->nh != 24 && R->nh != 16) || gated + qa > F27_TB || dT < 5) {
+     err_fail("fast chunk: the fulb shape / window does not fit (GQA 4 or 6 over 2 or 4 kv heads)");
+   }
+@@ -17867,7 +18670,7 @@
+   F.qs = (u32)F27_TB;
+   F.pos0 = pos0;
+   F.nt = nt;
+-  f27_go(en, kvd == 512 ? (G == 6 ? gpu_f27_attn2 : gpu_f9_attn2)
++  f27_go(en, G == 8 ? (kvd == 512 ? gpu_f8_attn2 : gpu_f8_attn) : kvd == 512 ? (G == 6 ? gpu_f27_attn2 : gpu_f9_attn2)
+     : R->gen ? (G == 6 ? gpu_f27_attn : gpu_f9_attn) : R->nh == 24 ? gpu_f27_attn : gpu_f9_attn,
+     &F, sizeof F, R->nkv, (nt + 7) / 8, 32 * G);
+   // the output gate: attn * sigmoid(gate), the gate at qg + qa
+@@ -17915,6 +18718,122 @@
+   f27_go(en, gpu_t27_elem, &T, sizeof T, (d + 255) / 256, nt, 256);
+ }
+ 
++// (METAL-CATCHUP) the MoE FFN of the fast chunk (layer i, nt tokens; the x := x1 + ffn of f27_fbn). The token
++// blocks hold x1, h2, the shared expert's chain (gg, uu, aa, dd), the router logits and the route; the routed rows
++// live in mx_cb (sized once for F27_CH tokens). Resident experts only (a streamed pool refuses the chunk by name)
++static void mxc_go(id<MTLComputeCommandEncoder> en, id<MTLComputePipelineState> p, const MxArgs* A, u32 gx, u32 gy,
++  u32 threads, bool bar) {
++  [en setBuffer:gpu_scr offset:0 atIndex:1];
++  [en setBuffer:mx_tab offset:0 atIndex:3];
++  [en setBuffer:mx_cb offset:0 atIndex:5];
++  [en setComputePipelineState:p];
++  [en setBytes:A length:sizeof *A atIndex:2];
++  [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
++  if (bar) {
++    [en memoryBarrierWithScope:MTLBarrierScopeBuffers];
++  }
++}
++static u32 mxc_qt(u32 f) {
++  return f == MX_Q8 ? 8 : f == MX_Q4K ? 4 : f == MX_Q5K ? 5 : f == MX_Q6K ? 6 : 0;
++}
++static void mx_cffn(id<MTLComputeCommandEncoder> en, u32 i, u64 b, const u32* p, const u32* row, const M9Rows* R,
++  u32 nt) {
++  const u64 B = f27_base;
++  const u32 d = R->d, sf = R->f, ne = R->mxe, k = R->mxk, ef = R->mxf;
++  const u64 x1 = F27_W0, h2 = x1 + d, gg = h2 + d, uu = gg + sf, aa = uu + sf, dd = aa + sf;
++  const u64 lg = (dd + d + 3) & ~3ull, rt = (lg + ne + 1 + 3) & ~3ull, end = rt + 2ull * k + 1;
++  const u32 qg = mxc_qt(mx_ten[i * 3].f), qd = mxc_qt(mx_ten[i * 3 + 2].f);
++  if (end > F27_TB || (u64)nt * k > 8192 || ne > 4096 || k > 1024 || mx_stream || qg == 0 || qd == 0
++    || mx_ten[i * 3].f != mx_ten[i * 3 + 1].f || d % 32 != 0 || ef % 32 != 0) {
++    fprintf(stderr, "fast chunk: qwen35moe layer %u: d %u experts %u top %u expert ff %u, formats %u / %u%s\n", i, d,
++      ne, k, ef, mx_ten[i * 3].f, mx_ten[i * 3 + 2].f, mx_stream ? ", streamed experts" : "");
++    err_fail("fast chunk: this MoE (streamed experts, an expert format other than Q8_0 / Q4_K / Q5_K / Q6_K, or a"
++      " block past the chunk's scratch) has no fast prefill: run it with --exactpf");
++  }
++  if (gpu_mx_crdot == nil) {
++    gpu_mx_crdot = warp_pipe("llb_mx_crdot");
++    gpu_mx_croute = warp_pipe("llb_mx_croute");
++    gpu_mx_cgroup = warp_pipe("llb_mx_cgroup");
++    gpu_mx_cmm[8] = warp_pipe("llb_mx_cmm8");
++    gpu_mx_cmm[4] = warp_pipe("llb_mx_cmm4");
++    gpu_mx_cmm[5] = warp_pipe("llb_mx_cmm5");
++    gpu_mx_cmm[6] = warp_pipe("llb_mx_cmm6");
++    gpu_mx_csilu = warp_pipe("llb_mx_csilu");
++    gpu_mx_ccomb = warp_pipe("llb_mx_ccomb");
++  }
++  // the MoE chunk buffer: counts, offsets, tile starts (ne each), the tile count, the tiles (3 words), the entries;
++  // then GU, ACT, DN
++  const u64 nq = (u64)F27_CH * k;
++  const u32 mt = (u32)((nq + MXC_TT - 1) / MXC_TT + ne);
++  const u64 gl = 3ull * ne + 1 + 3ull * mt, gend = (gl + nq + 63) & ~63ull;
++  const u64 cgu = gend, cac = cgu + nq * 2 * ef, cdn = cac + nq * ef, cend = cdn + nq * d;
++  if (mx_cb == nil) {
++    if (cend * 4 > (u64)[gpu_dev maxBufferLength]) {
++      err_fail("fast chunk: the MoE chunk buffer exceeds the device's largest buffer");
++    }
++    mx_cb = [gpu_dev newBufferWithLength:cend * 4
++      options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
++    if (mx_cb == nil) {
++      err_fail("fast chunk: cannot allocate the MoE chunk buffer");
++    }
++    mx_cmt = mt;
++  }
++  HybTArgs T;
++  // x1 = x + a, h2 = rms(x1) post (f27_fbn's first step)
++  f27_targs(&T, d, 0, 0, 0.0f);
++  T.a[0] = B + F27_X * 4; T.s[0] = F27_TS; T.a[1] = B + F27_AO * 4;
++  T.s[1] = F27_TS; T.a[2] = B + h2 * 4; T.s[2] = F27_TS;
++  T.a[3] = B + x1 * 4; T.s[3] = F27_TS; T.a[4] = b + p[1];
++  f27_go(en, gpu_t27_addrms, &T, sizeof T, 1, nt, 1024);
++  MxArgs A;
++  memset(&A, 0, sizeof A);
++  A.wr = b + (row[21] & 0x0fffffffu); A.wrs = b + (row[22] & 0x0fffffffu);
++  for (u32 r = 0; r < 3; r += 1) {
++    const MxTen* X = &mx_ten[i * 3 + r];
++    A.es[r] = X->es; A.wo[r] = X->wo; A.t[r] = X->t; A.epc[r] = X->epc; A.f[r] = X->f; A.rb[r] = X->rb;
++  }
++  A.d = d; A.eff = ef; A.sff = sf; A.ne = ne; A.k = k; A.mut = mx_mut;
++  A.cxb = B; A.cxs = (u32)F27_TB; A.cnt = nt;
++  A.ch2 = (u32)h2; A.cx1 = (u32)x1; A.clg = (u32)lg; A.crt = (u32)rt; A.cdd = (u32)dd; A.cxo = (u32)F27_X;
++  A.cgc = 0; A.cgo = ne; A.cgt = 2 * ne; A.cgn = 3 * ne; A.cgi = 3 * ne + 1; A.cgl = (u32)gl;
++  A.cgu = cgu; A.cac = cac; A.cdn = cdn;
++  for (u32 c = mx_lch[i]; c < mx_lch[i + 1]; c += 1) {
++    [en useResource:mx_chunks[c] usage:MTLResourceUsageRead];
++  }
++  // [router | shared gate / up] -> [routing | shared SiLU] -> [grouping | shared down] -> routed gate / up -> SiLU ->
++  // routed down -> combine
++  mxc_go(en, gpu_mx_crdot, &A, (ne + 1 + 3) / 4, (nt + 7) / 8, 128, false);
++  if (R->fm[2] == R->fm[3] && R->rb[2] == R->rb[3]) {
++    const u64 w2[2] = {b + p[2], b + p[3]};
++    const u64 y2[2] = {B + gg * 4, B + uu * 4};
++    const u32 m2[2] = {sf, sf};
++    f27_mms(en, R->fm[2], 2, w2, y2, m2, R->rb[2], B + h2 * 4, d, nt);
++  } else {
++    f27_mm1(en, R->fm[2], b + p[2], R->rb[2], B + h2 * 4, B + gg * 4, sf, d, nt);
++    f27_mm1(en, R->fm[3], b + p[3], R->rb[3], B + h2 * 4, B + uu * 4, sf, d, nt);
++  }
++  mxc_go(en, gpu_mx_croute, &A, nt, 1, ne < 1024 ? (ne + 31) / 32 * 32 : 1024, false);
++  f27_targs(&T, sf, 3, 0, 0.0f);
++  T.a[0] = B + gg * 4; T.s[0] = F27_TS; T.a[1] = B + uu * 4; T.s[1] = F27_TS;
++  T.a[2] = B + aa * 4; T.s[2] = F27_TS;
++  f27_go(en, gpu_t27_elem, &T, sizeof T, (sf + 255) / 256, nt, 256);
++  mxc_go(en, gpu_mx_cgroup, &A, 1, 1, 1024, false);
++  f27_mm1(en, R->fm[4], b + p[4], R->rb[4], B + aa * 4, B + dd * 4, d, sf, nt);
++  A.mode = 0;
++  mxc_go(en, gpu_mx_cmm[qg], &A, mt, (2 * ef + 63) / 64, 128, true);
++  mxc_go(en, gpu_mx_csilu, &A, (ef + 255) / 256, nt * k, 256, true);
++  A.mode = 1;
++  mxc_go(en, gpu_mx_cmm[qd], &A, mt, (d + 63) / 64, 128, true);
++  A.cpad0 = mx_cdump != nil ? 1u : 0u;
++  mxc_go(en, gpu_mx_ccomb, &A, (d + 255) / 256, nt, 256, true);
++  if (mx_cdump != nil) {
++    A.cpad1 = i;
++    [en setBuffer:mx_cdump offset:0 atIndex:6];
++    mxc_go(en, gpu_mx_cdump, &A, (d + 255) / 256, nt, 256, true);
++  }
++  [en setBuffer:gpu_buf offset:0 atIndex:3];
++}
++
+ // the chunk: nt (1 .. F27_CH) tokens at pos0 .. through all S0->nl layers,
+ // head-less. ids / erow: the tokens and the embedding region (Q4_K rows of
+ // 2880 B); pw / tw / po as m9_pass_run's (the table required)
+@@ -17939,6 +18858,23 @@
+     err_fail("fast chunk: no chunk area / not the 27B or 9B / nt out of range");
+   }
+   f27_pipes();
++  // (METAL-CATCHUP) a MoE model: its experts mapped (as the pass does); LLB_MX_DUMP: the chunk's records
++  if (S0->mxe != 0) {
++    mx_pool(S0);
++    if (getenv("LLB_MX_DUMP") != NULL) {
++      if (en != m30_en) {
++        err_fail("LLB_MX_DUMP: the fast chunk needs the serve's own encoder");
++      }
++      if (gpu_mx_cdump == nil) {
++        gpu_mx_cdump = warp_pipe("llb_mx_cdump");
++      }
++      u64 rec = 3 + 2ull * S0->d + 2ull * S0->mxk + 1;
++      mx_cdump = [gpu_dev newBufferWithLength:(u64)S0->nl * nt * rec * 4 options:MTLResourceStorageModeShared];
++      if (mx_cdump == nil) {
++        err_fail("LLB_MX_DUMP: cannot allocate the chunk's records");
++      }
++    }
++  }
+   // (lane m31) the embedding rows: Q4_K (d / 256 x 144 B) or Q8_0 (d / 32 x 34)
+   const u64 erb = ek4 ? S0->d / 256 * 144 : ek6 ? S0->d / 256 * 210
+     : S0->d / 32 * 34;
+@@ -17992,7 +18928,24 @@
+     } else {
+       f27_linb(en, i, b, tp, &R, nt);
+     }
+-    f27_fbn(en, b, tp, &R, nt);
++    // (METAL-CATCHUP) a MoE layer's FFN: the batched router, routing, gather-by-expert GEMMs and the shared expert
++    if (S0->mxe != 0) {
++      mx_cffn(en, i, b, tp, tw + i * 32, &R, nt);
++    } else {
++      f27_fbn(en, b, tp, &R, nt);
++    }
++  }
++  if (mx_cdump != nil) {
++    mx_cut();
++    if (mx_dumpf == NULL) {
++      mx_dumpf = fopen(getenv("LLB_MX_DUMP"), "ab");
++      if (mx_dumpf == NULL) {
++        err_fail("LLB_MX_DUMP: cannot open the file");
++      }
++    }
++    fwrite([mx_cdump contents], 1, [mx_cdump length], mx_dumpf);
++    fflush(mx_dumpf);
++    mx_cdump = nil;
+   }
+ }
+ 
+@@ -18538,19 +19491,21 @@
+     m9_rows_q8(&S0, rg, rd);
+     // (METAL-ANYSHAPE) the Shape from the row words and the engine's shape words 52 .. 54, as the pass arm;
+     // a generic Shape takes the chunk with its table; dT up to 27
+-    bool moe35 = rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u);
+-    // (METAL-MOE) the general MoE path has no fast chunk (the engine never asks; refused by name if it does)
++    // (METAL-CATCHUP) a table with the MoE words is the general MoE path (the pass arm's rule): its fast chunk runs
++    // the batched MoE FFN (mx_cffn); never the 35B arm's chunk
++    u32  mxe = 0, mxk = 0, mxf = 0, mxs = 0, mxu = 0;
++    bool mxg = false;
+     if (term_tag(H[a + 47]) == TAG_STR) {
+       StrParts q0 = str_peek_ro(e, H[a + 47]);
+       const u32* t0 = (const u32*)((const u8*)(H + term_peek_ro(e, q0.data)) + q0.off);
+-      u32 x0, x1, x2, x3, x4;
+-      if (str_nar(q0) == 2 && ((uintptr_t)t0 & 3) == 0 && q0.len >= 128 && mx_words(t0, &x0, &x1, &x2, &x3, &x4)) {
+-        err_fail("fast chunk: the general MoE path has no fast prefill tier (exact per-token prefill)");
+-      }
++      mxg = str_nar(q0) == 2 && ((uintptr_t)t0 & 3) == 0 && q0.len >= 128
++        && mx_words(t0, &mxe, &mxk, &mxf, &mxs, &mxu);
+     }
++    bool moe35 = rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u) && !mxg;
+     bool ok = fgm == 1 && fdm == 1 && rg % 17 == 0 && rd % 17 == 0 && !moe35
+-      && m9_shape_w(&S0, rg / 17 * 16, rd / 17 * 16, (u32)H[a + 52], (u32)H[a + 53],
++      && m9_shape_w(&S0, rg / 17 * 16, mxg ? 256 : rd / 17 * 16, (u32)H[a + 52], (u32)H[a + 53],
+         (u32)H[a + 54])
++      && (!mxg || ((S0.nl = (u32)H[a + 54]) != 0 && mxs == rd / 17 * 16 && mx_shape(&S0, mxe, mxk, mxf, mxs, mxu)))
+       && (S0.d == 5120 || S0.d == 4096 || S0.d == 2560 || S0.gen)
+       && dT >= 5 && dT <= 27 && nt >= 1 && nt <= F27_CH
+       && (u64)pos + nt <= (1ull << dT) && !M9_ARR(y)
+@@ -18649,6 +19604,16 @@
+             ? fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm) : fm == LLB_FM_F32));
+           sz += has >> f & 1 ? m9_tsz(&R, f) : 0;
+         }
++        // (METAL-CATCHUP) a MoE layer's blob also holds its router and shared gate (the pass arm's check)
++        if (S0.mxe != 0) {
++          u32 wr = tw[i * 32 + 21], wg = tw[i * 32 + 22], o1 = wr & 0x0fffffffu, o2 = wg & 0x0fffffffu;
++          ok = ok && wr >> 28 == LLB_FM_F32 && wg >> 28 == LLB_FM_F32 && o1 % 16 == 0 && o2 % 16 == 0
++            && (u64)o1 + (u64)S0.mxe * S0.d * 4 <= q.len && (u64)o2 + (u64)S0.d * 4 <= q.len;
++          for (u32 w = 24; w < 30; w += 1) {
++            ok = ok && tw[i * 32 + w] == tw[w];
++          }
++          sz += (u64)S0.mxe * S0.d * 4 + (u64)S0.d * 4;
++        }
+         // (tools/metal-27b.patch) the blob is exactly its tensors at this
+         // Shape (the packs have no gaps): a 27B layer read at the 9B's Shape
+         // (or any other mismatch) is refused here, not run
+@@ -18714,7 +19679,7 @@
+     if (!ok || (S0.d == 5120 && tw == NULL)) {
+       // (lane m32, f35) the 35B's Shape (rg q8rw(2048), rd q8rw(512)), refused
+       // above, takes the 35B fast chunk
+-      if (rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u)) {
++      if (rgw == (2176u | 0x50000000u) && rdw == (544u | 0x50000000u) && !mxg) {
+         f35_arm(e, H, en, a, aux);
+         return true;
+       }
+@@ -18726,6 +19691,10 @@
+       m9_bad(aux);
+     }
+     f27_chunk(en, ids, nt, ep, ek4, ek6, c, &S0, pw, po, tw);
++    // (METAL-CATCHUP) LLB_MX_DUMP cuts the serve's command buffer after a MoE chunk
++    if (m30_en != nil) {
++      en = m30_en;
++    }
+     // (ENGINE-DECIDECHUNK, patches/metal-dchunk.patch) the hook's rows
+     f27_rows(e, H, a, en, nt, pos, S0.d);
+     return true;
+@@ -22373,7 +23342,7 @@
+   // (METAL-MOE) the general MoE path's expert pool, scratch and pipelines
+   mx_close();
+   // (METAL-ANYSHAPE) the generic arms' pipelines and the scratch size
+-  gpu_f27_attn2 = nil; gpu_f9_attn2 = nil;
++  gpu_f27_attn2 = nil; gpu_f9_attn2 = nil; gpu_f8_attn2 = nil; gpu_f8_attn = nil;
+   gpu_m_attn6 = nil; gpu_m_a6s = nil; gpu_m_a6m = nil; gpu_m_a6p = nil; gpu_m_a6z = nil;
+   gpu_m_a6v = nil; gpu_m_a6c = nil; gpu_m_copy = nil;
+   for (u32 f = 0; f < 3; f += 1) {

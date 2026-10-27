@@ -1,0 +1,35 @@
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -182,8 +182,9 @@
+ def m.gfast(+m: Model) -> Bool:
+   +nh = (m.sh(m) .&. 255 : U32)
+   +nkv = ((m.sh(m) >> 8n : U32) .&. 255 : U32)
++  # (METAL-CATCHUP) or GQA 8 (the chunk attention llb_f8_attn*: the 35B-A3B's 16 q heads over 2 kv heads)
+   Bool.and(Bool.or(U32.is_eq(nkv, 2), U32.is_eq(nkv, 4)),
+-    Bool.or(U32.is_eq(nh, (nkv * 4 : U32)), U32.is_eq(nh, (nkv * 6 : U32))))
++    Bool.or(Bool.or(U32.is_eq(nh, (nkv * 4 : U32)), U32.is_eq(nh, (nkv * 6 : U32))), U32.is_eq(nh, (nkv * 8 : U32))))
+ 
+ # Resident weight files
+ # ---------------------
+@@ -1541,9 +1542,8 @@
+   # (METAL-ANYSHAPE) or a generic shape whose GQA the chunk attention has (m.gfast), any of the three embeddings
+   +gen = Bool.and(Bool.and(Bool.not(m.leg(m)), m.gfast(m)),
+     Bool.or(Bool.or(U32.is_eq(m.ef(m), 1), U32.is_eq(m.ef(m), 3)), U32.is_eq(m.ef(m), 4)))
+-  # (METAL-MOE) a general-path MoE has no fast chunk: exact per-token prefill (an explicit --fastpf too)
+-  Bool.and(Bool.not(m.gm(m)),
+-    Bool.or(Bool.and(m.leg(m), old), Bool.and(gen, Bool.and(Nat.is_le(m.nl(m), b), U32.is_eq(em, 4294967295)))))
++  # (METAL-CATCHUP) a general-path MoE takes the generic chunk too (the host runs its batched MoE FFN, mx_cffn)
++  Bool.or(Bool.and(m.leg(m), old), Bool.and(gen, Bool.and(Nat.is_le(m.nl(m), b), U32.is_eq(em, 4294967295))))
+ 
+ # (lane m32, f35) the chunk size: the 35B's K (<= 4096); the 27B / 9B at most 512 (their chunk area)
+ # (METAL-ANYSHAPE) the 35B by its d_ff too (the 2B's d_model is also 2048)
+@@ -1565,7 +1565,8 @@
+     Bool.pick(U32, U32.is_eq(m.dm(m), 2560), k4, 0)))
+   # (METAL-ANYSHAPE) a generic shape with a fast chunk: the 4B's rule (512 at nt >= 13)
+   +k = Bool.pick(U32, Bool.and(Bool.not(m.leg(m)), m.gfast(m)), k4, k0)
+-  Bool.pick(U32, Bool.and(Nat.is_le(5n, dT), Bool.not(m.gm(m))), k, 0)
++  # (METAL-CATCHUP) a general-path MoE as a generic shape (512 at nt >= 13)
++  Bool.pick(U32, Nat.is_le(5n, dT), k, 0)
+ 
+ def run.fgen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +steps: U32, +sp: List<&2, U32>,
+   r: U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) -> IO(Unit):

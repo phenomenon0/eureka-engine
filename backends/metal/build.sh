@@ -14,8 +14,11 @@
 #   6. (default) cc/metal-moe-cc.patch + engine/metal-moe-engine.patch: any qwen35moe shape on the general MoE path
 #      (README.md "Any MoE"); LLB_METAL_ANY=1 stops after step 5 (the any-shape build, emitted C 00979448), and so
 #      does VISION=1
+#   7. (default) cc/metal-catchup-cc.patch + engine/metal-catchup-engine.patch: the MoE decode kernels, the MoE fast
+#      prefill chunk, the MoE trunk GEMVs (README.md "Any MoE", reports/metal-catchup); LLB_METAL_MOE1=1 stops after
+#      step 6 (the first MoE build, emitted C a20c8ee2)
 # Env: LLB_ROOT, LLB_BEND (Bend checkout), LLB_OUT (default $LLB_ROOT/build/metal), VISION, LLB_METAL_EMIT_ONLY,
-#      LLB_METAL_BASE, LLB_METAL_ANY.
+#      LLB_METAL_BASE, LLB_METAL_ANY, LLB_METAL_MOE1.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LLB_ROOT=${LLB_ROOT:-$(cd -- "$here/../.." && pwd)}
@@ -31,6 +34,8 @@ EXPECT_C_ANY=009794484c3860bd111eb131a9fc1d73f995a031ee81114847ecfc221b93fb55
 EXPECT_C_ANY_VISION=85c8d3c489dda683d5bbd12b8928e2645a6268efdec6871d3e755fd1d6c56447
 # the same with the general MoE patches too (the default build; VISION=1 does not take them)
 EXPECT_C_MOE=a20c8ee2c4fcf772ad4ae9b8d3130d6f40054b697695fd5a87f3deb2e17e550e
+# the same with the MoE catch-up patches (the default build)
+EXPECT_C_CATCHUP=2355b1f11f249c9067cf0d270871ef63a7ab94843ab1c775772f3705db786ca7
 die() { echo "backends/metal/build.sh: $*" >&2; exit 1; }
 BUN=$(command -v bun || echo "$HOME/.bun/bin/bun"); [ -x "$BUN" ] || die "missing tool: bun"
 (cd "$here" && sha256sum -c --quiet SHA256SUMS 2>/dev/null || shasum -a 256 -c --quiet SHA256SUMS) \
@@ -77,6 +82,12 @@ if [ -z "${LLB_METAL_BASE:-}" ]; then
     patch --batch --silent --fuzz=0 -d "$LLB_OUT/cc" -p1 < "$here/cc/metal-moe-cc.patch" || die "metal-moe-cc"
     patch --batch --silent --fuzz=0 -d "$LLB_OUT/tree" -p1 < "$here/engine/metal-moe-engine.patch" || die "metal-moe-engine"
     expect=$EXPECT_C_MOE
+    if [ -z "${LLB_METAL_MOE1:-}" ]; then
+      patch --batch --silent --fuzz=0 -d "$LLB_OUT/cc" -p1 < "$here/cc/metal-catchup-cc.patch" || die "metal-catchup-cc"
+      patch --batch --silent --fuzz=0 -d "$LLB_OUT/tree" -p1 < "$here/engine/metal-catchup-engine.patch" \
+        || die "metal-catchup-engine"
+      expect=$EXPECT_C_CATCHUP
+    fi
   fi
 fi
 find "$LLB_OUT/cc" "$LLB_OUT/tree" -name '*.orig' -delete
@@ -85,7 +96,8 @@ find "$LLB_OUT/cc" "$LLB_OUT/tree" -name '*.orig' -delete
 got=$( (sha256sum "$LLB_OUT/sys1mac.c" 2>/dev/null || shasum -a 256 "$LLB_OUT/sys1mac.c") | cut -d' ' -f1)
 echo "sys1mac.c $got"
 [ "$got" = "$expect" ] || [ -n "${LLB_METAL_NOHASH:-}" ] || die "emitted C $got != product $expect"
-lab=$([ -n "${LLB_METAL_BASE:-}" ] || { [ -n "${LLB_METAL_ANY:-}${VISION:-}" ] && echo "any-shape " || echo "any-shape + MoE "; })
+lab=$([ -n "${LLB_METAL_BASE:-}" ] || { [ -n "${LLB_METAL_ANY:-}${VISION:-}" ] && echo "any-shape " \
+  || { [ -n "${LLB_METAL_MOE1:-}" ] && echo "any-shape + MoE " || echo "any-shape + MoE + catch-up "; }; })
 echo "emitted C == the Mac product build (${VISION:+VISION=1 }$lab${expect:0:8})"
 
 [ "$(uname -s)" = Darwin ] && [ -z "${LLB_METAL_EMIT_ONLY:-}" ] || exit 0
