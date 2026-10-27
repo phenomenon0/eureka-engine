@@ -102,3 +102,26 @@ are reported for every file. Added:
   stands alone.
 - **Controls:** the garbage mutant must also FAIL G-X (on S512 Q8_0, where X exists), in addition to the
   frozen control on S35 Q4_K_M.
+
+## Amendment 2 — 2026-10-26, scope change from the owner, before the final-candidate gate runs
+
+The owner widened the scope mid-run: any qwen35moe (35B-A3B, 122B-A10B, 397B-A17B), no caps sized to this
+machine, a working path when the experts do not fit in VRAM. The candidate changed: the expert stacks left the
+per-layer Bytes (a 397B layer's stacks exceed the 2 GiB Bytes cap) and are loaded by the host from the GGUF into
+one of three residencies (device VRAM; pinned, device-mapped host RAM; or streamed from the mmapped GGUF, the k
+chosen experts copied per layer and token), chosen from free VRAM / MemAvailable or forced with
+`LLB_MOE_EXPERTS`; `LLB_MOE_VRAM` / `LLB_MOE_RAM` stand in for the free amounts. Expert Q8_0 is read in the
+GGUF block layout. The router's 4,096-expert and 64-top-k caps are gone. Results gathered so far on the earlier
+candidate are kept as information (receipts `gate-v1`); the verdicts are taken on the final candidate:
+
+- Every gate file is regenerated (seeded generator, same commands) and checked identical to the first run by
+  re-running R on prompt 1 (byte-identical JSON required); then R, F and X are reused, C is re-run, and all
+  gates (frozen + amendment 1) are re-scored.
+- **G-MODE (new):** on every gate file, `LLB_MOE_EXPERTS=host` and `=stream`, and auto with
+  `LLB_MOE_VRAM=1000000000 LLB_MOE_RAM=1000000000`, give stdout and every stderr `logits` line byte-identical to
+  the device residency, greedy and TF, all 3 prompts. The kernels and bytes are the same, so any difference is
+  a bug.
+- Controls (mutants) are rebuilt from the final candidate and re-run.
+- One test-file construction note: S512's Q5_K_M was quantized with `--token-embedding-type q6_k` (the CUDA
+  embedding kernels take Q8_0 / Q4_K / Q6_K; a Q5_K embedding is refused for dense files too). No threshold
+  changed.
