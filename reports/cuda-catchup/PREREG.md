@@ -124,3 +124,18 @@ CUDA teacher-forced on the same file, reused as made there.
 - **T4 (no regression):** every candidate exact arm (dense decode x4, MoE device / host / stream decode on S35, MoE
   device on S128F and S35x8, exact prefill on S35) ≥ 0.98x its base.
 - Information: 2B, 4B, 9B ratios to llama.cpp; the marginal per-layer cost; dp4a vs exact; S128F.
+
+## Amendment 1 — 2026-10-27, before any measured candidate run (gate or speed round)
+
+Disclosed: written after development runs of the new tiers, before any gate scoring or speed round. It fixes the
+prefill instrument; no threshold changes.
+- **Why.** In development, `wall_ms(4 copies) − wall_ms(1 copy)` of the fast tier's 512-id prompt gave −67k and
+  +43k tok/s on two back-to-back pairs: the load's run-to-run spread (tens of ms, the GPU shared with resident
+  llama-servers) is larger than three fast prefills (about 50 ms). The frozen figure cannot resolve the fast tier.
+- **Amended prefill figure.** The 4-copy run only (`P , P , P , P`, `--steps 1`, `LLB_STEP_US=1`). The host prints
+  `pfus US` at each prompt's first folded step: the microseconds since the previous prompt's first step, that is one
+  whole prompt's period (its prefill in either tier, the exact last-token step, the prompt's end and the next
+  prompt's state reset). Three lines a run (prompts 1–3, timed from prompts 2–4 starting). Figure: tok/s =
+  512e6 / median(the 3 `pfus` lines). The load, the graph builds and the GPU program compile fall in prompt 1's
+  first step, before the first line. Medians over 3 interleaved rounds as before.
+- **Arm added (information).** The fast tier on S128F Q4_K_M prefill. T3 stays on S35 Q4_K_M.
