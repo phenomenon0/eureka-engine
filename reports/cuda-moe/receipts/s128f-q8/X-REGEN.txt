@@ -1,0 +1,4 @@
+regenerated on /mnt/storage (ntfs-3g) for the X arm, 2026-10-26
+first run:   430531c5d84f369a64174088d0275fc882546672f006a3c69e972b952cface7b s128f-q8.gguf
+regenerated: 430531c5d84f369a64174088d0275fc882546672f006a3c69e972b952cface7b s128f-q8.gguf (identical)
+F32 copy deleted after the X runs

@@ -1,0 +1,4 @@
+regenerated on /mnt/storage (ntfs-3g) for the X arm, 2026-10-26
+first run:   268d1a011e0d959dfd44da055a2922372e1b91b32e513eb94cf2b5526a0e1f8c s35-q8.gguf
+regenerated: 268d1a011e0d959dfd44da055a2922372e1b91b32e513eb94cf2b5526a0e1f8c s35-q8.gguf (identical)
+F32 copy (13,542,611,264 bytes) deleted after the X runs
