@@ -608,17 +608,25 @@ def vec(+wt: Bytes(), +off: U32, +d: Nat) -> Array<F32>:
 # A Data record cannot hold Array fields in this compiler, so a layer's state
 # is a right-nested tuple; the six are tied in one type expression.
 
-def st.new(+dT: Nat) -> Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>:
-  +cd = Nat.add(dT, 10n)
+def st.new(+cd: Nat) -> Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>:
   (Array.new(F32, 13n, 0.0), (Array.new(F32, 13n, 0.0), (Array.new(F32, 13n, 0.0),
     (Array.new(F32, 19n, 0.0), (Array.new(F32, cd, 0.0), Array.new(F32, cd, 0.0))))))
 
-def states(n: Nat, +dT: Nat) -> List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>:
+# cd: the K / V arrays' depth, 2^cd floats each (tools/payload-anyshape.patch: st.kd)
+def states(n: Nat, +cd: Nat) -> List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>:
   match n:
     case 0n:
       Nil{}
     case 1n+p:
-      st.new(dT) <> states(p, dT)
+      st.new(cd) <> states(p, cd)
+
+# the Bend-side K / V depth (tools/payload-anyshape.patch): the split path (--emit, --lpb < layers)
+# reads kc / vc, 2^(dT + 10) floats a layer; the folded step keeps its caches on the host
+# (llb_host.c pass_kv) and never reads these, so one leaf each -- they took 2^(dT + 13) bytes of
+# host memory a layer (6.4 GB at dT 15 on the 0.8B; 48 GB at dT 18)
+def st.kd(+m: Model, +b: Nat, +em: U32, +dT: Nat) -> Nat:
+  Bool.pick(Nat, Bool.and(U32.is_eq(em, 4294967295), (U32.from_nat(b) >= U32.from_nat(m.nl(m)) : U32)),
+    0n, Nat.add(dT, 10n))
 
 # One linear (gated delta net) layer: returns the updated state and the
 # attention block's contribution (Wo y), to be added to x by the caller.
@@ -1158,7 +1166,7 @@ def maxlen(ts: List<&2, U32>, +cur: U32, +best: U32) -> U32:
 @unsafe
 def multi(ps: List<&2, U32>, rest: List<&2, U32>, +m: Model, +b: Nat, +em: U32, +dT: Nat, +st: U32) -> IO(Unit):
   do IO<Unit>:
-    prompt(ps, U32.to_nat((st - 1 : U32)), m, b, em, dT, (1 << dT : U32), 0, 0, states(m.nl(m), dT), st)
+    prompt(ps, U32.to_nat((st - 1 : U32)), m, b, em, dT, (1 << dT : U32), 0, 0, states(m.nl(m), st.kd(m, b, em, dT)), st)
     multi.next(rest, a => z => multi(a, z, m, b, em, dT, st))
 
 # SYS1-DUAL (LLB_SYS1 set, docs/sys1dual-registration.md): one load, then
@@ -1188,7 +1196,7 @@ def srv.one(ok: Bool, ts: List<&2, U32>, +st: U32, +sp: U32, +m: Model, +b: Nat,
   match ok:
     case True{}:
       do IO<Unit>:
-        prompt(ts, U32.to_nat((st - 1 : U32)), m, b, em, dT, (1 << dT : U32), sp, 0, states(m.nl(m), dT), st)
+        prompt(ts, U32.to_nat((st - 1 : U32)), m, b, em, dT, (1 << dT : U32), sp, 0, states(m.nl(m), st.kd(m, b, em, dT)), st)
         S.sys1.done()
         k(Unit{})
     case False{}:

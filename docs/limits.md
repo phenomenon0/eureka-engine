@@ -111,7 +111,9 @@ lines inside the patch.
   27 bits); the practical bound is VRAM for the f32 KV. Attention score
   planes are 2^max(dT, 17) floats a head. The served generate prompt is
   bounded by the KV capacity fixed at launch (`--steps`), not `CLEF_MAX_T`;
-  `decide` keeps its 16,384-token budget. Decode attention is one block a
+  `decide` keeps its 16,384-token budget. The engine no longer allocates
+  unused Bend-side K/V arrays on the folded step (2^(dT + 13) bytes of host
+  memory a layer before; the split path, `--emit` / `--lpb`, still does). Decode attention is one block a
   head, so a token at 100k+ positions is slow; use `LLB_PREFILL=fast` for
   long prompts.
 - **Metal:** up to 2^27 slots (the step word's 27 position bits), bounded by

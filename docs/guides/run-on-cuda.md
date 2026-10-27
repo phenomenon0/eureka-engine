@@ -30,8 +30,11 @@ are the median and the range [min..max] against llama.cpp.
 ### 9B model
 
 The 9B model (Q8_0 and Q4_K_M) builds and decodes from the same binary with
-all flags off. It was not re-timed in `unify1`. Fast prefill does not support
-the 9B model.
+all flags off. It was not re-timed in `unify1`. Other dense Qwen3.5 sizes
+(0.8B, 2B, 4B tested) run from the same binary; see
+[limits](../limits.md). Fast prefill (`LLB_PREFILL=fast`) runs on all of
+them; on a 1,859-token needle prompt it gave the same 16 greedy tokens as
+exact prefill on the 0.8B, 2B, 4B, and 9B Q4_K_M.
 
 ## Before you begin
 
@@ -319,9 +322,13 @@ directories are documented in `tools/check_no_gpl_tts.py`.
 - Only sm_86 on an RTX 3090 (24 GB) is tested. The 27B model needs a 24 GB
   card. The minimum driver, CUDA version, and compute capability are not
   known. Tested: driver 580.119.02, CUDA 13.1.80.
-- Prompts up to 3,011 tokens, plus 64 generated tokens, are tested. An
-  8,192-token prompt does not run with `--gpu 40GB`, with any flag set: the
-  Bend heap span runs out of memory. `integ1` has the same limit.
+- Context is prompt + steps, up to 2^26 positions, bounded by VRAM (the f32
+  KV of the full-attention layers, allocated by position). A 145,115-token
+  prompt ran on the 0.8B with fast prefill (32 s, 0.6 GB host RSS). Before
+  `tools/payload-anyshape.patch` the engine also allocated 2^(dT + 13) bytes a
+  layer of unused Bend-side K/V arrays (6.4 GB host RSS for an 18k prompt on
+  the 0.8B), which is likely what stopped the 8,192-token 27B prompt
+  (`integ1`); that was not re-tested on the 27B.
 - The fast tier (`LLB_Q4_DP4A=9`) is not bit-identical to the exact tier.
   - It is gated on the 27B model.
   - It is gated on the 9B clef-flash Q4_K_S model on the sys1 path, which is
