@@ -1019,6 +1019,72 @@ def run.with(k: U32 -> List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> &
   (t, cs) = r
   k(t, cs)
 
+# The decode run (tools/payload-catchup.patch, reports/cuda-catchup): gen's folded step asks the
+# host for up to n greedy steps in one bang (word 47 bit 28, n in bits 0..27). The host serves c
+# of them back to back (1 <= c <= n), printing the ids and the logits and step lines of all but
+# the last exactly as this loop would; y's word 4 holds c (0, never written: one step). gen then
+# prints the last step's lines and goes on from pos + c. The split path (--emit, --lpb) is one
+# step a bang, as before.
+@unsafe
+def gen.cnt(+t: Array<F32>) -> U32:
+  +c = F32.to_u32(F.got(Array.get(F32, t, 4)))
+  Bool.pick(U32, U32.is_eq(c, 0), 1, c)
+
+@unsafe
+def gen.pair(+t: Array<F32>) -> Tops & U32:
+  (step.tops(t), gen.cnt(t))
+
+@unsafe
+def fwd.gen(+m: Model, +pos: U32, +dT: Nat, +tok: U32, +n: U32) -> Tops & U32:
+  gen.pair(llb.pass_warp!(14n, m.ws(m), Array.new(F32, 12n, 0.0), Array.new(F32, 12n, 0.0),
+    m.lino(m), m.fulo(m), (U32.from_nat(dT) .|. (pos << 5n) : U32), sh.rg(m.sh(m)), sh.rd(m.sh(m)),
+    (268435456 .|. n : U32), U32.from_nat(m.nl(m)), m.ep(m), (tok * U32.and(m.erw(m), 134217727) : U32), m.pk(m), m.nb(m),
+    m.ow(m), m.voc(m), m.orw(m), m.sh(m), m.tb(m), m.erw(m),
+    cf.eps(m.cf(m)), cf.rb(m.cf(m)), cf.rd(m.cf(m)), cf.cap(m.cf(m))))
+
+@unsafe
+def gen.after(+t0: Nat, +pos: U32, r: Tops & U32, st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) ->
+  IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+  (top, +c) = r
+  +last = ((pos + c : U32) - 1 : U32)
+  do IO<U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>>:
+    tok2 : U32 <- step.diag(last, top)
+    t1 : Nat <- IO.now()
+    IO.print_err("step " ++ U32.show(last) ++ " " ++ Nat.show(Nat.sub(t1, t0)))
+    return (tok2, (c, st))
+
+@unsafe
+def step.gfold(+m: Model, +dT: Nat, +pos: U32, +tok: U32, +n: U32, st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) ->
+  IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+  do IO<U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>>:
+    t0 : Nat <- IO.now()
+    gen.after(t0, pos, fwd.gen!(m, pos, dT, tok, n), st)
+
+def gen.one(r: U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) -> IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+  (t, st) = r
+  IO.pure(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, (t, (1, st)))
+
+@unsafe
+def step.gpick(fold: Bool, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +pos: U32, +tok: U32, +n: U32,
+  st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) -> IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+  match fold:
+    case True{}:
+      step.gfold(m, dT, pos, tok, n, st)
+    case False{}:
+      IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, step.split(m, b, em, dT, nT, pos, tok, st), gen.one)
+
+@unsafe
+def step.g(+m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +pos: U32, +tok: U32, st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, +n: U32) ->
+  IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+  step.gpick(Bool.and(U32.is_eq(em, 4294967295), (U32.from_nat(b) >= U32.from_nat(m.nl(m)) : U32)),
+    m, b, em, dT, nT, pos, tok, n, st)
+
+# (the count twice: the steps left and the next position)
+def run.with3(k: U32 -> U32 -> U32 -> List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)> -> IO(Unit), r: U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>) -> IO(Unit):
+  (t, r2) = r
+  (+c, cs) = r2
+  k(t, c, c, cs)
+
 @unsafe
 def gen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +pos: U32, +tok: U32, st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>,
   +steps: U32) -> IO(Unit):
@@ -1026,10 +1092,11 @@ def gen(n: Nat, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32, +pos: U32, +to
     case 0n:
       IO.print(U32.show(tok))
     case 1n+p:
+      +l = U32.from_nat(p)
       do IO<Unit>:
         IO.print(U32.show(tok))
-        IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, tok, st, steps, 0),
-          run.with(t => st2 => gen(p, m, b, em, dT, nT, (pos + 1 : U32), t, st2, steps)))
+        IO.bind(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step.g(m, b, em, dT, nT, pos, tok, st, (l + 1 : U32)),
+          run.with3(t => c1 => c2 => st2 => gen(U32.to_nat(((l + 1 : U32) - c1 : U32)), m, b, em, dT, nT, (pos + c2 : U32), t, st2, steps)))
 
 # the fast prefill tier's defer bit (word 47 bit 30, tools/payload-pf.patch): set on every
 # prompt token with another after it. With LLB_PREFILL=fast the host queues those and answers

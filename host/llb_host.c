@@ -200,7 +200,9 @@ static void llb_hidden_put(u32 pos, u32 width, llb_dptr row) {
 }
 static bool llb_kgemv_res(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n, u32 grid, u64 x1) {
   u32 rb = LLB_FM_RB(fm, cols), cg = cols / 4, d = llb_cdepth(cols);
-  if (!(llb_q4glue & 2) || (fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K) || cg % 256 != 0 || d < 9 || d > 13) {
+  // (reports/cuda-catchup: whole superblocks, cg % 64, the pair body's partial quad; was cg % 256)
+  if (!(llb_q4glue & 2) || (fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K) || cg % 64 != 0 || d < 9 || d > 13
+    || !llb_tuned(fm, cols)) {
     return false;
   }
   if (!LLB_LAUNCH(fm == LLB_FM_Q6_K ? gpu_warp6e : gpu_warpke, grid == 768 ? 984 : grid, 1, 128,
@@ -2733,7 +2735,37 @@ static void llb_pass_init(LlbShape sh, u32 dT, u32 nl) {
     llb_legacy(sh, dT, nl) ? "" : " [generic shape: spec / batch off]");
 }
 
+static void pass_fold(WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, bool dev);
+// LLB_STEP_US (reports/cuda-moe-speed): `stepus POS US` on stderr, the microseconds since the
+// previous folded step began (the whole token period: the Bend loop, the pass and the head);
+// timing only, nothing else changes. The decode run's steps print it too (reports/cuda-catchup)
+static void step_us(u32 pos) {
+  static int on = -1;
+  static struct timespec sp;
+  if (on < 0) {
+    on = getenv("LLB_STEP_US") != NULL;
+  }
+  if (!on) {
+    return;
+  }
+  struct timespec tn;
+  clock_gettime(CLOCK_MONOTONIC, &tn);
+  if (sp.tv_sec != 0) {
+    fprintf(stderr, "stepus %u %lld\n", pos,
+      (long long)(tn.tv_sec - sp.tv_sec) * 1000000 + (tn.tv_nsec - sp.tv_nsec) / 1000);
+  }
+  sp = tn;
+}
+static bool gen_ok(volatile WarpOp* o);
+static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, u32 n);
+
 static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
+  // reports/cuda-catchup: the decode run (pass_mail: fl word 47 bit 28 with the greedy steps
+  // left, o->bsn bit 31 | n); taken off the op first, so every other path sees the plain step
+  u32 gen = o->bsn >> 31 ? o->bsn & 0x7fffffffu : 0;
+  if (gen != 0) {
+    o->bsn = 0;
+  }
   u32 c = o->c, dT = c & 31, pos = c >> 5, s = o->n, k = o->d;
   volatile LlbShape* ms = &gpu_mail->sh;
   LlbShape sh = { ms->d, ms->f, ms->nh, ms->nkv, ms->hd, ms->lkh, ms->lvh, ms->sd };
@@ -2796,33 +2828,99 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
   if (fold && pf_take(o, pos, dT, sh, yp)) {
     return;
   }
-  if (fold && getenv("LLB_STEP_US") != NULL) {
-    // LLB_STEP_US (reports/cuda-moe-speed): `stepus POS US` on stderr, the microseconds since the
-    // previous folded step began (the whole token period: the Bend loop, the pass and the head);
-    // timing only, nothing else changes
-    static struct timespec sp;
-    struct timespec tn;
-    clock_gettime(CLOCK_MONOTONIC, &tn);
-    if (sp.tv_sec != 0) {
-      fprintf(stderr, "stepus %u %lld\n", pos,
-        (long long)(tn.tv_sec - sp.tv_sec) * 1000000 + (tn.tv_nsec - sp.tv_nsec) / 1000);
-    }
-    sp = tn;
+  if (fold) {
+    step_us(pos);
   }
   if (fold) {
-    llb_graph_begin();
-    // the folded step: the token's embedding row into pass_x[0] (o->bb its
-    // format, pass_mail admits Q8_0 and Q4_K; Q6_K the 0.8B's, tools/payload-w1024.patch)
-    u64 er = o->w, x0 = pass_x[0];
-    u32 c4 = sh.d;
-    // (G4 F1, FUS-V46 V5) an <|image_pad|> slot takes its image row instead
-    if (!llb_img_step((u32)((o->w - o->r) / LLB_FM_RB(o->bb, sh.d)), pos, x0, c4)
-      && !LLB_LAUNCH(o->bb == LLB_FM_Q4_K ? gpu_embedk : o->bb == LLB_FM_Q6_K ? gpu_embed6 : gpu_embed, (c4 + 255) / 256, 1, 256, &er, &c4, &x0)) {
+    if (gen >= 2 && gen_ok(o)) {
+      gen_run(o, yp, grid, sh, dT, pos, gen);
+    } else {
+      WarpOp op = *(WarpOp*)o;
+      pass_fold(&op, yp, grid, sh, dT, pos, false);
+    }
+    return;
+  }
+  for (u32 j = 0; j < k; j += 1) {
+    u32  i = s + j;
+    bool full = llb_full(i);
+    pass_layer(i, full, pos, dT, sh);
+    u64 base = gpu_mail->pw[j];
+    u32 p[20];
+    for (u32 f = 0; f < 20; f += 1) {
+      p[f] = gpu_mail->pt[i][f] & 0x0fffffffu;
+    }
+    WarpOp at = {0};
+    at.w = base; at.x = cur; at.brg = o->brg; at.bro = o->bro; at.ban = p[0];
+    if (full) {
+      at.k = pass_kc[i]; at.v = pass_vc[i];
+      at.bq = p[14]; at.bg = p[15]; at.bb = p[16];
+      at.ba = p[17]; at.bsa = p[18]; at.bdt = p[19];
+      at.c = c; at.fm = 1;
+      llb_fulb_run(&at, pass_x[2], grid, gpu_mail->pt[i]);
+    } else {
+      u32 r = pass_r[i];
+      pass_r[i] = r + 1;
+      at.k  = pass_b[i] + (u64)(r % 4) * cv * 4;
+      at.v  = pass_b[i] + (u64)((r + 1) % 4) * cv * 4;
+      at.wn = pass_b[i] + (u64)((r + 2) % 4) * cv * 4;
+      at.qk = pass_b[i] + (u64)((r + 3) % 4) * cv * 4;
+      at.r  = pass_S[i];
+      at.c = p[5]; at.bq = p[6]; at.bg = p[7]; at.bb = p[8]; at.ba = p[9];
+      at.bsa = p[10]; at.bdt = p[11]; at.bcv = p[12]; at.bsn = p[13];
+      llb_linb_run(&at, pass_x[2], grid, gpu_mail->pt[i]);
+    }
+    WarpOp ff = {0};
+    ff.w = base + p[1]; ff.k = base + p[2]; ff.v = base + p[3]; ff.wn = base + p[4];
+    ff.x = cur; ff.r = pass_x[2]; ff.n = sh.d; ff.rb = o->brg; ff.d = o->rb; ff.fm = 1;
+    u64 nxt = j + 1 == k ? yp : pass_x[cur == pass_x[0] ? 1 : 0];
+    if (llb_moe(i)) {  // tools/payload-moeany.patch
+      ff.qk = base;
+      llb_moe_run(&ff, nxt, grid, gpu_mail->pt[i], i);
+    } else {
+      llb_fbn_run(&ff, nxt, grid, gpu_mail->pt[i]);
+    }
+    if (llb_dump && llb_dump_pos >= 0) {
+      llb_dptr hp[2] = { pass_x[2], nxt };
+      u32 hn[2] = { sh.d, sh.d };
+      llb_dump_put("h", pos, -1, i == 0 ? "wb" : "ab", hp, hn, 2);
+      if ((int)pos == llb_dump_pos) {
+        llb_dptr fp[6] = { gpu_blk, gpu_blk + sh.d * 4, gpu_blk + 2 * sh.d * 4,
+          gpu_blk + (2 * sh.d + sh.f) * 4, gpu_blk + (2 * sh.d + 2 * sh.f) * 4, nxt };
+        u32 fn[6] = { sh.d, sh.d, sh.f, sh.f, sh.f, sh.d };
+        llb_dump_put("f", pos, (int)i, "wb", fp, fn, 6);
+      }
+    }
+    cur = nxt;
+  }
+}
+
+// One folded step at pos (o: the op's copy): the embedding row, every layer, rms_final, the head
+// GEMV and llb_amax's four words into yp -- the launches llb_pass_run made inline before
+// reports/cuda-catchup. dev: the decode run's later steps, whose token is the device's previous
+// pick (yp word 1): llb_embt reads it there, so the host queues the step before it knows the id.
+static void pass_fold(WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, bool dev) {
+  u32 s = o->n, k = o->d, c = dT | pos << 5;
+  u32 cv = 2 * sh.lkh * sh.sd + sh.lvh * sh.sd;
+  llb_graph_begin();
+  // the folded step: the token's embedding row into pass_x[0] (o->bb its
+  // format, pass_mail admits Q8_0 and Q4_K; Q6_K the 0.8B's, tools/payload-w1024.patch)
+  u64 er = o->w, x0 = pass_x[0], cur;
+  u32 c4 = sh.d;
+  if (dev) {
+    u64 eb = o->r, ty = yp;
+    u32 rb = LLB_FM_RB(o->bb, sh.d), fm = o->bb;
+    if (!LLB_LAUNCH(gpu_embt, (c4 + 255) / 256, 1, 256, &eb, &rb, &fm, &ty, &c4, &x0)) {
       err_fail("device launch failed");
     }
-    llb_img_seen_row(pos, x0, c4);
-    cur = x0;
+  // (G4 F1, FUS-V46 V5) an <|image_pad|> slot takes its image row instead
+  } else if (!llb_img_step((u32)((o->w - o->r) / LLB_FM_RB(o->bb, sh.d)), pos, x0, c4)
+    && !LLB_LAUNCH(o->bb == LLB_FM_Q4_K ? gpu_embedk : o->bb == LLB_FM_Q6_K ? gpu_embed6 : gpu_embed, (c4 + 255) / 256, 1, 256, &er, &c4, &x0)) {
+    err_fail("device launch failed");
   }
+  if (!dev) {
+    llb_img_seen_row(pos, x0, c4);
+  }
+  cur = x0;
   for (u32 j = 0; j < k; j += 1) {
     u32  i = s + j;
     bool full = llb_full(i);
@@ -2856,7 +2954,7 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
     WarpOp ff = {0};
     ff.w = base + p[1]; ff.k = base + p[2]; ff.v = base + p[3]; ff.wn = base + p[4];
     ff.x = cur; ff.r = pass_x[2]; ff.n = sh.d; ff.rb = o->brg; ff.d = o->rb; ff.fm = 1;
-    u64 nxt = j + 1 == k && !fold ? yp : pass_x[cur == pass_x[0] ? 1 : 0];
+    u64 nxt = pass_x[cur == pass_x[0] ? 1 : 0];
     if (llb_moe(i)) {  // tools/payload-moeany.patch
       ff.qk = base;
       llb_moe_run(&ff, nxt, grid, gpu_mail->pt[i], i);
@@ -2878,32 +2976,129 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
     }
     cur = nxt;
   }
-  if (fold) {
-    // the head bang's chain (kind 14): rms_final -> gpu_headh, the head GEMV
-    // (o->bg its format) into gpu_logit, llb_amax's four words into y
-    u64 wn = o->k, wo = o->v, op2 = gpu_headh, lg = gpu_logit;
-    u32 n4 = sh.d, nh = o->gm, rq = o->bq, cg = o->bq / 17 * 4, dh = llb_cdepth(sh.d);
-    bool q8 = o->bg == LLB_FM_Q8_0 && llb_tuned(LLB_FM_Q8_0, sh.d);
-    if (!LLB_LAUNCH(gpu_rnorm, 1, 1, 1024, &cur, &wn, &op2, &n4)
-      || (q8 && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wo, &rq, &cg, &op2, &lg, &nh, &dh))) {
-      err_fail("device launch failed");
+  // the head bang's chain (kind 14): rms_final -> gpu_headh, the head GEMV
+  // (o->bg its format) into gpu_logit, llb_amax's four words into y
+  u64 wn = o->k, wo = o->v, op2 = gpu_headh, lg = gpu_logit;
+  u32 n4 = sh.d, nh = o->gm, rq = o->bq, cg = o->bq / 17 * 4, dh = llb_cdepth(sh.d);
+  bool q8 = o->bg == LLB_FM_Q8_0 && llb_tuned(LLB_FM_Q8_0, sh.d);
+  if (!LLB_LAUNCH(gpu_rnorm, 1, 1, 1024, &cur, &wn, &op2, &n4)
+    || (q8 && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wo, &rq, &cg, &op2, &lg, &nh, &dh))) {
+    err_fail("device launch failed");
+  }
+  llb_hidden_put(pos, n4, op2);
+  if (!q8) {
+    llb_kgemv(o->bg, wo, n4, op2, lg, nh, grid);
+  }
+  if (!LLB_LAUNCH(gpu_amaxp, AMAX_G, 1, AMAX_T, &lg, &nh, &yp)
+    || !LLB_LAUNCH(gpu_amax, 1, 1, AMAX_G, &lg, &nh, &yp)) {
+    err_fail("device launch failed");
+  }
+  if (smp_on()) {
+    smp_pick(yp, lg, nh, pos, -1);
+  }
+  if (llb_dump) {
+    llb_dptr lgp = lg;
+    llb_dump_put("l", pos, -1, "wb", &lgp, &nh, 1);
+  }
+  llb_graph_end();
+}
+
+// reports/cuda-catchup: the decode run. gen's bang asks for up to n greedy steps (pos, pos + 1,
+// ...); the host serves them back to back -- every step the folded step above, the next one's
+// token the device's pick -- so the Bend loop (its host evaluation, unified-memory page traffic
+// and device interpreter rounds, ~0.8 ms a token) runs once a run instead of once a token. It
+// prints what gen would have printed for every step but the last (stdout: the ids; stderr: the
+// logits and step lines, stdout flushed first as io_errs does), and leaves the last step's four
+// words in y with the count in word 4; gen prints the rest. Only plain greedy decode takes it:
+// any feature that reads or changes the token on the host keeps one step a bang.
+// LLB_GEN=0 turns it off (one step a bang, as before).
+static bool gen_ok(volatile WarpOp* o) {
+  static int env = -1;
+  if (env < 0) {
+    const char* e = getenv("LLB_GEN");
+    env = e == NULL || atoi(e) != 0;
+  }
+  return env && !smp_on() && !gr_on() && spec_k < 0 && !spec_mtp && llb_bx_max() < 2 && !llb_dump
+    && !llb_hidden_path && !llb_img_dump && !llb_img_req && llb_img_state == 1 && !llb_pfx_on()
+    && o->n == 0;
+}
+
+static void gen_line(FILE* f, const char* t, u64 n) {
+  if (fwrite(t, 1, n, f) != n) {
+    err_fail("a short write on a standard stream");
+  }
+}
+
+static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, u32 n) {
+  static float* tp;  // pinned: two steps' four words
+  static CUevent ev[2];
+  if (tp == NULL) {
+    if (cuMemHostAlloc((void**)&tp, 8 * sizeof(float), 0) != CUDA_SUCCESS
+      || cuEventCreate(&ev[0], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS
+      || cuEventCreate(&ev[1], CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+      err_fail("decode run: cannot set up");
     }
-    llb_hidden_put(pos, n4, op2);
-    if (!q8) {
-      llb_kgemv(o->bg, wo, n4, op2, lg, nh, grid);
+  }
+  WarpOp op = *(WarpOp*)o;
+  u32 cnt = n;
+  if (pos + n > pass_cap) {
+    cnt = pass_cap - pos;
+  }
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (u32 s = 0; s <= cnt; s += 1) {
+    if (s < cnt) {
+      if (s > 0) {
+        step_us(pos + s);
+      }
+      llb_gforce = 1;
+      pass_fold(&op, yp, grid, sh, dT, pos + s, s > 0);
+      llb_gforce = 0;
+      if (cuMemcpyDtoHAsync(tp + 4 * (s & 1), yp, 16, NULL) != CUDA_SUCCESS
+        || cuEventRecord(ev[s & 1], NULL) != CUDA_SUCCESS) {
+        err_fail("decode run: cannot queue the pick's copy");
+      }
     }
-    if (!LLB_LAUNCH(gpu_amaxp, AMAX_G, 1, AMAX_T, &lg, &nh, &yp)
-      || !LLB_LAUNCH(gpu_amax, 1, 1, AMAX_G, &lg, &nh, &yp)) {
-      err_fail("device launch failed");
+    if (s == 0) {
+      continue;
     }
-    if (smp_on()) {
-      smp_pick(yp, lg, nh, pos, -1);
+    // step s - 1 is done once its copy is: print it (all but the last step of the run)
+    u32 q = s - 1;
+    if (cuEventSynchronize(ev[q & 1]) != CUDA_SUCCESS) {
+      err_fail("device fault");
     }
-    if (llb_dump) {
-      llb_dptr lgp = lg;
-      llb_dump_put("l", pos, -1, "wb", &lgp, &nh, 1);
+    const float* t = tp + 4 * (q & 1);
+    union { float f; u32 u; } v = { t[0] }, w = { t[2] };
+    bool fin = (v.u & 0x7f800000u) != 0x7f800000u && (w.u & 0x7f800000u) != 0x7f800000u;
+    if (q + 1 == cnt || !fin) {
+      // the last step (or a nonfinite one, which gen's check then reports): its words in y.
+      // A nonfinite step q < cnt - 1 has step q + 1 queued behind it; y gets q's words back
+      if (q + 1 != cnt) {
+        if (cuCtxSynchronize() != CUDA_SUCCESS || cuMemcpyHtoD(yp, t, 16) != CUDA_SUCCESS) {
+          err_fail("device fault");
+        }
+      }
+      union { float f; u32 u; } cf = { (float)(q + 1) };
+      if (cuMemsetD32Async(yp + 16, cf.u, 1, NULL) != CUDA_SUCCESS) {
+        err_fail("decode run: cannot set the count");
+      }
+      return;
     }
-    llb_graph_end();
+    char b[160];
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long long ms = ((long long)t1.tv_sec * 1000 + t1.tv_nsec / 1000000) - ((long long)t0.tv_sec * 1000 + t0.tv_nsec / 1000000);
+    t0 = t1;
+    u32 id = (u32)t[1], j = (u32)t[3];
+    if (fflush(stdout) != 0) {
+      err_fail("a short write on a standard stream");
+    }
+    int m = snprintf(b, sizeof b, "logits %u %u %u %u %u\n", pos + q, id, v.u, j, w.u);
+    gen_line(stderr, b, (u64)m);
+    m = snprintf(b, sizeof b, "step %u %lld\n", pos + q, ms);
+    gen_line(stderr, b, (u64)m);
+    m = snprintf(b, sizeof b, "%u\n", id);
+    gen_line(stdout, b, (u64)m);
   }
 }
 #endif

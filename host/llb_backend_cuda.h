@@ -37,13 +37,16 @@ static void llb_graph_fail(const char* m) {
   exit(1);
 }
 
+// reports/cuda-catchup: the decode run (llb_host.c gen_run) records its steps as graphs too,
+// unless LLB_GRAPH is set (LLB_GRAPH=0: plain launches there as well)
+static int llb_gforce;
 static bool llb_graph_on(void) {
   static int v = -1;
   if (v < 0) {
     const char* s = getenv("LLB_GRAPH");
     v = s != NULL && s[0] == '1';
   }
-  return v;
+  return v || (llb_gforce && getenv("LLB_GRAPH") == NULL);
 }
 
 // a kernel's param sizes, cached (cuFuncGetParamInfo per arg per launch was ~1 ms a spec cycle);
