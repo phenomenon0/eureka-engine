@@ -67,3 +67,4 @@ repository.
 | [`pack35-final.md`](../reports/pack35-final.md) | 35B-A3B pack conversion. |
 | [`e5-08b/REPORT.md`](../reports/e5-08b/REPORT.md) | Server batching on the 0.8B. |
 | [`webgpu-any-shape/REPORT.md`](../reports/webgpu-any-shape/REPORT.md) | WebGPU trunk on any Qwen3.5 model, format, and context length. |
+| [`cuda-moe/REPORT.md`](../reports/cuda-moe/REPORT.md) | CUDA on any Qwen3.5 MoE, with experts in VRAM, host RAM, or streamed. |
