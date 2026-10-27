@@ -670,7 +670,7 @@
    if (LLB_FM_KQ(fm)) {
      m9_kgemv(en, fm, w, rb, x, y, n, d);
      return;
-@@ -17002,6 +17642,23 @@
+@@ -17002,6 +17642,25 @@
  #define MX_Q5K  6u
  #define MX_Q6K  7u
  static id<MTLComputePipelineState> gpu_mx_rdot, gpu_mx_route, gpu_mx_gu, gpu_mx_dn;
@@ -688,13 +688,15 @@
 +  gpu_mx_ccomb;
 +static id<MTLBuffer> mx_cb;
 +static u32 mx_cmt;
++// (METAL-CATCHUP) streamed experts: the chunk's staging of a whole layer (ne experts a tensor, table entries 3 .. 5)
++static id<MTLBuffer> mx_cst[3];
 +// (LLB_MX_DUMP) the chunk's records (shared; written to the dump file once the chunk's command buffer is done)
 +static id<MTLComputePipelineState> gpu_mx_cdump;
 +static id<MTLBuffer> mx_cdump;
  // per layer and routed tensor (gate or gate_up, up, down): the GGUF offset, expert stride, row bytes, format, the
  // offset inside an expert (the fused up rows), the first pointer-table entry and experts a chunk
  typedef struct {
-@@ -17028,6 +17685,9 @@
+@@ -17028,6 +17687,9 @@
    u32 f[3], fs[3];
    u32 rb[3], rbs[3];
    u32 d, eff, sff, ne, k, mut, mode, pad;
@@ -704,7 +706,7 @@
  } MxArgs;
  
  int llb_gg_moe_pool(const char *path, int nl, uint64_t *src, uint32_t *ty, uint64_t *bytes, uint64_t *shp,
-@@ -17094,6 +17754,7 @@
+@@ -17094,6 +17756,7 @@
  }
  
  static FILE* mx_dumpf;
@@ -712,7 +714,7 @@
  static void mx_close(void) {
    if (mx_dumpf != NULL) {
      fclose(mx_dumpf);
-@@ -17115,6 +17776,19 @@
+@@ -17115,6 +17778,20 @@
    mx_scrn = 0;
    mx_path[0] = 0;
    gpu_mx_rdot = nil; gpu_mx_route = nil; gpu_mx_gu = nil; gpu_mx_dn = nil;
@@ -727,12 +729,13 @@
 +  }
 +  mx_cb = nil;
 +  mx_cmt = 0;
++  mx_cst[0] = nil; mx_cst[1] = nil; mx_cst[2] = nil;
 +  gpu_mx_cdump = nil;
 +  mx_cdump = nil;
  }
  
  static u64 mx_envu(const char* k) {
-@@ -17137,6 +17811,22 @@
+@@ -17137,6 +17814,22 @@
    gpu_mx_route = warp_pipe("llb_mx_route");
    gpu_mx_gu    = warp_pipe("llb_mx_gu");
    gpu_mx_dn    = warp_pipe("llb_mx_dn");
@@ -755,7 +758,7 @@
    if (gpu_mx_rdot.maxTotalThreadsPerThreadgroup < 128 || gpu_mx_route.maxTotalThreadsPerThreadgroup < 1024
      || gpu_mx_gu.maxTotalThreadsPerThreadgroup < 256 || gpu_mx_dn.maxTotalThreadsPerThreadgroup < 256) {
      err_fail("qwen35moe: a MoE kernel's threadgroup does not fit");
-@@ -17219,7 +17909,7 @@
+@@ -17219,7 +17912,7 @@
    u64 lg = 0, rt = ((u64)R->mxe + 1 + 63) & ~63ull, xs = rt + ((3ull * R->mxk + 1 + 63) & ~63ull);
    u64 act = xs + (((u64)R->f + 63) & ~63ull), an = (u64)R->mxk * R->mxf > R->mxe ? (u64)R->mxk * R->mxf : R->mxe;
    (void)lg;
@@ -764,7 +767,16 @@
    mx_scr = [gpu_dev newBufferWithLength:mx_scrn * 4 options:MTLResourceStorageModeShared];
    if (mx_scr == nil) {
      err_fail("qwen35moe: cannot allocate the MoE scratch");
-@@ -17346,6 +18036,36 @@
+@@ -17242,7 +17935,7 @@
+         err_fail("qwen35moe: cannot allocate the expert staging");
+       }
+     }
+-    mx_tab = [gpu_dev newBufferWithLength:3 * 8 options:MTLResourceStorageModeShared];
++    mx_tab = [gpu_dev newBufferWithLength:6 * 8 options:MTLResourceStorageModeShared];
+     u64* tb = (u64*)[mx_tab contents];
+     for (u32 r = 0; r < 3; r += 1) {
+       tb[r] = (u64)[mx_stage[r == 1 && mx_fused ? 0 : r] gpuAddress];
+@@ -17346,6 +18039,57 @@
    m28_bar(en);
  }
  
@@ -798,13 +810,46 @@
 +  return true;
 +}
 +
++// (METAL-CATCHUP) streamed mode: the layer's routed part is committed as soon as it is encoded (the GPU runs it
++// while the host encodes the next layer up to its routing); fence-ordered as m30_split, its error checked at the next
++// mx_cut (it completed before the buffer mx_cut waits for)
++static id<MTLCommandBuffer> mx_gone;
++static id<MTLComputeCommandEncoder> mx_go_on(void) {
++  if (m30_fence == nil) {
++    m30_fence = [gpu_dev newFence];
++  }
++  [m30_en updateFence:m30_fence];
++  [m30_en endEncoding];
++  [m30_cb commit];
++  mx_gone = m30_cb;
++  m30_cb = [gpu_que commandBuffer];
++  m30_en = [m30_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
++  [m30_en waitForFence:m30_fence];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:0];
++  [m30_en setBuffer:gpu_att offset:0 atIndex:1];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:3];
++  return m30_en;
++}
++
  // end and run the command buffer so far; a new one goes on (m30_cb / m30_en, as m30_split leaves them)
  static id<MTLComputeCommandEncoder> mx_cut(void) {
    [m30_en endEncoding];
-@@ -17362,6 +18082,44 @@
-   return m30_en;
- }
- 
+@@ -17354,6 +18098,39 @@
+   if ([m30_cb error]) {
+     gpu_fail([m30_cb error]);
+   }
++  if (mx_gone != nil && [mx_gone error]) {
++    gpu_fail([mx_gone error]);
++  }
++  mx_gone = nil;
++  m30_cb = [gpu_que commandBuffer];
++  m30_en = [m30_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:0];
++  [m30_en setBuffer:gpu_att offset:0 atIndex:1];
++  [m30_en setBuffer:gpu_buf offset:0 atIndex:3];
++  return m30_en;
++}
++
 +// (METAL-CATCHUP, diagnostic) LLB_MX_PROF=1: the command buffer is cut (committed and waited) after every MoE stage
 +// and each piece's GPU time (GPUEndTime - GPUStartTime) summed by stage, printed at exit. The cuts cost about 5 us
 +// each and the pairs that run side by side are split: a profile, not the production timing (the bits are the same)
@@ -826,13 +871,13 @@
 +  [m30_cb waitUntilCompleted];
 +  mx_pt[cat] += [m30_cb GPUEndTime] - [m30_cb GPUStartTime];
 +  mx_pn[cat] += 1;
-+  m30_cb = [gpu_que commandBuffer];
-+  m30_en = [m30_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-+  [m30_en setBuffer:gpu_buf offset:0 atIndex:0];
-+  [m30_en setBuffer:gpu_att offset:0 atIndex:1];
-+  [m30_en setBuffer:gpu_buf offset:0 atIndex:3];
-+  return m30_en;
-+}
+   m30_cb = [gpu_que commandBuffer];
+   m30_en = [m30_cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+   [m30_en setBuffer:gpu_buf offset:0 atIndex:0];
+@@ -17361,6 +18138,15 @@
+   [m30_en setBuffer:gpu_buf offset:0 atIndex:3];
+   return m30_en;
+ }
 +static void mx_prof_print(void) {
 +  static const char* nm[10] = { "trunkL", "addrms", "sgu", "sdn", "gu", "route", "dn", "tail", "trunkF", "rdot" };
 +  if (mx_prof > 0) {
@@ -842,11 +887,69 @@
 +    }
 +  }
 +}
-+
+ 
  // (diagnostic) LLB_MX_DUMP=FILE: after every MoE layer the command buffer is cut and the layer's record appended:
  // u32 layer, d, k; f32 h2[d] (the FFN input), out[d] (the FFN output before the residual); u32 ids[k]; f32 w[k], gs.
- // reports/metal-moe's mx_ref.py recomputes each record from the GGUF in float64 (the MoE FFN's own oracle)
-@@ -17416,8 +18174,10 @@
+@@ -17382,6 +18168,37 @@
+   fflush(mx_dumpf);
+ }
+ 
++// (METAL-CATCHUP) the streamed copies: a list of (dst, src, bytes) pieces run by dispatch_apply
++typedef struct {
++  u8* d;
++  const u8* s;
++  u64 n;
++} MxCpy;
++static MxCpy* mx_cpy;
++static u32 mx_cpy_n, mx_cpy_cap;
++static void mx_cpy_add(u8* d, const u8* s, u64 n) {
++  for (u64 o = 0; o < n; o += 262144) {
++    if (mx_cpy_n == mx_cpy_cap) {
++      mx_cpy_cap = mx_cpy_cap ? 2 * mx_cpy_cap : 1024;
++      mx_cpy = realloc(mx_cpy, (size_t)mx_cpy_cap * sizeof *mx_cpy);
++      if (mx_cpy == NULL) {
++        err_fail("qwen35moe: out of memory (the streamed copy list)");
++      }
++    }
++    mx_cpy[mx_cpy_n].d = d + o;
++    mx_cpy[mx_cpy_n].s = s + o;
++    mx_cpy[mx_cpy_n].n = n - o < 262144 ? n - o : 262144;
++    mx_cpy_n += 1;
++  }
++}
++static void mx_cpy_run(void) {
++  MxCpy* L = mx_cpy;
++  dispatch_apply(mx_cpy_n, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t j) {
++    memcpy(L[j].d, L[j].s, L[j].n);
++  });
++  mx_cpy_n = 0;
++}
++
+ // streamed mode: end and run the command buffer so far (through the routing), then copy the k chosen experts of
+ // layer i into the staging and point the route's ids at the staging slots; a new command buffer goes on
+ static id<MTLComputeCommandEncoder> mx_sync(u32 i, u64 rt) {
+@@ -17391,14 +18208,19 @@
+     if (ids[s] >= mx_ne) {
+       err_fail("qwen35moe: the routing chose no expert (non-finite logits?)");
+     }
++  }
++  // (METAL-CATCHUP) the copies in pieces of <= 256 KiB, spread over the cores (the same bytes land: the same bits)
++  mx_cpy_n = 0;
++  for (u32 s = 0; s < mx_k; s += 1) {
+     for (u32 r = 0; r < 3; r += 1) {
+       const MxTen* T = &mx_ten[i * 3 + r];
+       if (r == 1 && mx_fused) {
+         continue;
+       }
+-      memcpy((u8*)[mx_stage[r] contents] + (u64)s * T->es, mx_map + T->src + (u64)ids[s] * T->es, T->es);
++      mx_cpy_add((u8*)[mx_stage[r] contents] + (u64)s * T->es, mx_map + T->src + (u64)ids[s] * T->es, T->es);
+     }
+   }
++  mx_cpy_run();
+   // the kernels address the staging by slot; the chosen ids are kept past the weights (W[rt + 2k + 1 ..]) for a dump
+   for (u32 s = 0; s < mx_k; s += 1) {
+     ids[2 * mx_k + 1 + s] = ids[s];
+@@ -17416,8 +18238,10 @@
    const u32 dm = R->d, ne = R->mxe, k = R->mxk, ef = R->mxf, sf = R->f;
    const u64 x1b = M9_BLK + (u64)R->mxb * 4, h2b = x1b + dm * 4, ffo = h2b + dm * 4;
    HybArgs HA;
@@ -857,7 +960,7 @@
    MxArgs A;
    memset(&A, 0, sizeof A);
    A.x = h2b; A.out = ffo;
-@@ -17430,8 +18190,32 @@
+@@ -17430,8 +18254,32 @@
      A.s[r] = b + p[2 + r]; A.fs[r] = mx_hfmt(R->fm[2 + r]); A.rbs[r] = R->rb[2 + r];
    }
    A.d = dm; A.eff = ef; A.sff = sf; A.ne = ne; A.k = k; A.mut = mx_mut;
@@ -892,7 +995,7 @@
    if (mx_stream) {
      if (en != m30_en) {
        err_fail("qwen35moe: the streamed experts need the serve's own encoder");
-@@ -17448,12 +18232,23 @@
+@@ -17448,12 +18296,26 @@
        [en useResource:mx_chunks[c] usage:MTLResourceUsageRead];
      }
    }
@@ -908,6 +1011,9 @@
 +    en = mx_pc(en, 4);
 +    mx_go(en, gpu_mx_dn2[frd], &A, ((dm + 1) / 2 + 3) / 4, 1, 128);
 +    en = mx_pc(en, 6);
++    if (mx_stream && en == m30_en && getenv("LLB_MX_DUMP") == NULL) {
++      en = mx_go_on();
++    }
 +  } else {
 +    A.mode = 0;
 +    mx_go(en, gpu_mx_gu, &A, (ef + 7) / 8, k, 256);
@@ -922,7 +1028,7 @@
    [en setBuffer:gpu_buf offset:0 atIndex:3];
    if (getenv("LLB_MX_DUMP") != NULL) {
      if (en != m30_en) {
-@@ -17471,9 +18266,10 @@
+@@ -17471,9 +18333,10 @@
    if (nw != 0) {
      m9_args(&HA, x1b, ffo, nh, y, nw, 0, 0, dm, 0, 0, 0.0f);
      m9_go(en, gpu_m_addrms, &HA, 1, 1024);
@@ -934,7 +1040,7 @@
    return en;
  }
  
-@@ -17507,6 +18303,8 @@
+@@ -17507,6 +18370,8 @@
    if (S0->mxe != 0) {
      mx_pool(S0);
    }
@@ -943,7 +1049,7 @@
    if (dT != pass_dT) {
      err_fail("warp pass: dT changed");
    }
-@@ -17580,6 +18378,7 @@
+@@ -17580,6 +18445,7 @@
        en = m30_split();
      }
    }
@@ -951,7 +1057,7 @@
  }
  
  
-@@ -17596,6 +18395,8 @@
+@@ -17596,6 +18462,8 @@
  static id<MTLComputePipelineState> gpu_f27_mm[4], gpu_f27_gdl, gpu_f27_attn, gpu_f9_attn;
  // (METAL-ANYSHAPE) the chunk attention over kv rows of 512 floats (2 kv heads): GQA 6 / 4
  static id<MTLComputePipelineState> gpu_f27_attn2, gpu_f9_attn2;
@@ -960,7 +1066,7 @@
  static id<MTLComputePipelineState> gpu_f27_conv, gpu_f27_copy, gpu_f27_embt;
  static id<MTLComputePipelineState> gpu_t27_rnorm, gpu_t27_addrms, gpu_t27_elem;
  static id<MTLComputePipelineState> gpu_t27_grn, gpu_t27_mida, gpu_t27_midb;
-@@ -17613,6 +18414,8 @@
+@@ -17613,6 +18481,8 @@
    gpu_f27_gdl   = warp_pipe("llb_f27_gdl");
    gpu_f27_attn  = warp_pipe("llb_f27_attn");
    gpu_f27_attn2 = warp_pipe("llb_f27_attn_k512");
@@ -969,7 +1075,7 @@
    gpu_f9_attn2  = warp_pipe("llb_f9_attn_k512");
    gpu_f27_conv  = warp_pipe("llb_f27_conv1dt");
    gpu_f27_copy  = warp_pipe("llb_f27_copy");
-@@ -17822,7 +18625,7 @@
+@@ -17822,7 +18692,7 @@
    const u64 h = F27_W0, qgn = h + d, qg = qgn + 2 * qa, kb = qg + 2 * qa;
    const u64 kn = kb + kvd, vb = kn + kvd, attn = vb + kvd, gated = attn + qa;
    HybTArgs T;
@@ -978,7 +1084,7 @@
        : R->nh != 24 && R->nh != 16) || gated + qa > F27_TB || dT < 5) {
      err_fail("fast chunk: the fulb shape / window does not fit (GQA 4 or 6 over 2 or 4 kv heads)");
    }
-@@ -17867,7 +18670,7 @@
+@@ -17867,7 +18737,7 @@
    F.qs = (u32)F27_TB;
    F.pos0 = pos0;
    F.nt = nt;
@@ -987,7 +1093,7 @@
      : R->gen ? (G == 6 ? gpu_f27_attn : gpu_f9_attn) : R->nh == 24 ? gpu_f27_attn : gpu_f9_attn,
      &F, sizeof F, R->nkv, (nt + 7) / 8, 32 * G);
    // the output gate: attn * sigmoid(gate), the gate at qg + qa
-@@ -17915,6 +18718,122 @@
+@@ -17915,6 +18785,174 @@
    f27_go(en, gpu_t27_elem, &T, sizeof T, (d + 255) / 256, nt, 256);
  }
  
@@ -1009,19 +1115,19 @@
 +static u32 mxc_qt(u32 f) {
 +  return f == MX_Q8 ? 8 : f == MX_Q4K ? 4 : f == MX_Q5K ? 5 : f == MX_Q6K ? 6 : 0;
 +}
-+static void mx_cffn(id<MTLComputeCommandEncoder> en, u32 i, u64 b, const u32* p, const u32* row, const M9Rows* R,
-+  u32 nt) {
++static id<MTLComputeCommandEncoder> mx_cffn(id<MTLComputeCommandEncoder> en, u32 i, u64 b, const u32* p,
++  const u32* row, const M9Rows* R, u32 nt) {
 +  const u64 B = f27_base;
 +  const u32 d = R->d, sf = R->f, ne = R->mxe, k = R->mxk, ef = R->mxf;
 +  const u64 x1 = F27_W0, h2 = x1 + d, gg = h2 + d, uu = gg + sf, aa = uu + sf, dd = aa + sf;
 +  const u64 lg = (dd + d + 3) & ~3ull, rt = (lg + ne + 1 + 3) & ~3ull, end = rt + 2ull * k + 1;
 +  const u32 qg = mxc_qt(mx_ten[i * 3].f), qd = mxc_qt(mx_ten[i * 3 + 2].f);
-+  if (end > F27_TB || (u64)nt * k > 8192 || ne > 4096 || k > 1024 || mx_stream || qg == 0 || qd == 0
++  if (end > F27_TB || (u64)nt * k > 8192 || ne > 4096 || k > 1024 || (mx_stream && en != m30_en) || qg == 0 || qd == 0
 +    || mx_ten[i * 3].f != mx_ten[i * 3 + 1].f || d % 32 != 0 || ef % 32 != 0) {
-+    fprintf(stderr, "fast chunk: qwen35moe layer %u: d %u experts %u top %u expert ff %u, formats %u / %u%s\n", i, d,
-+      ne, k, ef, mx_ten[i * 3].f, mx_ten[i * 3 + 2].f, mx_stream ? ", streamed experts" : "");
-+    err_fail("fast chunk: this MoE (streamed experts, an expert format other than Q8_0 / Q4_K / Q5_K / Q6_K, or a"
-+      " block past the chunk's scratch) has no fast prefill: run it with --exactpf");
++    fprintf(stderr, "fast chunk: qwen35moe layer %u: d %u experts %u top %u expert ff %u, formats %u / %u\n", i, d,
++      ne, k, ef, mx_ten[i * 3].f, mx_ten[i * 3 + 2].f);
++    err_fail("fast chunk: this MoE (an expert format other than Q8_0 / Q4_K / Q5_K / Q6_K, or a block past the"
++      " chunk's scratch) has no fast prefill: run it with --exactpf");
 +  }
 +  if (gpu_mx_crdot == nil) {
 +    gpu_mx_crdot = warp_pipe("llb_mx_crdot");
@@ -1045,7 +1151,7 @@
 +      err_fail("fast chunk: the MoE chunk buffer exceeds the device's largest buffer");
 +    }
 +    mx_cb = [gpu_dev newBufferWithLength:cend * 4
-+      options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked];
++      options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
 +    if (mx_cb == nil) {
 +      err_fail("fast chunk: cannot allocate the MoE chunk buffer");
 +    }
@@ -1070,8 +1176,36 @@
 +  A.ch2 = (u32)h2; A.cx1 = (u32)x1; A.clg = (u32)lg; A.crt = (u32)rt; A.cdd = (u32)dd; A.cxo = (u32)F27_X;
 +  A.cgc = 0; A.cgo = ne; A.cgt = 2 * ne; A.cgn = 3 * ne; A.cgi = 3 * ne + 1; A.cgl = (u32)gl;
 +  A.cgu = cgu; A.cac = cac; A.cdn = cdn;
-+  for (u32 c = mx_lch[i]; c < mx_lch[i + 1]; c += 1) {
-+    [en useResource:mx_chunks[c] usage:MTLResourceUsageRead];
++  if (!mx_stream) {
++    for (u32 c = mx_lch[i]; c < mx_lch[i + 1]; c += 1) {
++      [en useResource:mx_chunks[c] usage:MTLResourceUsageRead];
++    }
++  } else if (mx_cst[0] == nil) {
++    // the whole-layer staging, the largest expert of each tensor x ne; table entries 3 .. 5
++    u64* tb = (u64*)[mx_tab contents];
++    for (u32 r = 0; r < 3; r += 1) {
++      u64 mx = 0;
++      for (u32 j = 0; j < mx_nl; j += 1) {
++        mx = mx_ten[j * 3 + r].es > mx ? mx_ten[j * 3 + r].es : mx;
++      }
++      if (r == 1 && mx_fused) {
++        tb[4] = tb[3];
++        continue;
++      }
++      if (mx * ne > (u64)[gpu_dev maxBufferLength]) {
++        err_fail("fast chunk: a layer's experts of one tensor exceed the device's largest buffer (streamed)");
++      }
++      mx_cst[r] = [gpu_dev newBufferWithLength:mx * ne options:MTLResourceStorageModeShared];
++      if (mx_cst[r] == nil) {
++        err_fail("fast chunk: cannot allocate the streamed experts' staging");
++      }
++      tb[3 + r] = (u64)[mx_cst[r] gpuAddress];
++    }
++  }
++  if (mx_stream) {
++    for (u32 r = 0; r < 3; r += 1) {
++      A.t[r] = 3 + r; A.epc[r] = ne;
++    }
 +  }
 +  // [router | shared gate / up] -> [routing | shared SiLU] -> [grouping | shared down] -> routed gate / up -> SiLU ->
 +  // routed down -> combine
@@ -1092,6 +1226,29 @@
 +  f27_go(en, gpu_t27_elem, &T, sizeof T, (sf + 255) / 256, nt, 256);
 +  mxc_go(en, gpu_mx_cgroup, &A, 1, 1, 1024, false);
 +  f27_mm1(en, R->fm[4], b + p[4], R->rb[4], B + aa * 4, B + dd * 4, d, sf, nt);
++  if (mx_stream) {
++    // the grouping read back; the experts any token chose copied into the staging at their own index
++    en = mx_cut();
++    const u32* G = (const u32*)[mx_cb contents];
++    for (u32 e = 0; e < ne; e += 1) {
++      if (G[e] == 0) {
++        continue;
++      }
++      for (u32 r = 0; r < 3; r += 1) {
++        const MxTen* X = &mx_ten[i * 3 + r];
++        if (r == 1 && mx_fused) {
++          continue;
++        }
++        mx_cpy_add((u8*)[mx_cst[r] contents] + (u64)e * X->es, mx_map + X->src + (u64)e * X->es, X->es);
++      }
++    }
++    mx_cpy_run();
++    for (u32 r = 0; r < 3; r += 1) {
++      if (mx_cst[r] != nil) {
++        [en useResource:mx_cst[r] usage:MTLResourceUsageRead];
++      }
++    }
++  }
 +  A.mode = 0;
 +  mxc_go(en, gpu_mx_cmm[qg], &A, mt, (2 * ef + 63) / 64, 128, true);
 +  mxc_go(en, gpu_mx_csilu, &A, (ef + 255) / 256, nt * k, 256, true);
@@ -1105,12 +1262,13 @@
 +    mxc_go(en, gpu_mx_cdump, &A, (d + 255) / 256, nt, 256, true);
 +  }
 +  [en setBuffer:gpu_buf offset:0 atIndex:3];
++  return en;
 +}
 +
  // the chunk: nt (1 .. F27_CH) tokens at pos0 .. through all S0->nl layers,
  // head-less. ids / erow: the tokens and the embedding region (Q4_K rows of
  // 2880 B); pw / tw / po as m9_pass_run's (the table required)
-@@ -17939,6 +18858,23 @@
+@@ -17939,6 +18977,23 @@
      err_fail("fast chunk: no chunk area / not the 27B or 9B / nt out of range");
    }
    f27_pipes();
@@ -1134,14 +1292,14 @@
    // (lane m31) the embedding rows: Q4_K (d / 256 x 144 B) or Q8_0 (d / 32 x 34)
    const u64 erb = ek4 ? S0->d / 256 * 144 : ek6 ? S0->d / 256 * 210
      : S0->d / 32 * 34;
-@@ -17992,7 +18928,24 @@
+@@ -17992,7 +19047,24 @@
      } else {
        f27_linb(en, i, b, tp, &R, nt);
      }
 -    f27_fbn(en, b, tp, &R, nt);
 +    // (METAL-CATCHUP) a MoE layer's FFN: the batched router, routing, gather-by-expert GEMMs and the shared expert
 +    if (S0->mxe != 0) {
-+      mx_cffn(en, i, b, tp, tw + i * 32, &R, nt);
++      en = mx_cffn(en, i, b, tp, tw + i * 32, &R, nt);
 +    } else {
 +      f27_fbn(en, b, tp, &R, nt);
 +    }
@@ -1160,7 +1318,7 @@
    }
  }
  
-@@ -18538,19 +19491,21 @@
+@@ -18538,19 +19610,21 @@
      m9_rows_q8(&S0, rg, rd);
      // (METAL-ANYSHAPE) the Shape from the row words and the engine's shape words 52 .. 54, as the pass arm;
      // a generic Shape takes the chunk with its table; dT up to 27
@@ -1189,7 +1347,7 @@
        && (S0.d == 5120 || S0.d == 4096 || S0.d == 2560 || S0.gen)
        && dT >= 5 && dT <= 27 && nt >= 1 && nt <= F27_CH
        && (u64)pos + nt <= (1ull << dT) && !M9_ARR(y)
-@@ -18649,6 +19604,16 @@
+@@ -18649,6 +19723,16 @@
              ? fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm) : fm == LLB_FM_F32));
            sz += has >> f & 1 ? m9_tsz(&R, f) : 0;
          }
@@ -1206,7 +1364,7 @@
          // (tools/metal-27b.patch) the blob is exactly its tensors at this
          // Shape (the packs have no gaps): a 27B layer read at the 9B's Shape
          // (or any other mismatch) is refused here, not run
-@@ -18714,7 +19679,7 @@
+@@ -18714,7 +19798,7 @@
      if (!ok || (S0.d == 5120 && tw == NULL)) {
        // (lane m32, f35) the 35B's Shape (rg q8rw(2048), rd q8rw(512)), refused
        // above, takes the 35B fast chunk
@@ -1215,7 +1373,7 @@
          f35_arm(e, H, en, a, aux);
          return true;
        }
-@@ -18726,6 +19691,10 @@
+@@ -18726,6 +19810,10 @@
        m9_bad(aux);
      }
      f27_chunk(en, ids, nt, ep, ek4, ek6, c, &S0, pw, po, tw);
@@ -1226,7 +1384,7 @@
      // (ENGINE-DECIDECHUNK, patches/metal-dchunk.patch) the hook's rows
      f27_rows(e, H, a, en, nt, pos, S0.d);
      return true;
-@@ -22373,7 +23342,7 @@
+@@ -22373,7 +23461,7 @@
    // (METAL-MOE) the general MoE path's expert pool, scratch and pipelines
    mx_close();
    // (METAL-ANYSHAPE) the generic arms' pipelines and the scratch size
