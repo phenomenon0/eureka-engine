@@ -139,3 +139,11 @@ prefill instrument; no threshold changes.
   512e6 / median(the 3 `pfus` lines). The load, the graph builds and the GPU program compile fall in prompt 1's
   first step, before the first line. Medians over 3 interleaved rounds as before.
 - **Arm added (information).** The fast tier on S128F Q4_K_M prefill. T3 stays on S35 Q4_K_M.
+
+## Amendment 2 — 2026-10-27, before any speed round (the gate runs had started; no speed arm had run)
+
+The base build has no `pfus` line. Its per-prompt period is the same quantity read from its `stepus` lines: in the
+4-copy run every exact step prints `stepus POS US` (the time since the previous step began), so the period of
+prompt k is the sum of the `stepus` lines after prompt k's `pos 0` line up to and including prompt k + 1's `pos 0`
+line (prompt 1: from the first line). The candidate's exact arm is scored both ways as a cross-check. No other
+change.
