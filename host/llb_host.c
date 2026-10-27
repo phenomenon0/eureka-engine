@@ -207,9 +207,11 @@ static void llb_hidden_put(u32 pos, u32 width, llb_dptr row) {
 }
 static bool llb_kgemv_res(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n, u32 grid, u64 x1) {
   u32 rb = LLB_FM_RB(fm, cols), cg = cols / 4, d = llb_cdepth(cols);
-  // (reports/cuda-catchup: whole superblocks, cg % 64, the pair body's partial quad; was cg % 256)
+  // (reports/cuda-catchup: whole superblocks, cg % 64, the pair body's partial quad; was cg % 256.
+  // A partial-quad Q6_K row under LLB_Q4_DP4A bit 32 stays llb_kgemv's two-plane dp4a GEMV + vadd,
+  // as before: only rows the tile body ran move here)
   if (!(llb_q4glue & 2) || (fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K) || cg % 64 != 0 || d < 9 || d > 13
-    || !llb_tuned(fm, cols)) {
+    || !llb_tuned(fm, cols) || (cg % 256 != 0 && fm == LLB_FM_Q6_K && (llb_q4dp & 32))) {
     return false;
   }
   if (!LLB_LAUNCH(fm == LLB_FM_Q6_K ? gpu_warp6e : gpu_warpke, grid == 768 ? 984 : grid, 1, 128,
