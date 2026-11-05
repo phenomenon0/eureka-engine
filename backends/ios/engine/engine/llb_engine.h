@@ -68,6 +68,10 @@ typedef struct {
 } llb_dstats;
 
 int         llb_load(const char* model_dir, const char* cache_dir);
+// Thread-safe cooperative cancellation. Reset immediately before starting a request;
+// cancel may be called from another thread while it is running.
+void        llb_cancel_reset(void);
+void        llb_cancel(void);
 int         llb_generate(const uint32_t* ids, int n_ids, int n_new, uint32_t* out,
               llb_stats* st);
 // (ENGINE-ONE) n request bodies (each one /v1/systemone JSON object) -> replies[i], malloc'd: the

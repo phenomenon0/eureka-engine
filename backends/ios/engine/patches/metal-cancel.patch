@@ -1,0 +1,23 @@
+--- a/bend2/effs/signal_pending.c
++++ b/bend2/effs/signal_pending.c
+@@ -37,9 +37,19 @@
+   }
+ }
+ 
++// Signal 0 is reserved for the embedding host's cooperative request cancellation.
++#ifdef LLB_CANCEL_HOST
++extern int llb_cancel_requested(void);
++#else
++static int llb_cancel_requested(void) { return 0; }
++#endif
++
+ Term io_signal_pending_run(Env e, Term* f, IoWork* w) {
+   u32 sig = (u32)f[0];
+-  if (sig == 0 || sig >= 65) {
++  if (sig == 0) {
++    return sig_bool(llb_cancel_requested());
++  }
++  if (sig >= 65) {
+     return sig_bool(false);
+   }
+   io_sig_catch(sig);

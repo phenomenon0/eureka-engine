@@ -138,6 +138,7 @@ typedef struct {
     atomic_int ready, dead;
     long n_req;
     int status; // wait status once reaped (pid < 0)
+    pthread_t err_thread;
     double t_last;
     char *last; // the last prompt text sent to this slot (affinity)
     struct Bank *bk; // G20: the engine's banks (n_banks of them)
@@ -160,11 +161,12 @@ static int native_cont;
 static long affinity_min = 256;
 static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cond = PTHREAD_COND_INITIALIZER;
-static unsigned long q_tail, q_head; // FIFO tickets: next to issue, next to serve
+static unsigned long q_tail; // FIFO tickets: next to issue, next to serve
 static atomic_int ready, engine_dead, inflight, queued, stopping, closing; // closing: past the drain
 static atomic_long req_seq;
 static time_t t_start;
 static int wake[2];
+static char **engine_argv;
 static atomic_long mm_seq;
 static mm_caps mmc; // G5 multimodal content caps + what the engine takes (--mm-*)
 // G41: the TTS child (--tts DIR). tts_lock serialises requests on its pipes.
@@ -247,6 +249,7 @@ static void *engine_err(void *p) {
         funlockfile(stderr);
     }
     free(line);
+    fclose(a.f);
     return NULL;
 }
 
@@ -332,7 +335,7 @@ static void engine_start(Slot *s, char **argv) {
     if (engine_pid < 0) perror("fork"), exit(1);
     if (!engine_pid) {
         // children must not hold the other slots' pipe ends (EOF on shutdown)
-        for (int i = 0; i < s->idx; i++) fclose(slots[i].in), fclose(slots[i].out);
+        /* close_extra_fds below closes all unrelated descriptors safely. */
         dup2(in[0], 0), dup2(out[1], 1), dup2(err[1], 2);
         close(in[0]), close(in[1]), close(out[0]), close(out[1]), close(err[0]), close(err[1]);
         close_extra_fds(); // HARDEN
@@ -357,11 +360,10 @@ static void engine_start(Slot *s, char **argv) {
     close(in[0]), close(out[1]), close(err[1]);
     s->in = fdopen(in[1], "w");
     s->out = fdopen(out[0], "r");
+    setvbuf(s->out, NULL, _IONBF, 0);
     ErrArg *a = malloc(sizeof *a);
     *a = (ErrArg){s, fdopen(err[0], "r")};
-    pthread_t t;
-    pthread_create(&t, NULL, engine_err, a);
-    pthread_detach(t);
+    pthread_create(&s->err_thread, NULL, engine_err, a);
 }
 
 // ---- G41: TTS child ---------------------------------------------------------
@@ -555,15 +557,19 @@ static size_t lcp(const char *a, const char *b) {
     return n;
 }
 
-static Slot *slot_acquire(const char *prompt, unsigned long *ticket, int *bank) {
+typedef struct Waiter { struct Waiter *next; } Waiter;
+static Waiter *wait_first, *wait_last;
+static int client_gone(int fd) { char ch; ssize_t n = recv(fd, &ch, 1, MSG_PEEK | MSG_DONTWAIT); return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR); }
+static Slot *slot_acquire(const char *prompt, unsigned long *ticket, int *bank, int fd) {
     pthread_mutex_lock(&q_lock);
-    unsigned long me = *ticket = q_tail++;
+    *ticket = q_tail++;
+    Waiter me = {0}; if (wait_last) wait_last->next = &me; else wait_first = &me; wait_last = &me;
     Slot *s = NULL;
     double t_best = 0;
     *bank = 0;
     for (;;) {
-        if (all_dead() || closing) break;
-        if (me == q_head) {
+        if (all_dead() || closing || client_gone(fd)) break;
+        if (wait_first == &me) {
             long best = -1;
             for (int i = 0; i < n_slots; i++) {
                 Slot *x = &slots[i];
@@ -578,13 +584,36 @@ static Slot *slot_acquire(const char *prompt, unsigned long *ticket, int *bank) 
             }
             if (s) break;
         }
-        pthread_cond_wait(&q_cond, &q_lock);
+        struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 100000000; if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&q_cond, &q_lock, &until);
     }
-    q_head++; // also when giving up, so the tickets behind stay live
+    Waiter **p = &wait_first; while (*p && *p != &me) p = &(*p)->next;
+    if (*p) *p = me.next;
+    if (wait_last == &me) { wait_last = wait_first; while (wait_last && wait_last->next) wait_last = wait_last->next; }
     if (s) s->busy = 1, s->t_last = now(); // HARDEN: the watchdog baseline
     pthread_cond_broadcast(&q_cond);
     pthread_mutex_unlock(&q_lock);
     return s;
+}
+
+static void slot_restart(Slot *s) {
+    pthread_mutex_lock(&q_lock);
+    pid_t pid = s->pid; s->ready = 0;
+    if (pid > 0) { kill(pid, SIGKILL); int status; while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {} s->pid = -pid; }
+    pthread_mutex_unlock(&q_lock);
+    pthread_join(s->err_thread, NULL); s->ready = 0;
+    fclose(s->in); fclose(s->out);
+    pthread_mutex_lock(&q_lock);
+    free(s->last); s->last = NULL;
+    if (s->bk) for (int b = 0; b < n_banks; b++) { free(s->bk[b].last); s->bk[b].last = NULL; }
+    s->dead = 0; engine_start(s, engine_argv); engine_dead = 0;
+    pthread_cond_broadcast(&q_cond); pthread_mutex_unlock(&q_lock);
+}
+static int wait_engine_line(Slot *s, int fd) {
+    struct pollfd fds[2] = {{.fd = fileno(s->out), .events = POLLIN}, {.fd = fd, .events = POLLIN}};
+    while (!client_gone(fd)) { int n = poll(fds, 2, 100); if (n < 0 && errno != EINTR) return 0; if (n > 0 && (fds[0].revents & (POLLIN | POLLHUP | POLLERR))) return 1; }
+    return 0;
 }
 
 static void slot_release(Slot *s, int bank, const char *prompt) {
@@ -888,7 +917,7 @@ static const char *render_chat(const jv *body, sb *o, Req *rq) {
 static int num_field(const jv *body, const char *k, int *v, const char **err) {
     const jv *x = json_get(body, k);
     if (!x || x->type == J_NULL) return 0;
-    if (x->type != J_NUM || x->num != (double)(long)x->num || x->num < 1 || x->num > 65536)
+    if (x->type != J_NUM || x->num < 1 || x->num > 65536 || x->num != (double)(long)x->num)
         return *err = "max_tokens must be an integer 1..65536", -1;
     *v = (int)x->num;
     return 1;
@@ -1234,7 +1263,9 @@ static void run_generate(Slot *s, int bank, Conn *c, const jv *body, const Req *
     size_t cap = 0;
     jv *fin = NULL;
     for (;;) {
-        if (c->broken && !c->cancelled) c->cancelled = 1; // HARDEN: drain, do not stream to a gone client
+        if (c->broken || !wait_engine_line(s, c->fd)) {
+            c->cancelled = 1; free(l); gen_free(&g); slot_restart(s); return;
+        }
         if (getline(&l, &cap, s->out) <= 0) {
             s->dead = 1;
             if (!r->stream) err_reply(c, 503, "unavailable_error", "engine exited");
@@ -1640,11 +1671,12 @@ static void run_decide(Slot *s, Conn *c, const char *line) {
 }
 
 // BATCH-NATIVE-2 --native-cont: the {"bx_item":k} line before an out-of-order reply; -1 = none
-static int bx_item_read(Slot *s) {
+static int bx_item_read(Slot *s, Conn *c) {
     char *l = NULL;
     size_t cap = 0;
     int k = -1;
     for (;;) {
+        if (c->broken || !wait_engine_line(s, c->fd)) { c->cancelled = 1; slot_restart(s); break; }
         ssize_t n = getline(&l, &cap, s->out);
         if (n <= 0) break;
         const char *err = NULL;
@@ -1665,6 +1697,7 @@ static void decide_read(Slot *s, Conn *c) {
     char *l = NULL;
     size_t cap = 0;
     for (;;) {
+        if (!wait_engine_line(s, c->fd)) { c->cancelled = 1; slot_restart(s); break; }
         ssize_t k = getline(&l, &cap, s->out);
         if (k <= 0) {
             s->dead = 1;
@@ -1755,7 +1788,7 @@ static int batch_run(Conn *c, Item *it, int n, int kind, int stream, long *pn) {
         if (serve_gate(c)) return -1;
         queued++;
         double tq = now();
-        s = slot_acquire(kind == K_DECIDE ? "" : it[first].r.prompt, &ticket, &bank);
+        s = slot_acquire(kind == K_DECIDE ? "" : it[first].r.prompt, &ticket, &bank, c->fd);
         queued--;
         if (!s) {
             err_reply(c, 503, "unavailable_error", closing ? "server is shutting down" : "engine is not running");
@@ -1770,6 +1803,7 @@ static int batch_run(Conn *c, Item *it, int n, int kind, int stream, long *pn) {
     int grp_end = 0; // BATCH-NATIVE: the items before it are already sent
     for (int i = 0; i < n; i++) {
         Item *t = &it[i];
+        if (s && (c->broken || client_gone(c->fd))) { c->cancelled = 1; slot_restart(s); break; }
         if (!t->status && s->dead) item_err(t, 503, "engine exited", NULL);
         if (!t->status) {
             Conn ic = *c; // the item's own request id; its reply is captured into t->out
@@ -1794,12 +1828,14 @@ static int batch_run(Conn *c, Item *it, int n, int kind, int stream, long *pn) {
                     // --native-cont: the engine answers each item when it is done; route by bx_item and
                     // stream it at once (its event carries its index)
                     for (int r = 0; native_cont && r < k; r++) {
-                        int m = s->dead ? -1 : bx_item_read(s);
+                        int m = s->dead ? -1 : bx_item_read(s, c);
+                        if (c->cancelled) break;
                         if (m < 0 || m >= k || it[gi[m]].status) { s->dead = 1; break; }
                         Item *u = &it[gi[m]];
                         Conn uc = *c;
                         uc.cap = &u->out, uc.id = ++req_seq, uc.gen_n = 0, uc.prompt_n = 0;
                         decide_read(s, &uc);
+                        if (uc.cancelled) { c->cancelled = 1; break; }
                         u->status = uc.cap_status ? uc.cap_status : 500;
                         if (stream) {
                             sb o = {0};
@@ -1810,6 +1846,7 @@ static int batch_run(Conn *c, Item *it, int n, int kind, int stream, long *pn) {
                         }
                     }
                     free(gi);
+                    if (c->cancelled) break;
                 }
                 if (native_cont) {
                     if (!t->status) item_err(t, 503, "engine exited", NULL);
@@ -1832,6 +1869,7 @@ static int batch_run(Conn *c, Item *it, int n, int kind, int stream, long *pn) {
                 }
                 run_decide(s, &ic, t->line);
             } else run_generate(s, bank, &ic, t->jb, &t->r);
+            if (ic.cancelled) { c->cancelled = 1; break; }
             t->status = ic.cap_status ? ic.cap_status : 500;
             c->gen_n += ic.gen_n;
             *pn += ic.prompt_n;
@@ -1989,7 +2027,7 @@ static void handle_decide(Conn *c, const char *body_s) {
         unsigned long ticket;
         int bank;
         double tq = now();
-        Slot *s = slot_acquire("", &ticket, &bank);
+        Slot *s = slot_acquire("", &ticket, &bank, c->fd);
         queued--;
         if (!s) err_reply(c, 503, "unavailable_error", closing ? "server is shutting down" : "engine is not running");
         else {
@@ -2049,7 +2087,7 @@ static void handle_generate(Conn *c, const char *body_s, int chat) {
         unsigned long ticket;
         int bank;
         double tq = now();
-        Slot *s = slot_acquire(r.prompt, &ticket, &bank);
+        Slot *s = slot_acquire(r.prompt, &ticket, &bank, c->fd);
         queued--;
         if (!s) err_reply(c, 503, "unavailable_error", closing ? "server is shutting down" : "engine is not running");
         else {
@@ -2679,16 +2717,16 @@ static void *watchdog_main(void *arg) {
         usleep(500000);
         for (int i = 0; i < n_slots; i++) {
             Slot *x = &slots[i];
-            if (!x->busy || x->dead || x->pid <= 0) continue;
+            pthread_mutex_lock(&q_lock);
+            if (!x->busy || x->dead || x->pid <= 0) { pthread_mutex_unlock(&q_lock); continue; }
             double idle = now() - x->t_last;
             if (engine_timeout_s > 0 && idle > engine_timeout_s) {
                 logf_("watchdog: engine[%d] silent %.0fs (limit %ds) — killing pid %d", i, idle, engine_timeout_s, (int)x->pid);
                 kill(x->pid, SIGKILL);
                 x->dead = 1;
-                pthread_mutex_lock(&q_lock);
                 pthread_cond_broadcast(&q_cond);
-                pthread_mutex_unlock(&q_lock);
             }
+            pthread_mutex_unlock(&q_lock);
         }
     }
     return NULL;
@@ -2834,6 +2872,7 @@ int main(int argc, char **argv) {
     freeaddrinfo(ai);
 
     t_start = time(NULL);
+    engine_argv = ev;
     slots = calloc((size_t)n_slots, sizeof *slots);
     for (int i = 0; i < n_slots; i++) {
         slots[i].idx = i;
@@ -2867,6 +2906,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_slots; i++) {
             Slot *x = &slots[i];
             int st;
+            pthread_mutex_lock(&q_lock);
             if (x->pid > 0 && waitpid(x->pid, &st, WNOHANG) == x->pid) {
                 x->pid = -x->pid;
                 x->status = st;
@@ -2874,12 +2914,13 @@ int main(int argc, char **argv) {
                 ready_check();
                 if (n_slots == 1) logf_("engine exited (status %d) — serving 503", st);
                 else logf_("engine[%d] exited (status %d)%s", i, st, all_dead() ? " — serving 503" : "");
-                pthread_mutex_lock(&q_lock);
                 pthread_cond_broadcast(&q_cond);
-                pthread_mutex_unlock(&q_lock);
             }
+            pthread_mutex_unlock(&q_lock);
         }
+        pthread_mutex_lock(&q_lock);
         if (all_dead()) engine_dead = 1;
+        pthread_mutex_unlock(&q_lock);
         if (!(pf[0].revents & POLLIN)) continue;
         struct sockaddr_storage sa2;
         socklen_t sl = sizeof sa2;

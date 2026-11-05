@@ -148,11 +148,7 @@ objects are unaffected, because comments do not reach the compiled code.
 `isildur.sh verify` compares headers, so it reports that header as
 different against a Vendor directory built by isildur.
 
-The app's [`../Vendor/SHA256SUMS`](../Vendor/SHA256SUMS) pins a header
-`8106b41f…` and its own library hashes. That is neither of the headers
-above, so the Vendor files that the app was graded with were not built from
-isildur `8ff026e`. They come from a later engine. Rebuild and compare before
-you treat this recipe as the source of that Vendor.
+The earlier app Vendor contained later G3 APIs absent from the original isildur wrapper. The build now applies the G3 transformations from `g18-memlevers-eng` commit `030443f` and preserves those APIs. The app Vendor manifest records the rebuilt slices.
 
 ## Relation to `backends/metal`
 
@@ -181,10 +177,25 @@ revision and does not apply to `vision/host/` here.
 ## Gaps
 
 - `base/` (4.2 MB) and `S1D/` are not vendored. See [Inputs](#inputs).
-- This copy was not built. It was checked with `bash -n` and the hash
-  checks only. The upstream build was proven from a fresh clone.
+- This copy has been rebuilt for macOS, iOS and simulator from the pinned inputs. A Mac hardware test exercised cancellation and subsequent reuse; an iOS simulator build compiled and linked. Real iOS device cancellation has not been tested.
 - `mac/fresh36.sh` and `mac/fresh41.sh` cannot run, because their lane trees
   no longer exist.
 - The EngineHost project expects `../../build/LLBEngine.xcframework`
   relative to `ios/engine-host`, as in upstream's layout. Copy or link the
   xcframework there, or edit `project.yml`.
+
+### Cooperative cancellation
+
+The iOS-specific `engine-cancel.patch` checks the host cancellation flag between
+Bend decode steps and between prefill chunks or exact-token steps. `llb_cancel()` sets that atomic flag from another thread;
+`llb_cancel_reset()` must be called before a new generation. The poll cannot interrupt a GPU command already submitted. A
+caller must associate cancellation with the active request and clear the flag
+before starting the next one. `scripts/cancel-test.sh MODEL_DIR CACHE_DIR` checks
+that a cancelled resident generation stops and a subsequent generation works.
+
+The emitted-C input is pinned by `patches/CAM_SRC_SHA`. The G3 source transformations are from `g18-memlevers-eng` commit `030443f`;
+they preserve `llb_generate_px`, `llb_state_save`, `llb_state_load`, and
+`llb_packmap_report`. The host source tag changes with the emitted program, so
+snapshots from a previous build are safely rejected.
+
+The current Bend-emitted C SHA256 is `9884e4c50b95e4e58c5bfd326ec40a8278a49ce99d3b7a9a0130bf8e887aadfb`; after the G3 host transformations it is `da60adc346edcb76a598ac4ccffb238f9e1478fbc4daad28ae515602aa959ba7`. The app cache tag is `da60adc3`. Base and S1D inputs are from isildur `8ff026e4d723803385bcd089f61191bddd22dd57` and are checked against the repository manifests.

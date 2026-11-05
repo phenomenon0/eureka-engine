@@ -6,6 +6,14 @@ Copied verbatim from the served site the served WEBGPU-E2E site bundle (the bund
 - Not here: `models/` (weights; HF or local symlinks), `models/qwen35-tokenizer.bin` (7.5 MB, no HF home yet), `senses/vendor/` (`scripts/senses/vendor.sh`).
 - Owner of record stays bendweb. Replace these as a set and re-run the e2e matrix.
 
+The hashes below describe the original bundle. The lifecycle fixes from app commit `9dd22af21b7ec84df708866e47f7e96364230eac` were ported onto this source's newer batched-prefill worker on 2026-11-04; the two current files are:
+
+- `engine/bend-worker.js`: `b8202186287bcdc8a0e366dd244bfe1215931b778783746c6a05c799e04e7bbb`
+- `engine/app-worker.js`: `35f6e4e5a0593e2e1e3eaec7ae2498f02238e259422b709ead4e70a12ffaa1fd`
+- `trunk/clef_session.js`: `e9abf5e5b3c9399dd3cdd576873ff2d549e104116fdd25d9979262b80c301480`
+
+Run `node --test backends/webgpu/tests/worker-lifecycle.test.mjs` from the repository root. This checks worker orchestration with a simulated session; the WebGPU device and model matrix still require live testing. This source is not interchangeable with the app's older worker: retain its prefill options when folding changes back to bendweb.
+
 ```
 0b5185f77335186e094c431aa1fae6202c4196ada113be487d5a44a74c5c92c5  engine/app-worker.js
 a47f970d27e3c8664043a98182a586632229b4d9dd7b742d7b202341ed7580e8  engine/bend-worker.js
@@ -45,7 +53,7 @@ bb2c4b86f4f16567e4827cb03237977b385d812bcbffcb9d4675ef132ca68cdf  trunk/trunk_se
 
 ## Batched prefill + WebKit twins (webprefill3 `3a66615`, adopted tree `race/n3`)
 
-The three engine files above were replaced, and 12 runtime modules, one check module and one check page were added (see README.md, "Batched prefill and the Safari/WebKit twins"). The before hashes are the ones in the table above; they were byte-equal to the lane's `race/shipped-src`. Current hashes:
+The three engine files above were replaced, and 12 runtime modules, one check module and one check page were added (see README.md, "Batched prefill and the Safari/WebKit twins"). The before hashes are the ones in the table above; they were byte-equal to the lane's `race/shipped-src`. Hashes at that adoption (the lifecycle update above supersedes the worker hash):
 
 ```
 967c807e5695986191145905049dd0c67293854f80d5ccda3ecda65c6d836611  engine/bend-worker.js

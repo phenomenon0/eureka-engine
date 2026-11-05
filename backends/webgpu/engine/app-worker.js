@@ -44,7 +44,7 @@ async function trunkOpen(m, shipped) {
   };
   cached = [];
   const w0 = performance.now(); await session.step(IM_END, 0); session.reset(); const warm_ms = performance.now() - w0;
-  post({ t: "ready", label: m.label ?? "", open_ms: Math.round(performance.now() - t0), warm_ms: Math.round(warm_ms),
+  post({ t: "ready", openId: m.openId, label: m.label ?? "", open_ms: Math.round(performance.now() - t0), warm_ms: Math.round(warm_ms),
     facts: { numerics: "trunk f32", subgroups: false, dispatches: e.dispatches, ctx, resident_bytes: e.resident_bytes, pack_sha256: null, verified: false,
       engine: "trunk", shape: `${chk.shape.arch} · ${chk.shape.n_layer} layers · d${chk.shape.d}`, adapter: e.adapter ?? {} } });
 }

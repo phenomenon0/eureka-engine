@@ -36,14 +36,16 @@ export class ClefDecider {
     this.e = await trunk_open(read, { ctx, gguf: g, onProgress });
     return { open_ms: Math.round(performance.now() - t0), head_load_ms: Math.round(th - t0), arch: a, head_bytes: this.head.bytes, resident_bytes: this.e.resident_bytes };
   }
-  async decide(body, { debug = false } = {}) {
+  async decide(body, { debug = false, cancelled = () => false } = {}) {
     const questions = clef_questions(body), pieces = clef_pieces(body.state, questions), tk = clef_tokens(pieces, this.encode);
     const n = tk.ids.length, d = this.e.shape.d;
     if (n > this.e.ctx) throw new Error(`The prompt (${n} tokens) doesn't fit the ${this.e.ctx}-token context.`);
     const t0 = performance.now();
+    if (cancelled()) throw new Error("decision cancelled");
     await this.e.reset();   // clef's graph has no cache: every request starts from zero state
     const hidden = new Float32Array(n * d);
-    for (let i = 0; i < n; i++) hidden.set((await this.e.step(tk.ids[i], { wantHidden: true, noHead: true })).hidden, i * d);
+    for (let i = 0; i < n; i++) { if (cancelled()) throw new Error("decision cancelled"); hidden.set((await this.e.step(tk.ids[i], { wantHidden: true, noHead: true })).hidden, i * d); }
+    if (cancelled()) throw new Error("decision cancelled");
     const t1 = performance.now(), trace = {};
     const scores = await this.head.scores(hidden, tk.ids, tk.spans, { trace });
     const answers = this.head.answers(questions, scores), t2 = performance.now();

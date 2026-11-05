@@ -1,0 +1,11 @@
+--- a/tools/kevserve/kev.c
++++ b/tools/kevserve/kev.c
+@@ -458,6 +458,8 @@
+     t[need] = 0;
+     sb_add(&o, "],\"text\":");
+     json_quote(&o, t);
++    if (getenv("KEV_EOS"))
++      sb_fmt(&o, ",\"finish_reason\":\"%s\"", k < steps ? "stop" : "length");
+     sb_addc(&o, '}');
+     free(t);
+     reply(o.p);

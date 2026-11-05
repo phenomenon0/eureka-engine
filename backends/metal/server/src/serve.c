@@ -69,6 +69,7 @@ typedef struct {
     atomic_int ready, dead;
     long n_req;
     int status; // wait status once reaped (pid < 0)
+    pthread_t err_thread;
     double t_last;
     char *last; // the last prompt text sent to this slot (affinity)
 } Slot;
@@ -76,11 +77,12 @@ static Slot *slots;
 static int n_slots = 1;
 static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cond = PTHREAD_COND_INITIALIZER;
-static unsigned long q_tail, q_head; // FIFO tickets: next to issue, next to serve
+static unsigned long q_tail; // monotonically increasing FIFO ticket
 static atomic_int ready, engine_dead, inflight, queued, stopping;
 static atomic_long req_seq;
 static time_t t_start;
 static int wake[2];
+static char **engine_argv;
 
 // hear: one whisper-server sidecar (whisper.cpp) owns the ear. It is a separate
 // process on loopback; /v1/hear serializes on hear_lock because the sidecar
@@ -144,19 +146,22 @@ static void *engine_err(void *p) {
         funlockfile(stderr);
     }
     free(line);
+    fclose(a.f);
     return NULL;
 }
 
 static void engine_start(Slot *s, char **argv) {
     int in[2], out[2], err[2];
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0) max_fd = 65536;
     if (pipe(in) || pipe(out) || pipe(err)) perror("pipe"), exit(1);
     pid_t engine_pid = s->pid = fork();
     if (engine_pid < 0) perror("fork"), exit(1);
     if (!engine_pid) {
-        // children must not hold the other slots' pipe ends (EOF on shutdown)
-        for (int i = 0; i < s->idx; i++) fclose(slots[i].in), fclose(slots[i].out);
         dup2(in[0], 0), dup2(out[1], 1), dup2(err[1], 2);
-        close(in[0]), close(in[1]), close(out[0]), close(out[1]), close(err[0]), close(err[1]);
+        // A restart occurs after listening and accepted sockets exist. The child
+        // must not keep any supervisor or other worker descriptors alive.
+        for (long fd = 3; fd < max_fd; fd++) close((int)fd);
         setenv("LLB_SYS1", "1", 1);
         setenv("LLB_SYS1_STREAM", "1", 1);
         // dual.c / sys1.c refuse these (exact pass only)
@@ -168,11 +173,10 @@ static void engine_start(Slot *s, char **argv) {
     close(in[0]), close(out[1]), close(err[1]);
     s->in = fdopen(in[1], "w");
     s->out = fdopen(out[0], "r");
+    setvbuf(s->out, NULL, _IONBF, 0);
     ErrArg *a = malloc(sizeof *a);
     *a = (ErrArg){s, fdopen(err[0], "r")};
-    pthread_t t;
-    pthread_create(&t, NULL, engine_err, a);
-    pthread_detach(t);
+    pthread_create(&s->err_thread, NULL, engine_err, a);
 }
 
 static int all_dead(void) {
@@ -189,13 +193,25 @@ static size_t lcp(const char *a, const char *b) {
     return n;
 }
 
-static Slot *slot_acquire(const char *prompt, unsigned long *ticket) {
+typedef struct Waiter { struct Waiter *next; } Waiter;
+static Waiter *wait_first, *wait_last;
+
+static int client_gone(int fd) {
+    char ch;
+    ssize_t n = recv(fd, &ch, 1, MSG_PEEK | MSG_DONTWAIT);
+    return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
+}
+
+static Slot *slot_acquire(const char *prompt, unsigned long *ticket, int fd) {
     pthread_mutex_lock(&q_lock);
-    unsigned long me = *ticket = q_tail++;
+    *ticket = q_tail++;
+    Waiter me = {0};
+    if (wait_last) wait_last->next = &me; else wait_first = &me;
+    wait_last = &me;
     Slot *s = NULL;
     for (;;) {
-        if (all_dead()) break;
-        if (me == q_head) {
+        if (all_dead() || client_gone(fd) || stopping) break;
+        if (wait_first == &me) {
             long best = -1;
             for (int i = 0; i < n_slots; i++) {
                 Slot *x = &slots[i];
@@ -205,13 +221,43 @@ static Slot *slot_acquire(const char *prompt, unsigned long *ticket) {
             }
             if (s) break;
         }
-        pthread_cond_wait(&q_cond, &q_lock);
+        struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 100000000; if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&q_cond, &q_lock, &until);
     }
-    q_head++; // also when giving up, so the tickets behind stay live
+    Waiter **p = &wait_first;
+    while (*p && *p != &me) p = &(*p)->next;
+    if (*p) *p = me.next;
+    if (wait_last == &me) { wait_last = wait_first; while (wait_last && wait_last->next) wait_last = wait_last->next; }
     if (s) s->busy = 1;
     pthread_cond_broadcast(&q_cond);
     pthread_mutex_unlock(&q_lock);
     return s;
+}
+
+// A canceled engine has an unread response in its pipe. Replace only that slot,
+// and do not return it to the queue until the new child reports readiness.
+static void slot_restart(Slot *s) {
+    pthread_mutex_lock(&q_lock);
+    pid_t pid = s->pid;
+    s->ready = 0;
+    if (pid > 0) {
+        kill(pid, SIGKILL);
+        int status;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        s->pid = -pid;
+    }
+    pthread_mutex_unlock(&q_lock);
+    pthread_join(s->err_thread, NULL);
+    s->ready = 0;
+    fclose(s->in); fclose(s->out);
+    free(s->last); s->last = NULL;
+    pthread_mutex_lock(&q_lock);
+    s->dead = 0;
+    engine_start(s, engine_argv);
+    engine_dead = 0;
+    pthread_cond_broadcast(&q_cond);
+    pthread_mutex_unlock(&q_lock);
 }
 
 static void slot_release(Slot *s, const char *prompt) {
@@ -243,7 +289,7 @@ typedef struct {
     int fd, status, stream, prompt_n, gen_n;
     long bytes, id;
     char ip[64], method[16], path[256];
-    int broken; // client went away mid-stream (the engine is still drained)
+    int broken; // client went away mid-stream
     int slot;   // G6: the slot that ran it (-1 = none)
     int authed;
     char xh[128]; // G6: extra response headers (N>1 only: slot, ticket, queue wait)
@@ -428,7 +474,7 @@ static const char *render_chat(const jv *body, sb *o) {
 static int num_field(const jv *body, const char *k, int *v, const char **err) {
     const jv *x = json_get(body, k);
     if (!x || x->type == J_NULL) return 0;
-    if (x->type != J_NUM || x->num != (double)(long)x->num || x->num < 1 || x->num > 65536)
+    if (x->type != J_NUM || x->num < 1 || x->num > 65536 || x->num != (double)(long)x->num)
         return *err = "max_tokens must be an integer 1..65536", -1;
     *v = (int)x->num;
     return 1;
@@ -571,6 +617,16 @@ static void run_generate(Slot *s, Conn *c, const jv *body, const Req *r) {
     size_t cap = 0;
     jv *fin = NULL;
     for (;;) {
+        struct pollfd fds[2] = {{.fd = fileno(s->out), .events = POLLIN}, {.fd = c->fd, .events = POLLIN}};
+        while (!c->broken && !client_gone(c->fd)) {
+            int n = poll(fds, 2, 100);
+            if (n < 0 && errno != EINTR) { c->broken = 1; break; }
+            if (n > 0 && (fds[0].revents & (POLLIN | POLLHUP | POLLERR))) break;
+        }
+        if (c->broken || client_gone(c->fd)) {
+            logf_("client disconnected; restarting slot %d", s->idx);
+            free(l); free(g.text.p); slot_restart(s); return;
+        }
         if (getline(&l, &cap, s->out) <= 0) {
             s->dead = 1;
             if (!r->stream) err_reply(c, 503, "unavailable_error", "engine exited");
@@ -695,7 +751,7 @@ static void handle_generate(Conn *c, const char *body_s, int chat) {
         queued++;
         unsigned long ticket;
         double tq = now();
-        Slot *s = slot_acquire(r.prompt, &ticket);
+        Slot *s = slot_acquire(r.prompt, &ticket, c->fd);
         queued--;
         if (!s) err_reply(c, 503, "unavailable_error", "engine is not running");
         else {
@@ -715,14 +771,18 @@ static void handle_generate(Conn *c, const char *body_s, int chat) {
 // the engine's decide line: the request body itself (the engine needs "model"; the served
 // alias is filled in when the caller leaves it out). The body is already JSON.
 static char *decide_line(const char *body_s, const jv *body) {
-    if (json_get(body, "model")) return trim(body_s);
-    char *t = trim(body_s);
+    (void)body_s;
     sb o = {0};
-    sb_add(&o, "{\"model\":");
-    json_quote(&o, alias);
-    sb_addc(&o, ',');
-    sb_add(&o, t + 1); // past '{', keeps the caller's keys as they are
-    free(t);
+    if (json_get(body, "model")) json_dump(&o, body);
+    else {
+        sb_add(&o, "{\"model\":");
+        json_quote(&o, alias);
+        for (size_t i = 0; i < body->n; i++) {
+            sb_addc(&o, ','); json_quote(&o, body->keys[i]); sb_addc(&o, ':');
+            json_dump(&o, body->items[i]);
+        }
+        sb_addc(&o, '}');
+    }
     return o.p;
 }
 
@@ -751,7 +811,7 @@ static void handle_decide(Conn *c, const char *body_s) {
         char *line = decide_line(body_s, body);
         queued++;
         unsigned long ticket;
-        Slot *s = slot_acquire(line, &ticket);
+        Slot *s = slot_acquire(line, &ticket, c->fd);
         queued--;
         if (!s) {
             err_reply(c, 503, "unavailable_error", "engine is not running");
@@ -769,6 +829,13 @@ static void handle_decide(Conn *c, const char *body_s) {
                 // LLB_SYS1_STREAM=1 is set for the chat path, so the engine answers a decide's
                 // forward with token events before the decision line: skip them here.
                 for (;;) {
+                    struct pollfd fds[2] = {{.fd = fileno(s->out), .events = POLLIN}, {.fd = c->fd, .events = POLLIN}};
+                    while (!client_gone(c->fd)) {
+                        int n = poll(fds, 2, 100);
+                        if (n < 0 && errno != EINTR) { c->broken = 1; break; }
+                        if (n > 0 && (fds[0].revents & (POLLIN | POLLHUP | POLLERR))) break;
+                    }
+                    if (c->broken || client_gone(c->fd)) { slot_restart(s); break; }
                     if (getline(&l, &cap, s->out) <= 0) {
                         s->dead = 1;
                         err_reply(c, 503, "unavailable_error", "engine exited");
@@ -922,7 +989,7 @@ static void handle_see(Conn *c, const char *body_s) {
     }
     see_path(py, sizeof py, "LLB_SEE_PY", "/.eureka/see/.venv/bin/python");
     see_path(cli, sizeof cli, "LLB_SEE_CLI", "/.eureka/see/detect_cli.py");
-    see_path(model, sizeof model, "LLB_SEE_MODEL", "/.eureka/see/dfine_n_hf.onnx");
+    see_path(model, sizeof model, "LLB_SEE_MODEL", "/macops/workroom/E-METAL-LEAD/see/dfine_n_hf.onnx");
     snprintf(cmd, sizeof cmd, "'%s' '%s' --model '%s' --image '%s' 2>/dev/null", py, cli, model, tpl);
     double t0 = now();
     FILE *f = popen(cmd, "r");
@@ -1587,6 +1654,7 @@ int main(int argc, char **argv) {
     freeaddrinfo(ai);
 
     t_start = time(NULL);
+    engine_argv = ev;
     slots = calloc((size_t)n_slots, sizeof *slots);
     for (int i = 0; i < n_slots; i++) {
         slots[i].idx = i;
@@ -1604,18 +1672,20 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_slots; i++) {
             Slot *x = &slots[i];
             int st;
+            pthread_mutex_lock(&q_lock);
             if (x->pid > 0 && waitpid(x->pid, &st, WNOHANG) == x->pid) {
                 x->pid = -x->pid;
                 x->status = st;
                 x->dead = 1;
                 if (n_slots == 1) logf_("engine exited (status %d) — serving 503", st);
                 else logf_("engine[%d] exited (status %d)%s", i, st, all_dead() ? " — serving 503" : "");
-                pthread_mutex_lock(&q_lock);
                 pthread_cond_broadcast(&q_cond);
-                pthread_mutex_unlock(&q_lock);
             }
+            pthread_mutex_unlock(&q_lock);
         }
+        pthread_mutex_lock(&q_lock);
         if (all_dead()) engine_dead = 1;
+        pthread_mutex_unlock(&q_lock);
         if (whisper_pid > 0) {
             int st;
             if (waitpid(whisper_pid, &st, WNOHANG) == whisper_pid) {

@@ -1,0 +1,69 @@
+--- a/engine_qwen35_gpu.bend
++++ b/engine_qwen35_gpu.bend
+@@ -1215,17 +1215,26 @@
+       IO.pure(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, (pos, (0, st)))
+ 
+ @unsafe
++def cancel.prefill(cancelled: Bool, +pos: U32, st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, k: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)> -> IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>)) -> IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
++  match cancelled:
++    case True{}:
++      IO.pure(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, (pos, (0, st)))
++    case False{}:
++      k(st)
++
++@unsafe
+ def prefill.f27.go(go: Bool, +n: U32, +k: U32, +ts: List<&2, U32>, +m: Model, +b: Nat, +em: U32, +dT: Nat, +nT: U32,
+   +pos: U32, st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, +steps: U32) ->
+   IO(U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>):
+   match go:
+     case True{}:
+       +nt : U32 = Bool.pick(U32, U32.is_lt(k, (n - 1 : U32)), k, (n - 1 : U32))
+-      IO.bind(List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>,
+-        U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>,
+-        step.chunkf(m, dT, pos, ts, nt, st),
+-        st2 => prefill.f27.go(U32.is_gt((n - nt : U32), 1), (n - nt : U32), k, f27.drop(ts, U32.to_nat(nt)), m, b, em,
+-          dT, nT, (pos + nt : U32), st2, steps))
++      IO.bind(Bool, U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, IO.signal_pending(0), cancelled =>
++        cancel.prefill(cancelled, pos, st, st0 =>
++          IO.bind(List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>,
++            U32 & U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, step.chunkf(m, dT, pos, ts, nt, st0),
++            st2 => prefill.f27.go(U32.is_gt((n - nt : U32), 1), (n - nt : U32), k, f27.drop(ts, U32.to_nat(nt)), m, b, em,
++              dT, nT, (pos + nt : U32), st2, steps))))
+     case False{}:
+       prefill.f27.last(ts, m, b, em, dT, nT, pos, st, steps)
+ 
+@@ -1260,14 +1269,16 @@
+   +steps: U32, +sp: List<&2, U32>, go: Bool) -> IO(Unit):
+   match n:
+     case 0n:
+-      IO.print(U32.show(tok))
++      IO.bind(Bool, Unit, IO.signal_pending(0), cancelled =>
++        Bool.pick(IO(Unit), cancelled, IO.print_err("cancelled"), IO.print(U32.show(tok))))
+     case 1n+p:
+       match go:
+         case True{}:
+-          do IO<Unit>:
+-            IO.print(U32.show(tok))
+-            IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, tok, st, steps),
+-              run.with(+t => st2 => gen(p, m, b, em, dT, nT, (pos + 1 : U32), t, st2, steps, sp, stop.go(sp, t))))
++          IO.bind(Bool, Unit, IO.signal_pending(0), cancelled =>
++            Bool.pick(IO(Unit), cancelled, IO.print_err("cancelled"),
++              IO.bind(Unit, Unit, IO.print(U32.show(tok)), _ =>
++                IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, tok, st, steps),
++                  run.with(+t => st2 => gen(p, m, b, em, dT, nT, (pos + 1 : U32), t, st2, steps, sp, stop.go(sp, t)))))))
+         case False{}:
+           do IO<Unit>:
+             IO.print(U32.show(tok))
+@@ -1278,8 +1289,10 @@
+   st: List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, +steps: U32, +sp: List<&2, U32>) -> IO(Unit):
+   match ts:
+     case Con{t, rest}:
+-      IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, t, st, steps),
+-        run.with(nt => st2 => prompt(rest, n, m, b, em, dT, nT, (pos + 1 : U32), nt, st2, steps, sp)))
++      IO.bind(Bool, Unit, IO.signal_pending(0), cancelled =>
++        Bool.pick(IO(Unit), cancelled, IO.print_err("cancelled"),
++          IO.bind(U32 & List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>, Unit, step(m, b, em, dT, nT, pos, t, st, steps),
++            run.with(nt => st2 => prompt(rest, n, m, b, em, dT, nT, (pos + 1 : U32), nt, st2, steps, sp)))))
+     case Nil{}:
+       gen(n, m, b, em, dT, nT, pos, prev, st, steps, sp, stop.go(sp, prev))
+ 

@@ -13,6 +13,7 @@ W=${W:-${ISILDUR_OUT:-$top}/work/mac}  # (ISILDUR) re-rooted to this repo (PHONE
 export HOME=$W/home TMPDIR=$W/tmp CLANG_MODULE_CACHE_PATH=$W/modules BUN_INSTALL_CACHE_DIR=$W/tmp/bun
 mkdir -p "$HOME" "$TMPDIR" "$CLANG_MODULE_CACHE_PATH" "$W/inc"
 S=$W/tree O=${O:-$W/build}
+(cd "$root" && shasum -a 256 -c --quiet "$top/S1D.SHA256SUMS") || { echo "S1D input differs from pinned checksums"; exit 3; }
 bash "$here/base_tree.sh" "$S"
 if [ -z "${NO4B:-}" ]; then
   (cd "$top/patches" && shasum -a 256 -c --quiet SHA256SUMS) || { echo "4B patch hashes differ"; exit 3; }
@@ -56,6 +57,8 @@ if [ -z "${NO4B:-}" ]; then
     # named logits of the head at a prompt pos, in process); VISION=1 only, NORO=1 skips
     [ -n "${NORO:-}" ] || (cd "$S/cc" && patch -s --fuzz=0 -p1 < "$top/patches/metal-camera.patch")
   fi
+  (cd "$S/engine" && patch -s --fuzz=0 -p1 < "$top/patches/engine-cancel.patch")
+  (cd "$S/cc" && patch -s --fuzz=0 -p1 < "$top/patches/metal-cancel.patch")
   # (ENGINE-PHONE2) no gate instrument here: gate-logits*.patch are not carried (never in a product build)
   find "$S" -name '*.orig' -delete
 fi

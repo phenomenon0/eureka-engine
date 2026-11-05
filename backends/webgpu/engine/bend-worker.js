@@ -19,6 +19,8 @@ const IM_END = 248046, END_OF_TEXT = 248044;
 
 let engine = null, ggufpack = null, device = null, session = null, Tok = null;
 let ctx = 4096, cached = [], current = null, tail = Promise.resolve(), gen = 0, label = "", kev = null, pfOn = true;
+const requests = new Set();
+let openTail = Promise.resolve();
 
 const toU8 = (b) => b instanceof Uint8Array ? b : new Uint8Array(b);
 const fileReader = (file) => async (offset, length) => toU8(await file.slice(offset, offset + length).arrayBuffer());
@@ -117,7 +119,7 @@ async function open(m) {
   session = s; cached = [];
   // a first step compiles the graph variant; do it now so the person's first token doesn't pay for it
   const w0 = performance.now(); await s.step(IM_END, 0); s.reset(); const warm_ms = performance.now() - w0;
-  post({ t: "ready", label, open_ms: Math.round(performance.now() - t0), warm_ms: Math.round(warm_ms),
+  post({ t: "ready", openId: m.openId, label, open_ms: Math.round(performance.now() - t0), warm_ms: Math.round(warm_ms),
     facts: { numerics: s.facts.numerics, subgroups: s.facts.subgroups, dispatches: s.facts.dispatches, ctx, resident_bytes: s.facts.resident_bytes,
       pack_sha256: s.facts.pack_sha256, verified: verify, adapter: { vendor: info.vendor, architecture: info.architecture, description: info.description } } });
 }
@@ -127,18 +129,21 @@ function chat({ id, system, messages, maxNew = 768, prompt }) {
   const text = prompt ?? render(system, messages);
   const ids = encode(text);
   if (ids.length + 8 > ctx) { post({ t: "error", id, message: `The conversation is ${ids.length} tokens; the web engine holds ${ctx}. Start a new chat.` }); return; }
-  const mine = current = { id, finished: false };
-  tail = tail.then(() => loop(mine, ids, Math.min(maxNew, ctx - ids.length)));
+  const mine = { id, finished: false };
+  requests.add(mine);
+  tail = tail.catch(() => {}).then(() => loop(mine, ids, Math.min(maxNew, ctx - ids.length)));
 }
 
 async function loop(r, ids, maxNew) {
+  if (r.finished) return;
+  current = r;
   const t0 = performance.now(), dec = new BendWire.Utf8Stream();
   let reuse = cached.length && cached.length <= ids.length && cached.every((x, i) => ids[i] === x) ? cached.length : 0;
   if (reuse === ids.length) reuse = 0;   // nothing new to feed: the last prompt token must be stepped for its logits
   post({ t: "prompt", id: r.id, ids: ids.length, reused: reuse });
   let prefill = 0, decode = 0, steps = 0, n = 0, firstAt = null, batch = null;
   const finish = (reason, extra = {}) => {
-    if (r.finished) return; r.finished = true; if (current === r) current = null;
+    if (r.finished) return; r.finished = true; requests.delete(r); if (current === r) current = null;
     post({ t: "done", id: r.id, reason, ...extra, stats: { numerics: session?.numerics, prompt_tokens: ids.length, reused_tokens: reuse,
       prefill_tokens: ids.length - reuse, prefill_ms: Math.round(prefill), decode_tokens: n, decode_ms: Math.round(decode),
       decode_steps: steps, tokens_per_second: steps ? steps * 1000 / decode : null, first_token_ms: firstAt, prefill_batch: batch, wall_ms: Math.round(performance.now() - t0) } });
@@ -205,7 +210,8 @@ function orderedKeys(body, key) {
   }
   return keys;
 }
-async function decide({ id, body }) {
+async function decide({ id, body }, request) {
+  if (request.finished) return;
   if (!session || !kev) { post({ t: "error", id, message: "The decision model isn't loaded." }); return; }
   const t0 = performance.now(), req = JSON.parse(body), names = Object.keys(req.questions ?? {});
   const qn = names[0], q = req.questions?.[qn];
@@ -221,6 +227,7 @@ async function decide({ id, body }) {
   session.reset(); cached = [];
   for (let pos = 0; pos < ids.length; pos++) {
     const out = await session.step(ids[pos], pos); ms += out.ms;
+    if (request.finished) return;
     if (want.has(pos)) rows.set(pos, new Float32Array(out.stages["head.h"].buffer.slice(0, 2560 * 4)));
   }
   const embed = (h) => { const e = new Float32Array(kev.rows); for (let r = 0; r < kev.rows; r++) { let a = 0; const o = r * 2560; for (let k = 0; k < 2560; k++) a += kev.w[o + k] * h[k]; e[r] = a + kev.bias[r]; } return e; };
@@ -229,13 +236,17 @@ async function decide({ id, body }) {
   const mx = Math.max(...scores), ex = scores.map(x => Math.exp((x - mx) / kev.temperature)), z = ex.reduce((a, b) => a + b, 0), p = ex.map(x => x / z);
   const best = p.indexOf(Math.max(...p)), n = p.length;
   const answer = { type: "choice", choice: options[best], probabilities: Object.fromEntries(options.map((o, i) => [o, p[i]])), confidence: n < 2 ? 1 : Math.max(0, (p[best] - 1 / n) / (1 - 1 / n)) };
+  if (request.finished) return;
   post({ t: "decided", id, reply: { answers: { [qn]: answer }, usage: { input_tokens: ids.length, output_tokens: 0 } },
     stats: { prompt_tokens: ids.length, engine_ms: Math.round(ms), wall_ms: Math.round(performance.now() - t0), scores } });
 }
 
 async function free(keepGen) {
   if (!keepGen) gen++;
-  if (current) { current.finished = true; current = null; }
+  for (const r of requests) {
+    if (r.finish) r.finish("aborted");
+    else { r.finished = true; requests.delete(r); post({ t: "done", id: r.id, reason: "aborted", stats: {} }); }
+  }
   await tail.catch(() => {});
   const s = session; session = null; cached = [];
   try { await s?.free(); } catch {}
@@ -246,13 +257,39 @@ async function free(keepGen) {
 onmessage = async (e) => {
   const m = e.data;
   try {
-    if (m.t === "open") await open(m);
+    if (m.t === "open") {
+      // Abort active requests immediately, but serialize GPU teardown/open operations.
+      for (const r of requests) {
+        if (r.finish) r.finish("aborted");
+        else { r.finished = true; requests.delete(r); post({ t: "done", id: r.id, reason: "aborted", stats: {} }); }
+      }
+      openTail = openTail.catch(() => {}).then(() => open(m));
+      await openTail;
+    }
     else if (m.t === "chat") chat(m);
-    else if (m.t === "decide") await (tail = tail.then(() => decide(m)).catch(e => post({ t: "error", id: m.id, message: String(e?.message ?? e) })));
-    else if (m.t === "cancel") { if (current && current.id === m.id) { const r = current; if (r.finish) r.finish("aborted"); else { r.finished = true; current = null; post({ t: "done", id: m.id, reason: "aborted", stats: {} }); } } }
+    else if (m.t === "decide") {
+      const r = { id: m.id, finished: false };
+      r.finish = reason => { if (r.finished) return; r.finished = true; requests.delete(r); post({ t: "done", id: r.id, reason, stats: {} }); };
+      requests.add(r);
+      tail = tail.catch(() => {}).then(async () => {
+        if (r.finished) return;
+        try { await decide(m, r); }
+        catch (e) { if (!r.finished) post({ t: "error", id: m.id, message: String(e?.message ?? e) }); }
+        finally { r.finished = true; requests.delete(r); }
+      });
+      await tail;
+    }
+    else if (m.t === "cancel") { const r = [...requests].find(r => r.id === m.id); if (r) { if (r.finish) r.finish("aborted"); else { r.finished = true; requests.delete(r); post({ t: "done", id: m.id, reason: "aborted", stats: {} }); } } }
     else if (m.t === "setNumerics") { await tail; const x = await session.setNumerics(m.numerics); post({ t: "numerics", ...x }); }
-    else if (m.t === "free") { await free(); post({ t: "freed" }); }
+    else if (m.t === "free") {
+      for (const r of requests) {
+        if (r.finish) r.finish("aborted");
+        else { r.finished = true; requests.delete(r); post({ t: "done", id: r.id, reason: "aborted", stats: {} }); }
+      }
+      openTail = openTail.catch(() => {}).then(() => free());
+      await openTail; post({ t: "freed" });
+    }
   } catch (err) {
-    post({ t: "error", id: m.id, op: m.t, message: String(err?.message ?? err), stack: String(err?.stack ?? ""), code: err?.code, problems: err?.problems, describe: err?.describe });
+    post({ t: "error", id: m.id, op: m.t, openId: m.openId, message: String(err?.message ?? err), stack: String(err?.stack ?? ""), code: err?.code, problems: err?.problems, describe: err?.describe });
   }
 };

@@ -1,0 +1,25 @@
+{
+  "slices": {
+    "macos": {
+      "archive_equal_without_timestamps": true,
+      "detail": "IDENTICAL modulo ar member mtime/uid/gid/mode"
+    },
+    "ios": {
+      "archive_equal_without_timestamps": true,
+      "detail": "IDENTICAL modulo ar member mtime/uid/gid/mode"
+    },
+    "sim": {
+      "archive_equal_without_timestamps": true,
+      "detail": "IDENTICAL modulo ar member mtime/uid/gid/mode"
+    }
+  },
+  "header_identical": true,
+  "backends/metal/server/src/serve.c": "cd7596c798e2a831d61de40dd15bb9cb393fb0554e17908ea822f3851cd2243e",
+  "tools/sys1dual/serve.c": "543ae12ca43946a2c2e825095ee4617ec4ffeaf7fd39dd31fa102993e38d3a63",
+  "backends/webgpu/engine/bend-worker.js": "b8202186287bcdc8a0e366dd244bfe1215931b778783746c6a05c799e04e7bbb",
+  "emitted_c": "9884e4c50b95e4e58c5bfd326ec40a8278a49ce99d3b7a9a0130bf8e887aadfb",
+  "host_c": "da60adc346edcb76a598ac4ccffb238f9e1478fbc4daad28ae515602aa959ba7",
+  "android_sources_match_receipt": true,
+  "backends/metal/server/src/json.c": "09e307748824a7fb4482855548ba8f14fd6001f1176e64c722ad03323171355f",
+  "tools/clef3/json.c": "119d876e003ece643b01e86efdc3da2d5951ec8fb8a46966fb650374dbd2cecb"
+}

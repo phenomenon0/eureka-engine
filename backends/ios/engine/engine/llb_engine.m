@@ -31,6 +31,12 @@
 
 #include <mach-o/dyld.h>
 #include <stdint.h>
+#include <stdatomic.h>
+
+static atomic_bool llb_cancel_flag;
+int llb_cancel_requested(void) { return atomic_load_explicit(&llb_cancel_flag, memory_order_relaxed); }
+void llb_cancel(void) { atomic_store_explicit(&llb_cancel_flag, 1, memory_order_relaxed); }
+void llb_cancel_reset(void) { atomic_store_explicit(&llb_cancel_flag, 0, memory_order_relaxed); }
 #include <stdio.h>
 #include <string.h>
 
@@ -57,6 +63,7 @@ static FILE* llb_ferr;
 
 #define _NSGetExecutablePath llb_exe_path
 #define main llb_bend_main
+#define LLB_CANCEL_HOST 1
 #include "sys1mac.c"
 #undef main
 #undef _NSGetExecutablePath

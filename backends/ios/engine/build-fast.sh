@@ -29,10 +29,15 @@ fi
 cp "$W/tree/engine/host/llb_gguf.c" "$G/host/llb_gguf.c"   # the MMPROJ-patched loader vmm.c includes
 grep -q gg_mm_ "$G/host/llb_gguf.c" || { echo "work/mac/tree is not the VISION tree (no gg_mm_ in llb_gguf.c)"; exit 3; }
 (cd "$ENG/vision/host" && xxd -i vitm.metal) > "$G/vitm_msl.h"
-cp "$here/engine/llb_engine.h" "$B/cam/include/"
+mkdir -p "$G/wrap"
+cp "$here/engine/llb_engine.m" "$here/engine/llb_engine.h" "$G/wrap/"
+python3 "$here/patches/g3_emit.py" "$G/src/sys1mac.c"
+python3 "$here/patches/g3_wrap.py" "$G/wrap/llb_engine.m" "$G/wrap/llb_engine.h"
+TAG=$(shasum -a 256 "$G/src/sys1mac.c" | cut -c1-16)
+cp "$G/wrap/llb_engine.h" "$B/cam/include/"
 
 CFLAGS=(-DBEND_METAL=1 -DLLB_VISION=1 -x objective-c -fobjc-arc -fmodules -std=c11 -O3 -ffp-contract=off
-  -Wno-unused-function -I"$G/src" -I"$here/engine" -I"$ENG/engine" -I"$ENG/head" -I"$S1DT" -I"$here/vision/host"
+  -Wno-unused-function -DLLB_SRC_TAG=\"$TAG\" -I"$G/src" -I"$G/wrap" -I"$ENG/engine" -I"$ENG/head" -I"$S1DT" -I"$here/vision/host"
   -I"$ENG/vision/host")
 HFLAGS=(-O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off -fno-fast-math
   -D_POSIX_C_SOURCE=200809L -D_DARWIN_C_SOURCE)
@@ -46,7 +51,7 @@ lib() {  # lib <name> <sdk> <target>
   for f in "${HSRC[@]}"; do
     xcrun -sdk "$2" clang -target "$3" "${HFLAGS[@]}" -c "$f" -o "$d/obj/$(basename "$f" .c).o"
   done
-  xcrun -sdk "$2" clang -target "$3" "${CFLAGS[@]}" -c "$here/engine/llb_engine.m" -o "$d/obj/llb_engine.o"
+  xcrun -sdk "$2" clang -target "$3" "${CFLAGS[@]}" -c "$G/wrap/llb_engine.m" -o "$d/obj/llb_engine.o"
   xcrun -sdk "$2" clang -target "$3" "${VFLAGS[@]}" -DLLBV_NO_CPU -c "$here/vision/host/llbv.c" -o "$d/obj/llbv.o"
   for f in vpre vmm; do
     xcrun -sdk "$2" clang -target "$3" "${VFLAGS[@]}" -c "$ENG/vision/host/$f.c" -o "$d/obj/$f.o"
@@ -58,7 +63,7 @@ lib() {  # lib <name> <sdk> <target>
   local blas; blas=$(nm -u "$d/libllbengine.a" 2>/dev/null | grep -E '_(cblas|openblas)_' | sort -u || true)
   [ -z "$blas" ] || { echo "OpenBLAS symbols in $1: $blas"; exit 6; }
   printf '%s\n' '#include "llb_engine.h"' 'int main(void) { llb_prefix_forget(); return llb_classify_rgb(0, 0, 0, 0, 0, 0, 0, 0, 0, 0) + llb_generate_rgb(0, 0, 0, 0, 0, 0, 0, 0, 0, 0) + llb_vision_has(0, 0, 0); }' > "$d/probe.c"
-  xcrun -sdk "$2" clang -target "$3" -O2 -I"$here/engine" "$d/probe.c" -Wl,-all_load "$d/libllbengine.a" \
+  xcrun -sdk "$2" clang -target "$3" -O2 -I"$G/wrap" "$d/probe.c" -Wl,-all_load "$d/libllbengine.a" \
     -framework Metal -framework Foundation -o "$d/probe"
   echo "== cam-$1 ($3): probe linked (-all_load); $(shasum -a 256 "$d/libllbengine.a" | cut -c1-16) $(stat -f %z "$d/libllbengine.a") B"
 }

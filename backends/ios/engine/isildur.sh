@@ -24,7 +24,7 @@ OUTR=${ISILDUR_OUT:-$here}; export ISILDUR_OUT=$OUTR
 W=$OUTR/work/mac; export W
 export ZERO_AR_DATE=${ZERO_AR_DATE:-1}
 CAM_SHA=$(cat "$here/patches/CAM_SRC_SHA")
-PROGRAM_TAG=${CAM_SHA:0:8}   # the device program (Metal cache dir llb-<tag>); host-prefix.patch is host-only
+PROGRAM_TAG=${CAM_SHA:0:8}   # replaced by the final emitted+host source hash after lib()
 
 emit() {
   # the VISION tree must be the last one mac/build.sh wrote to work/mac/tree: build-fast.sh reads its llb_gguf.c
@@ -40,6 +40,7 @@ lib() { emit; bash "$here/build-fast.sh"; }
 
 dist() {
   lib
+  PROGRAM_TAG=$(shasum -a 256 "$OUTR/build/cam-gen/src/sys1mac.c" | cut -c1-8)
   local D=$OUTR/dist B=$OUTR/build; rm -rf "$D"; mkdir -p "$D/macos"
   cp -R "$B/cam/LLBEngine.xcframework" "$D/"
   # xcodebuild lists the slices in no fixed order; sorted, Info.plist depends only on its content

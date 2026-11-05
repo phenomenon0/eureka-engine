@@ -27,7 +27,7 @@ void sb_fmt(sb *s, const char *fmt, ...) {
 }
 
 typedef struct { const char *p; const char *err; } P;
-static jv *pv(P *c);
+static jv *pv(P *c, unsigned depth);
 static void ws(P *c) { while (*c->p == ' ' || *c->p == '\n' || *c->p == '\t' || *c->p == '\r') c->p++; }
 static jv *mk(jtype t) { jv *v = calloc(1, sizeof *v); v->type = t; return v; }
 static void put_utf8(sb *s, unsigned cp) {
@@ -48,6 +48,7 @@ static char *pstr(P *c) {
         if (!ch) { c->err = "unterminated string"; free(s.p); return NULL; }
         c->p++;
         if (ch == '"') break;
+        if ((unsigned char)ch < 0x20) { c->err = "control character in string"; free(s.p); return NULL; }
         if (ch != '\\') { sb_addc(&s, ch); continue; }
         ch = *c->p++;
         switch (ch) {
@@ -67,7 +68,8 @@ static char *pstr(P *c) {
     if (!s.p) s.p = strdup("");
     return s.p;
 }
-static jv *pv(P *c) {
+static jv *pv(P *c, unsigned depth) {
+    if (depth > 128) { c->err = "JSON nesting too deep"; return NULL; }
     ws(c);
     char ch = *c->p;
     if (ch == '"') { jv *v = mk(J_STR); v->str = pstr(c); if (!v->str) { free(v); return NULL; } return v; }
@@ -80,7 +82,7 @@ static jv *pv(P *c) {
             if (obj) { if (*c->p != '"') { c->err = "expected key"; json_free(v); return NULL; }
                 k = pstr(c); if (!k) { json_free(v); return NULL; } ws(c);
                 if (*c->p++ != ':') { c->err = "expected :"; free(k); json_free(v); return NULL; } }
-            jv *e = pv(c); if (!e) { free(k); json_free(v); return NULL; }
+            jv *e = pv(c, depth + 1); if (!e) { free(k); json_free(v); return NULL; }
             if (v->n == cap) { cap = cap ? cap * 2 : 8; v->items = realloc(v->items, cap * sizeof *v->items); if (obj) v->keys = realloc(v->keys, cap * sizeof *v->keys); }
             v->items[v->n] = e; if (obj) v->keys[v->n] = k; v->n++;
             ws(c);
@@ -93,13 +95,20 @@ static jv *pv(P *c) {
     if (!strncmp(c->p, "false", 5)) { c->p += 5; return mk(J_BOOL); }
     if (!strncmp(c->p, "null", 4))  { c->p += 4; return mk(J_NULL); }
     if (ch == '-' || (ch >= '0' && ch <= '9')) {
-        const char *s = c->p; while (*c->p && strchr("+-0123456789.eE", *c->p)) c->p++;
-        jv *v = mk(J_NUM); v->raw = strndup(s, c->p - s); v->num = strtod(v->raw, NULL); return v;
+        const char *s = c->p;
+        if (*c->p == '-') c->p++;
+        if (*c->p == '0') c->p++;
+        else if (*c->p >= '1' && *c->p <= '9') while (*c->p >= '0' && *c->p <= '9') c->p++;
+        else { c->err = "invalid number"; return NULL; }
+        if (*c->p == '.') { c->p++; if (*c->p < '0' || *c->p > '9') { c->err = "invalid number"; return NULL; } while (*c->p >= '0' && *c->p <= '9') c->p++; }
+        if (*c->p == 'e' || *c->p == 'E') { c->p++; if (*c->p == '+' || *c->p == '-') c->p++; if (*c->p < '0' || *c->p > '9') { c->err = "invalid number"; return NULL; } while (*c->p >= '0' && *c->p <= '9') c->p++; }
+        jv *v = mk(J_NUM); v->raw = strndup(s, c->p - s); v->num = strtod(v->raw, NULL);
+        if (!isfinite(v->num)) { c->err = "number out of range"; json_free(v); return NULL; } return v;
     }
     c->err = "unexpected character"; return NULL;
 }
 jv *json_parse(const char *s, const char **err) {
-    P c = { s, NULL }; jv *v = pv(&c);
+    P c = { s, NULL }; jv *v = pv(&c, 0);
     if (v) { ws(&c); if (*c.p) { c.err = "trailing data"; json_free(v); v = NULL; } }
     if (!v && err) *err = c.err ? c.err : "parse error";
     return v;
