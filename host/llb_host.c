@@ -1,3 +1,23 @@
+#if defined(BEND_CUDA) && defined(LLB_LAUNCH)
+// LLB_ATTN_SK8=1 (default off): decode attention split over 8 key segments per head, then
+// combined (llb_attn4_sk8 / _combine, tools/payload-sk8add.patch). llb_attn4 stays the default.
+static bool llb_sk8_enabled(void) {
+  const char* e = getenv("LLB_ATTN_SK8"); return e && !strcmp(e, "1");
+}
+// its private planes hold 2^17 slots a head for <= 128 heads; past that the canonical
+// llb_attn4 runs (its planes grow with dT, tools/payload-anyshape.patch)
+static bool llb_sk8_fits(u32 c, u32 nh) { return nh <= 128 && (c & 31) <= 17; }
+static bool llb_sk8_launch(CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr out,
+  u32 c, u32 grp, u32 nh) {
+  static CUdeviceptr tmp, sc, pr;
+  // Private planes, allocated only for the opt-in; default launch is unchanged.
+  if (!tmp && cuMemAlloc(&tmp, 128 * 8 * 258 * sizeof(float)) != CUDA_SUCCESS) return false;
+  if (!sc && cuMemAlloc(&sc, 128ull * (1u << 17) * sizeof(float)) != CUDA_SUCCESS) return false;
+  if (!pr && cuMemAlloc(&pr, 128ull * (1u << 17) * sizeof(float)) != CUDA_SUCCESS) return false;
+  return LLB_LAUNCH(gpu_sk8, nh * 8, 1, 1024, &q, &k, &v, &tmp, &sc, &pr, &c, &grp, &nh)
+    && LLB_LAUNCH(gpu_sk8_combine, nh, 1, 256, &tmp, &out);
+}
+#endif
 #if defined(LLB_LAUNCH) && defined(LLB_WARP_FID)
 #include "llb_backend.h"
 #include "llb_formats.h"
@@ -832,7 +852,9 @@ static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
     // past 1024, blocks of 256 (tools/payload-anyshape.patch)
     || !LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &kn22, &kslot22)
     || !LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &vb22, &vslot22)
-    || !LLB_LAUNCH(gpu_attn4, ah22, 1, 1024, &qg22, &kcp22, &vcp22, &attn22, &s22, &p22, &c22, &grp22)
+    // LLB_ATTN_SK8=1: split-key decode attention (tools/payload-sk8add.patch), where it fits
+    || !(llb_sk8_enabled() && llb_sk8_fits(c22, ah22) ? llb_sk8_launch(qg22, kcp22, vcp22, attn22, c22, grp22, ah22) :
+      LLB_LAUNCH(gpu_attn4, ah22, 1, 1024, &qg22, &kcp22, &vcp22, &attn22, &s22, &p22, &c22, &grp22))
     || !LLB_LAUNCH(gpu_og, gog22, 1, 1024, &attn22, &gate22, &gated22, &nqa)
     || (fo == 1 && llb_tuned(fo, qa) && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wop22, &ro22, &co22, &gated22, &yp, &n4, &dqa))) {
     err_fail("device launch failed");

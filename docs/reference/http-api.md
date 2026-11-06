@@ -42,7 +42,7 @@ Replace the following:
 | `--mm-remote` | `off` | Handling of http(s) image URLs: `off`, `on` (public addresses only), or `private` (any address). |
 | `--mm-max-image-mb` / `--mm-max-images` | `6` / `8` | Per-image decoded cap / images per request. |
 | `--ear DIR` | Off | Runs the speech-recognition worker (EARS-CANON). `llb-ear` sits beside `llb-serve` (`LLB_EAR_BIN`). `DIR` holds `Qwen3-ASR-0.6B-Q8_0.gguf` and `mmproj-Qwen3-ASR-0.6B-bf16.gguf`. Serves `POST /v1/audio/transcriptions` and turns a chat `input_audio` part into the user turn's text. See [Multimodal content §8](multimodal-content.md#8-audio-transcription). |
-| `--vis-tower CLI --vis-mmproj MMPROJ` | Off | Sends images through the Qwen3.5 vision tower (MIMG). Each request's images run `CLI --batch MMPROJ` (cudavis-cli, outside the engine lock). The rows are stamped and sent as the dual.c `"images"` key (IMRoPE). Needs `--exact` (refused with `--decide-path`) and the 9B trunk. Implies `--mm image`. See [Multi-image requests](#multi-image-requests). |
+| `--vis-tower CLI --vis-mmproj MMPROJ` | Off | Sends images through the Qwen3.5 vision tower (MIMG). Each request's images run `CLI --batch MMPROJ` (cudavis-cli, outside the engine lock). The rows are stamped and sent as the dual.c `"images"` key (IMRoPE). Needs `--exact` (refused with `--decide-path`) and an mmproj whose rows are the trunk width (9B 4096, 27B 5120, 0.8B 1024; a mismatch is refused per request). Implies `--mm image`. See [Multi-image requests](#multi-image-requests). |
 | `--ear-llm-cpu` | Off | Runs the ear's decoder on the CPU. The tower stays on the GPU. |
 | `-- ARGS` | `--threads 16 -- $SYS1_SIDECAR 0 --steps 4096` | Engine argv. This is the usual SYS1 launch. `--steps` fixes the KV capacity. |
 
@@ -440,7 +440,8 @@ SYS1 rules:
 
 - Each `X.f32` needs the `llb-tower-rows-v1` stamp `X.json`, written by
   [`tools/vision/tower_stamp.py`](../../tools/vision/tower_stamp.py). The stamp
-  holds mmproj_sha256, nx, ny, d 4096, and rows_sha256.
+  holds mmproj_sha256, nx, ny, d (the tower rows width), and rows_sha256. `d` must equal
+  the trunk width (4096 on the 9B, 5120 on the 27B, 1024 on the 0.8B), or `"images"` is refused.
 - The engine's `LLB_VIS_MMPROJ_SHA256` must equal the stamp's. If it is unset,
   `"images"` is refused.
 - Tower rows carry no trunk table. The binding from mmproj to trunk is set by the
@@ -567,9 +568,11 @@ The threshold is the maximum achieved free MiB. RTX 3090 sm_86 only.
 - The prereg, its amendments, and the cell logs are in the lab archive.
 - End to end: `llb doctor` passes, and `llb chat 08b` completes at 294–313 tok/s
 .
-- `llb-serve` does not serve the stock 0.8B. Its engine is the SYS1/CLEF engine,
-  which exits at load with `clef: missing/corrupt head tensors` on a GGUF without
-  the CLEF decision head.
+- `llb-serve` serves the stock 0.8B with `LLB_SYS1_NOHEAD=1`. Without it, the
+  SYS1/CLEF engine exits at load with `clef: missing/corrupt head tensors` on a GGUF
+  without the CLEF decision head. NOHEAD reads the width from the GGUF and, on a
+  tied-embedding trunk, the readout rows from `token_embd.weight`. Decide is refused
+  (no head).
 
 ## Encoder batch
 

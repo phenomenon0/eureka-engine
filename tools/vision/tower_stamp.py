@@ -22,10 +22,14 @@ def main(a):
     rows, mm, nx, ny = a[0], a[1], int(a[2]), int(a[3])
     if not rows.endswith(".f32") or nx < 1 or ny < 1:
         sys.exit("tower_stamp: ROWS must be a .f32 file, nx/ny >= 1")
-    if os.path.getsize(rows) != nx * ny * 4096 * 4:
-        sys.exit("tower_stamp: %s is not nx*ny x 4096 F32" % rows)
+    # SENSES-MATRIX: d is the tower's (its mmproj projection: 4096 on the 9B, 1024 / 2560 / 5120 on the 0.8B / 4B / 27B);
+    # dual.c refuses rows whose d is not the trunk's width
+    sz = os.path.getsize(rows)
+    d = sz // (nx * ny * 4) if nx * ny and sz % (nx * ny * 4) == 0 else 0
+    if d < 256 or d > 8192 or d % 256:
+        sys.exit("tower_stamp: %s is not nx*ny x d F32 (d a multiple of 256, <= 8192)" % rows)
     st = {"kind": "llb-tower-rows-v1", "mmproj_sha256": ms or sha(mm), "mmproj": os.path.basename(mm),
-          "nx": nx, "ny": ny, "d": 4096, "rows_sha256": sha(rows)}
+          "nx": nx, "ny": ny, "d": d, "rows_sha256": sha(rows)}
     with open(rows[:-4] + ".json", "w") as f:
         json.dump(st, f, indent=1)
         f.write("\n")

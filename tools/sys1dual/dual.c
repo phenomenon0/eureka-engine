@@ -208,6 +208,7 @@ static const char *stamp_check(const char *rows, unsigned n) {
  * with S equal to the engine's LLB_VIS_MMPROJ_SHA256 (the operator names the mmproj that belongs to this trunk; unset =
  * "images" refused) and rows_sha256 equal to the file's. The G4 "image" form above is unchanged. */
 void llb_vis_request_list(const char *spec);
+static int trunk_d; /* defined below (ENGINE-HEAD27); the stamp check compares the rows' d to it */
 static const char *tower_stamp_check(const char *rows, unsigned nx, unsigned ny) {
     static char msg[512];
     size_t L=strlen(rows);
@@ -225,7 +226,11 @@ static const char *tower_stamp_check(const char *rows, unsigned nx, unsigned ny)
     const char *why=NULL;
     if (!kd || kd->type!=J_STR || strcmp(kd->str,"llb-tower-rows-v1")) why="images rows stamp is not an llb-tower-rows-v1 stamp";
     else if (!ms || ms->type!=J_STR || strlen(ms->str)!=64) why="images rows are not bound to an mmproj (stamp lacks mmproj_sha256)";
-    else if (!sx || sx->type!=J_NUM || sx->num!=nx || !sy || sy->type!=J_NUM || sy->num!=ny || !d || d->type!=J_NUM || d->num!=4096) why="images rows stamp: nx/ny/d differ from the request / 4096";
+    else if (!sx || sx->type!=J_NUM || sx->num!=nx || !sy || sy->type!=J_NUM || sy->num!=ny || !d || d->type!=J_NUM || d->num!=trunk_d) {
+        if (d && d->type==J_NUM && d->num!=trunk_d && sx && sx->type==J_NUM && sx->num==nx && sy && sy->type==J_NUM && sy->num==ny)
+            snprintf(msg,sizeof msg,"images rows are %.0f wide (their tower's mmproj); this trunk is %d wide",d->num,trunk_d),why=msg;
+        else why="images rows stamp: nx/ny/d differ from the request / the trunk width";
+    }
     else if (!rs || rs->type!=J_STR || glue_file_sha(rows,fs) || strcmp(fs,rs->str)) why="images rows differ from their stamp (rows_sha256)";
     else if (strcmp(ms->str,want))
         snprintf(msg,sizeof msg,"images rows were made with another mmproj (stamp %.12s..., engine LLB_VIS_MMPROJ_SHA256 %.12s...)",ms->str,want),why=msg;
@@ -404,12 +409,14 @@ static void init(const char *dir) {
     const char *nh=getenv("LLB_SYS1_NOHEAD");
     nohead=nh && *nh && strcmp(nh,"0");
     if (getenv("LLB_VIS_EMBD")) clef_fail("sys1: the image is per request (\"image\"), unset LLB_VIS_EMBD");
-    /* tools/payload-anyshape.patch: glue_out (the NOHEAD readout rows) is 4096-only; any other
-       width serves generate requests and refuses readout (was: refused at start) */
+    /* glue_out (the NOHEAD readout rows) reads the width from the GGUF: output.weight, or token_embd.weight on a
+       tied-embedding trunk (SENSES-MATRIX), 256k cols <= 8192. Any other width serves generate requests and refuses
+       readout (tools/payload-anyshape.patch; was: refused at start) */
     trunk_d=clef_gguf_width(gguf);
-    glue_ok=nohead && trunk_d==4096;
+    glue_ok=nohead && trunk_d%256==0 && trunk_d<=8192;
     if (glue_ok) glue_out_open(gguf);
-    if (nohead) fprintf(stderr,"sys1: NOHEAD (no clef head; decide refused; readout %s)\n",glue_ok?"from output.weight":"off: glue_out reads 4096-wide rows only");
+    if (glue_ok && glue_out_width()!=trunk_d) clef_fail("sys1: NOHEAD readout rows are not the trunk width (embedding_length)");
+    if (nohead) fprintf(stderr,"sys1: NOHEAD (no clef head; decide refused; readout %s, d %d)\n",glue_ok?"from output.weight":"off: glue_out reads rows of 256k cols <= 8192 only",trunk_d);
     else clef_head_open(&head,gguf);
     if (!nohead) head_width(&head,gguf);
     const char *gguf2=getenv("LLB_HEAD2_GGUF");
@@ -607,7 +614,7 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         if (img && trunk_d!=4096) return refuse("image rows are 4096 wide (the 9B tower); this trunk is not"),0;
         if (ro) {
             if (ro->type!=J_ARR || ro->n<1 || ro->n>8) return refuse("readout must be an array of 1..8 token ids"),0;
-            if (nohead && !glue_ok) return refuse("readout needs a 4096-wide model under LLB_SYS1_NOHEAD (glue_out)"),0;
+            if (nohead && !glue_ok) return refuse("readout needs a trunk of 256k cols <= 8192 under LLB_SYS1_NOHEAD (glue_out)"),0;
             for (size_t i=0; i<ro->n; i++) {
                 jv *v=ro->items[i];
                 if (v->type!=J_NUM || v->num<0 || v->num>=248320 || v->num!=floor(v->num)) return refuse("readout ids must be integers 0..248319"),0;
@@ -621,7 +628,6 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         if (ims) {
             if (img) return refuse("image and images are exclusive (image = G4 connector rows, images = tower rows)"),0;
             if (ims->type!=J_ARR || ims->n<1 || ims->n>16) return refuse("images must be an array of 1..16 {rows,nx,ny}"),0;
-            if (trunk_d!=4096) return refuse("images rows are 4096 wide (the 9B tower); this trunk is not"),0;
             if (json_get(req,"session")) return refuse("images requests are sessionless"),0;
             const char *pf=getenv("LLB_PREFILL");
             if (getenv("LLB_SPEC") || getenv("LLB_MTP") || (pf && !strcmp(pf,"fast")))
@@ -638,7 +644,7 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
                 long sz=-1;
                 if (f && !fseek(f,0,SEEK_END)) sz=ftell(f);
                 if (f) fclose(f);
-                if (sz!=(long)im_nx[i]*im_ny[i]*4096*4) return free(w.p),refuse("images rows must be a file of nx*ny x 4096 F32"),0;
+                if (sz!=(long)im_nx[i]*im_ny[i]*trunk_d*4) return free(w.p),refuse("images rows must be a file of nx*ny x d F32 (d = the trunk width)"),0;
                 const char *why=tower_stamp_check(er->str,im_nx[i],im_ny[i]);
                 if (why) return free(w.p),refuse(why),0;
                 sb_fmt(&w,"%s%s:%u:%u",i?";":"",er->str,im_nx[i],im_ny[i]);

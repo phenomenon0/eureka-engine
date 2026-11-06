@@ -6,7 +6,7 @@
 #include "../../host/llb_gguf.c"
 #include <math.h>
 
-static int out_fd = -1, out_type, out_rows;
+static int out_fd = -1, out_type, out_rows, out_d;
 static uint64_t out_off, out_rb;
 
 static float half(const unsigned char *p) {
@@ -41,32 +41,38 @@ void glue_out_open(const char *path) {
         for (unsigned j = 0; j < nd; j++) ne[j] = gg_u64(&r);
         uint32_t type = gg_u32(&r);
         uint64_t off = gg_u64(&r);
-        if (!strcmp(name, "output.weight")) {
-            if (nd != 2 || ne[0] != 4096 || (type != 0 && type != 8 && type != 14)) clef_fail("glue: output.weight wants 4096 cols, F32/Q8_0/Q6_K");
-            out_type = (int)type, out_rows = (int)ne[1], out_off = off, found = 1;
-            out_rb = type == 0 ? 4096 * 4 : type == 8 ? 4096 / 32 * 34 : 4096 / 256 * 210;
+        // SENSES-MATRIX: the width is the model's (ne[0]), not a 9B constant; a tied-embedding trunk (the 0.8B has
+        // no output.weight) reads token_embd.weight, which is its output matrix. output.weight wins when both exist.
+        int out = !strcmp(name, "output.weight"), tied = !strcmp(name, "token_embd.weight");
+        if (out || (tied && found < 2)) {
+            if (nd != 2) clef_fail("glue: output matrix is not 2-D");
+            out_type = (int)type, out_rows = (int)ne[1], out_d = (int)(ne[0] > 8192 ? 0 : ne[0]), out_off = off, found = out ? 2 : 1;
         }
         free(name);
     }
     if (r.bad || !found || !align || align > 4096) clef_fail("glue: output.weight missing / corrupt GGUF");
+    if (!out_d || out_d % 256 || (out_type != 0 && out_type != 8 && out_type != 14))
+        clef_fail(found == 2 ? "glue: output.weight wants 256k cols <= 8192, F32/Q8_0/Q6_K"
+                             : "glue: tied token_embd.weight wants 256k cols <= 8192, F32/Q8_0/Q6_K");
+    out_rb = out_type == 0 ? (uint64_t)out_d * 4 : out_type == 8 ? (uint64_t)out_d / 32 * 34 : (uint64_t)out_d / 256 * 210;
     out_off += (r.off + r.p + align - 1) / align * align;
     free(r.buf);
     if (out_off + (uint64_t)out_rows * out_rb > (uint64_t)st.st_size) clef_fail("glue: output.weight outside GGUF");
 }
 
 void glue_out_row(int id, float *w) {
-    static unsigned char raw[4096 * 4];
+    static unsigned char raw[8192 * 4];
     if (out_fd < 0 || id < 0 || id >= out_rows || gg_pread(out_fd, raw, out_rb, out_off + (uint64_t)id * out_rb))
         clef_fail("glue: output row read failed");
     const unsigned char *b = raw;
-    if (out_type == 0) memcpy(w, b, 4096 * 4);
+    if (out_type == 0) memcpy(w, b, (size_t)out_d * 4);
     else if (out_type == 8) {
-        for (int i = 0; i < 4096; i += 32, b += 34) {
+        for (int i = 0; i < out_d; i += 32, b += 34) {
             float d = half(b);
             for (int j = 0; j < 32; j++) w[i + j] = d * (int8_t)b[2 + j];
         }
     } else {
-        for (int i = 0; i < 4096; i += 256, b += 210) {
+        for (int i = 0; i < out_d; i += 256, b += 210) {
             float d = half(b + 208);
             for (int j = 0; j < 256; j++) {
                 int group = j / 128, lane = j % 32, quarter = (j % 128) / 32;
@@ -76,8 +82,10 @@ void glue_out_row(int id, float *w) {
             }
         }
     }
-    for (int i = 0; i < 4096; i++) if (!isfinite(w[i])) clef_fail("glue: nonfinite output row");
+    for (int i = 0; i < out_d; i++) if (!isfinite(w[i])) clef_fail("glue: nonfinite output row");
 }
+
+int glue_out_width(void) { return out_d; }
 
 // ---- G24 F2/F4: the trunk binding ------------------------------------------------
 // tensor_table_sha256 = sha256 over "name:sha256(tensor bytes)\n" for every tensor,

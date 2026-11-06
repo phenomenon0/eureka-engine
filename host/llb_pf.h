@@ -546,6 +546,12 @@ static void pf_push(u64 er, u32 fm, u32 pos, u32 tok, u32 k, u32 dT, LlbShape sh
 // 1 one deferred token (answered with pf_mark's cue), 2 + n a batch of n ids in x (as F32) from
 // pos on, o->w then the embedding's row 0
 static bool pf_take(volatile WarpOp* o, u32 pos, u32 dT, LlbShape sh, u64 yp) {
+  // Check the embedding before pf_fast can admit any deferred position.
+  const char* mode = getenv("LLB_PREFILL");
+  if (mode != NULL && strcmp(mode, "fast") == 0
+    && o->bb != LLB_FM_Q8_0 && o->bb != LLB_FM_Q4_K && o->bb != LLB_FM_Q6_K) {
+    err_fail("fast prefill: unsupported token_embd format; refused before defer; run exact");
+  }
   if (!pf_fast(o->d, sh)) {
     return false;
   }

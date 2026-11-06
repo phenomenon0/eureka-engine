@@ -254,6 +254,7 @@ static void *engine_err(void *p) {
 }
 
 static int decide_path; // --decide-path (G15); --exact = the default
+static int prefill_fast, prefix_cache; // explicit opt-ins, independent of --exact
 
 // S6-GUARD: the load-time pre-check for --decide-path. Reads the GGUF's tensor table (no weights) and
 // returns 0 when every GEMM the fast chunks run (host/llb_pf.h pf_mm) has a fast format: Q4_K / Q5_K /
@@ -346,8 +347,12 @@ static void engine_start(Slot *s, char **argv) {
         if (decide_path) { // G15 decide path (docs/reference/decide-configuration.md): fast prefill, prefix cache, greedy default
             setenv("LLB_PREFILL", "fast", 1), setenv("LLB_PREFIX_CACHE", "1", 1);
             setenv("LLB_SAMPLE", "preset=greedy", 0);
-        } else
-            unsetenv("LLB_PREFILL"), unsetenv("LLB_PREFIX_CACHE");
+        } else {
+            if (prefill_fast) setenv("LLB_PREFILL", "fast", 1);
+            else unsetenv("LLB_PREFILL");
+            if (prefix_cache) setenv("LLB_PREFIX_CACHE", "1", 1);
+            else unsetenv("LLB_PREFIX_CACHE");
+        }
         if (metrics_base) { // R5-FIX: one listener port per engine (the same port: every engine but one died on bind)
             char mp[16];
             snprintf(mp, sizeof mp, "%d", metrics_base + s->idx);
@@ -785,7 +790,7 @@ static void sse_open(Conn *c) {
     char h[1024];
     snprintf(h, sizeof h, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                     "Connection: close\r\nX-Accel-Buffering: no\r\nX-LLB-Sampler: w1-sampler\r\nServer: llb-serve\r\n"
-                    "X-LLB-Prefill: %s\r\n%s%s\r\n", decide_path ? "fast" : "exact", c->xh, c->cors);
+                    "X-LLB-Prefill: %s\r\n%s%s\r\n", (decide_path || prefill_fast) ? "fast" : "exact", c->xh, c->cors);
     c->status = 200;
     c->close = 1; // an SSE body ends at the close
     if (send_all(c->fd, h, strlen(h))) c->broken = 1;
@@ -1230,7 +1235,7 @@ static void st_finish(Gen *g, const jv *fin, double t0, double t1, double t2) {
         }
         sb_addc(&o, '}');
         respond(c, 200, "application/json; charset=utf-8", o.p, // merge-train S11: same headers as the plain path (G15)
-            decide_path ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n" : "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: exact\r\n");
+            (decide_path || prefill_fast) ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n" : "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: exact\r\n");
     }
     free(o.p);
 }
@@ -1392,7 +1397,7 @@ static void run_generate(Slot *s, int bank, Conn *c, const jv *body, const Req *
         }
         sb_addc(&o, '}');
         respond(c, 200, "application/json; charset=utf-8", o.p,
-                decide_path ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n"
+                (decide_path || prefill_fast) ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n"
                             : "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: exact\r\n");
     }
     free(o.p);
@@ -1555,13 +1560,18 @@ static int vis_attach(Req *r, const char **msg) {
         unsigned char *b = NULL;
         long sz = -1;
         if (rf && !fseek(rf, 0, SEEK_END) && (sz = ftell(rf)) > 0 && !fseek(rf, 0, SEEK_SET) && (b = malloc((size_t)sz)) &&
-            fread(b, 1, (size_t)sz, rf) == (size_t)sz && sz == (long)gx[i] * gy[i] * 4096 * 4) mm_sha256_hex(b, (size_t)sz, sha);
+            fread(b, 1, (size_t)sz, rf) == (size_t)sz && gx[i] && gy[i] && sz % ((long)gx[i] * gy[i] * 4) == 0)
+            mm_sha256_hex(b, (size_t)sz, sha);
         else sz = -1;
+        // SENSES-MATRIX: the rows' width is the tower's (its mmproj's projection: 4096 on the 9B, 1024 / 2560 / 5120 on
+        // the 0.8B / 4B / 27B); the stamp carries it and dual.c refuses rows that are not the trunk's width.
+        long rd = sz > 0 ? sz / ((long)gx[i] * gy[i] * 4) : 0;
+        if (rd < 256 || rd > 8192 || rd % 256) sz = -1;
         if (rf) fclose(rf);
         free(b);
         FILE *sf = sz > 0 ? fopen(sp, "w") : NULL;
-        if (!sf || fprintf(sf, "{\"kind\":\"llb-tower-rows-v1\",\"mmproj_sha256\":\"%s\",\"nx\":%u,\"ny\":%u,\"d\":4096,\"rows_sha256\":\"%s\"}\n",
-                vis_mmsha, gx[i], gy[i], sha) < 0 || fclose(sf)) {
+        if (!sf || fprintf(sf, "{\"kind\":\"llb-tower-rows-v1\",\"mmproj_sha256\":\"%s\",\"nx\":%u,\"ny\":%u,\"d\":%ld,\"rows_sha256\":\"%s\"}\n",
+                vis_mmsha, gx[i], gy[i], rd, sha) < 0 || fclose(sf)) {
             free(js.p);
             return *msg = "cannot stamp the vision tower's rows", 503;
         }
@@ -1950,7 +1960,7 @@ static void batch_items(Conn *c, Item *it, int n, int kind, int stream) {
     } else
         respond(c, 200, "application/json; charset=utf-8", o.p,
             kind == K_DECIDE ? "X-LLB-Prefill: exact\r\n"
-            : decide_path    ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n"
+            : (decide_path || prefill_fast) ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n"
                              : "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: exact\r\n");
     free(o.p);
 }
@@ -2005,7 +2015,7 @@ static void handle_prompt_array(Conn *c, const jv *body) {
         sb_addc(&o, '}');
         c->prompt_n = (int)pn;
         respond(c, 200, "application/json; charset=utf-8", o.p,
-            decide_path ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n" : "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: exact\r\n");
+            (decide_path || prefill_fast) ? "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: fast\r\n" : "X-LLB-Sampler: w1-sampler\r\nX-LLB-Prefill: exact\r\n");
         free(o.p), free(llb.p);
     }
     for (int i = 0; i < n; i++) item_free(&it[i]);
@@ -2661,7 +2671,7 @@ static void on_signal(int s) {
 
 static void usage(const char *a0) {
     fprintf(stderr,
-        "usage: %s [--decide-path | --exact] [--host H] [--port P] [--alias NAME] [--chat-max-tokens N] [--drain-seconds S]\n"
+        "usage: %s [--decide-path | --exact] [--prefill exact|fast] [--prefix-cache] [--host H] [--port P] [--alias NAME] [--chat-max-tokens N] [--drain-seconds S]\n"
         "          [--keepalive-seconds S] [--cors none|*|ORIGIN,...] [--tts DIR] [--ear DIR [--ear-llm-cpu]]\n"
         "          [--parallel N] [--banks B] [--native-batch N [--native-cont]] [--heads SPEC] [--discipline strict|normal]\n"
         "          [--affinity-min N] [--structured TOKENIZER.BIN]\n"
@@ -2698,7 +2708,9 @@ static void usage(const char *a0) {
         "  POST /v1/hear (503 until set): env LLB_HEAR_URL=http://127.0.0.1:PORT/inference (a running whisper.cpp\n"
         "             whisper-server), LLB_HEAR_MODEL_ID, LLB_HEAR_MODEL_PATH, LLB_HEAR_MODEL_SHA256, LLB_HEAR_ENGINE\n"
         "  ENGINE ARGS default: --threads 16 -- $SYS1_SIDECAR 0 --steps 4096  (the SYS1-DUAL launch)\n"
-        "  --exact (default): exact prefill, no prefix cache (the golden oracle, W1-SERVER launch)\n"
+        "  --exact (default): exact tier; prefill/cache opt-ins below still apply\n"
+        "  --prefill exact|fast: exact default; fast changes numerics, refuses unsupported models\n"
+        "  --prefix-cache: enable engine prefix cache (off by default, also under --exact)\n"
         "  --decide-path: LLB_PREFILL=fast + LLB_PREFIX_CACHE=1 + greedy LLB_SAMPLE (DECIDE-PATH.md);\n"
         "                 needs a GGUF whose GEMMs are all Q4_K/Q5_K/Q6_K/Q8_0, checked at start (S6-GUARD):\n"
         "                 any other model serves --exact, with one stderr line. 9B clef-flash Q4_K_S (F32\n"
@@ -2746,6 +2758,13 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(a, "--decide-path")) { decide_path = 1; continue; }
         if (!strcmp(a, "--exact")) { decide_path = 0; continue; }
+        if (!strcmp(a, "--prefix-cache")) { prefix_cache = 1; continue; }
+        if (!strcmp(a, "--prefill")) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "exact") && strcmp(argv[i + 1], "fast")))
+                fprintf(stderr, "serve: --prefill takes exact|fast\n"), exit(2);
+            prefill_fast = !strcmp(argv[++i], "fast");
+            continue;
+        }
         if (i + 1 >= argc) usage(argv[0]);
         if (!strcmp(a, "--host")) host = argv[++i];
         else if (!strcmp(a, "--port")) port = atoi(argv[++i]);
@@ -2838,6 +2857,8 @@ int main(int argc, char **argv) {
                 metrics_base, metrics_base + n_slots - 1, port), exit(2);
     }
     char why[320];
+    if (prefill_fast && fast_unsupported(getenv("LLB_GGUF"), why, sizeof why))
+        fprintf(stderr, "serve: --prefill fast refused for this model (%s)\n", why), exit(2);
     if (decide_path && fast_unsupported(getenv("LLB_GGUF"), why, sizeof why)) { // S6-GUARD: fall back, never exit
         fprintf(stderr, "serve: --decide-path refused for this model (%s; fast prefill needs Q4_K/Q5_K/Q6_K/Q8_0 GEMMs): serving --exact\n", why);
         decide_path = 0;

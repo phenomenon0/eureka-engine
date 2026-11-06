@@ -263,3 +263,14 @@ error codes, see [HTTP API: Senses](../../docs/reference/http-api.md#senses).
 - [Decide configuration](../../docs/reference/decide-configuration.md): decide
   path tiers.
 - [Dual-mode residency](../../docs/reference/dual-mode-residency.md).
+
+## Prefill and cache flags
+
+| Flag | Behavior |
+| --- | --- |
+| `--prefill exact\|fast` | Default `exact` unsets `LLB_PREFILL`; `fast` sets it to `fast` even under `--exact`. Fast changes numerics and may change text; unsupported models fail at startup with exit 2. |
+| `--prefix-cache` | Sets `LLB_PREFIX_CACHE=1` even under `--exact`; off by default (variable unset). |
+
+`--decide-path` retains fast prefill, cache, and the greedy sampler default.
+Decide responses still take the exact pass. `X-LLB-Prefill` reports `fast` for
+fast responses and `exact` for decide responses. No default changed.

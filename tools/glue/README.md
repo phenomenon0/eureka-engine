@@ -21,7 +21,7 @@ image map yet. That is the encoder step listed under "Limitations".
 | File | Description |
 |---|---|
 | `host/llb_host.c` `llb_img_*` | The splice: `llb_img_step` in the folded step of `llb_pass_run`. `llb_vis_request` is the per-request entry that SYS1 uses. |
-| [`glue_out.c`](glue_out.c), [`glue_out.h`](glue_out.h) | `output.weight` rows (Q8_0/Q6_K/F32, width 4096) for the served readout when no clef head is resident. |
+| [`glue_out.c`](glue_out.c), [`glue_out.h`](glue_out.h) | `output.weight` rows (Q8_0/Q6_K/F32, the GGUF width, at most 8192; `token_embd.weight` on a tied-embedding trunk) for the served readout when no clef head is resident. |
 | [`glue_rows.py`](glue_rows.py) | Run-ahead step. It verifies the pack sha, refuses a GGUF that is not the bound trunk or is below the quant floor, and runs the trainer's own `Resampler`. It writes `rows.f32` (K×4096) and `ids.txt`. |
 | [`train_connector.py`](train_connector.py) | The trainer, verbatim (sha `f9aa291d…`, asserted by the pack). |
 | [`readout.py`](readout.py) | CLI readout. It takes the last row of an `LLB_DUMP_HIDDEN` dump and the dequantized `output.weight`, and prints the diff and p_yes. `--full` adds the vocabulary argmax. |
@@ -176,7 +176,8 @@ Hashing reads the whole GGUF: 4–6 min for the 9B on the FUSE store. So
 
 - There is no IMRoPE image map in this tree yet.
 - There is no in-engine SigLIP. Python stays on the served path.
-- The readout works only at width 4096.
+- The connector rows (`llb_image`) work only at width 4096. The readout reads the
+  trunk width from the GGUF.
 - The readout is not returned on streams.
 - An image is refused with `LLB_SPEC`, `LLB_MTP`, or `LLB_PREFILL=fast`.
 
