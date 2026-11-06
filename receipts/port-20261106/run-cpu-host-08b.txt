@@ -1,0 +1,15 @@
+build exit=0
+$ gguf2pack $MODELS/Qwen3.5-0.8B-Q4_K_M.gguf PACK
+wrote /tmp/pack (pack.bin, 24 layer files, manifest.json, index.tsv, table.bin)
+exit=0
+usage: /tmp/cpu/kev-engine-host <packdir> [tok...] [options]
+  text in (the normal way):
+    --prompt "text"      raw text prompt (tokenized, parse_special)
+$ kev-engine-host PACK 760 6511 314 9338 369 --steps 8
+exit=0
+step 10 130
+logits 11 760 1099247590 32 1097764224
+step 11 132
+ids: 279 6511 314 279 3046 13 198 760 
+text:  the capital of the country.
+The

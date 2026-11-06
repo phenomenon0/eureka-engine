@@ -1,0 +1,49 @@
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+aarch64
+$ bash backends/android/engine/build.sh host /tmp/cpu
+/tmp/cpu/src/tools/qwen35_engine.c: In function 'main':
+/tmp/cpu/src/tools/qwen35_engine.c:550:34: warning: '/index.tsv' directive output may be truncated writing 10 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+  550 |   snprintf(path, sizeof path, "%s/index.tsv", dir);
+      |                                  ^~~~~~~~~~
+In file included from /usr/include/stdio.h:980,
+                 from /tmp/cpu/src/tools/qwen35_engine.c:21:
+In function 'snprintf',
+    inlined from 'load_index' at /tmp/cpu/src/tools/qwen35_engine.c:550:3,
+    inlined from 'main' at /tmp/cpu/src/tools/qwen35_engine.c:1830:3:
+/usr/include/aarch64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 11 and 4106 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/tmp/cpu/src/tools/qwen35_engine.c: In function 'main':
+/tmp/cpu/src/tools/qwen35_engine.c:1833:36: warning: '/pack.bin' directive output may be truncated writing 9 bytes into a region of size between 1 and 4096 [-Wformat-truncation=]
+ 1833 |   snprintf(ppath, sizeof ppath, "%s/pack.bin", dir);
+      |                                    ^~~~~~~~~
+In function 'snprintf',
+    inlined from 'main' at /tmp/cpu/src/tools/qwen35_engine.c:1833:3:
+/usr/include/aarch64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin___snprintf_chk' output between 10 and 4105 bytes into a destination of size 4096
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+/tmp/cpu/src/tools/qwen35_engine.c: In function 'main':
+/tmp/cpu/src/tools/qwen35_engine.c:1713:186: warning: '%s' directive output may be truncated writing up to 299 bytes into a region of size 256 [-Wformat-truncation=]
+ 1713 |       else if (vis_open(mm, D, err) || vis_encode(imgp, vmax, &emb, &nt, &gx, &gy, &vms, err)) { char e2[300]; snprintf(e2, sizeof e2, "no-vision: %s", err); snprintf(err, sizeof err, "%s", e2); }
+      |                                                                                                                                                                                          ^~   ~~
+In function 'snprintf',
+    inlined from 'serve_decide' at /tmp/cpu/src/tools/qwen35_engine.c:1713:159,
+    inlined from 'main' at /tmp/cpu/src/tools/qwen35_engine.c:1920:26:
+/usr/include/aarch64-linux-gnu/bits/stdio2.h:54:10: note: '__builtin_snprintf' output between 1 and 300 bytes into a destination of size 256
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+4e80c3735c1a8f9ee5cafadc412c21892ceadec15fe8a4eadd16ac30dbc28414  /tmp/cpu/kev-engine-host
+exit=0
+-rwxr-xr-x 1 root root 287784 Nov  6 23:51 /tmp/cpu/kev-engine-host

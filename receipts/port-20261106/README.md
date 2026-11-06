@@ -24,6 +24,7 @@ Local paths in these files were replaced by `$REPO` (this checkout) and
 | CUDA engine C, compile only | clang-19, `tools/remap_cc.sh`'s flags, `-c`, CUDA 12.8 headers (NVIDIA pip wheels). No link: there is no libcuda here | base exit 0, port exit 0. The port adds `llb_sk8_launch` | `cuda-engine-compile-{base,port}.txt`, `scripts/cuda-compile.sh` |
 | CUDA kernels through NVRTC | the emitted C as NVRTC source with `gpu_make`'s options, `--gpu-architecture=sm_86` | base and port `NVRTC_SUCCESS`. The port's PTX defines `llb_attn4_sk8` and `llb_attn4_sk8_combine`. The NVRTC log is the same length (169,461 bytes) for both | `nvrtc-sm86-{base,port}.txt`, `scripts/nvrtc-check.c` |
 | Request objects, `gguf2pack`, `llb-serve` (CUDA line, Linux) | `build.sh` step 4 objects, `-Wall -Wextra`; `build-serve.sh`'s `llb-serve` line | base exit 0, port exit 0, no warnings | `linux-host-{base,port}.txt`, `scripts/linux-host-build.sh` |
+| CPU engine (host build of the Android engine), Linux | `bash backends/android/engine/build.sh host OUT` (gcc 13, OpenMP) | exit 0 (3 `-Wformat-truncation` warnings in the vendored source) | `build-cpu-host-linux.txt`, `scripts/cpu-build.sh` |
 | SK8 host dispatch, isolated | `scripts/sk8-host-harness.c` with stub CUDA types, `-Wall -Wextra -Werror` (the command is in its header) | exit 0. Guard: enabled only for `LLB_ATTN_SK8=1`; fits only when dT ≤ 17 and ≤ 128 heads; 2 launches | `scripts/sk8-host-harness.c` |
 
 The CUDA engine was not linked or run: this Mac has no NVIDIA driver.
@@ -33,6 +34,7 @@ The CUDA engine was not linked or run: this Mac has no NVIDIA driver.
 | What | Result | Receipt |
 |---|---|---|
 | `sys1mac` CLI on stock Qwen3.5-0.8B Q4_K_M (sha256 `bd258782…`), 5 prompt ids, 16 steps | exit 0, 16 ids, decodes to text | `run-metal-cli-08b.txt` |
+| CPU engine (`kev-engine-host`, Linux container) on the same GGUF via a full `gguf2pack` pack, same 5 ids, 8 steps | exit 0. Its 8 ids equal the first 8 of the Metal run | `run-cpu-host-08b.txt`, `scripts/cpu-run.sh` |
 | Metal `llb-serve` + `sys1mac` on the same stock GGUF | The engine exits at load: `clef: missing/corrupt head tensors`. The served (SYS1) engine needs a GGUF with the CLEF decision head | `run-metal-served-stock-gguf.txt`, `scripts/metal-serve-smoke.sh` |
 | `gguf2pack --sidecar-only` on Qwen3.5-0.8B IQ4_XS and on Unsloth UD-IQ2_XXS | exit 1 for both: `type IQ4_XS unsupported for packing`, `ggml type 18 unsupported` | `quant-refusal.txt` |
 
