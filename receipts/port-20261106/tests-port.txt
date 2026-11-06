@@ -1,0 +1,22 @@
+native server regression passed
+native multislots regression passed
+native server regression passed
+native server regression passed
+native-batch passed
+native-cont passed
+Android native JSON hardening passed
+✔ free settles active and queued chats exactly once (3.063375ms)
+✔ open operations serialize even when an earlier open is delayed (1.1115ms)
+✔ decision cancellation settles active and queued requests without later results (0.565ms)
+✔ free cancels an active decision and waits for its underlying work (0.4495ms)
+✔ Kev decision stops after the in-flight GPU step on cancellation (1.164208ms)
+✔ cancel during batched prefill settles once and prevents decode (0.496416ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.293791
+exit=0

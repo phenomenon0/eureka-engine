@@ -1,0 +1,3 @@
+FROM eepub-linux:1
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang-19 python3-pip && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --break-system-packages --no-deps --target /opt/nv "nvidia-cuda-runtime-cu12==12.8.*" "nvidia-cuda-nvrtc-cu12==12.8.*" && find /opt/nv -name cuda.h -o -name nvrtc.h

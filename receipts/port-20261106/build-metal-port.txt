@@ -1,0 +1,13 @@
+$ LLB_BACKEND=metal LLB_OUT=/tmp/eepub-build/metal-port ./build.sh   (2026-11-06T23:27:46Z, macOS 27.0 arm64)
+All terms check, but 75 defs rely on unsafe or foreign code:
+sys1mac.c 5a766ce4998cdbf40b6fc73a4829ba97da264ed707697386db50ac2f99aa7901
+emitted C == the Mac product build (any-shape + MoE + catch-up 5a766ce4)
+5a766ce4998cdbf40b6fc73a4829ba97da264ed707697386db50ac2f99aa7901  /tmp/eepub-build/metal-port/sys1mac.c
+8809576f52daf083449bb37697c4358c72e9fb527c2c1cb5155f50d223fbc030  /tmp/eepub-build/metal-port/sys1mac
+35a2040fb51c67b0da53ef0b357e907dd7ac9ad8bd8a4bf7c352a589a22a29fd  /tmp/eepub-build/metal-port/obj/dual.o
+6b7a6f532018f3742f628979cadede2370a4bb914bf709840de63b50af472227  /tmp/eepub-build/metal-port/obj/head.o
+87d81feeb2e7ed399e1df60f02741bfb87257e98679a896d45501e670a561101  /tmp/eepub-build/metal-port/obj/json.o
+4b9d5a8bef36b77bf6d4385239fdf67b2d5b12a07f0fbfa284e39a2a01eb567d  /tmp/eepub-build/metal-port/obj/qwen35_tokenizer.o
+8a1d167eb877bc91a6bf4ab5f684a1cec089e36b5e79a494854967576f1dd12e  /tmp/eepub-build/metal-port/obj/spans.o
+4ef62473a0e3ad545f807a90874f7c45c8f4db19064cc65cdbea5987be76f41e  /tmp/eepub-build/metal-port/obj/weights.o
+exit=0

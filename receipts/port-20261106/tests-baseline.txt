@@ -1,0 +1,62 @@
++ set -euo pipefail
++++ dirname -- tests/inference/run-host.sh
+++ cd -- tests/inference/../..
+++ pwd
++ root=$REPO
++ cd $REPO
+++ mktemp -d /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.XXXXXX
++ work=/var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH
++ trap 'rm -rf "$work"' EXIT
++ cc=clang
++ metal=backends/metal/server/src
++ for parser in '"$metal"' tools/clef3
++ clang -fsanitize=address,undefined -g -Ibackends/metal/server/src tests/inference/native_json_regression.c backends/metal/server/src/json.c -lm -o /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/json-test
++ /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/json-test
++ for parser in '"$metal"' tools/clef3
++ clang -fsanitize=address,undefined -g -Itools/clef3 tests/inference/native_json_regression.c tools/clef3/json.c -lm -o /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/json-test
++ /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/json-test
++ clang -D_GNU_SOURCE -std=c11 -O2 -pthread backends/metal/server/src/serve.c backends/metal/server/src/json.c backends/metal/server/src/speak_route.c -lm -o /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/metal-serve
++ EUREKA_TEST_SERVE=/var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/metal-serve
++ python3 tests/inference/native_server_regression.py
+native server regression passed
++ EUREKA_TEST_SERVE=/var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/metal-serve
++ EUREKA_TEST_SLOTS=2
++ python3 tests/inference/native_server_regression.py
+native multislots regression passed
++ compat=()
+++ uname -s
++ '[' Darwin = Darwin ']'
++ compat=(-include tests/inference/cuda-host-compat.h)
++ clang -include tests/inference/cuda-host-compat.h -D_GNU_SOURCE -std=c11 -O2 -pthread tools/sys1dual/serve.c tools/sys1dual/serve_structured.c host/llb_structured.c tools/sys1dual/mm.c tools/clef3/json.c -lm -o /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/cuda-serve
++ EUREKA_TEST_SERVE=/var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/cuda-serve
++ EUREKA_TEST_CUDA=1
++ python3 tests/inference/native_server_regression.py
+native server regression passed
++ EUREKA_TEST_SERVE=/var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/cuda-serve
++ EUREKA_TEST_CUDA=1
++ EUREKA_TEST_BANKS=2
++ python3 tests/inference/native_server_regression.py
+native server regression passed
++ python3 tools/sys1dual/tests/cancellation_batch_regression.py /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH/cuda-serve
+native-batch passed
+native-cont passed
++ bash backends/android/engine/tests/json-hardening.sh
+Android native JSON hardening passed
++ node --test backends/webgpu/tests/worker-lifecycle.test.mjs
+✔ free settles active and queued chats exactly once (3.326542ms)
+✔ open operations serialize even when an earlier open is delayed (1.208042ms)
+✔ decision cancellation settles active and queued requests without later results (0.54175ms)
+✔ free cancels an active decision and waits for its underlying work (0.495959ms)
+✔ Kev decision stops after the in-flight GPU step on cancellation (1.200292ms)
+✔ cancel during batched prefill settles once and prevents decode (0.467084ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 66.680875
++ rm -rf /var/folders/8c/2sc_phnn5nz6r_fr34rt8cd80000gn/T//bend-inference-tests.ncyvBH
+bash -x tests/inference/run-host.sh  3.25s user 1.30s system 48% cpu 9.291 total
+exit=0

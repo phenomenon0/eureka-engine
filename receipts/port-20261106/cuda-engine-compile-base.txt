@@ -1,0 +1,4 @@
+Ubuntu clang version 19.1.1 (1ubuntu1~24.04.2)
+compile base-engine.c rc=0
+text symbols: 1075
+base exit=0

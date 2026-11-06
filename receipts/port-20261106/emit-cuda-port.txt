@@ -1,0 +1,5 @@
+$ BEND_ROOT=/tmp/eepub-build/cuda-port/bend-pinned BEND_BUILD=/tmp/eepub-build/cuda-port/bend-joint bash tools/build_gpu.sh engine_qwen35_gpu.bend -o /tmp/eepub-build/cuda-port/llb-engine.c   (emit only: the CUDA patch stack at --fuzz=0 incl. payload-sk8add.patch, Bend type check, C emit; no CUDA on this Mac)
+All terms check, but 66 defs rely on unsafe or foreign code:
+exit=0
+patches applied: 66
+657f29bf8eeb2bc6c2fed35133801fab5ab82fe005ca9c6be46578949663cdf8  /tmp/eepub-build/cuda-port/llb-engine.c

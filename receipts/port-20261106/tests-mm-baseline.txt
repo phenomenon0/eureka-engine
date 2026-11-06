@@ -1,0 +1,9 @@
+== unit
+92/94 passed
+== http e2e
+exit=1
+unit: 92/94 passed
+NOT OK 42 - 1 image manifest: image/jpeg 640x480 191947 B detail=auto part=1
+NOT OK 43 - 1 image sha256 = file sha (db717381…) e24aad0c532dcb7825a6f1423249b7079c615d3d0ffd5e8d6992829998701539
+e2e:  TimeoutError: timed out
+e2e PASS lines: 13, FAIL lines: 0

@@ -1,0 +1,7 @@
+# gguf2pack (build-mac-served-path.txt) on llama.cpp-format IQ quants of the same model
+$ gguf2pack Qwen3.5-0.8B-IQ4_XS.gguf --sidecar-only OUT
+gguf2pack: blk.0.attn_gate.weight: type IQ4_XS unsupported for packing (doors F32 Q8_0 Q4_K Q5_K Q6_K Q3_K Q2_0 PQ2_0)
+exit=1
+$ gguf2pack Qwen3.5-0.8B-UD-IQ2_XXS.gguf --sidecar-only OUT
+gguf2pack: blk.0.attn_gate.weight: ggml type 18 unsupported (known: F32 F16 Q8_0 Q3_K Q4_K Q5_K Q6_K IQ4_XS BF16 Q2_0 PQ2_0)
+exit=1

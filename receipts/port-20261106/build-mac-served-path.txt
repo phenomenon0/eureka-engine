@@ -1,0 +1,9 @@
+$ clang -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -pthread backends/metal/server/src/serve.c backends/metal/server/src/json.c backends/metal/server/src/speak_route.c -o /tmp/eepub-build/mac-serve/llb-serve
+exit=0
+$ clang -std=c11 -O2 -Wall -o /tmp/eepub-build/mac-serve/gguf2pack tools/gguf2pack.c
+exit=0
+$ clang -O2 -o /tmp/eepub-build/mac-serve/llb-tok tools/llb/llb-tok.c
+exit=0
+dc4997910f30c3d168aa7eeec7c997e4d82e4737977b31ce358666388fbc1879  /tmp/eepub-build/mac-serve/gguf2pack
+48ae203ddc365584eb3e214f442ea3dd2d08b742f1ce601c48e850f86d50cc3a  /tmp/eepub-build/mac-serve/llb-serve
+7989a2f3079bf53e7a179b6a242f358bca0c4d73bc2e2c7cec703fc85ea9f02d  /tmp/eepub-build/mac-serve/llb-tok

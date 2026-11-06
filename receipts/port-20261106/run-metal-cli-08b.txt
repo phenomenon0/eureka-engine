@@ -1,0 +1,28 @@
+# Metal engine CLI on this Mac (sys1mac from build-metal-port.txt), stock Qwen3.5-0.8B-Q4_K_M.gguf sha256 bd258782...
+# sidecar: llb-tok extract + gguf2pack --sidecar-only (build-mac-served-path.txt binaries)
+$ LLB_GGUF=$MODELS/Qwen3.5-0.8B-Q4_K_M.gguf sys1mac --gpu 4GB --threads 8 -- side08 760 6511 314 9338 369 --steps 16
+exit=0
+out ids: 279 6511 314 279 3046 13 198 760 6511 314 9338 369 279 6511 314 279 
+text:  the capital of the country.
+The capital of France is the capital of the
+step 17 5
+step 18 4
+step 19 5
+--- stdout
+279
+6511
+314
+279
+3046
+13
+198
+760
+6511
+314
+9338
+369
+279
+6511
+314
+279
+wall_ms 258

@@ -1,0 +1,13 @@
+# Metal served path (backends/metal/server/src llb-serve + sys1mac) on the same stock GGUF: the SYS1 engine needs a CLEF decision head
+export LLB_GGUF=$MODELS/Qwen3.5-0.8B-Q4_K_M.gguf LLB_DUAL_FASTPF=0
+echo "\$ LLB_GGUF=$LLB_GGUF LLB_DUAL_FASTPF=0 $B/llb-serve --port $P --api-key smoke --engine $E -- --gpu 4GB --threads 8 -- /tmp/eepub-run/side08 0 --steps 2048"
+$B/llb-serve --port $P --api-key smoke --engine $E -- --gpu 4GB --threads 8 -- /tmp/eepub-run/side08 0 --steps 2048 > /tmp/eepub-run/serve.log 2>&1 &
+2026-11-06T17:34:20.068 serve: listening on http://127.0.0.1:18951 model=Qwen3.5-0.8B-Q4_K_M.gguf engine=/tmp/eepub-build/metal-port/sys1mac pid=87105 (loading)
+engine: bend: compiling the GPU program (/tmp/eepub-build/metal-port/sys1mac.gpu is missing or stale)
+engine: gguf: weights from $MODELS/Qwen3.5-0.8B-Q4_K_M.gguf (320 tensors, 24 layers, pack_bytes 521555200)
+engine: resident 5989464064 bytes in 84 ms (table formats, emitted cpu)
+engine: clef: missing/corrupt head tensors
+2026-11-06T17:34:22.383 serve: engine exited (status 256) — serving 503
+2026-11-06T17:35:31.209 serve: #121 127.0.0.1 "POST /v1/chat/completions" 503 237B 0.1ms prompt=0 gen=0
+2026-11-06T17:35:31.210 serve: shutdown: no new connections; draining 0 in-flight (0 queued)
+2026-11-06T17:35:31.211 serve: shutdown complete: drained in 0.0 ms, 0 left, engine exit rc 1
