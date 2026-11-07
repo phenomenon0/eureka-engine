@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "version": "0.2.0",
+  "platforms": {
+    "linux-x86_64-cuda": {
+      "status": "available",
+      "version": "0.2.0",
+      "url": "llb-linux-x86_64-cuda-0.2.0.tar.gz",
+      "sha256": "95c9f22e3369890ce80ae2dae3bece869c42065679ce6855a01ca5784dfb6bfa"
+    },
+    "linux-x86_64-cuda12": {
+      "status": "unavailable",
+      "missing": "not built for 0.2.0; use the cuda variant (driver R580+) or build from source"
+    },
+    "linux-x86_64-cpu": {
+      "status": "unavailable",
+      "missing": "not built for 0.2.0; build from source: bash backends/android/engine/build.sh host build/cpu"
+    },
+    "macos-arm64": {
+      "status": "unavailable",
+      "missing": "no macOS bundle in 0.2.0; build from source: LLB_BACKEND=metal ./build.sh (README)"
+    }
+  }
+}

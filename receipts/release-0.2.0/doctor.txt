@@ -1,0 +1,37 @@
+llb 0.2.0
+engine $PROOF/inst/share/llb-linux-x86_64-cuda-0.2.0/llb-engine
+PASS GPU 0 of 1: NVIDIA GeForce RTX 3090, compute 8.6, 24124 MiB, L2 6144 KiB (engine bag CUBE_LOG 6)
+PASS driver supports CUDA 13.0; this engine needs 13.0 or newer
+PASS compute capability 8.0 or newer (sm_80+)
+PASS concurrent managed memory access
+PASS GPU memory: 24 GB (27b needs about 19 GB)
+PASS GPU idle
+PASS engine: $PROOF/inst/share/llb-linux-x86_64-cuda-0.2.0/llb-engine
+PASS engine libraries found (libcuda, libnvrtc)
+WARN no GPU kernel cache yet: the first run builds it
+     fix: none needed (one time, about 70 s)
+PASS llb-tok found
+PASS stdbuf found (text streams as it is generated)
+PASS cache ~/.cache/llb writable, 117 GB free
+PASS RAM available: 19 GB
+PASS temp dir $PROOF/tmp writable (llb writes only small files there)
+PASS /dev/shm: 0 MB used, 15592 MB free (llb does not use it)
+WARN model 27b not found (Qwen3.8-27B-Q4_K_M.gguf)
+     fix: put Qwen3.8-27B-Q4_K_M.gguf in ~/models or set LLB_MODELS
+WARN model 9b not found (Qwen3.5-9B-Q4_K_M.gguf)
+     fix: llb pull 9b, or set LLB_MODELS
+WARN model 9b-q8 not found (Qwen3.5-9B-Q8_0.gguf)
+     fix: llb pull 9b-q8, or set LLB_MODELS
+WARN model 4b not found (Qwen3.5-4B-Q4_K_M.gguf)
+     fix: llb pull 4b, or set LLB_MODELS
+WARN model 4b-q8 not found (Qwen3.5-4B-Q8_0.gguf)
+     fix: llb pull 4b-q8, or set LLB_MODELS
+WARN model 4b-kev not found (Kev-4B-Q4_K_M.gguf)
+     fix: put Kev-4B-Q4_K_M.gguf in ~/models or set LLB_MODELS
+WARN model 4b-kev-q8 not found (Kev-4B-Q8_0.gguf)
+     fix: llb pull 4b-kev-q8, or set LLB_MODELS
+WARN model 4b-kev-upstream not found (Kev-4B-Q4_K_M.gguf)
+     fix: llb pull 4b-kev-upstream, or set LLB_MODELS
+WARN model 08b not found (Qwen3.5-0.8B-Q4_K_M.gguf)
+     fix: put Qwen3.5-0.8B-Q4_K_M.gguf in ~/models or set LLB_MODELS
+doctor rc=0

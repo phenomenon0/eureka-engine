@@ -1,0 +1,16 @@
+platform  : linux-x86_64-cuda (Linux/x86_64)
+manifest  : file://$PROOF/dist/manifest.json
+status    : available
+version   : 0.2.0
+download  : file://$PROOF/dist/llb-linux-x86_64-cuda-0.2.0.tar.gz
+sha256    : 95c9f22e3369890ce80ae2dae3bece869c42065679ce6855a01ca5784dfb6bfa (checked before unpacking)
+unpack to : $PROOF/inst/share
+link      : $PROOF/inst/bin/llb -> <unpacked dir>/llb
+you need  : native Linux, glibc 2.34+, NVIDIA Ampere or newer with concurrent managed memory access; NVRTC 13.1 is bundled, no CUDA toolkit needed; driver R580+ (CUDA 13.0); tested on driver 580.119.02 and an RTX 3090
+sha256 ok
+unpacked  : $PROOF/inst/share/llb-linux-x86_64-cuda-0.2.0
+linked    : $PROOF/inst/bin/llb
+note: $PROOF/inst/bin is not on your PATH
+next: llb doctor    (checks this machine)
+then: llb run 27b "your text"    (needs the Qwen3.8-27B Q4_K_M GGUF; see $PROOF/inst/share/llb-linux-x86_64-cuda-0.2.0/README.md)
+install rc=0

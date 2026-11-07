@@ -1,0 +1,14 @@
+llb: preparing 4b-q8 (tokenizer and sidecar, one time)
+llb: loading 4b-q8 (4.2 GB)
+llb: building the GPU kernel cache next to the engine (one time, about 70 s)
+shape d_model 2560 d_ff 9216 heads 16 kv 4 layers 32 lin 16/32 sd 128 eps 1e-06 rope 1e+07/64 kv_cap 20 (dT 5) [generic shape: spec / batch off]
+llb: loaded in 58.5 s
+ Paris.
+A. True
+B. False
+Answer:
+A
+
+LLB_GRAPH: built 2, steps 15, node updates 1144, bails 0
+llb: 4b-q8 | prompt 5 tok, 96.2 tok/s | generated 16 tok, 59.8 tok/s (16.7 ms/tok) | load 58.5 s | first token 58.6 s | stop: token limit
+run rc=0

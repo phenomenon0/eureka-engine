@@ -1,0 +1,6 @@
+platform  : macos-arm64 (Darwin/arm64)
+manifest  : file://$PROOF/dist/manifest.json
+status    : unavailable
+no download is available for macos-arm64: no macOS bundle in 0.2.0; build from source: LLB_BACKEND=metal ./build.sh (README)
+(dry run: nothing would be installed)
+mac rc=1

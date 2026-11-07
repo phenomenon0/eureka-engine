@@ -100,7 +100,27 @@ The WebGPU backend is a separate engine with different formats:
   IQ3_S ([reports/webgpu-any-shape](reports/webgpu-any-shape/REPORT.md)).
 - Its shipped 4B engine reads only F32, Q8_0, Q4_K, Q5_K and Q6_K.
 
-## 3. How to build
+## 3. Install a release (Linux, NVIDIA)
+
+Release [v0.2.0](https://github.com/phenomenon0/eureka-engine/releases/tag/v0.2.0)
+has one bundle: Linux x86-64 with an NVIDIA GPU (Ampere or newer, driver R580+).
+NVRTC is bundled, so no CUDA toolkit is needed. The bundle has the engine, the
+`llb` front end, `gguf2pack` and `llb-tok`. `llb-serve` is not in it: build that from
+source (below).
+
+```sh
+curl -fsSL https://github.com/phenomenon0/eureka-engine/releases/latest/download/install.sh -o install.sh
+sh install.sh            # read it first; it checks the sha256 before unpacking
+llb doctor
+llb run /path/to/Qwen3.5-4B-Q8_0.gguf "The capital of France is"
+```
+
+The installer, `llb doctor` and `llb run` were run from the published manifest's
+contents on an RTX 3090 ([receipts](receipts/release-0.2.0/README.md)). There is no
+macOS, CUDA 12 or CPU bundle yet. On those, the installer says so and exits; build
+from source instead.
+
+## 4. How to build
 
 ### The pinned Bend compiler (all backends)
 
@@ -186,7 +206,7 @@ Qwen3.5-0.8B
 [run](receipts/port-20261106/run-cpu-host-08b.txt)). The CPU engine is slow.
 [docs/backends.md](docs/backends.md) has the numbers it records.
 
-## 4. How to run
+## 5. How to run
 
 ### Make the sidecar (once per GGUF)
 
@@ -267,7 +287,7 @@ Details are in [HTTP API](docs/reference/http-api.md) and the
 | `LLB_ATTN_SK8=1` | CUDA engine | Split-key decode attention. `--canon` forces it off. |
 | `LLB_MOE_DP4A=1` | CUDA engine | int8 MoE experts |
 
-## 5. What is not in this repository
+## 6. What is not in this repository
 
 - **The Eureka app.** The desktop, iOS and Android apps, and the Android app's
   Kotlin, WebView and sense glue, live in the app repository.
@@ -284,7 +304,7 @@ Details are in [HTTP API](docs/reference/http-api.md) and the
 - **Model files.** No GGUF is distributed here. A `clef` GGUF is not published
   in this repository either.
 
-## 6. Measured numbers
+## 7. Measured numbers
 
 Only numbers with a receipt in this repository are listed here.
 
