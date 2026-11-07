@@ -77,7 +77,7 @@ Use a K-quant or Q8_0 file (Q4_K_M, Q4_K_S, Q5_K_M, Q6_K, Q8_0).
 | ggml type | Engine support |
 |---|---|
 | Q8_0, Q4_K, Q5_K, Q6_K | CUDA and Metal kernels. These cover every tested file (Q4_K_M, Q4_K_S, Q8_0 GGUFs). |
-| IQ4_XS | CUDA (generic GEMV body; about 40 tok/s on the 4B, RTX 3090) |
+| IQ4_XS | CUDA and Metal (generic GEMV body, not yet tuned; about 40 tok/s on the 4B, RTX 3090) |
 | Q2_0, PQ2_0 | This project's own 2-bit formats ([`tools/q20.py`](tools/q20.py)) |
 | F32 | Norms and small tensors |
 | F16, BF16 | MoE experts |
