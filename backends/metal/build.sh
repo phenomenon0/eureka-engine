@@ -46,10 +46,15 @@ if [ -f "$LLB_BEND/.commit" ] && [ "$(cat "$LLB_BEND/.commit")" = "$BEND_COMMIT"
   src=$LLB_BEND   # an already-exported bend-pinned dir (build.sh's $LLB_OUT/bend-pinned)
 elif git -C "$LLB_BEND" cat-file -e "$BEND_COMMIT^{commit}" 2>/dev/null; then
   src=$LLB_OUT/cc.src; mkdir -p "$src"; git -C "$LLB_BEND" archive "$BEND_COMMIT" bend2 | tar -xm -C "$src"
-elif BEND_TREE=$(sed -n 's/^BEND_TREE=//p' "$LLB_ROOT/build.sh") && [ -n "$BEND_TREE" ] &&
-     [ "$(git -C "$LLB_ROOT" rev-parse -q --verify pins/bend-240ecef4:bend2 2>/dev/null)" = "$BEND_TREE" ]; then
-  src=$LLB_OUT/cc.src; mkdir -p "$src"; git -C "$LLB_ROOT" archive pins/bend-240ecef4 bend2 | tar -xm -C "$src" # the content record (build.sh)
-else die "LLB_BEND=$LLB_BEND is neither a Bend checkout nor a bend-pinned export of $BEND_COMMIT"; fi
+else
+  # the pin may be local (pins/...) or only remote (origin/pins/...) in a fresh clone
+  BEND_TREE=$(sed -n 's/^BEND_TREE=//p' "$LLB_ROOT/build.sh"); BENDREF=
+  for ref in pins/bend-240ecef4 origin/pins/bend-240ecef4; do
+    [ -n "$BEND_TREE" ] && [ "$(git -C "$LLB_ROOT" rev-parse -q --verify "$ref:bend2" 2>/dev/null)" = "$BEND_TREE" ] && BENDREF=$ref && break
+  done
+  [ -n "$BENDREF" ] || die "LLB_BEND=$LLB_BEND is neither a Bend checkout nor a bend-pinned export of $BEND_COMMIT (run: git fetch origin pins/bend-240ecef4:pins/bend-240ecef4)"
+  src=$LLB_OUT/cc.src; mkdir -p "$src"; git -C "$LLB_ROOT" archive "$BENDREF" bend2 | tar -xm -C "$src" # the content record (build.sh)
+fi
 cp -r "$src/bend2/"{bend.ts,comp.ts,main.ts,hand.ts,export.ts,base.bend,effs} "$LLB_OUT/cc/bend2/"
 n=0
 for p in $(grep -oE 'tools/[a-z0-9/_-]+\.patch' "$LLB_ROOT/tools/build_gpu.sh"); do
