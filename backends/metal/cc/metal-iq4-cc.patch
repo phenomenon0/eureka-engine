@@ -1,0 +1,156 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -12380,6 +12380,7 @@
+ #define MX_Q4K  5u
+ #define MX_Q5K  6u
+ #define MX_Q6K  7u
++#define MX_IQ4  8u
+ 
+ struct MxPtr {
+   device const u8* p;
+@@ -12419,9 +12420,25 @@
+ 
+ // the sum over chunk c (columns 32 c .. 32 c + 31) of a row r of cols columns in format f, times x (x in device or
+ // threadgroup memory: XP)
++// kvalues_iq4nl (ggml-common.h): the IQ4_XS codebook
++constant char mx_kv4[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
++
+ template <typename XP>
+ INLINE float mx_chunk(device const u8* r, u32 f, u32 cols, u32 c, XP x) {
+   float a = 0.0f;
++  if (f == MX_IQ4) {
++    // IQ4_XS (block_iq4_xs, 136 B a 256-weight superblock): chunk c is sub-block ib = c % 8 of superblock c / 8;
++    // w = d (ls - 32) kvalues_iq4nl[q], q the low nibbles (weights 0..15) then the high (16..31)
++    device const u8* b = r + (u64)(c >> 3) * 136;
++    const u32 ib = c & 7;
++    const u32 sh = (u32)b[2] | ((u32)b[3] << 8);
++    const int ls = (int)((((u32)b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 15u) | (((sh >> (2 * ib)) & 3u) << 4));
++    device const u8* q = b + 8 + 16 * ib;
++    for (u32 i = 0; i < 16; i += 1) {
++      a += (float)mx_kv4[q[i] & 15] * x[i] + (float)mx_kv4[q[i] >> 4] * x[i + 16];
++    }
++    return mx_hf(b) * (float)(ls - 32) * a;
++  }
+   if (f == MX_F32) {
+     device const float* w = (device const float*)r + 32 * c;
+     for (u32 i = 0; i < 32; i += 1) {
+@@ -12770,6 +12787,10 @@
+   for (u32 t = 0; t < 4; t++) {
+     xs[4 * t] = xl[t].x; xs[4 * t + 1] = xl[t].y; xs[4 * t + 2] = xl[t].z; xs[4 * t + 3] = xl[t].w;
+     xs[16 + 4 * t] = xh[t].x; xs[17 + 4 * t] = xh[t].y; xs[18 + 4 * t] = xh[t].z; xs[19 + 4 * t] = xh[t].w;
++  }
++  // (IQ4_XS) mx_chunk's x is chunk-relative: xs already holds chunk c's 32 columns (mx_dot passes x + 32 c)
++  if (F == MX_IQ4) {
++    return mx_chunk(r, f, cols, c, (thread const float*)xs);
+   }
+   return mx_chunk(r, f, cols, c, (thread const float*)xs - 32 * c);
+ }
+@@ -13024,7 +13045,7 @@
+ #define MXGV_INST(F, R) \
+   template [[host_name("llb_mx_gv_f" #F "_r" #R)]] kernel void llb_mx_gv<F, R>(device u8*, device u8*, \
+     constant MxGv&, uint, ushort, ushort, ushort);
+-MXGV_INST(4, 4) MXGV_INST(5, 4) MXGV_INST(6, 4) MXGV_INST(7, 4) MXGV_INST(15, 4)
++MXGV_INST(4, 4) MXGV_INST(5, 4) MXGV_INST(6, 4) MXGV_INST(7, 4) MXGV_INST(8, 4) MXGV_INST(15, 4)
+ 
+ // ---- (METAL-CATCHUP) the MoE FFN of the fast prefill chunk (nt tokens a layer) ---------------------------------------
+ // Token t's f27 block at A.cxb + t A.cxs floats holds its h2 / x1 (the FFN input and the residual), its router logits
+@@ -16627,12 +16648,15 @@
+ #define LLB_FM_Q4_K 3u
+ #define LLB_FM_Q6_K 4u
+ #define LLB_FM_Q5_K 9u
++#define LLB_FM_IQ4_XS 8u
+ #define LLB_FM_KQ(fm) ((fm) == LLB_FM_Q4_K || (fm) == LLB_FM_Q6_K \
+   || (fm) == LLB_FM_Q5_K)
+ #define LLB_FM_SB(fm) ((fm) == LLB_FM_Q4_K ? 144u : (fm) == LLB_FM_Q5_K ? 176u \
+-  : (fm) == LLB_FM_Q6_K ? 210u : 0u)
++  : (fm) == LLB_FM_Q6_K ? 210u : (fm) == LLB_FM_IQ4_XS ? 136u : 0u)
+ #define LLB_FM_RB(fm, c) ((fm) == LLB_FM_Q8_0 ? (u32)(c) / 32 * 34 \
+   : (fm) == LLB_FM_F32 ? (u32)(c) * 4 : (u32)(c) / 256 * LLB_FM_SB(fm))
++// a GEMV row format with 256-weight superblocks: the K-quants and IQ4_XS (llb_mx_gv's IQ4_XS body)
++#define LLB_FM_BQ(fm) (LLB_FM_KQ(fm) || (fm) == LLB_FM_IQ4_XS)
+ 
+ // the K bodies' pipelines: [Q4_K, Q5_K, Q6_K][d 10 NS 4, d 10 NS 2, d 12 NS 8];
+ // (tools/metal-27b.patch) gpu_kx: bd2 d 11 Q4_K, Q6_K; rd2 Q4_K d 13 (17
+@@ -16919,6 +16943,9 @@
+   // (METAL-CATCHUP) a MoE model's trunk takes the mx_gv bodies (numerics-changing; dense models never reach this)
+   if (mx_gv(en, fm, w, rb, x, y, n)) {
+     return;
++  }
++  if (fm == LLB_FM_IQ4_XS) {
++    err_fail("warp GEMV: IQ4_XS operands refused (Metal: 2-aligned rows, 16-aligned x)");
+   }
+   if (LLB_FM_KQ(fm)) {
+     m9_kgemv(en, fm, w, rb, x, y, n, d);
+@@ -17641,6 +17668,7 @@
+ #define MX_Q4K  5u
+ #define MX_Q5K  6u
+ #define MX_Q6K  7u
++#define MX_IQ4  8u
+ static id<MTLComputePipelineState> gpu_mx_rdot, gpu_mx_route, gpu_mx_gu, gpu_mx_dn;
+ // (METAL-CATCHUP) the v2 decode kernels: the routing, gate / up and down per row format (MX_Q8 .. MX_Q6K, MX_GEN);
+ // LLB_MX_V1=1 keeps the v1 kernels and schedule (the oracle for the scheduling-only changes)
+@@ -18046,7 +18074,7 @@
+   u32 rb, cols, n, f;
+ } MxGv;
+ static bool mx_gv(id<MTLComputeCommandEncoder> en, u32 fm, u64 w, u32 rb, u64 x, u64 y, u32 n) {
+-  if (!mx_tg || n == 0) {
++  if (n == 0 || (!mx_tg && fm != LLB_FM_IQ4_XS)) {
+     return false;
+   }
+   u32 F, cols;
+@@ -18054,10 +18082,16 @@
+     F = MX_Q8R; cols = rb / 34 * 32;
+   } else if (LLB_FM_KQ(fm)) {
+     F = mx_hfmt(fm); cols = rb / LLB_FM_SB(fm) * 256;
++  } else if (fm == LLB_FM_IQ4_XS) {
++    // dense or MoE: IQ4_XS rows have no fixed-tree body; llb_mx_gv's (built on first use)
++    F = MX_IQ4; cols = rb / 136 * 256;
++    if (gpu_mx_gv[F] == nil) {
++      gpu_mx_gv[F] = warp_pipe("llb_mx_gv_f8_r4");
++    }
+   } else {
+     return false;
+   }
+-  if (gpu_mx_gv[F] == nil || (x & 15) != 0 || (w & 1) != 0 || (F != MX_Q6K && ((w & 15) != 0 || (rb & 15) != 0))) {
++  if (gpu_mx_gv[F] == nil || (x & 15) != 0 || (w & 1) != 0 || (F != MX_Q6K && F != MX_IQ4 && ((w & 15) != 0 || (rb & 15) != 0))) {
+     return false;
+   }
+   MxGv A = { w, x, y, rb, cols, n, F };
+@@ -19333,15 +19367,15 @@
+     bool     ok = m9_rw((u32)H[a + 7], &rb, &fm);
+     StrParts p  = str_peek_ro(e, H[a + 1]);
+     const u8* w = (const u8*)(H + term_peek_ro(e, p.data)) + p.off + bs;
+-    if (!ok || (fm != 0 && fm != 1 && !LLB_FM_KQ(fm))) {
++    if (!ok || (fm != 0 && fm != 1 && !LLB_FM_BQ(fm))) {
+       err_fail("warp GEMV: row format refused (Metal serves F32, Q8_0, Q4_K,"
+-        " Q5_K and Q6_K)");
++        " Q5_K, Q6_K and IQ4_XS)");
+     }
+     // (tools/metal-kquant.patch) a K-quant row: whole superblocks; m9_kgemv
+     // checks the rest (d 10 / 12, cols % 1024, alignment)
+     if (term_tag(H[a + 1]) != TAG_STR || str_nar(p) != 2 || d < 9
+-      || d > (LLB_FM_KQ(fm) ? 13u : fm ? 12u : 11u)
+-      || (LLB_FM_KQ(fm) ? rb % LLB_FM_SB(fm) != 0
++      || d > (LLB_FM_BQ(fm) ? 13u : fm ? 12u : 11u)
++      || (LLB_FM_BQ(fm) ? rb % LLB_FM_SB(fm) != 0
+         : fm == 1 ? rb / 17 % 4 != 0 : rb % 16 != 0)
+       || ((uintptr_t)w & 15) != 0
+       || (u64)bs + (u64)n * rb > p.len || M9_ARR(x) || M9_ARR(y)
+@@ -19720,7 +19754,7 @@
+           R.fm[f] = fm;
+           R.rb[f] = LLB_FM_RB(fm, m9_cols(&R, f));
+           ok = ok && (!(has >> f & 1) || (gv >> f & 1
+-            ? fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm) : fm == LLB_FM_F32));
++            ? fm == LLB_FM_Q8_0 || LLB_FM_BQ(fm) : fm == LLB_FM_F32));
+           sz += has >> f & 1 ? m9_tsz(&R, f) : 0;
+         }
+         // (METAL-CATCHUP) a MoE layer's blob also holds its router and shared gate (the pass arm's check)
+@@ -19949,7 +19983,7 @@
+           // (SYS1-MAC) Clef's F32 ssm_beta / ssm_alpha (linear slots 7, 8):
+           // m9_gemv's F32 arm (llb_warp, float4 stride rb / 16) serves them
+           ok = ok && (!(has >> f & 1) || (gv >> f & 1
+-            ? fm == LLB_FM_Q8_0 || LLB_FM_KQ(fm)
++            ? fm == LLB_FM_Q8_0 || LLB_FM_BQ(fm)
+               || (!full && (f == 7 || f == 8) && fm == LLB_FM_F32)
+             : fm == LLB_FM_F32));
+           sz += has >> f & 1 ? m9_tsz(&R, f) : 0;

@@ -36,6 +36,7 @@ EXPECT_C_ANY_VISION=85c8d3c489dda683d5bbd12b8928e2645a6268efdec6871d3e755fd1d6c5
 EXPECT_C_MOE=a20c8ee2c4fcf772ad4ae9b8d3130d6f40054b697695fd5a87f3deb2e17e550e
 # the same with the MoE catch-up patches (the default build)
 EXPECT_C_CATCHUP=5a766ce4998cdbf40b6fc73a4829ba97da264ed707697386db50ac2f99aa7901
+EXPECT_C_IQ4=45c295c0596d1b806c84d907c06a0b69eaed7ceb6942bc08e4395c23bb9a83c2
 die() { echo "backends/metal/build.sh: $*" >&2; exit 1; }
 BUN=$(command -v bun || echo "$HOME/.bun/bin/bun"); [ -x "$BUN" ] || die "missing tool: bun"
 (cd "$here" && sha256sum -c --quiet SHA256SUMS 2>/dev/null || shasum -a 256 -c --quiet SHA256SUMS) \
@@ -92,6 +93,8 @@ if [ -z "${LLB_METAL_BASE:-}" ]; then
       patch --batch --silent --fuzz=0 -d "$LLB_OUT/tree" -p1 < "$here/engine/metal-catchup-engine.patch" \
         || die "metal-catchup-engine"
       expect=$EXPECT_C_CATCHUP
+      patch --batch --silent --fuzz=0 -d "$LLB_OUT/cc" -p1 < "$here/cc/metal-iq4-cc.patch" || die "metal-iq4-cc"
+      expect=$EXPECT_C_IQ4
     fi
   fi
 fi

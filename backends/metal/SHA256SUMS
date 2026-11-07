@@ -20,3 +20,4 @@ ff133966d078f4de3b54b7c59aadc706d7198b06f32a94debfb18d3406af6ce8  cc/metal-moe-c
 2e1e13890dad4e1d7154d70ed3fff81f7d6ce82d5ca677b911056abbf2c9c7f8  engine/metal-moe-engine.patch
 e8d1cb43284de3f7ee6cf2d798839412fbc44e024574bd70d9220185b4ed1f03  cc/metal-catchup-cc.patch
 ab0b7aa74058d9ba9e5caaaba0f008283bca4406ea2b3d8ecd44eeb5fef78841  engine/metal-catchup-engine.patch
+ecbd93e36b38249b8ea5b58021b36b7065d235020fd0c5583d801e6d3513738f  cc/metal-iq4-cc.patch
