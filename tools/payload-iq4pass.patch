@@ -1,0 +1,29 @@
+--- a/bend2/comp.ts
++++ b/bend2/comp.ts
+@@ -8714,7 +8714,7 @@
+ // tools/payload-anyshape.patch: the any-width GEMV, where no tuned body applies (a K-quant row
+ // of cols % 1024 != 0 past the tile body's depths, Q5_K below whole quads, Q8_0 / F32 outside
+ // their tree depths): a warp a row, lane l sums the groups l, l + 32, .. of the cg = cols / 4,
+-// then the xor butterfly. fm: 0 F32, 1 Q8_0 (row-split), 3 Q4_K, 4 Q6_K, 9 Q5_K. x is read to
++// then the xor butterfly. fm: 0 F32, 1 Q8_0 (row-split), 3 Q4_K, 4 Q6_K, 8 IQ4_XS, 9 Q5_K. x is read to
+ // cols only (no pad). Not the engine's fixed tree: tolerance-class, used by no shape the
+ // tuned bodies cover
+ extern "C" __global__ void __launch_bounds__(128) llb_gemv_any(
+@@ -8734,6 +8734,8 @@
+         w = q6k_w(row, g);
+       } else if (fm == 9) {
+         w = q5k_w(row, g);
++      } else if (fm == 8) {
++        w = iq4xs_w(row, g);
+       } else {
+         const float* f = (const float*)row + 4 * (u64)g;
+         w = make_float4(f[0], f[1], f[2], f[3]);
+@@ -9902,7 +9904,7 @@
+       u32  w = tw[i * 32 + 1 + f], fm = w >> 28;
+       bool kq = fm == LLB_FM_Q4_K || fm == LLB_FM_Q6_K || fm == LLB_FM_Q5_K;
+       p[f] = w & 0x0fffffffu;
+-      ok = ok && (!(has >> f & 1) || (q8 >> f & 1 ? fm == LLB_FM_Q8_0 || kq || (!full && (f == 7 || f == 8) && fm == LLB_FM_F32) : fm == LLB_FM_F32));
++      ok = ok && (!(has >> f & 1) || (q8 >> f & 1 ? fm == LLB_FM_Q8_0 || kq || fm == LLB_FM_IQ4_XS || (!full && (f == 7 || f == 8) && fm == LLB_FM_F32) : fm == LLB_FM_F32));
+     }
+ #define PRB(f, c) ((u64)LLB_FM_RB(tw[i * 32 + 1 + (f)] >> 28, (u32)(c)))
+     // the 0.8B's 3584-col down: 14 superblocks on the K-quant tile body (tools/payload-w1024.patch)

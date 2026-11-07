@@ -392,7 +392,8 @@ static const Fmt *fmt_of(const char *name) {
 // quant_pack_qwen35.DOORS; scale (f16) byte offset inside each block, -1 none
 static const struct { const char *name; int d0, d1; } DOORS[] = {
     {"F32", -1, -1}, {"Q8_0", 0, -1}, {"Q4_K", 0, 2}, {"Q6_K", 208, -1},
-    {"Q3_K", 108, -1}, {"Q5_K", 0, 2}, {"Q2_0", 0, -1}, {"PQ2_0", 0, -1}};
+    {"Q3_K", 108, -1}, {"Q5_K", 0, 2}, {"Q2_0", 0, -1}, {"PQ2_0", 0, -1},
+    {"IQ4_XS", 0, -1}};
 
 typedef struct {
   char *name;
@@ -1624,7 +1625,7 @@ int main(int argc, char **argv) {
   int allq8 = 1;
   for (size_t i = 0; i < g.nt; i++) {
     T *t = &g.t[i];
-    if (t->door < 0) die("%s: type %s unsupported for packing (doors F32 Q8_0 Q4_K Q5_K Q6_K Q3_K Q2_0 PQ2_0)", t->name, t->tn);
+    if (t->door < 0) die("%s: type %s unsupported for packing (doors F32 Q8_0 Q4_K Q5_K Q6_K Q3_K Q2_0 PQ2_0 IQ4_XS)", t->name, t->tn);
     allq8 &= !strcmp(t->tn, "Q8_0") || !strcmp(t->tn, "F32");
   }
   int q8 = fmtarg ? !strcmp(fmtarg, "q8") : allq8;

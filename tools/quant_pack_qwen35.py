@@ -55,7 +55,7 @@ ALIGN = 64
 # engine reads pack.bin + index.tsv, so a flaky NTFS mount can skip them
 # (Q35_PACK_LAYERS=0) without affecting any gate.
 WRITE_LAYERS = os.environ.get("Q35_PACK_LAYERS", "1") != "0"
-DOORS = {"F32", "Q8_0", "Q4_K", "Q6_K", "Q3_K", "Q5_K", "Q2_0", "PQ2_0"}
+DOORS = {"F32", "Q8_0", "Q4_K", "Q6_K", "Q3_K", "Q5_K", "Q2_0", "PQ2_0", "IQ4_XS"}
 AUDIT_FULL = 4_000_000  # dequant-audit tensors <= this many elements fully
 AUDIT_BLOCKS = 512      # else compare this many sampled super-blocks per tensor
 

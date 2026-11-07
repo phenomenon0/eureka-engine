@@ -75,11 +75,11 @@ static bool llb_tuned(u32 fm, u32 cols) {
   return fm == LLB_FM_Q5_K && cg % 256 == 0 && d >= 8 && d <= 13;
 }
 
-// y = W x by llb_gemv_any: n rows of cols in format fm (F32, Q8_0, Q4_K, Q6_K, Q5_K)
+// y = W x by llb_gemv_any: n rows of cols in format fm (F32, Q8_0, Q4_K, Q6_K, Q5_K, IQ4_XS)
 static void llb_gany(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n) {
   u32 rb = LLB_FM_RB(fm, cols), cg = cols / 4, g = (n + 3) / 4;
   g = g < 4096 ? g : 4096;
-  if (fm != LLB_FM_F32 && fm != LLB_FM_Q8_0 && fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K && fm != LLB_FM_Q5_K) {
+  if (fm != LLB_FM_F32 && fm != LLB_FM_Q8_0 && fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K && fm != LLB_FM_Q5_K && fm != LLB_FM_IQ4_XS) {
     err_fail("warp pass: no GEMV body for a table format");
   }
   // reports/cuda-catchup: K-quant rows on llb_gemv_anyk (moe_dotn: the same leaf and order, two rows a
@@ -120,6 +120,11 @@ static void llb_kgemv(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n, u32 grid) {
       || !LLB_LAUNCH(gpu_q6dp2, g6, 1, 128, &w, &rb, &qx, &dx, &y, &n)) {
       err_fail("device launch failed");
     }
+    return;
+  }
+  // IQ4_XS has no tuned body here: the generic llb_gemv_any row (iq4xs_w)
+  if (fm == LLB_FM_IQ4_XS) {
+    llb_gany(fm, w, cols, x, y, n);
     return;
   }
   if (fm != LLB_FM_Q8_0 && fm != LLB_FM_Q4_K && fm != LLB_FM_Q6_K && fm != LLB_FM_Q5_K) {
