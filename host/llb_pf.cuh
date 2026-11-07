@@ -858,3 +858,218 @@ extern "C" __global__ void __launch_bounds__(256) llb_mx_gather(const signed cha
     dg[s * (c / 32) + i] = xd[t * (c / 32) + i];
   }
 }
+
+// ATTN4S: llb_attn4 split over slot chunks (LONGDEC: one block a head left 16 blocks on the
+// board, 24.8 ms/token at 14,426 ids). Four launches, grid (NC chunks, nkv kv heads) for the
+// first three, one block a kv head's grp q heads so K / V are read once, not grp times. Every
+// reduction of llb_attn4 is a perfect pairwise tree over T2 = the power of two >= n (lower
+// index on the left); a tree over T2 is the tree over its NC = T2 / C chunks of the chunks'
+// perfect subtrees, so the max, the softmax sum and the weighted V keep llb_attn4's bits.
+// C = T2 up to 256, else max(256, T2 / 256): NC <= 256. Per head h, sc + (h << 17) holds the
+// scores then the exps; pr + (h << 17) holds the chunks' V partials (NC x 256 <= 2^16 floats),
+// the chunk maxes at 2^16 and the chunk sums at 2^16 + 512.
+#define A4S_GMAX 8
+#define A4S_ST 0x10000u
+__device__ __forceinline__ void a4s_shape(u32 c, u32* n, u32* T2, u32* C, u32* T) {
+  const u32 dT = c & 31, pos = c >> 5;
+  *T = 1u << dT;
+  *n = pos < *T ? pos + 1 : *T;
+  u32 t2 = 1;
+  while (t2 < *n) {
+    t2 <<= 1;
+  }
+  *T2 = t2;
+  *C = t2 <= 256 ? t2 : (t2 >> 8 > 256 ? t2 >> 8 : 256);
+}
+
+__device__ __forceinline__ float a4s_max(float a, float v) {
+  return a < v ? v : a;
+}
+
+// scores of chunk blockIdx.x for the grp q heads of kv head blockIdx.y, then each head's
+// chunk max (the subtree of llb_attn4's max tree)
+extern "C" __global__ void __launch_bounds__(256) llb_a4s_score(
+  const float* __restrict__ q, const float* __restrict__ kc,
+  float* __restrict__ sc, float* __restrict__ pr, u32 c, u32 grp) {
+  __shared__ float qs[A4S_GMAX][8 * 33];
+  __shared__ float bs[A4S_GMAX * 512];
+  u32 n, T2, C, T;
+  a4s_shape(c, &n, &T2, &C, &T);
+  const u32 kvh = blockIdx.y, h0 = kvh * grp, t0 = blockIdx.x * C;
+  const u32 g = kvh * 256, ks = gridDim.y * 256;
+  const float scale = __fdiv_rn(1.0f, __fsqrt_rn(256.0f));
+  const float ninf = __uint_as_float(0xFF800000u);
+  for (u32 i = threadIdx.x; i < grp * 256; i += blockDim.x) {
+    const u32 gi = i >> 8, d = i & 255;
+    qs[gi][(d >> 5) * 33 + (d & 31)] = q[(u64)(h0 + gi) * 256 + d];
+  }
+  __syncthreads();
+  const u32 sub = threadIdx.x & 7;
+  for (u32 tb = 0; tb < C; tb += blockDim.x >> 3) {
+    const u32 tl = tb + (threadIdx.x >> 3), t = t0 + tl;
+    float v[A4S_GMAX];
+#pragma unroll
+    for (u32 gi = 0; gi < A4S_GMAX; gi++) {
+      v[gi] = 0.0f;
+    }
+    if (tl < C && t < n) {
+      const float4* k4 = (const float4*)(kc + (u64)t * ks + g + sub * 32);
+      float kk[32];
+#pragma unroll
+      for (u32 u = 0; u < 8; u++) {
+        const float4 w = k4[u];
+        kk[4 * u] = w.x, kk[4 * u + 1] = w.y, kk[4 * u + 2] = w.z, kk[4 * u + 3] = w.w;
+      }
+      for (u32 gi = 0; gi < grp; gi++) {
+        const float* qq = qs[gi] + sub * 33;
+        float st[6];
+        u32   sp = 0;
+#pragma unroll
+        for (u32 i = 0; i < 32; i++) {
+          attn_push(st, &sp, i, __fmul_rn(kk[i], qq[i]));
+        }
+        v[gi] = st[0];
+      }
+    }
+    for (u32 gi = 0; gi < grp; gi++) {
+      float x = v[gi];
+#pragma unroll
+      for (u32 m = 1; m < 8; m <<= 1) {
+        x = __fadd_rn(x, __shfl_xor_sync(0xffffffffu, x, m));
+      }
+      if (sub == 0 && tl < C) {
+        const float s = t < n ? __fmul_rn(x, scale) : ninf;
+        sc[((u64)(h0 + gi) << 17) + t] = s;
+        bs[gi * C + tl] = s;
+      }
+    }
+  }
+  __syncthreads();
+  for (u32 s = 1; s < C; s <<= 1) {
+    for (u32 i = threadIdx.x * 2 * s; i < grp * C; i += blockDim.x * 2 * s) {
+      bs[i] = a4s_max(bs[i], bs[i + s]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < grp) {
+    pr[((u64)(h0 + threadIdx.x) << 17) + A4S_ST + blockIdx.x] = bs[threadIdx.x * C];
+  }
+}
+
+// the head's max (the tree over the NC chunk maxes), the chunk's exps and its sum subtree
+extern "C" __global__ void __launch_bounds__(256) llb_a4s_exp(
+  float* __restrict__ sc, float* __restrict__ pr, u32 c, u32 grp) {
+  __shared__ float bs[512];
+  __shared__ float ms;
+  u32 n, T2, C, T;
+  a4s_shape(c, &n, &T2, &C, &T);
+  const u32 NC = T2 / C, t0 = blockIdx.x * C;
+  for (u32 gi = 0; gi < grp; gi++) {
+    const u32 h = blockIdx.y * grp + gi;
+    float* sh = sc + ((u64)h << 17);
+    float* st = pr + ((u64)h << 17) + A4S_ST;
+    for (u32 i = threadIdx.x; i < NC; i += blockDim.x) {
+      bs[i] = st[i];
+    }
+    __syncthreads();
+    for (u32 s = 1; s < NC; s <<= 1) {
+      for (u32 i = threadIdx.x * 2 * s; i < NC; i += blockDim.x * 2 * s) {
+        bs[i] = a4s_max(bs[i], bs[i + s]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      ms = bs[0];
+    }
+    __syncthreads();
+    const float m = ms;
+    for (u32 i = threadIdx.x; i < C; i += blockDim.x) {
+      bs[i] = sh[t0 + i] = attn_exp(__fsub_rn(sh[t0 + i], m));
+    }
+    __syncthreads();
+    for (u32 s = 1; s < C; s <<= 1) {
+      for (u32 i = threadIdx.x * 2 * s; i < C; i += blockDim.x * 2 * s) {
+        bs[i] = __fadd_rn(bs[i], bs[i + s]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      st[512 + blockIdx.x] = bs[0];
+    }
+    __syncthreads();
+  }
+}
+
+// z (the tree over the NC chunk sums, + 0 when T2 < T as llb_attn4), the chunk's probs and
+// its weighted-V subtree per q head and dim; NC == 1 writes att directly
+extern "C" __global__ void __launch_bounds__(1024) llb_a4s_wv(
+  const float* __restrict__ vc, float* __restrict__ att,
+  float* __restrict__ sc, float* __restrict__ pr, u32 c, u32 grp) {
+  __shared__ float ps[A4S_GMAX][512];
+  __shared__ float bs[A4S_GMAX][256];
+  u32 n, T2, C, T;
+  a4s_shape(c, &n, &T2, &C, &T);
+  const u32 NC = T2 / C, t0 = blockIdx.x * C, h0 = blockIdx.y * grp;
+  const u32 g = blockIdx.y * 256, ks = gridDim.y * 256;
+  for (u32 i = threadIdx.x; i < grp * NC; i += blockDim.x) {
+    const u32 gi = i / NC, k = i % NC;
+    bs[gi][k] = pr[((u64)(h0 + gi) << 17) + A4S_ST + 512 + k];
+  }
+  __syncthreads();
+  for (u32 s = 1; s < NC; s <<= 1) {
+    for (u32 i = threadIdx.x; i < grp * NC; i += blockDim.x) {
+      const u32 gi = i / NC, k = i % NC;
+      if ((k & (2 * s - 1)) == 0) {
+        bs[gi][k] = __fadd_rn(bs[gi][k], bs[gi][k + s]);
+      }
+    }
+    __syncthreads();
+  }
+  for (u32 i = threadIdx.x; i < grp * C; i += blockDim.x) {
+    const u32 gi = i / C, k = i % C;
+    const float z = T2 < T ? __fadd_rn(bs[gi][0], 0.0f) : bs[gi][0];
+    ps[gi][k] = __fdiv_rn(sc[((u64)(h0 + gi) << 17) + t0 + k], z);
+  }
+  __syncthreads();
+  const u32 j = threadIdx.x & 255;
+  for (u32 gi = threadIdx.x >> 8; gi < grp; gi += blockDim.x >> 8) {
+    float st[11];
+    u32   sp = 0;
+    const float* pp = ps[gi];
+    u32 t = 0;
+    for (; t + 8 <= C; t += 8) {
+      float vv[8];
+#pragma unroll
+      for (u32 u = 0; u < 8; u++) {
+        vv[u] = vc[(u64)(t0 + t + u) * ks + g + j];
+      }
+#pragma unroll
+      for (u32 u = 0; u < 8; u++) {
+        attn_push(st, &sp, t + u, __fmul_rn(vv[u], pp[t + u]));
+      }
+    }
+    for (; t < C; t++) {
+      attn_push(st, &sp, t, __fmul_rn(vc[(u64)(t0 + t) * ks + g + j], pp[t]));
+    }
+    if (NC == 1) {
+      att[(u64)(h0 + gi) * 256 + j] = T2 < T ? __fadd_rn(st[0], 0.0f) : st[0];
+    } else {
+      pr[((u64)(h0 + gi) << 17) + (u64)blockIdx.x * 256 + j] = st[0];
+    }
+  }
+}
+
+// att: the tree over the NC chunk partials (NC > 1), + 0 when T2 < T; a block a q head
+extern "C" __global__ void __launch_bounds__(256) llb_a4s_out(
+  float* __restrict__ att, const float* __restrict__ pr, u32 c) {
+  u32 n, T2, C, T;
+  a4s_shape(c, &n, &T2, &C, &T);
+  const u32 NC = T2 / C, h = blockIdx.x, j = threadIdx.x;
+  const float* p = pr + ((u64)h << 17) + j;
+  float st[9];
+  u32   sp = 0;
+  for (u32 k = 0; k < NC; k++) {
+    attn_push(st, &sp, k, p[(u64)k * 256]);
+  }
+  att[(u64)h * 256 + j] = T2 < T ? __fadd_rn(st[0], 0.0f) : st[0];
+}

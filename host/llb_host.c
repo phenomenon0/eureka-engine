@@ -800,6 +800,35 @@ static void llb_linb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
   }
 }
 
+// llb_attn4 as the ATTN4S split (host/llb_pf.cuh llb_a4s_*): the same bits over NC x nkv
+// blocks instead of nh. LLB_ATTN4_SPLIT=0 keeps the one-block-a-head kernel. nh q heads, grp
+// a kv head; the args as llb_attn4's.
+static CUfunction gpu_a4s_score, gpu_a4s_exp, gpu_a4s_wv, gpu_a4s_out;
+static bool llb_attn4_run(u32 nh, u64 q, u64 kc, u64 vc, u64 att, u64 s, u64 p, u32 c, u32 grp) {
+  static int on = -1;
+  if (on < 0) {
+    const char* e = getenv("LLB_ATTN4_SPLIT");
+    on = !(e != NULL && e[0] == '0')
+      && cuModuleGetFunction(&gpu_a4s_score, gpu_lib, "llb_a4s_score") == CUDA_SUCCESS
+      && cuModuleGetFunction(&gpu_a4s_exp, gpu_lib, "llb_a4s_exp") == CUDA_SUCCESS
+      && cuModuleGetFunction(&gpu_a4s_wv, gpu_lib, "llb_a4s_wv") == CUDA_SUCCESS
+      && cuModuleGetFunction(&gpu_a4s_out, gpu_lib, "llb_a4s_out") == CUDA_SUCCESS;
+  }
+  if (!on || grp == 0 || grp > 8 || nh % grp != 0 || (kc & 15) != 0) {
+    return LLB_LAUNCH(gpu_attn4, nh, 1, 1024, &q, &kc, &vc, &att, &s, &p, &c, &grp);
+  }
+  const u32 dT = c & 31, pos = c >> 5, T = 1u << dT, n = pos < T ? pos + 1 : T;
+  u32 T2 = 1;
+  while (T2 < n) {
+    T2 <<= 1;
+  }
+  const u32 C = T2 <= 256 ? T2 : (T2 >> 8 > 256 ? T2 >> 8 : 256), NC = T2 / C, nkv = nh / grp;
+  return LLB_LAUNCH(gpu_a4s_score, NC, nkv, 256, &q, &kc, &s, &p, &c, &grp)
+    && LLB_LAUNCH(gpu_a4s_exp, NC, nkv, 256, &s, &p, &c, &grp)
+    && LLB_LAUNCH(gpu_a4s_wv, NC, nkv, 1024, &vc, &att, &s, &p, &c, &grp)
+    && (NC == 1 || LLB_LAUNCH(gpu_a4s_out, nh, 1, 256, &att, &p, &c));
+}
+
 static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32* tw) {
   u64 base22 = o->w, xp22 = o->x, kcp22 = o->k, vcp22 = o->v;
   u64 anp22 = base22 + o->ban, wqp22 = base22 + o->bq, wkp22 = base22 + o->bg;
@@ -854,7 +883,7 @@ static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
     || !LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &vb22, &vslot22)
     // LLB_ATTN_SK8=1: split-key decode attention (tools/payload-sk8add.patch), where it fits
     || !(llb_sk8_enabled() && llb_sk8_fits(c22, ah22) ? llb_sk8_launch(qg22, kcp22, vcp22, attn22, c22, grp22, ah22) :
-      LLB_LAUNCH(gpu_attn4, ah22, 1, 1024, &qg22, &kcp22, &vcp22, &attn22, &s22, &p22, &c22, &grp22))
+      llb_attn4_run(ah22, qg22, kcp22, vcp22, attn22, s22, p22, c22, grp22))
     || !LLB_LAUNCH(gpu_og, gog22, 1, 1024, &attn22, &gate22, &gated22, &nqa)
     || (fo == 1 && llb_tuned(fo, qa) && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wop22, &ro22, &co22, &gated22, &yp, &n4, &dqa))) {
     err_fail("device launch failed");
@@ -3391,7 +3420,7 @@ static bool warp_serve(Corpus H) {
         u32 c15 = o->c;
         u64 s15 = gpu_atts, p15 = gpu_atts + ((u64)16 << 17) * 4;
         u32 gqa4 = 4;
-        if (!LLB_LAUNCH(gpu_attn4, 16, 1, 1024, &qp15, &kp15, &vp15, &yp, &s15, &p15, &c15, &gqa4)) {
+        if (!llb_attn4_run(16, qp15, kp15, vp15, yp, s15, p15, c15, gqa4)) {
           err_fail("device launch failed");
         }
       } else if (o->kind == 16) {
@@ -3431,7 +3460,7 @@ static bool warp_serve(Corpus H) {
         u32 gqa19 = 4;
         llb_dptr attn19 = gpu_blk, gated19 = attn19 + 4096 * 4;
         u32 n4_19 = 4096, d10_19 = 10, gog19 = (4096 + 1023) / 1024;
-        if (!LLB_LAUNCH(gpu_attn4, 16, 1, 1024, &qp19, &kcp19, &vcp19, &attn19, &s19, &p19, &c19, &gqa19)
+        if (!llb_attn4_run(16, qp19, kcp19, vcp19, attn19, s19, p19, c19, gqa19)
           || !LLB_LAUNCH(gpu_og, gog19, 1, 1024, &attn19, &gp19, &gated19, &n4_19)
           || !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wao19, &rg19, &cg19, &gated19, &yp, &n4_19, &d10_19)) {
           err_fail("device launch failed");
