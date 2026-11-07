@@ -1,0 +1,10 @@
+health=200
+## chat
+{"id":"chatcmpl-6aee97740047","object":"chat.completion","created":1794021236,"model":"Qwen3.5-4B-Q8_0.gguf","system_fingerprint":"llb-sys1","choices":[{"index":0,"message":{"role":"assistant","content":"Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one word.\"\n\n2.  **Identify the Fact:**\n    *   The capital of France is Paris.\n\n3.  **Check Constraint:**\n    *   \"Paris\" is one word.\n\n4.  **Formulate Output:**\n    *   Paris\n\n5.  **Final Review:**\n    *   Does it answer the question? Yes.\n    *   Is it one word? Yes.\n\n6.  **Construct Final Response:** Paris.cw\n</think>\n\nParis"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":22,"completion_tokens":140,"total_tokens":162},"timings":{"prompt_n":22,"prompt_ms":222.747,"prompt_per_token_ms":10.125,"prompt_per_second":98.767,"predicted_n":140,"predicted_ms":1318.895,"predicted_per_token_ms":9.488,"predicted_per_second":105.391}}
+## chat stream
+data: {"id":"chatcmpl-6aee97760049","object":"chat.completion.chunk","created":1794021238,"model":"Qwen3.5-4B-Q8_0.gguf","system_fingerprint":"llb-sys1","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":22,"completion_tokens":140,"total_tokens":162},"timings":{"prompt_n":22,"prompt_ms":207.310,"prompt_per_token_ms":9.423,"prompt_per_second":106.121,"predicted_n":140,"predicted_ms":1319.676,"predicted_per_token_ms":9.494,"predicted_per_second":105.329}}
+
+data: [DONE]
+
+## completions
+{"id":"cmpl-6aee9778004a","object":"text_completion","created":1794021240,"model":"Qwen3.5-4B-Q8_0.gguf","system_fingerprint":"llb-sys1","choices":[{"index":0,"text":"Hi there! How can I help you?","logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":29,"completion_tokens":9,"total_tokens":38},"timings":{"prompt_n":29,"prompt_ms":272.536,"prompt_per_token_ms":9.398,"prompt_per_second":106.408,"predicted_n":9,"predicted_ms":83.749,"predicted_per_token_ms":10.469,"predicted_per_second":95.523}}

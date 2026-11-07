@@ -1,0 +1,59 @@
+PASS golden 0: plain request, flag on == flag off (/v1/completions)
+PASS golden 1: plain request, flag on == flag off (/v1/completions)
+PASS golden 2: plain request, flag on == flag off (/v1/completions)
+PASS golden 3: plain request, flag on == flag off (/v1/chat/completions)
+PASS golden 4: plain request, flag on == flag off (/v1/chat/completions)
+PASS golden 5: plain request, flag on == flag off (/v1/chat/completions)
+PASS golden: the 6 engine request lines are byte-identical
+PASS tools: [] + response_format text on S == the bare request on P
+PASS flag off: response_format -> 400 naming --structured
+PASS flag off: grammar -> 400
+PASS flag off: tools -> W1-SERVER's own 400
+PASS json_schema (thinking off): stream deltas reassemble to the non-stream message
+PASS json_schema: content validates, finish stop, nothing past EOG
+PASS EOG stop: completion_tokens / ids end at the first EOG id
+PASS engine line: the schema went as GBNF in dual.c's grammar field
+PASS json_schema + thinking: stream deltas reassemble to the non-stream message
+PASS thinking: reasoning_content split off, content = the JSON
+PASS json_schema UTF-8: stream deltas reassemble to the non-stream message
+PASS top-level json_schema, multi-byte strings
+PASS json_object: stream deltas reassemble to the non-stream message
+PASS json_object: an object
+PASS off-script: stream deltas reassemble to the non-stream message
+PASS off-script: the mask forced a valid instance
+PASS completions GBNF passthrough
+PASS completions GBNF, streamed
+PASS max_tokens before the end: finish length
+PASS tools auto (thinking off): stream deltas reassemble to the non-stream message
+PASS tools auto: one call, typed arguments, content null, finish tool_calls
+PASS tools auto: unconstrained, tools block in the prompt
+PASS tools auto + thinking: stream deltas reassemble to the non-stream message
+PASS tools + thinking: reasoning split, then the call
+PASS two calls + content: stream deltas reassemble to the non-stream message
+PASS two calls + leading content (array arg parsed, UTF-8 kept)
+PASS no tool: stream deltas reassemble to the non-stream message
+PASS tools offered, plain answer: content, finish stop
+PASS malformed call: stream deltas reassemble to the non-stream message
+PASS malformed call: no tool_calls, raw text kept as content
+PASS tool_choice required: stream deltas reassemble to the non-stream message
+PASS tool_choice required: grammar sent, call made
+PASS tool_choice named: stream deltas reassemble to the non-stream message
+PASS tool_choice named: the scripted plain answer is overridden by the forced search call
+PASS tool history: stream deltas reassemble to the non-stream message
+PASS tool history rendered (tool role + prior call)
+PASS fuzz tools required: 24/24 finished, 24/24 validate
+PASS fuzz json_schema: 24/24 finished, 24/24 validate
+PASS error 0: 400 'json_schema.schema'
+PASS error 1: 400 'response_format type'
+PASS error 2: 400 'unsupported keyword'
+PASS error 3: 400 'grammar:'
+PASS error 4: 400 'at most one'
+PASS error 5: 400 'cannot be combined'
+PASS error 6: 400 'not in tools'
+PASS error 7: 400 'tool_choice must be'
+PASS error 8: 400 'tools must be an array'
+PASS error 9: 400 'deprecated'
+PASS completions + tools: 400
+PASS the server still serves after the error surface
+PASS both servers shut down cleanly (rc 0)
+structured_tests: 58 PASS / 0 FAIL

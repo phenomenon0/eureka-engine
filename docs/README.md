@@ -72,3 +72,11 @@ repository.
 | [`metal-catchup/REPORT.md`](../reports/metal-catchup/REPORT.md) | Metal MoE speed: 35B-A3B decode 1.14x llama.cpp Metal, fast MoE prefill. |
 | [`cuda-catchup/REPORT.md`](../reports/cuda-catchup/REPORT.md) | CUDA catch-up to llama.cpp: the decode run, exact GEMV bodies, dp4a MoE and fast MoE prefill tiers. |
 | [`metal-moe/REPORT.md`](../reports/metal-moe/REPORT.md) | Metal on any Qwen3.5 MoE, with experts mapped from the file or streamed; 35B-A3B against llama.cpp. |
+
+## Records
+
+| Record | Covers |
+|---|---|
+| [Inference reliability, 2026-11-04](records/inference-reliability-2026-11-04.md) | Request parsing, cancellation and recovery fixes across the five backends. |
+| [Split-key attention and long-context decode, 2026-11-06](records/sk8-and-long-context-2026-11-06.md) | `LLB_ATTN_SK8` has no measurable NLL cost; 4B decode time at long context is attention-bound. |
+| [CUDA clean-clone proof, 2026-11-06](records/cuda-proof-2026-11-06.md) | This repository's tip built from a clean clone and run on an RTX 3090. |

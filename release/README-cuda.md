@@ -1,6 +1,6 @@
 # @@NAME@@
 
-Eureka Engine is an inference engine for the Qwen3.5 model family. The engine is written in Bend and compiled to C and CUDA. This bundle runs Qwen3.8-27B Q4_K_M on one NVIDIA GPU through `llb`, a front end that runs a model with one command. The bundle is built from engine commit `@@COMMIT@@` (branch `pkg2`) with Bend compiler `240ecef4b52a1efcc2151df689cca9a2a769aac6` plus 57 patches. The bundle needs no Python.
+Eureka Engine is an inference engine for the Qwen3.5 model family. The engine is written in Bend and compiled to C and CUDA. This bundle runs Qwen3.8-27B Q4_K_M on one NVIDIA GPU through `llb`, a front end that runs a model with one command. The bundle is built from engine commit `@@COMMIT@@` (release @@VERSION@@) with Bend compiler `240ecef4b52a1efcc2151df689cca9a2a769aac6` plus the 66 patches listed in `tools/build_gpu.sh`. The bundle needs no Python.
 
 ## System requirements
 

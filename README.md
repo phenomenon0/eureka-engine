@@ -160,15 +160,10 @@ beside it. Run the engine once before `build-serve.sh`.
 The full guide is [Run on CUDA](docs/guides/run-on-cuda.md). The CUDA numbers
 below are from an RTX 3090.
 
-The latest port's checks did not link the CUDA build, because no NVIDIA machine
-was available. They did check the parts that need no GPU:
-
-- the patch stack and the C emit;
-- a compile of the emitted C against CUDA 12.8 headers;
-- an NVRTC compile of the kernels for sm_86;
-- the request objects and `llb-serve` on Linux.
-
-All of these exit 0 ([receipts](receipts/port-20261106/README.md)).
+These commands were run from a fresh clone on an RTX 3090 (Fedora 43, CUDA 13.1,
+clang 21). The engine ran the Qwen3.5-2B, 4B and 9B, and `llb-serve` served the 4B
+([record](docs/records/cuda-proof-2026-11-06.md),
+[receipts](receipts/cuda-proof-20261106/README.md)).
 
 ### CPU only (Linux)
 
@@ -217,7 +212,8 @@ works on a stock Qwen3.5 GGUF
 `llb-serve` runs the engine as a child process (the `SYS1` mode) and serves an
 OpenAI-compatible API. The default port is **8080** (`--port`).
 
-**Required environment:** `LLB_GGUF`, the path to the model's GGUF.
+**Required environment:** `LLB_GGUF`, the path to the model's GGUF, and `TMPDIR`, a
+scratch directory the engine owns.
 
 Everything after `--` goes to the engine, in this order:
 
@@ -227,6 +223,7 @@ Everything after `--` goes to the engine, in this order:
 
 ```sh
 export LLB_GGUF=MODEL.gguf
+export TMPDIR=${TMPDIR:-$(mktemp -d)}   # the engine needs TMPDIR set; macOS sets it, most Linux systems do not
 # macOS
 build/bin/llb-serve --port 8080 --engine build/metal/sys1mac -- --gpu 12GB --threads 8 -- SIDE 0 --steps 8192
 # Linux / CUDA
@@ -242,6 +239,11 @@ Routes:
 - `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/decide`;
 - the senses: `/v1/see`, `/v1/hear` and `/v1/speak` (CUDA also has
   `/v1/audio/*`). These need their sidecar workers.
+
+A reply ends at the model's end-of-turn token with `finish_reason` `"stop"`.
+The CUDA engine has no early stop, though: it runs all `max_tokens` steps and the
+server drops the extra text, so set `max_tokens` to what you need. `stop` strings
+and `logprobs` are not supported.
 
 Details are in [HTTP API](docs/reference/http-api.md) and the
 [server quickstart](tools/sys1dual/README.md).
