@@ -56,7 +56,7 @@ json.dump(m, open(os.path.join(out, 'manifest.json'), 'w'), indent=2); open(os.p
 open(os.path.join(out, 'files'), 'w').write('\n'.join(files) + '\n')
 PY
 cp release/install.sh "$out/install.sh"
-mapfile -t tarballs < "$out/files"
+tarballs=(); while IFS= read -r f; do tarballs+=("$f"); done < "$out/files"  # bash 3.2 (macOS) has no mapfile
 echo "assets    : install.sh manifest.json ${tarballs[*]##*/}"
 if [ "$publish" != --publish ]; then echo "(dry run: pass --publish to create release v$version)"; exit 0; fi
 gh release create "v$version" --repo phenomenon0/eureka-engine --title "llb $version" \
