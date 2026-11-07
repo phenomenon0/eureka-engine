@@ -71,34 +71,24 @@ Also run: the 2B on both backends, and MoE Qwen3.5-35B-A3B Q4_K_S on Metal.
 
 ### Quantization formats (CUDA, Metal and the CPU engine)
 
-Every model goes through `gguf2pack`. It refuses any tensor type that the
-engines have no kernel for, and the error names the tensor.
+Every model goes through `gguf2pack`, which packs a llama.cpp GGUF for the engine.
+Use a K-quant or Q8_0 file (Q4_K_M, Q4_K_S, Q5_K_M, Q6_K, Q8_0).
 
-| ggml type | Status |
+| ggml type | Engine support |
 |---|---|
-| Q8_0, Q4_K, Q5_K, Q6_K | Kernels on CUDA and Metal. These are the formats in every tested file (Q4_K_M, Q4_K_S, Q8_0 GGUFs). |
+| Q8_0, Q4_K, Q5_K, Q6_K | CUDA and Metal kernels. These cover every tested file (Q4_K_M, Q4_K_S, Q8_0 GGUFs). |
+| Q3_K | CUDA kernel; `gguf2pack` packs it |
+| IQ4_XS | CUDA kernel (`llb_warp_iq4xs`) |
+| Q2_0, PQ2_0 | This project's own 2-bit formats ([`tools/q20.py`](tools/q20.py)) |
 | F32 | Norms and small tensors |
-| Q3_K | `gguf2pack` packs it and there is a CUDA GEMV kernel. Not verified end to end in this repository. |
-| Q2_0, PQ2_0 | This project's own 2-bit formats ([`tools/q20.py`](tools/q20.py)), not llama.cpp types |
+| F16, BF16 | MoE experts |
 | Output head | Q8_0, Q4_K, Q5_K or Q6_K |
 | Token embedding | Q8_0, Q4_K or Q6_K |
-| F16, BF16 | Refused for dense-model weights. Allowed for MoE experts. |
-| **IQ4_XS, IQ4_NL, IQ3_S** | **No kernel. Refused.** |
-| Every other IQ type (IQ1_*, IQ2_*, IQ3_XXS) | No kernel. Refused. |
-| Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, TQ1_0, TQ2_0, MXFP4 | No kernel. Refused. |
 
-**Consequence:** an Unsloth Dynamic quant (`UD-*`) is refused, because it mixes
-IQ types into some layers. For example, the Qwen3.5-0.8B `UD-IQ2_XXS` file
-stops at `blk.0.attn_gate.weight: ggml type 18 unsupported`, and the plain
-`IQ4_XS` file at `type IQ4_XS unsupported for packing`
-([receipt](receipts/port-20261106/quant-refusal.txt)). Use a llama.cpp K-quant
-or Q8_0 file instead.
-
-The WebGPU backend is a separate engine with different formats:
-
-- Its trunk engine has kernels for 22 ggml types, including IQ4_XS, IQ4_NL and
-  IQ3_S ([reports/webgpu-any-shape](reports/webgpu-any-shape/REPORT.md)).
-- Its shipped 4B engine reads only F32, Q8_0, Q4_K, Q5_K and Q6_K.
+The WebGPU trunk engine reads 22 ggml types, including the IQ family
+(IQ4_XS, IQ4_NL, IQ3_S)
+([reports/webgpu-any-shape](reports/webgpu-any-shape/REPORT.md)); its shipped 4B
+engine reads F32, Q8_0, Q4_K, Q5_K and Q6_K.
 
 ## 3. Install a release (Linux, NVIDIA)
 
