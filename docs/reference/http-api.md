@@ -83,7 +83,7 @@ HTTP/1.1 with `Connection: close` (no keep-alive). Request bodies must carry
 | `add_generation_prompt` | – | Default true | |
 | `return_tokens` | bool | bool | Non-standard. The non-stream response gains `"llb":{"prompt_ids":[...],"ids":[...]}`. |
 | `tools`, `functions`, role `tool` | – | 400 | Not supported in the wire-format release. |
-| `temperature top_p top_k min_p seed stop presence_penalty frequency_penalty repeat_penalty repetition_penalty logit_bias logprobs top_logprobs n_probs typical_p` | Accepted | Accepted | Passed through verbatim to the engine line as `"sampling":{...}`. They are not applied yet. The engine decodes greedily until the sampler work (W1-SAMPLER) wires them. Every response states this with the header `X-LLB-Sampler: greedy`. |
+| `temperature top_p top_k min_p seed stop presence_penalty frequency_penalty repeat_penalty repetition_penalty logit_bias logprobs top_logprobs n_probs typical_p` | Accepted | Accepted | Passed through verbatim to the engine line as `"sampling":{...}`. The engine applies `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty` and `repeat_penalty` / `repetition_penalty` through its sampler (`--sample`). The rest are accepted and ignored: `stop` strings, `logit_bias`, `logprobs`, `top_logprobs`, `n_probs`, `typical_p`. Without sampling fields, decoding is greedy. Responses carry the header `X-LLB-Sampler: w1-sampler`. |
 | `model` | Ignored | Ignored | One model per server. |
 
 ### Chat template
@@ -119,9 +119,12 @@ A non-stream completion looks like this:
 A chat response is the same, except that `"object"` is `"chat.completion"` and
 the choice carries `"message":{"role":"assistant","content":"…"}`.
 
-`finish_reason` is always `"length"`. The engine runs exactly `max_tokens` steps.
-No EOS or stop handling exists yet. That belongs to the sampler work
-(W1-SAMPLER). `logprobs` is always `null`.
+`finish_reason` is `"stop"` when the model emits an end-of-generation token
+(`<|im_end|>` or `<|endoftext|>`), and `"length"` when it reaches `max_tokens`
+first. The reply ends before that token, and `usage.completion_tokens` counts the
+tokens before it. The engine itself has no early stop. It still runs all
+`max_tokens` steps and the server drops their text, so the reply takes as long as
+`max_tokens` steps. `stop` strings are not applied. `logprobs` is always `null`.
 
 ### Timings
 
@@ -483,8 +486,8 @@ Limitations of the multi-image path:
   (~2-4 s), and it also computes its batch rows.
 - Images are refused on the decide path (fast prefill).
 - The Metal backend is still single-image.
-- The engine runs past EOG as before. Served `max_tokens` text can carry tokens
-  after `<|im_end|>`.
+- The engine runs past EOG. The server drops the text after it (see
+  [Responses](#responses)), but the request still takes `max_tokens` steps.
 
 ## Pocket 0.8B tier
 

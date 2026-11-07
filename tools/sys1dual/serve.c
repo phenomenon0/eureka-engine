@@ -1054,6 +1054,7 @@ typedef struct {
     // G16, a structured request
     LlbTcParser *tp;          // chat: the reasoning / tool-call parser
     int stopped, ncalls;      // an end-of-generation id was seen; tool calls so far
+    int n_eog;                // ids before the end-of-generation id (unstructured requests)
     double t_eog;
     sb content, reasoning, calls; // the message parts (calls = the tool_calls JSON items)
 } Gen;
@@ -1307,13 +1308,17 @@ static void run_generate(Slot *s, int bank, Conn *c, const jv *body, const Req *
             json_free(v);
             continue;
         }
-        if (tk) {
+        if (tk) { // stop the response at the first end-of-generation id, as the Metal server does;
+                  // the engine still runs its n steps (it has no early stop), their text is dropped
             if (!t1) t1 = now();
+            c->gen_n++;
+            if (g.stopped) { json_free(v); continue; }
+            int id = (int)tk->num;
+            if (id == ST_EOG_A || id == ST_EOG_B) { g.stopped = 1, g.t_eog = now(), g.n_eog = c->gen_n - 1; json_free(v); continue; }
             const jv *tx = json_get(v, "text");
             const char *piece = tx && tx->type == J_STR ? tx->str : "";
             sb_add(&g.text, piece);
             if (r->stream && *piece && !c->cancelled) stream_piece(&g, piece);
-            c->gen_n++;
             json_free(v);
             continue;
         }
@@ -1349,12 +1354,14 @@ static void run_generate(Slot *s, int bank, Conn *c, const jv *body, const Req *
     const char *full = txt && txt->type == J_STR ? txt->str : "";
     size_t have = g.text.p ? g.text.n : 0;
     if (strncmp(full, g.text.p ? g.text.p : "", have)) logf_("warning: streamed text is not a prefix of the final text");
+    const char *fr = "length";
+    if (g.stopped) full = g.text.p ? g.text.p : "", gn = g.n_eog, t2 = g.t_eog, fr = "stop";
     sb o = {0};
     if (r->stream) {
         if (strlen(full) > have) stream_piece(&g, full + have); // held-back UTF-8 tail, if any
         chunk_head(&g, &o);
-        if (r->chat) sb_add(&o, "{\"index\":0,\"delta\":{},\"logprobs\":null,\"finish_reason\":\"length\"}],");
-        else sb_add(&o, "{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":\"length\"}],");
+        if (r->chat) sb_fmt(&o, "{\"index\":0,\"delta\":{},\"logprobs\":null,\"finish_reason\":\"%s\"}],", fr);
+        else sb_fmt(&o, "{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":\"%s\"}],", fr);
         usage_timings(&o, pn, gn, t0, t1, t2);
         sb_addc(&o, '}');
         sse(c, o.p);
@@ -1380,7 +1387,7 @@ static void run_generate(Slot *s, int bank, Conn *c, const jv *body, const Req *
             json_quote(&o, full);
             sb_addc(&o, ',');
         }
-        sb_add(&o, "\"logprobs\":null,\"finish_reason\":\"length\"}],");
+        sb_fmt(&o, "\"logprobs\":null,\"finish_reason\":\"%s\"}],", fr);
         usage_timings(&o, pn, gn, t0, t1, t2);
         const jv *ro = json_get(fin, "readout");
         if (r->ret_tokens || ro || r->glue) {
