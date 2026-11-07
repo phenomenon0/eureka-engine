@@ -125,8 +125,8 @@ bounds it:
 
 - **Kernel:** expert and shared widths are whole blocks of their format (32
   columns; 256 for a K-quant); experts F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K /
-  Q6_K; trunk Q8_0 and K-quants, router and shared-expert gate F32 (BF16 or
-  IQ trunk tensors are refused by name); head_dim 256, SSM state 128 and the
+  Q6_K; trunk Q8_0 and K-quants, router and shared-expert gate F32; head_dim
+  256, SSM state 128 and the
   other dense rules above.
 - **Cap:** the dense trunk's: d_model ≤ 8192, 64 q / 16 kv heads, 1,024
   layers, vocab ≤ 250,048, head region ≤ 2 GiB, a layer's trunk below 2^28
