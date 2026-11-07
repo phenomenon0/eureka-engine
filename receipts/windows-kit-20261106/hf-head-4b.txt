@@ -1,0 +1,8 @@
+$ curl -sIL https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf | grep -iE "^(HTTP|content-length|x-linked-size|x-linked-etag)"
+HTTP/2 302 
+content-length: 1064
+x-linked-size: 2740937888
+x-linked-etag: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+HTTP/2 200 
+content-length: 2740937888
+# 2026-11-07T00:39:28Z; x-linked-etag is the LFS sha256; tools/llb/models.conf pins 00fe7986... size 2740937888

@@ -32,21 +32,20 @@
 // are holes (they live in layers/); the GPU engine reads nothing else, but the
 // CPU twin / KAT tools that mmap pack.bin would read zeros (HEAD_ONLY.txt).
 //
-// C11 + POSIX, no dependencies. Little-endian hosts only (checked at start).
+// C11 + POSIX (Windows through llb_platform.h, untested), no dependencies. Little-endian hosts only (checked at start).
 
 #define _FILE_OFFSET_BITS 64
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
-#include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
+#define LLB_PLATFORM_NO_MAP
+#include "llb_platform.h"
 #include "../host/llb_formats.h"
 
 static void die(const char *fmt, ...) {
@@ -293,7 +292,7 @@ typedef struct {
 
 static void rd_fill(Rd *r) {
   r->off += r->n, r->p = 0;
-  ssize_t k = pread(r->fd, r->buf, 1 << 20, (off_t)r->off);
+  int64_t k = llb_pread(r->fd, r->buf, 1 << 20, r->off);
   if (k <= 0) die("GGUF header truncated at byte %llu", (unsigned long long)r->off);
   r->n = (size_t)k;
 }
@@ -424,9 +423,9 @@ static KV *kv_get(Gguf *g, const char *key) {
 
 static Gguf gguf_read(int fd) {
   Gguf g = {0};
-  struct stat st;
-  if (fstat(fd, &st)) die("stat: %s", strerror(errno));
-  g.fsize = (uint64_t)st.st_size;
+  int64_t fsz = llb_fdsize(fd);
+  if (fsz < 0) die("stat: %s", strerror(errno));
+  g.fsize = (uint64_t)fsz;
   Rd r = {fd, 0, xmalloc(1 << 20), 0, 0};
   char magic[4];
   rd_get(&r, magic, 4);
@@ -767,7 +766,7 @@ typedef struct { uint64_t lo, hi; int fd; } Layer;
 static int pread_all(int fd, void *p, size_t n, uint64_t off) {
   uint8_t *b = p;
   while (n) {
-    ssize_t k = pread(fd, b, n, (off_t)off);
+    int64_t k = llb_pread(fd, b, n, off);
     if (k < 0 && errno == EINTR) continue;
     if (k <= 0) return -1;
     b += k, n -= (size_t)k, off += (uint64_t)k;
@@ -778,7 +777,7 @@ static int pread_all(int fd, void *p, size_t n, uint64_t off) {
 static void pwrite_all(int fd, const void *p, size_t n, uint64_t off, const char *what) {
   const uint8_t *b = p;
   while (n) {
-    ssize_t k = pwrite(fd, b, n, (off_t)off);
+    int64_t k = llb_pwrite(fd, b, n, off);
     if (k < 0 && errno == EINTR) continue;
     if (k <= 0) die("write %s: %s", what, k < 0 ? strerror(errno) : "short write");
     b += k, n -= (size_t)k, off += (uint64_t)k;
@@ -818,7 +817,7 @@ static void rowsplit(const uint8_t *in, uint8_t *out, size_t n, size_t cols, siz
 
 static double now_s(void) {
   struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
+  llb_clock_monotonic(&ts);
   return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
@@ -879,10 +878,10 @@ static Buf read_file(const char *dir, const char *name, int *ok) {
 static void write_file(const char *dir, const char *name, const void *p, size_t n) {
   char path[4096];
   snprintf(path, sizeof path, "%s/%s", dir, name);
-  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int fd = llb_open_write(path, 0);
   if (fd < 0) die("open %s: %s", path, strerror(errno));
   pwrite_all(fd, p, n, 0, name);
-  if (close(fd)) die("close %s: %s", path, strerror(errno));
+  if (llb_close(fd)) die("close %s: %s", path, strerror(errno));
 }
 
 // compare generated vs on-disk; returns 1 if identical
@@ -1064,18 +1063,18 @@ static int moe_pack(Gguf *g, int fd, const char *src, const char *out) {
   }
   char path[4096];
   if (strlen(out) > sizeof path - 64) die("output path too long");
-  if (mkdir(out, 0755) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
+  if (llb_mkdir(out) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
   snprintf(path, sizeof path, "%s/manifest.json", out);
-  if (!access(path, F_OK)) die("%s exists; refusing to overwrite a pack", path);
+  if (llb_exists(path)) die("%s exists; refusing to overwrite a pack", path);
   snprintf(path, sizeof path, "%s/layers", out);
-  if (mkdir(path, 0755) && errno != EEXIST) die("mkdir %s: %s", path, strerror(errno));
+  if (llb_mkdir(path) && errno != EEXIST) die("mkdir %s: %s", path, strerror(errno));
   Out o = {.head_only = 1, .cur_layer = -1, .nl = nl, .ly = ly};
   snprintf(path, sizeof path, "%s/pack.bin", out);
-  o.pack_fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  o.pack_fd = llb_open_write(path, 1);
   if (o.pack_fd < 0) die("create %s: %s (refusing to overwrite)", path, strerror(errno));
   for (int L = 0; L < nl; L++) {
     snprintf(path, sizeof path, "%s/layers/blk.%d.bin", out, L);
-    ly[L].fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    ly[L].fd = llb_open_write(path, 1);
     if (ly[L].fd < 0) die("create %s: %s (refusing to overwrite)", path, strerror(errno));
   }
   uint8_t *in = xmalloc(chunk), *tmp = xmalloc(chunk), zero[ALIGN] = {0};
@@ -1104,9 +1103,9 @@ static int moe_pack(Gguf *g, int fd, const char *src, const char *out) {
       fprintf(stderr, "gguf2pack: qwen35moe %s complete, %.1f s\n", t->layer < 0 ? "heads" : t->name, now_s() - t0);
   }
   if (o.pos != pos) die("qwen35moe: internal virtual size mismatch");
-  if (close(o.pack_fd)) die("close pack.bin: %s", strerror(errno));
+  if (llb_close(o.pack_fd)) die("close pack.bin: %s", strerror(errno));
   for (int L = 0; L < nl; L++)
-    if (close(ly[L].fd)) die("close layer %d: %s", L, strerror(errno));
+    if (llb_close(ly[L].fd)) die("close layer %d: %s", L, strerror(errno));
   Buf m = {0};
   bs(&m, "{\n \"format\": \"llama-bend-pack-q35-quant/v0\",\n \"alignment\": 64,\n \"dtype\": \"mixed-quant\",\n \"source\": {\n  \"file\": ");
   bjstr(&m, src, 1);
@@ -1314,9 +1313,9 @@ static int moe_sidecar_cuda(Gguf *g, const char *src, const char *out) {
   int allq8 = 1;
   for (size_t i = 0; i < g->nt; i++) allq8 &= !strcmp(ts[i].tn, "Q8_0") || !strcmp(ts[i].tn, "F32");
   char p[4096];
-  if (mkdir(out, 0755) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
+  if (llb_mkdir(out) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
   snprintf(p, sizeof p, "%s/manifest.json", out);
-  if (!access(p, F_OK)) die("%s exists; refusing to overwrite a pack", p);
+  if (llb_exists(p)) die("%s exists; refusing to overwrite a pack", p);
   Buf m = {0};
   bf(&m, "{\n \"format\": \"%s\",\n \"alignment\": %d,\n \"dtype\": \"%s\",\n \"source\": {\n  \"file\": ",
      allq8 ? "llama-bend-pack-q8/v0" : "llama-bend-pack-q35-quant/v0", ALIGN, allq8 ? "q8_0-rowsplit" : "mixed-quant");
@@ -1516,9 +1515,9 @@ static int moe_sidecar_metal(Gguf *g, const char *src, const char *out) {
   free(fz);
   char path[4096];
   if (strlen(out) > sizeof path - 64) die("output path too long");
-  if (mkdir(out, 0755) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
+  if (llb_mkdir(out) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
   snprintf(path, sizeof path, "%s/manifest.json", out);
-  if (!access(path, F_OK)) die("%s exists; refusing to overwrite a pack", path);
+  if (llb_exists(path)) die("%s exists; refusing to overwrite a pack", path);
   Buf m = {0};
   bs(&m, "{\n \"format\": \"llama-bend-pack-q35-quant/v0\",\n \"alignment\": 64,\n \"dtype\": \"mixed-quant\",\n \"source\": {\n  \"file\": ");
   bjstr(&m, src, 1);
@@ -1577,7 +1576,7 @@ int main(int argc, char **argv) {
   if (target && (!sidecar || (strcmp(target, "cuda") && strcmp(target, "metal")))) usage();
   metal = target && !strcmp(target, "metal");
 
-  int fd = open(src, O_RDONLY);
+  int fd = llb_open_read(src);
   if (fd < 0) die("open %s: %s", src, strerror(errno));
   Gguf g = gguf_read(fd);
 
@@ -1681,18 +1680,18 @@ int main(int argc, char **argv) {
   sha_init(&o.pack);
   if (out) {
     char p[4096];
-    if (mkdir(out, 0755) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
+    if (llb_mkdir(out) && errno != EEXIST) die("mkdir %s: %s", out, strerror(errno));
     snprintf(p, sizeof p, "%s/manifest.json", out);
-    if (!access(p, F_OK)) die("%s exists; refusing to overwrite a pack", p);
+    if (llb_exists(p)) die("%s exists; refusing to overwrite a pack", p);
     if (sidecar) goto made;
     snprintf(p, sizeof p, "%s/layers", out);
-    if (mkdir(p, 0755) && errno != EEXIST) die("mkdir %s: %s", p, strerror(errno));
+    if (llb_mkdir(p) && errno != EEXIST) die("mkdir %s: %s", p, strerror(errno));
     snprintf(p, sizeof p, "%s/pack.bin", out);
-    o.pack_fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    o.pack_fd = llb_open_write(p, 1);
     if (o.pack_fd < 0) die("create %s: %s (refusing to overwrite)", p, strerror(errno));
     for (int L = 0; L < nl; L++) {
       snprintf(p, sizeof p, "%s/layers/blk.%d.bin", out, L);
-      if ((ly[L].fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0) die("create %s: %s", p, strerror(errno));
+      if ((ly[L].fd = llb_open_write(p, 0)) < 0) die("create %s: %s", p, strerror(errno));
     }
   made:;
   }
@@ -1794,10 +1793,10 @@ int main(int argc, char **argv) {
     printf("sidecar %s: manifest.json + table.bin for %s (%zu tensors, pack_bytes %llu, sha256 %s)\n", out, src, g.nt,
            (unsigned long long)pack_bytes, shas ? "filled" : "empty");
   } else if (out) {
-    if (head_only && ftruncate(o.pack_fd, (off_t)pack_bytes)) die("ftruncate pack.bin: %s", strerror(errno));
-    if (close(o.pack_fd)) die("close pack.bin: %s", strerror(errno));
+    if (head_only && llb_ftruncate(o.pack_fd, pack_bytes)) die("ftruncate pack.bin: %s", strerror(errno));
+    if (llb_close(o.pack_fd)) die("close pack.bin: %s", strerror(errno));
     for (int L = 0; L < nl; L++)
-      if (close(ly[L].fd)) die("close layer %d: %s", L, strerror(errno));
+      if (llb_close(ly[L].fd)) die("close layer %d: %s", L, strerror(errno));
     write_file(out, "table.bin", tb.p, tb.n);
     write_file(out, "index.tsv", ix.p, ix.n);
     if (head_only) {

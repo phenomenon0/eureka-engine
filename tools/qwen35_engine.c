@@ -21,11 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <time.h>
 
+#include "llb_platform.h"
 #include "../host/llb_formats.h"
 #include "qwen35_tokenizer.c"
 #include "qwen35_template.c"
@@ -353,7 +351,7 @@ typedef struct { char name[64]; u64 off; u64 bytes; int rows, cols; int is_f32; 
 static TInfo gT[1024];
 static int gNT = 0;
 static const uint8_t *gPack = NULL;
-static size_t gMapSz = 0;  // nonzero: gPack is an mmap; drop its pages per layer (RSS <= one layer)
+static size_t gMapSz = 0;  // nonzero: gPack is mapped; drop its pages per layer (RSS <= one layer)
 static const char *gDumpLayers = NULL;
 
 static int L, D, H, KV, HDIM, dff, V, INTERVAL, KC, SZ, GK, TR, VHD, KDC, VDC, CONVD, ROPEDIM;
@@ -745,7 +743,7 @@ static void forward_token(int tok, int pos) {
       FILE *f = fopen(fn, "wb"); fwrite(X, 4, D, f); fclose(f);
     }
 #undef N
-    if (gMapSz) madvise((void *)gPack, gMapSz, MADV_DONTNEED);
+    if (gMapSz) llb_drop_pages(gPack, gMapSz);
   }
 }
 
@@ -775,7 +773,7 @@ static void top2(int *i1, float *v1, int *i2, float *v2) {
 
 static u64 now_ms(void) {
   struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
+  llb_clock_monotonic(&ts);
   return (u64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
@@ -865,25 +863,29 @@ int main(int argc, char **argv) {
   if (layers > 0 && layers < L) L = layers;
   char ppath[4096];
   snprintf(ppath, sizeof ppath, "%s/pack.bin", dir);
-  int fd = open(ppath, O_RDONLY);
-  if (fd < 0) { perror("open pack"); return 1; }
-  size_t psz = lseek(fd, 0, SEEK_END);
+  int fd = llb_open_read(ppath);
+  if (fd < 0) { llb_perror("open pack"); return 1; }
+  int64_t fsz = llb_fdsize(fd);
+  if (fsz < 0) { llb_perror("stat pack"); return 1; }
+  size_t psz = (size_t)fsz;
   if (preload) {
     uint8_t *buf = (uint8_t *)malloc(psz);
     if (!buf) { fprintf(stderr, "preload malloc %zu failed\n", psz); return 1; }
     size_t off = 0;
     while (off < psz) {
-      ssize_t got = pread(fd, buf + off, psz - off, off);
-      if (got <= 0) { perror("pread pack"); return 1; }
+      int64_t got = llb_pread(fd, buf + off, psz - off, off);
+      if (got <= 0) { llb_perror("pread pack"); return 1; }
       off += got;
       if ((off & ((64u << 20) - 1)) < (size_t)got) fprintf(stderr, "preload %zu/%zu MB\n", off >> 20, psz >> 20);
     }
     gPack = buf;
     fprintf(stderr, "preloaded pack %zu bytes into RAM\n", psz);
   } else {
-    gPack = (const uint8_t *)mmap(NULL, psz, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (gPack == MAP_FAILED) { perror("mmap"); return 1; }
-    gMapSz = psz;
+    // 1: mapped, drop pages per layer; 0: Windows only, mapping failed and the
+    // pack was read into RAM (no page drop); -1: failed
+    int mapped = llb_map_read(fd, psz, &gPack);
+    if (mapped < 0) { llb_perror("mmap"); return 1; }
+    if (mapped) gMapSz = psz;
   }
   fprintf(stderr, "loaded %d tensors, pack %zu bytes; L=%d D=%d H=%d KV=%d hd=%d dff=%d V=%d\n",
           gNT, psz, L, D, H, KV, HDIM, dff, V);

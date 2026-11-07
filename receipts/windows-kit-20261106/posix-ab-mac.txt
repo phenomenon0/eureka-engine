@@ -1,0 +1,27 @@
+# macOS 27.0 arm64, Apple clang version 21.0.0 (clang-2100.4.1.1)
+$ bash tools/build_qwen35_cli.sh
+skip qwen35_ref_tokenize (no libllama at $HOME/llama.cpp)
+-rwxr-xr-x   1 user staff  120280 qwen35-cli
+-rwxr-xr-x   1 user staff   68112 qwen35_toktest
+exit=0
+$ posix-ab.sh $MODELS/Qwen3.5-0.8B-Q4_K_M.gguf /tmp/ab   # base = dd824b9
+$ cc -std=c11 -O2 -Wall -o base/gguf2pack tools/gguf2pack.c   # base
+$ cc -O2 -ffp-contract=off -fno-fast-math tools/qwen35_engine.c -o base/qwen35-cli -lm   # base
+wrote base/pack (pack.bin, 24 layer files, manifest.json, index.tsv, table.bin)
+base cli exit=0
+base cli --preload exit=0
+$ cc -std=c11 -O2 -Wall -o new/gguf2pack tools/gguf2pack.c   # new
+$ cc -O2 -ffp-contract=off -fno-fast-math tools/qwen35_engine.c -o new/qwen35-cli -lm   # new
+wrote new/pack (pack.bin, 24 layer files, manifest.json, index.tsv, table.bin)
+new cli exit=0
+new cli --preload exit=0
+PASS pack dir byte-identical (diff -r)
+PASS --head-only pack byte-identical (ftruncate path)
+verify-against: PASS (manifest.json, index.tsv, table.bin byte-identical)
+PASS run: token ids identical: 279 6511 314 279 3046 13 198 760 
+PASS run: logit bits identical (8 lines)
+PASS pre: token ids identical: 279 6511 314 279 3046 13 198 760 
+PASS pre: logit bits identical (8 lines)
+PASS new: mmap == --preload logit bits
+PASS missing pack.bin: same error text (open pack: No such file or directory)
+posix-ab 9/9 PASS

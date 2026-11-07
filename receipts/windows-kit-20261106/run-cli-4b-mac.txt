@@ -1,0 +1,48 @@
+# macOS 27.0 arm64, Apple clang version 21.0.0 (clang-2100.4.1.1); build/ from tools/build_qwen35_cli.sh + build.sh's gguf2pack line
+$ shasum -a 256 $MODELS/Qwen3.5-4B-Q4_K_M.gguf
+00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4  $MODELS/Qwen3.5-4B-Q4_K_M.gguf
+$ gguf2pack $MODELS/Qwen3.5-4B-Q4_K_M.gguf pack4b --format quant
+426 tensors (+ output.weight alias), 2729969664 bytes, pack_sha256 86be153fc89f33ea1125d7d6c07e193b2ef73043eafbb1be851511a3c0d9ba9f
+wrote pack4b (pack.bin, 32 layer files, manifest.json, index.tsv, table.bin)
+exit=0
+$ du -sh pack4b
+4.8G	pack4b
+$ qwen35-cli pack4b 760 6511 314 9338 369 --steps 8
+exit=0
+-- stdout
+11751
+13
+198
+32
+13
+2912
+198
+33
+wall_ms 42336
+tok_s 0.1890
+-- stderr
+loaded 427 tensors, pack 2729969664 bytes; L=32 D=2560 H=16 KV=4 hd=256 dff=9216 V=248320
+logits 4 11751 1100047528 7172 1098922251
+logits 5 13 1101343111 11 1100849196
+step 5 3715
+logits 6 198 1099743449 271 1099474450
+step 6 3858
+logits 7 32 1097709062 760 1097591250
+step 7 3747
+logits 8 13 1099243022 3177 1095299429
+step 8 3686
+logits 9 2912 1096092421 220 1094342170
+step 9 3786
+logits 10 198 1103114782 318 1099815782
+step 10 3684
+logits 11 33 1103993842 51 1100464919
+step 11 3649
+$ llb-tok dec TOKDIR 11751 13 198 32 13 2912 198 33 | od -c
+0000000        P   a   r   i   s   .  \n   A   .       T   r   u   e  \n
+0000020    B                                                            
+0000021
+$ llb-tok enc TOKDIR "The capital of France is"
+760 6511 314 9338 369
+
+$ llb-tok dec TOKDIR 9707 264 11   # the ids the brief proposed: not a sentence, not used
+.Q a,

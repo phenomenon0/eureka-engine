@@ -1,0 +1,7 @@
+# qwen35_engine.c as C++14 (nvcc compiles it as C++ through qwen35_engine.cu); host side only, no CUDA headers here
+$ clang++ -std=c++14 -x c++ -fsyntax-only tools/qwen35_engine.c
+exit=0
+$ cc -std=c11 -fsyntax-only -Wvla -Wgnu -Wlanguage-extension-token tools/gguf2pack.c tools/qwen35_engine.c   # MSVC C has no VLAs / GNU extensions
+exit=0 (no output = no warnings)
+$ clang++ -std=c++14 -x c++ -fsyntax-only -pedantic tools/qwen35_engine.c   # MSVC C++ (nvcc host on Windows) has no compound literals / C99 designators
+exit=0 (no output = no warnings)
