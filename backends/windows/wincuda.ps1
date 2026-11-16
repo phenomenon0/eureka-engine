@@ -104,6 +104,66 @@ $lines.InsertRange($i + 1, [string[]]$pad)
 $i = Find-One '    && !llb_hidden_path && !llb_img_dump && !llb_img_req && llb_img_state == 1 && !llb_pfx_on()' 'gen_ok'
 $lines[$i] = '    && !llb_hidden_path && !llb_img_dump && (!llb_img_req || llb_img_spec[0] == 0) && llb_img_state == 1 && !llb_pfx_on() /* XPLAT-WIN: wincuda.ps1 */'
 
+# 4. the corpus. Measured (RTX 3090, driver 610.88, Windows 11): a process that ends without cuMemFree on its
+#    cuMemAllocManaged block (a plain return, _exit, abort, or a kill) leaves the block's size charged to the system
+#    commit with no process left to own it; the charge stays until a reboot (4 GB a run: 14.9 -> 19 -> 23 GB), and the
+#    exit itself took 18..117 s. Freed first (cuMemFree) it leaves nothing and the exit takes 0.2 s. So the managed
+#    corpus is freed at exit (atexit), in err_fail (_exit), on abort (SIGABRT) and on a crash (an unhandled exception);
+#    only a kill (TerminateProcess) still leaks it, so llb-serve ends the engine by closing its stdin. Pinned host memory
+#    (cuMemHostAlloc) never leaks, even on a kill, but the device reads it over the bus: 0.8B, a 65-token reply in a
+#    200-step request, 2.0 s pinned vs 0.59 s managed. LLB_CORPUS_PINNED=1 picks it.
+$i = Find-One 'static void err_fail(const char* msg) {' 'err_fail'
+$lines[$i] = 'static void gpu_unmap(void);  // XPLAT-WIN (wincuda.ps1): free a managed corpus before _exit' + $nl + $lines[$i]
+$lines.Insert($i + 1, '  gpu_unmap();')
+
+$i = Find-One 'static Corpus gpu_map(u64 bytes) {' 'gpu_map'
+$map = @(
+  '// XPLAT-WIN (backends/windows/wincuda.ps1): the managed corpus, freed on every exit but a kill (or LLB_CORPUS_PINNED)',
+  'static void gpu_unmap(void) {',
+  '  CUdeviceptr p = gpu_managed;',
+  '  gpu_managed = 0;',
+  '  if (p != 0) {',
+  '    cuCtxSynchronize();',
+  '    cuMemFree(p);',
+  '  }',
+  '}',
+  'typedef struct _EXCEPTION_POINTERS* llbw_xp;',
+  '__declspec(dllimport) void* __stdcall SetUnhandledExceptionFilter(void* f);',
+  'static long __stdcall gpu_crash(llbw_xp x) {',
+  '  (void)x;',
+  '  gpu_unmap();',
+  '  return 0;  // EXCEPTION_CONTINUE_SEARCH: the crash goes on as before',
+  '}',
+  'static void gpu_abort(int sig) {',
+  '  (void)sig;',
+  '  gpu_unmap();',
+  '}',
+  'static Corpus gpu_map(u64 bytes) {',
+  '  const char* m = getenv("LLB_CORPUS_PINNED");',
+  '  if (m != NULL && strcmp(m, "1") == 0) {',
+  '    void*       h = NULL;',
+  '    CUdeviceptr d = 0;',
+  '    if (cuMemHostAlloc(&h, bytes, CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE) != CUDA_SUCCESS) {',
+  '      err_fail("corpus reservation failed (pinned host memory: lower --gpu)");',
+  '    }',
+  '    if (cuMemHostGetDevicePointer(&d, h, 0) != CUDA_SUCCESS || (uintptr_t)d != (uintptr_t)h) {',
+  '      err_fail("corpus reservation failed (no unified address for the pinned corpus)");',
+  '    }',
+  '    return (Corpus)h;',
+  '  }',
+  '  Corpus c = gpu_map_managed(bytes);',
+  '  atexit(gpu_unmap);',
+  '  signal(SIGABRT, gpu_abort);',
+  '  SetUnhandledExceptionFilter((void*)gpu_crash);',
+  '  return c;',
+  '}',
+  ''
+)
+$lines[$i] = 'static CUdeviceptr gpu_managed;  // XPLAT-WIN (wincuda.ps1)' + $nl + 'static Corpus gpu_map_managed(u64 bytes) {'
+$i = Find-One '  return (Corpus)(uintptr_t)p;' 'gpu_map''s return'
+$lines[$i] = '  gpu_managed = p;' + $nl + $lines[$i]
+$lines.InsertRange($i + 2, [string[]]$map)
+
 [IO.File]::WriteAllText($Out, ($lines -join $nl), (New-Object Text.UTF8Encoding($false)))
-Write-Host "wincuda: $In -> $Out (gpu_probe asks for MANAGED_MEMORY; gen_run stops at LLB_GEN_EOG ids)"
+Write-Host "wincuda: $In -> $Out (gpu_probe asks for MANAGED_MEMORY; gen_run stops at LLB_GEN_EOG ids; the corpus is freed at exit)"
 exit 0
