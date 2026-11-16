@@ -164,6 +164,13 @@ $i = Find-One '  return (Corpus)(uintptr_t)p;' 'gpu_map''s return'
 $lines[$i] = '  gpu_managed = p;' + $nl + $lines[$i]
 $lines.InsertRange($i + 2, [string[]]$map)
 
+# 5. the kernel cache. gpu_load maps <exe>.gpu and, when its key is stale, gpu_make rewrites it with fopen("wb") while
+#    the old file is still open and mapped. POSIX allows that; Windows refuses to truncate a mapped file, so the write
+#    failed silently and every start compiled the kernels again (~80 s on an RTX 3090). Unmap and close it first.
+$i = Find-One '    gpu_note(path);' 'gpu_load''s stale branch'
+$lines[$i] = '    if (bin != NULL && bin != MAP_FAILED) munmap(bin, st.st_size);  // XPLAT-WIN (wincuda.ps1): Windows keeps a mapped file' + $nl +
+  '    if (fd >= 0) close(fd), fd = -1;  // from being rewritten' + $nl + $lines[$i]
+
 [IO.File]::WriteAllText($Out, ($lines -join $nl), (New-Object Text.UTF8Encoding($false)))
 Write-Host "wincuda: $In -> $Out (gpu_probe asks for MANAGED_MEMORY; gen_run stops at LLB_GEN_EOG ids; the corpus is freed at exit)"
 exit 0
