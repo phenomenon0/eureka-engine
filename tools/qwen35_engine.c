@@ -478,6 +478,12 @@ HD void gemv(int id, const uint8_t *W, const float *x, float *y) {
 #endif
   int rows = trows(id), cols = tcols(id), fmt = tfmt(id);
   int rb = (fmt == 0) ? cols * 4 : trb(id);
+#ifdef LLB_GEMV_ROWS
+  // XPLAT-WIN: engine_cpu (backends/windows/engine_cpu.c) splits the rows over its
+  // worker threads. Each row is the same dot_fmt call over the same bytes, so y is
+  // bit-identical to the loop below. Only that build defines LLB_GEMV_ROWS.
+  if (LLB_GEMV_ROWS(fmt, W, rb, rows, cols, x, y)) return;
+#endif
   for (int r = 0; r < rows; r++)
     y[r] = dot_fmt(fmt, W + (size_t)r * rb, cols, x);
 }
