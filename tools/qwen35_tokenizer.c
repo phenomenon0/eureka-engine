@@ -191,28 +191,49 @@ static int bpe_rank(Q35Tokenizer *t, const char *l, int ln, const char *r, int r
 }
 
 // ---- load -------------------------------------------------------------------
-static int rd(FILE *f, void *p, size_t n) { return fread(p, 1, n, f) == n ? 0 : -1; }
+// The whole file is read once and parsed from memory: ~1M small freads (each a locked CRT call on Windows) took
+// 2.9 s for Qwen3.5's 248k-token vocab and merges (RTX 3090 box, 2026-11-16).
+typedef struct { const unsigned char *p, *e; } TokRd;
+static int rd(TokRd *f, void *p, size_t n) {
+    if ((size_t)(f->e - f->p) < n) return -1;
+    memcpy(p, f->p, n);
+    f->p += n;
+    return 0;
+}
 
 int q35_tok_load(Q35Tokenizer *t, const char *dir) {
     memset(t, 0, sizeof(*t));
     byte_maps_init();
     char path[4096];
     snprintf(path, sizeof path, "%s/tokenizer.bin", dir);
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "tokenizer: cannot open %s\n", path); return -1; }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { fprintf(stderr, "tokenizer: cannot open %s\n", path); return -1; }
+    unsigned char *all = NULL;
+    size_t size = 0, acap = 0, got;
+    do {
+        if (size == acap) {
+            unsigned char *g = (unsigned char *)realloc(all, acap = acap ? acap * 2 : (size_t)8 << 20);
+            if (!g) { free(all); fclose(fp); return -1; }
+            all = g;
+        }
+        got = fread(all + size, 1, acap - size, fp);
+        size += got;
+    } while (got);
+    fclose(fp);
+    TokRd rf = {all, all + size}, *f = &rf;
     char magic[8];
-    if (rd(f, magic, 8) || memcmp(magic, "Q35TOK01", 8) != 0) { fprintf(stderr, "tokenizer: bad magic\n"); fclose(f); return -1; }
+    if (rd(f, magic, 8) || memcmp(magic, "Q35TOK01", 8) != 0) { fprintf(stderr, "tokenizer: bad magic\n"); free(all); return -1; }
     uint32_t n_vocab, n_merges, max_len, n_special;
     int32_t bos, eos, pad, add_bos;
     if (rd(f, &n_vocab, 4) || rd(f, &n_merges, 4) || rd(f, &max_len, 4) ||
         rd(f, &bos, 4) || rd(f, &eos, 4) || rd(f, &pad, 4) || rd(f, &add_bos, 4) ||
-        rd(f, &n_special, 4)) { fclose(f); return -1; }
+        rd(f, &n_special, 4)) { free(all); return -1; }
     t->n_vocab = n_vocab; t->n_merges = n_merges; t->max_token_len = max_len;
     t->bos = bos; t->eos = eos; t->pad = pad; t->add_bos = add_bos; t->mask_id = -1;
 
     t->special = (int32_t *)malloc(sizeof(int32_t) * (n_special ? n_special : 1));
     t->n_special = n_special;
-    if (n_special && rd(f, t->special, 4 * n_special)) { fclose(f); return -1; }
+    if (n_special && rd(f, t->special, 4 * n_special)) { free(all); return -1; }
 
     // token blobs
     size_t cap = 0;
@@ -224,9 +245,9 @@ int q35_tok_load(Q35Tokenizer *t, const char *dir) {
     size_t boff = 0;
     for (int i = 0; i < (int)n_vocab; i++) {
         uint16_t l; uint8_t ty;
-        if (rd(f, &l, 2) || rd(f, &ty, 1)) { fclose(f); return -1; }
+        if (rd(f, &l, 2) || rd(f, &ty, 1)) { free(all); return -1; }
         t->off[i] = (uint32_t)boff; t->len[i] = l; t->type[i] = ty;
-        if (rd(f, t->buf + boff, l)) { fclose(f); return -1; }
+        if (rd(f, t->buf + boff, l)) { free(all); return -1; }
         boff += l;
     }
 
@@ -241,16 +262,16 @@ int q35_tok_load(Q35Tokenizer *t, const char *dir) {
     size_t moff = 0;
     for (int i = 0; i < (int)n_merges; i++) {
         uint16_t ll, rl;
-        if (rd(f, &ll, 2)) { fclose(f); return -1; }
+        if (rd(f, &ll, 2)) { free(all); return -1; }
         t->ml_off[i] = (uint32_t)moff; t->ml_len[i] = ll;
-        if (rd(f, t->mbuf + moff, ll)) { fclose(f); return -1; }
+        if (rd(f, t->mbuf + moff, ll)) { free(all); return -1; }
         moff += ll;
-        if (rd(f, &rl, 2)) { fclose(f); return -1; }
+        if (rd(f, &rl, 2)) { free(all); return -1; }
         t->mr_off[i] = (uint32_t)moff; t->mr_len[i] = rl;
-        if (rd(f, t->mbuf + moff, rl)) { fclose(f); return -1; }
+        if (rd(f, t->mbuf + moff, rl)) { free(all); return -1; }
         moff += rl;
     }
-    fclose(f);
+    free(all);
 
     int bits = 1;
     while ((1u << bits) < n_vocab * 2u) bits++;

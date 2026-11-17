@@ -68,13 +68,30 @@ $fn = @(
   '  for (int k = 0; k < ne; k += 1) if (eog[k] == id) return true;',
   '  return false;',
   '}',
+  '// XPLAT-WIN (wincuda.ps1, 2.b): the cancel request. llb-serve sets Local\llb-engine-cancel-<pid> when a client leaves',
+  '// mid-reply; the run then ends at its next step as at an end id, instead of computing the request''s every step (the',
+  '// drain took 4.1 s on the 9B). Reset when a run starts, so a late cancel never ends the next request.',
+  '__declspec(dllimport) int __stdcall ResetEvent(void* h);',
+  'static void* gen_cev;',
+  'static bool gen_cancel(void) {',
+  '  static int armed;',
+  '  if (!armed) {',
+  '    char name[64];',
+  '    armed = 1;',
+  '    snprintf(name, sizeof name, "Local\\llb-engine-cancel-%lu", (unsigned long)GetCurrentProcessId());',
+  '    gen_cev = CreateEventA(NULL, 1, 0, name);',
+  '  }',
+  '  return gen_cev != NULL && WaitForSingleObject(gen_cev, 0) == 0;  /* WAIT_OBJECT_0 */',
+  '}',
   ''
 )
 $lines.InsertRange($i, [string[]]$fn)
+$i = Find-One 'static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, u32 n) {' 'gen_run (cancel reset)'
+$lines.Insert($i + 1, '  if (gen_cancel()) ResetEvent(gen_cev);  /* XPLAT-WIN (wincuda.ps1, 2.b): a cancel for an earlier request */')
 
 $i = Find-One '    u32 id = (u32)t[1], j = (u32)t[3];' 'gen_run''s pick'
 $pad = @(
-  '    if (gen_eog(id)) {  // XPLAT-WIN (wincuda.ps1): the reply ended at step q',
+  '    if (gen_eog(id) || gen_cancel()) {  // XPLAT-WIN (wincuda.ps1): the reply ended (or was cancelled) at step q',
   '      // pad the run''s remaining lines with the end id instead of computing them (dual.c wants n ids), then hand gen',
   '      // step q''s words as the run''s last, with the whole run''s count (step q + 1 may be queued: let it finish first)',
   '      if (fflush(stdout) != 0) {',
@@ -197,6 +214,13 @@ $lines.InsertRange($i + 2, [string[]]$map)
 $i = Find-One '    gpu_note(path);' 'gpu_load''s stale branch'
 $lines[$i] = '    if (bin != NULL && bin != MAP_FAILED) munmap(bin, st.st_size);  // XPLAT-WIN (wincuda.ps1): Windows keeps a mapped file' + $nl +
   '    if (fd >= 0) close(fd), fd = -1;  // from being rewritten' + $nl + $lines[$i]
+
+# 7. the weight copies. io_put sends a file read into the managed corpus through the copy engine (cuMemcpyHtoD) only
+#    from 16 MiB up; smaller ones are a CPU memcpy. Under WDDM a CPU write to managed memory faults page by page:
+#    measured ~130 MB/s, 95 ms for each ~13 MB layer of the 0.8B (2.3 s of its 2.5 s load), against 14 ms for a 198 MB
+#    copy-engine put. From 64 KiB up every put takes the copy engine.
+$i = Find-One '#define io_big(n) (io_gpu && (n) >= 1ull << 24)' 'io_put''s threshold'
+$lines[$i] = '#define io_big(n) (io_gpu && (n) >= 1ull << 16)  /* XPLAT-WIN (wincuda.ps1): WDDM managed-memory CPU writes fault */'
 
 [IO.File]::WriteAllText($Out, ($lines -join $nl), (New-Object Text.UTF8Encoding($false)))
 Write-Host "wincuda: $In -> $Out (gpu_probe asks for MANAGED_MEMORY; gen_run stops at LLB_GEN_EOG ids; the corpus is freed at exit)"

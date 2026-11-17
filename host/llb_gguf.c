@@ -20,6 +20,7 @@
 //                       read the block back (cuMemcpyDtoH on the GPU build),
 //                       sha256 every whole tensor in it, print one line each,
 //                       fail the load on a mismatch. Off the timed path.
+//      LLB_LOAD_TRACE   each region's read and put times on stderr ("load: ...")
 
 #ifndef _FILE_OFFSET_BITS
 #define _FILE_OFFSET_BITS 64
@@ -32,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -789,8 +791,21 @@ static int gg_state;  // 0 unopened, 1 open, -1 failed
 static char gg_err0[256];
 static pthread_mutex_t gg_mu = PTHREAD_MUTEX_INITIALIZER;
 
+// LLB_LOAD_TRACE: per-region load times on stderr (the read from the GGUF, then the put into the block)
+static int gg_trace(void) {
+  static int on = -1;
+  if (on < 0) { const char* e = getenv("LLB_LOAD_TRACE"); on = e && *e && strcmp(e, "0"); }
+  return on;
+}
+static double gg_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 static void gguf_read_call(IoWork* w) {
   char err[256] = "";
+  double t0 = gg_trace() ? gg_ms() : 0;
   uint32_t which = (uint32_t)w->hand;
   uint64_t n = w->size, lo = 0;
   pthread_mutex_lock(&gg_mu);
@@ -806,6 +821,7 @@ static void gguf_read_call(IoWork* w) {
                        : (snprintf(err, sizeof err, "%s", gg_err0), 0);
   pthread_mutex_unlock(&gg_mu);
   if (ok) ok = !gg_fill(&gg_file, lo, n, (uint8_t*)w->data, gg_threads(), err);
+  if (gg_trace()) fprintf(stderr, "load: region %u %llu B read %.1f ms\n", which, (unsigned long long)n, gg_ms() - t0);
   w->made = (intptr_t)lo;
   if (!ok) {
     w->code = EIO;
@@ -868,7 +884,9 @@ static Term gguf_read_pack(Env e, IoWork* w) {
   } else {
     StrParts out = str_alloc(e, w->size, 2);
     if (out.data && !err_seen(e.mem)) {
+      double t0 = gg_trace() ? gg_ms() : 0;
       io_put((u8*)(e.mem + term_peek(e, out.data)), w->data, w->size);
+      if (gg_trace()) fprintf(stderr, "load: put %llu B %.1f ms\n", (unsigned long long)w->size, gg_ms() - t0);
       const char* man = getenv("LLB_GGUF_VERIFY");
       if (man && *man && gguf_verify(e, out.data, (uint64_t)w->made, w->size, man)) {
         fprintf(stderr, "gguf verify: device bytes differ from %s\n", man);

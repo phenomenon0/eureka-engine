@@ -416,6 +416,16 @@ static u64 moe_env(const char* k, u64 dflt) {
   return e != NULL && *e ? strtoull(e, NULL, 10) : dflt;
 }
 
+#ifdef _WIN32
+// XPLAT-WIN: no /proc/meminfo; GlobalMemoryStatusEx's available physical memory (it read 0 here, so a 35B-A3B whose
+// experts missed the VRAM by 0.1 GiB streamed them from the GGUF at ~1 token/s instead of using the RAM)
+typedef struct { unsigned long len, load; unsigned long long phys, avail, pf, apf, virt, avirt, x; } MoeMs;
+__declspec(dllimport) int __stdcall GlobalMemoryStatusEx(MoeMs* m);
+static u64 moe_memavail(void) {
+  MoeMs m = { sizeof m };
+  return GlobalMemoryStatusEx(&m) ? m.avail : 0;
+}
+#else
 static u64 moe_memavail(void) {
   FILE* f = fopen("/proc/meminfo", "r");
   char ln[256];
@@ -430,6 +440,7 @@ static u64 moe_memavail(void) {
   }
   return kb * 1024;
 }
+#endif
 
 // one stack: device (cuMemAlloc + pread in 64 MiB pieces) or host (pinned, mapped, pread in place)
 static llb_dptr moe_fill(int fd, u64 src, u64 n, int mode, const char* name) {
@@ -521,7 +532,10 @@ static void llb_moe_load(LlbShape sh) {
   size_t fr = 0, tv = 0;
   cuMemGetInfo(&fr, &tv);
   u64 vram = moe_env("LLB_MOE_VRAM", fr), ram = moe_env("LLB_MOE_RAM", moe_memavail());
-  u64 rv = (u64)1 << 30, rr = (u64)4 << 30;  // the reserves: KV growth and scratch / the rest of the system
+  // the reserves: KV growth and scratch / the rest of the system. VRAM 0.75 GiB (was 1): a 35B-A3B Q4_K_S on a 24 GB
+  // card (Windows desktop holding 1.1 GB) had 17.75 GiB free for 16.88 GiB of experts and streamed them at ~1 token/s;
+  // in VRAM it runs 137 tokens/s at an 8K context with 0.3 GB to spare (RTX 3090, 2026-11-16)
+  u64 rv = (u64)3 << 28, rr = (u64)4 << 30;
   const char* e = getenv("LLB_MOE_EXPERTS");
   moe_mode = e != NULL && strcmp(e, "device") == 0 ? 0 : e != NULL && strcmp(e, "host") == 0 ? 1
     : e != NULL && strcmp(e, "stream") == 0 ? 2 : tot + rv <= vram ? 0 : tot + rr <= ram ? 1 : 2;

@@ -407,6 +407,8 @@ static void init(const char *dir) {
     if (!tmp || !*tmp) clef_fail("set TMPDIR to owned scratch");
     if (snprintf(hidden_path,sizeof hidden_path,"%s/sys1dual-%d.hidden",tmp,(int)getpid())>=(int)sizeof hidden_path) clef_fail("TMPDIR too long");
     if (q35_tok_load(&tok,dir)) clef_fail("sidecar requires tokenizer.bin (llb-tok extract)");
+    const char *ltr=getenv("LLB_LOAD_TRACE");
+    if (ltr && *ltr && strcmp(ltr,"0")) fprintf(stderr,"load: tokenizer %.1f ms\n",(now()-t0)*1000);
     const char *nh=getenv("LLB_SYS1_NOHEAD");
     nohead=nh && *nh && strcmp(nh,"0");
     if (getenv("LLB_VIS_EMBD")) clef_fail("sys1: the image is per request (\"image\"), unset LLB_VIS_EMBD");

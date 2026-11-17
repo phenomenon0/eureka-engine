@@ -86,10 +86,12 @@ skipped; checked on synthetic random-weight files against llama.cpp
   is far below these. The expert stacks are outside them: loaded by name
   with 64-bit offsets and sizes, one allocation a stack.
 - **Hardware:** the trunk, head, KV and scratch must fit in VRAM. The experts
-  go to VRAM when they fit the free VRAM less 1 GiB, else to pinned
+  go to VRAM when they fit the free VRAM less 0.75 GiB, else to pinned
   device-mapped host RAM when they fit MemAvailable less 4 GiB, else they
   stream from the mmapped GGUF (the k chosen experts of each layer copied to
   a k-slot VRAM staging area each token; disk and page-cache speed).
+  A fourth residency, a VRAM cache of the hot experts with the misses on the
+  CPU, is designed in [Hybrid expert placement](reference/hybrid-experts.md).
   `LLB_MOE_EXPERTS` forces a residency; `LLB_MOE_VRAM` / `LLB_MOE_RAM` stand
   in for the free amounts. One GPU only.
 - **Speed** ([reports/cuda-catchup](../reports/cuda-catchup/REPORT.md); synthetic 4-layer 35B-A3B-like

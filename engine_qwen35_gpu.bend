@@ -645,9 +645,15 @@ def vec(+wt: Bytes(), +off: U32, +d: Nat) -> Array<F32>:
 # A Data record cannot hold Array fields in this compiler, so a layer's state
 # is a right-nested tuple; the six are tied in one type expression.
 
+# cd 0 is the folded step (st.kd), which keeps every layer state on the host (llb_host.c pass_b / pass_S / pass_kv)
+# and passes these through unread: one leaf each then. They were 3 x 2^13 + 2^19 floats a layer, made and zeroed for
+# every request: 2 MiB a layer of fresh corpus pages the CPU wrote (WDDM: ~512 faults a layer, 0.36 s a request on
+# the 0.8B, 0.48 s on the 4B; RTX 3090, 2026-11-16).
 def st.new(+cd: Nat) -> Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>:
-  (Array.new(F32, 13n, 0.0), (Array.new(F32, 13n, 0.0), (Array.new(F32, 13n, 0.0),
-    (Array.new(F32, 19n, 0.0), (Array.new(F32, cd, 0.0), Array.new(F32, cd, 0.0))))))
+  +cv = Bool.pick(Nat, Nat.is_le(cd, 0n), 0n, 13n)
+  +sv = Bool.pick(Nat, Nat.is_le(cd, 0n), 0n, 19n)
+  (Array.new(F32, cv, 0.0), (Array.new(F32, cv, 0.0), (Array.new(F32, cv, 0.0),
+    (Array.new(F32, sv, 0.0), (Array.new(F32, cd, 0.0), Array.new(F32, cd, 0.0))))))
 
 # cd: the K / V arrays' depth, 2^cd floats each (tools/payload-anyshape.patch: st.kd)
 def states(n: Nat, +cd: Nat) -> List<(Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32> & Array<F32>)>:

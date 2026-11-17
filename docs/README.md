@@ -23,6 +23,7 @@ This directory holds the Eureka Engine documentation. Start with the
 | [Decide configuration](reference/decide-configuration.md) | Served configuration of the decide path and its signed bound. |
 | [Module contract](reference/module-contract.md) | Module classes, attach points, and pack containers. |
 | [Dual-mode residency](reference/dual-mode-residency.md) | Memory residency and queue policy of the dual-mode engine. |
+| [Hybrid expert placement](reference/hybrid-experts.md) | Design: a VRAM cache of hot MoE experts, the misses computed on the CPU. |
 | [Clean machine requirements](reference/clean-machine-requirements.md) | What a clean machine needs to reproduce the build. |
 
 ## Tool documentation
