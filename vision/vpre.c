@@ -38,7 +38,7 @@ int vpre_decode(const char *path, VImg *out, char *err) {
   char m[2] = {0};
   if (fread(m, 1, 2, f) == 2 && m[0] == 'P' && m[1] == '6') {
     int w = ppm_tok(f), h = ppm_tok(f), mx = ppm_tok(f);
-    if (w <= 0 || h <= 0 || mx != 255) { fclose(f); return snprintf(err, 256, "%s: PPM must be P6 maxval 255", path), -1; }
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || mx != 255) { fclose(f); return snprintf(err, 256, "%s: PPM must be P6 maxval 255", path), -1; }
     out->nx = w, out->ny = h, out->rgb = malloc((size_t)w * h * 3);
     size_t got = out->rgb ? fread(out->rgb, 1, (size_t)w * h * 3, f) : 0;
     fclose(f);
@@ -49,6 +49,9 @@ int vpre_decode(const char *path, VImg *out, char *err) {
   fseek(f, 0, SEEK_END);
   long n = ftell(f);
   fseek(f, 0, SEEK_SET);
+  // HARDEN E5: a 32-bit long (Windows) wraps for a file of 2 GB or more, and stb_image takes an int length: bound it. A photo
+  // is a few MB; 256 MB is far above any real one.
+  if (n <= 0 || n > (256L << 20)) { fclose(f); return snprintf(err, 256, "%s: not a photo this tool reads (size)", path), -1; }
   unsigned char *buf = malloc(n > 0 ? (size_t)n : 1);
   size_t got = buf ? fread(buf, 1, (size_t)n, f) : 0;
   fclose(f);
@@ -58,6 +61,7 @@ int vpre_decode(const char *path, VImg *out, char *err) {
   free(buf);
   if (!d) return snprintf(err, 256, "%s: stb_image: %s", path, stbi_failure_reason()), -1;
   out->nx = nx, out->ny = ny, out->rgb = malloc((size_t)nx * ny * 3);
+  if (!out->rgb) { stbi_image_free(d); return snprintf(err, 256, "%s: out of memory", path), -1; }
   memcpy(out->rgb, d, (size_t)nx * ny * 3);
   stbi_image_free(d);
   return 0;
