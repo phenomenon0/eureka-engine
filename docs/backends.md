@@ -95,15 +95,21 @@ source location and build commands.
 - Vulkan on Linux is parked. As of 2026-10-19, SPIR-V output is proven, coverage
   is 26 %, and there is no runtime.
 - There is no CPU/WASM build of the engine.
-- Windows: not supported. The CLI sources (`tools/qwen35_engine.c`,
-  `tools/gguf2pack.c`) now go through a portability layer, `tools/llb_platform.h`.
-  A build and test kit for the CPU CLI and its CUDA build is in
-  [`backends/windows/`](../backends/windows/BUILD.md). **As of the commit that adds
-  them, these builds are untested on Windows**; see
-  [`WINDOWS-TEST-STATUS.md`](../WINDOWS-TEST-STATUS.md). The only earlier datapoint is
-  64 s per token on CPU (2 tokens in 128 s, 4 vCPUs, Windows Server 2025 VM). That
-  build has no recipe in the tree. The CUDA engine (`build.sh`) and the server do
-  not build for Windows or WSL2. The WebGPU backend is not yet tested on Windows.
+- Windows (2026-11-16): `backends/windows/build.ps1` builds the CUDA engine
+  (`engine_gpu.exe`, the emitted Bend engine with `winabi.ps1` and `wincuda.ps1`)
+  and the CPU engine. Both run on Windows 11 with an RTX 3090:
+  - 9B: 94 tok/s.
+  - 27B Q4_K_M: 38 tok/s.
+  - 35B-A3B Q4_K_S: 144 tok/s.
+
+  The bend-app desktop app ships them behind `llb-serve.exe`. Remaining gaps:
+  - the WebGPU backend is untested on AMD and Intel GPUs;
+  - a 35B-A3B needs its experts in VRAM, and a smaller card streams them at about
+    1 tok/s until [hybrid experts](reference/hybrid-experts.md) lands;
+  - WSL2 is not tested.
+
+  Details: [`backends/windows/`](../backends/windows/BUILD.md),
+  [`WINDOWS-TEST-STATUS.md`](../WINDOWS-TEST-STATUS.md).
 - The Metal macOS `see` cell runs D-FINE-N on the ONNX Runtime CPU execution
   provider, not on Metal.
 - The iOS receipts come from a debug build with Swift optimization `-O`.

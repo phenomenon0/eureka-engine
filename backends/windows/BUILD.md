@@ -1,10 +1,15 @@
 # Building the engine on Windows
 
-**Status (2026-11-16): the CPU part is built and run on Windows.** That covers
-`qwen35-cli`, `gguf2pack`, `llb-tok`, the desktop CPU engine `engine_cpu`, and the
-POSIX shim. The CUDA part (`qwen35-cli-gpu`, and the emitted CUDA engine) has not
-been built here. Measurements are in
-[`WINDOWS-TEST-STATUS.md`](../../WINDOWS-TEST-STATUS.md).
+**Status (2026-11-16): the CPU and CUDA engines are built and run on Windows.**
+- **CPU:** `qwen35-cli`, `gguf2pack`, `llb-tok`, the desktop CPU engine
+  `engine_cpu`, and the POSIX shim.
+- **CUDA:** the desktop engine `engine_gpu.exe`. It is the emitted Bend engine,
+  with `winabi.ps1` and then `wincuda.ps1` applied, and NVRTC at run time.
+  `build.ps1` builds it into `build\win\cuda\engine\cuda\`.
+- **Speed, RTX 3090:** 9B 94 tok/s, 27B Q4_K_M 38 tok/s, 35B-A3B Q4_K_S
+  144 tok/s.
+
+Measurements: [`WINDOWS-TEST-STATUS.md`](../../WINDOWS-TEST-STATUS.md).
 
 | File | What it is |
 |---|---|
@@ -190,6 +195,9 @@ This is the CUDA lane's first step, run and checked here.
 5. **Run `winabi.ps1` on the output before compiling it.** On Win64 the
    runtime's `musttail` segment chain reads a dead `Env` copy. The script changes
    two lines to `sysv_abi`. Details: [compat/README.md](compat/README.md).
+   For the CUDA engine, run `wincuda.ps1` after it. It applies the WDDM edits:
+   the device probe, stopping a reply at its end and on cancel, and the decode
+   run. Its header lists each edit.
 6. **Compile against `compat/`** with `-D_CRT_DECLARE_NONSTDC_NAMES=0`, and link
    `llbw_posix.o`, `cblas_sgemm.c` (for `head.c`), `clang_rt.builtins`,
    `-lws2_32 -lwinmm`, and `/STACK:8388608`.

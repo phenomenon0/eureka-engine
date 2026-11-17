@@ -29,7 +29,7 @@
 
 | Backend | Runs on | Chat speed | Guide |
 | :---: | :---: | :---: | :---: |
-| **CUDA** | NVIDIA, Linux | `38.8 tok/s` 27B | [cuda](backends/cuda/README.md) |
+| **CUDA** | NVIDIA, Linux and Windows | `38.8 tok/s` 27B | [cuda](backends/cuda/README.md), [windows](backends/windows/BUILD.md) |
 | **Metal** | macOS | `70.2 tok/s` 9B | [metal](backends/metal/README.md) |
 | **iOS** | iPhone | `20.6 tok/s` 4B | [ios](backends/ios/README.md) |
 | **Android** | Android phones | `3.2 s` per reply, 4B | [android](backends/android/README.md) |
@@ -38,8 +38,17 @@
 </div>
 
 All five backends pass all five verbs on a real HTTP route (2026-10-21).
-Windows runs a CPU build of the engine today. Devices, conditions, and gaps:
-[docs/backends.md](docs/backends.md).
+Devices, conditions, and gaps: [docs/backends.md](docs/backends.md).
+
+Windows (2026-11-16): the CUDA engine runs natively on an RTX 3090. Chat speeds
+are 94 tok/s on the 9B, 38 tok/s on the 27B Q4_K_M, and 144 tok/s on the
+35B-A3B MoE Q4_K_S, with the first token in about 60 ms. The CPU build is the
+fallback. Build and status: [backends/windows](backends/windows/BUILD.md),
+[WINDOWS-TEST-STATUS.md](WINDOWS-TEST-STATUS.md).
+
+Next: a hybrid placement for MoE experts. The most-used experts stay in VRAM,
+and the CPU computes the rest. This would run a 35B-A3B on 6 to 16 GB cards:
+[design](docs/reference/hybrid-experts.md).
 
 ## What it does
 
@@ -148,6 +157,8 @@ eureka-engine/
 | [HTTP API](docs/reference/http-api.md) | Endpoints, fields, streaming, errors |
 | [Multimodal content](docs/reference/multimodal-content.md) | Images, audio, and video in requests |
 | [Structured output](docs/guides/structured-output.md) | JSON schema, grammars, tool calls |
+| [Build on Windows](backends/windows/BUILD.md) | CPU and CUDA engines on Windows |
+| [Hybrid experts](docs/reference/hybrid-experts.md) | Design: MoE experts split between VRAM and the CPU |
 | [All docs](docs/README.md) | Full index |
 
 </div>

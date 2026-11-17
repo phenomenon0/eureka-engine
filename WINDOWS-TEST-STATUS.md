@@ -11,9 +11,9 @@ As of 2026-11-16, on a real Windows machine:
 |---|---|
 | CPU lane builds on Windows? | **Yes.** `qwen35-cli`, `gguf2pack`, `llb-tok`, `engine_cpu`, and the POSIX shim, all with clang. |
 | CPU lane runs on Windows? | **Yes, measured below.** |
-| CUDA lane | **Not built, not run.** The CUDA toolkit was still installing. |
-| llb-serve.exe | Not part of this lane (another lane ports `tools/sys1dual/serve.c`). |
-| Windows support claimed? | CPU engine: works on this machine. Nothing else yet. |
+| CUDA lane | **Built and run (later the same day).** `engine_gpu.exe` behind the bend-app's `llb-serve.exe`, RTX 3090: 9B 94 tok/s (first token 56 to 63 ms), 27B Q4_K_M 38 tok/s (engine only), 35B-A3B Q4_K_S 144 tok/s (first token 60 to 69 ms), 0.8B ready 0.74 s after start, a cancelled reply drains in about 20 ms. |
+| llb-serve.exe | Built by bend-app (`desktop/engine/metal/src/build-win.ps1`). |
+| Windows support claimed? | CPU and CUDA engines: work on this machine. WebGPU on AMD and Intel: not tested. |
 
 ## Proven (commands in `backends/windows/TEST.md`)
 
