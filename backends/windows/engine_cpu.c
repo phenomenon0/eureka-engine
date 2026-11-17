@@ -574,5 +574,7 @@ void llb_bx_select(const int *ids, unsigned n) { (void)ids, (void)n; }
 int llb_bx_next_done(void) { return -1; }
 void llb_vis_request(const char *rows, unsigned n) { (void)rows, (void)n; }
 void llb_vis_request_list(const char *spec) { (void)spec; }
+/* host/llb_pf.h IMG-FAST: dual.c marks image requests for the exact prefill; the CPU engine has one prefill */
+int llb_pf_hold_req;
 /* dual.c's LLB_MEMPROBE line asks libcuda for device memory; the CPU engine has no device (no line) */
 int cuMemGetInfo_v2(size_t *free_b, size_t *total_b) { (void)free_b, (void)total_b; return 1; }

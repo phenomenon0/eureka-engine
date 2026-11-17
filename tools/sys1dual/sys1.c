@@ -62,7 +62,7 @@ Term sys1_next_run(Env e, Term* f, IoWork* w) {
   int got = dual_next(dir, (unsigned)(u32)f[1], &cmd, &hidden, &n);
   free(dir);
   llb_hidden_path = hidden;
-  llb_pf_hold = hidden != NULL;  /* G15: hidden rows at every position need the exact pass */
+  llb_pf_hold = hidden != NULL || llb_pf_hold_req;  /* G15: hidden rows at every position need the exact pass; IMG-FAST: images too */
   llb_hidden_tokens = n;
   llb_hidden_written = false;
   /* S6 W5 P1: latch --pos K (belt) and PASS the pair through to cfg. */

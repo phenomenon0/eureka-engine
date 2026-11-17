@@ -111,21 +111,62 @@ static int batch_main(int argc, char **argv) {
   return same == n ? 0 : 3;
 }
 
+// SERVE-VISION: SHA-256 (FIPS 180-4) of the rows, for --stamp (the stamp's rows_sha256)
+static void sha256_hex(const void *data, size_t len, char hex[65]) {
+  static const unsigned K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
+    0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
+    0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
+    0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+  unsigned h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  const unsigned char *p = data;
+  const unsigned long long bits = (unsigned long long)len * 8;
+  const size_t total = ((len + 9 + 63) / 64) * 64;
+  for (size_t off = 0; off < total; off += 64) {
+    unsigned char blk[64];
+    for (int i = 0; i < 64; i++) {
+      const size_t k = off + i;
+      blk[i] = k < len ? p[k] : k == len ? 0x80 : k >= total - 8 ? (unsigned char)(bits >> (8 * (total - 1 - k))) : 0;
+    }
+    unsigned w[64], a[8];
+    for (int i = 0; i < 16; i++) w[i] = (unsigned)blk[4*i] << 24 | (unsigned)blk[4*i+1] << 16 | (unsigned)blk[4*i+2] << 8 | blk[4*i+3];
+#define ROR(x, n) ((x) >> (n) | (x) << (32 - (n)))
+    for (int i = 16; i < 64; i++) {
+      const unsigned s0 = ROR(w[i-15], 7) ^ ROR(w[i-15], 18) ^ (w[i-15] >> 3), s1 = ROR(w[i-2], 17) ^ ROR(w[i-2], 19) ^ (w[i-2] >> 10);
+      w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    memcpy(a, h, sizeof a);
+    for (int i = 0; i < 64; i++) {
+      const unsigned S1 = ROR(a[4], 6) ^ ROR(a[4], 11) ^ ROR(a[4], 25), ch = (a[4] & a[5]) ^ (~a[4] & a[6]);
+      const unsigned t1 = a[7] + S1 + ch + K[i] + w[i];
+      const unsigned S0 = ROR(a[0], 2) ^ ROR(a[0], 13) ^ ROR(a[0], 22), mj = (a[0] & a[1]) ^ (a[0] & a[2]) ^ (a[1] & a[2]);
+      a[7] = a[6], a[6] = a[5], a[5] = a[4], a[4] = a[3] + t1, a[3] = a[2], a[2] = a[1], a[1] = a[0], a[0] = t1 + S0 + mj;
+    }
+#undef ROR
+    for (int i = 0; i < 8; i++) h[i] += a[i];
+  }
+  for (int i = 0; i < 8; i++) snprintf(hex + 8 * i, 9, "%08x", h[i]);
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--batch")) return batch_main(argc, argv);
-  const char *img = NULL, *pre = NULL, *mm = NULL, *out = NULL;
-  int nx = 0, ny = 0, rep = 1, i = 1;
+  const char *img = NULL, *pre = NULL, *mm = NULL, *out = NULL, *stamp = NULL;
+  int nx = 0, ny = 0, rep = 1, i = 1, maxtok = 0;
   char *list = NULL;
   Ctx c = {NULL, NULL, NULL, 0};
   if (argc > 1 && !strcmp(argv[1], "--pre") && argc > 5) pre = argv[2], nx = atoi(argv[3]), ny = atoi(argv[4]), mm = argv[5], i = 6;
   else if (argc > 2) img = argv[1], mm = argv[2], i = 3;
   else {
-    fprintf(stderr, "usage: cudavis-cli IMAGE MMPROJ [--out EMBD.f32] [--dump DIR [--nodes a,b | --nodes-from MANIFEST]] [--repeat R]\n"
+    fprintf(stderr, "usage: cudavis-cli IMAGE MMPROJ [--out EMBD.f32 [--stamp MMPROJ_SHA256]] [--max-tokens N] [--dump DIR [--nodes a,b | --nodes-from MANIFEST]] [--repeat R]\n"
                     "       cudavis-cli --pre PRE.f32 NX NY MMPROJ [same options]\n");
     return 1;
   }
   for (; i < argc; i++) {
     if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
+    else if (!strcmp(argv[i], "--stamp") && i + 1 < argc) stamp = argv[++i];
+    else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) maxtok = atoi(argv[++i]);  // SERVE-VISION: cap the grid (prefill time)
     else if (!strcmp(argv[i], "--dump") && i + 1 < argc) c.dir = argv[++i];
     else if (!strcmp(argv[i], "--repeat") && i + 1 < argc) rep = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--nodes") && i + 1 < argc) list = strdup(argv[++i]);
@@ -161,6 +202,7 @@ int main(int argc, char **argv) {
   if (img) {
     VPreCfg pc;
     vpre_cfg_default(&pc);
+    if (maxtok >= 8) pc.max_px = maxtok * 32 * 32;  // the image is scaled down to at most maxtok tokens
     if (vpre_image(&pc, img, &planar, &nx, &ny, err)) { fprintf(stderr, "%s\n", err); return 2; }
   } else {
     const size_t n = 3 * (size_t)nx * ny;
@@ -183,6 +225,26 @@ int main(int argc, char **argv) {
     FILE *f = fopen(out, "wb");
     if (!f || fwrite(embd, sizeof(float), ne, f) != ne) { fprintf(stderr, "write %s failed\n", out); return 2; }
     fclose(f);
+    // SERVE-VISION (--stamp MMPROJ_SHA256): tools/vision/tower_stamp.py's llb-tower-rows-v1 stamp beside the rows, so a
+    // server can hand them to the engine as "images":[{rows,nx,ny}] (dual.c tower_stamp_check). The grid is the merged
+    // token grid (32 px a token). stdout: "grid GX GY" for the caller.
+    if (stamp) {
+      const int gx = nx / 32, gy = ny / 32;
+      if (gx * gy != nt) { fprintf(stderr, "--stamp: grid %dx%d is not %d tokens\n", gx, gy, nt); return 2; }
+      char hex[65], sp[4096];
+      sha256_hex(embd, sizeof(float) * ne, hex);
+      const size_t L = strlen(out);
+      if (L < 5 || strcmp(out + L - 4, ".f32")) { fprintf(stderr, "--stamp: --out must end in .f32\n"); return 2; }
+      snprintf(sp, sizeof sp, "%.*s.json", (int)(L - 4), out);
+      const char *base = mm;
+      for (const char *p = mm; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+      FILE *j = fopen(sp, "wb");
+      if (!j) { fprintf(stderr, "--stamp: cannot write %s\n", sp); return 2; }
+      fprintf(j, "{\n \"kind\": \"llb-tower-rows-v1\",\n \"mmproj_sha256\": \"%s\",\n \"mmproj\": \"%s\",\n \"nx\": %d,\n \"ny\": %d,\n"
+                 " \"d\": %d,\n \"rows_sha256\": \"%s\"\n}\n", stamp, base, gx, gy, pd, hex);
+      fclose(j);
+      printf("grid %d %d\n", gx, gy);
+    }
   }
   if (rep > 1) {
     float *e2 = malloc(sizeof(float) * ne);

@@ -208,6 +208,7 @@ static const char *stamp_check(const char *rows, unsigned n) {
  * with S equal to the engine's LLB_VIS_MMPROJ_SHA256 (the operator names the mmproj that belongs to this trunk; unset =
  * "images" refused) and rows_sha256 equal to the file's. The G4 "image" form above is unchanged. */
 void llb_vis_request_list(const char *spec);
+extern int llb_pf_hold_req; /* host/llb_pf.h IMG-FAST: this request takes the exact prefill (images) */
 static int trunk_d; /* defined below (ENGINE-HEAD27); the stamp check compares the rows' d to it */
 static const char *tower_stamp_check(const char *rows, unsigned nx, unsigned ny) {
     static char msg[512];
@@ -629,9 +630,9 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
             if (img) return refuse("image and images are exclusive (image = G4 connector rows, images = tower rows)"),0;
             if (ims->type!=J_ARR || ims->n<1 || ims->n>16) return refuse("images must be an array of 1..16 {rows,nx,ny}"),0;
             if (json_get(req,"session")) return refuse("images requests are sessionless"),0;
-            const char *pf=getenv("LLB_PREFILL");
-            if (getenv("LLB_SPEC") || getenv("LLB_MTP") || (pf && !strcmp(pf,"fast")))
-                return refuse("images run on the exact tier only (this engine has LLB_SPEC, LLB_MTP or LLB_PREFILL=fast)"),0;
+            /* IMG-FAST: LLB_PREFILL=fast is fine (this request is held to the exact prefill, llb_pf_hold_req) */
+            if (getenv("LLB_SPEC") || getenv("LLB_MTP"))
+                return refuse("images run on the exact tier only (this engine has LLB_SPEC or LLB_MTP)"),0;
             sb w={0};
             unsigned tot=0;
             for (size_t i=0; i<ims->n; i++) {
@@ -718,7 +719,7 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
         *n=(unsigned)c;
         *hidden=NULL;
         if (img) llb_vis_request(ir->str,(unsigned)in->num);
-        else if (ims) llb_vis_request_list(im_spec);
+        else if (ims) llb_vis_request_list(im_spec), llb_pf_hold_req=1;
         if (ro) {
             ro_n=(int)ro->n;
             for (int i=0; i<ro_n; i++) ro_ids[i]=(int)ro->items[i]->num;
@@ -884,6 +885,7 @@ static int bx_split(const char *line,unsigned ctx) {
 
 int dual_next(const char *dir,unsigned ctx,char **cmd,const char **hidden,unsigned *n) {
     if (!out) init(dir);
+    llb_pf_hold_req=0;
     for (;;) {
         char *line=NULL;
         size_t len=0;

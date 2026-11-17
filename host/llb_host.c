@@ -2048,8 +2048,8 @@ static void llb_img_load(u32 d) {
     else c1 = NULL;
     if (!c1 || (size_t)(c1 - item) >= sizeof path || sscanf(tail, ":%u:%u", &ax, &ay) != 2 || !ax || !ay)
       err_fail("vision: LLB_VIS_EMBD wants <rows.f32>:<nx>:<ny>[;<rows.f32>:<nx>:<ny>...]");
-    if (getenv("LLB_SPEC") || getenv("LLB_MTP") || (pf && !strcmp(pf, "fast")))
-      err_fail("vision: exact pass only with an image (no LLB_SPEC, LLB_MTP, LLB_PREFILL=fast)");
+    if (getenv("LLB_SPEC") || getenv("LLB_MTP") || (pf && !strcmp(pf, "fast") && !llb_pf_hold))
+      err_fail("vision: exact pass only with an image (no LLB_SPEC, LLB_MTP, LLB_PREFILL=fast unless held, llb_pf.h)");
     memcpy(path, item, (size_t)(c1 - item));
     path[c1 - item] = 0;
     size_t want = (size_t)ax * ay * d;

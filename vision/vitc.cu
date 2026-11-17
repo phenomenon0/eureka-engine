@@ -7,7 +7,18 @@
 extern "C" {
 #include "vmm.h"
 }
+#ifdef VITC_NO_CUBLAS
+// XPLAT-WIN (SERVE-VISION): the tower's one GEMM (gemm_h) as this file's own tensor-core kernel, so the tower needs no
+// cuBLAS (whose DLLs are ~500 MB on Windows). A "handle" is the stream the GEMM runs on.
+typedef cudaStream_t cublasHandle_t;
+typedef int cublasStatus_t;
+#define CUBLAS_STATUS_SUCCESS 0
+static inline cublasStatus_t cublasCreate(cublasHandle_t *h) { *h = 0; return 0; }
+static inline cublasStatus_t cublasDestroy(cublasHandle_t h) { (void)h; return 0; }
+#define cublasSetStream(h, s) ((h) = (s), CUBLAS_STATUS_SUCCESS)
+#else
 #include <cublas_v2.h>
+#endif
 #include <cuda_fp16.h>
 #include <float.h>
 #include <math.h>
@@ -430,6 +441,46 @@ static int ensure(VitcW *c, size_t N, size_t pix, char *err) {
 }
 
 // Y[n][o] = X16[n][k] . W[o][k]^T, F32 accumulate (column-major view: Y^T = W . X^T)
+#ifdef VITC_NO_CUBLAS
+// Y[n][o] = X[n][k] . W[o][k]^T: one warp a 16x16 tile of Y, WMMA 16x16x16 (F16 in, F32 accumulate) straight from global
+// memory; a tile past an edge (or rows that break WMMA's 32-byte alignment: `wmma_ok` 0) takes the scalar loop.
+__global__ void vitc_gemm_wmma(const __half *__restrict__ W, const __half *__restrict__ X, float *__restrict__ Y, int n, int k,
+                               int o, int wmma_ok) {
+  const long warp = ((long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int tiles_o = (o + 15) / 16, tiles_n = (n + 15) / 16;
+  if (warp >= (long)tiles_o * tiles_n) return;
+  const int r0 = (int)(warp / tiles_o) * 16, c0 = (int)(warp % tiles_o) * 16;
+  if (wmma_ok && r0 + 16 <= n && c0 + 16 <= o) {
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
+    nvcuda::wmma::fill_fragment(acc, 0.0f);
+    for (int kk = 0; kk < k; kk += 16) {
+      nvcuda::wmma::load_matrix_sync(a, X + (size_t)r0 * k + kk, k);
+      nvcuda::wmma::load_matrix_sync(b, W + (size_t)c0 * k + kk, k);
+      nvcuda::wmma::mma_sync(acc, a, b, acc);
+    }
+    nvcuda::wmma::store_matrix_sync(Y + (size_t)r0 * o + c0, acc, o, nvcuda::wmma::mem_row_major);
+    return;
+  }
+  for (int e = threadIdx.x & 31; e < 256; e += 32) {
+    const int r = r0 + e / 16, cc = c0 + e % 16;
+    if (r >= n || cc >= o) continue;
+    float s = 0.0f;
+    for (int q = 0; q < k; q++) s += __half2float(X[(size_t)r * k + q]) * __half2float(W[(size_t)cc * k + q]);
+    Y[(size_t)r * o + cc] = s;
+  }
+}
+static int gemm_h(VitcW *c, cublasHandle_t cb, size_t woff, const __half *X, float *Y, int n, int k, int o, char *err) {
+  const __half *Wp = (const __half *)(c->wb + woff);
+  const int ok = k % 16 == 0 && o % 4 == 0 && ((uintptr_t)Wp & 31) == 0 && ((uintptr_t)X & 31) == 0 && ((uintptr_t)Y & 31) == 0;
+  const long warps = (long)((n + 15) / 16) * ((o + 15) / 16);
+  vitc_gemm_wmma<<<(unsigned)((warps * 32 + 255) / 256), 256, 0, cb>>>(Wp, X, Y, n, k, o, ok);
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) { snprintf(err, 256, "vitc: gemm %dx%dx%d: %s", n, k, o, cudaGetErrorString(e)); return -1; }
+  return 0;
+}
+#else
 static int gemm_h(VitcW *c, cublasHandle_t cb, size_t woff, const __half *X, float *Y, int n, int k, int o, char *err) {
   const float one = 1.0f, zero = 0.0f;
   const cublasStatus_t s = cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, o, n, k, &one, c->wb + woff, CUDA_R_16F, k, X,
@@ -437,6 +488,7 @@ static int gemm_h(VitcW *c, cublasHandle_t cb, size_t woff, const __half *X, flo
   if (s != CUBLAS_STATUS_SUCCESS) { snprintf(err, 256, "vitc: cublasGemmEx %dx%dx%d: status %d", n, k, o, (int)s); return -1; }
   return 0;
 }
+#endif
 static int gemm(VitcW *c, size_t woff, const __half *X, float *Y, int n, int k, int o, char *err) {
   return gemm_h(c, c->cb, woff, X, Y, n, k, o, err);
 }

@@ -15,6 +15,9 @@ static u32 pf_mode = 2;  // 2 = LLB_PREFILL unread, 1 = fast, 0 = off
 // G15: nonzero = this request takes the exact path even with LLB_PREFILL=fast (tools/sys1dual/sys1.c
 // sets it for requests that read hidden rows at every position, i.e. decide)
 int llb_pf_hold;
+// IMG-FAST: nonzero = the request dual.c just parsed carries images (tower rows spliced at <|image_pad|>); sys1.c holds
+// it to the exact path, so an image request runs on an engine started with LLB_PREFILL=fast instead of being refused
+int llb_pf_hold_req;
 static u32 pf_T, pf_n, pf_pos0;
 // W1-PREFILL: LLB_PF_MS (--prefill-ms) caps a chunk by time: after each full chunk the flush
 // threshold pf_lim becomes the rows that fit pf_ms at the chunk just measured (multiple of 16,
