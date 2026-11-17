@@ -138,6 +138,28 @@ $map = @(
   '  (void)sig;',
   '  gpu_unmap();',
   '}',
+  '// the exit request (edit 6): a kill never frees the managed corpus, so whoever would kill this engine sets the event',
+  '// Local\llb-engine-exit-<pid> first; this thread frees the corpus and ends the process, even mid-request',
+  '__declspec(dllimport) void* __stdcall CreateEventA(void* sa, int manual, int initial, const char* name);',
+  '__declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void* h, unsigned long ms);',
+  '__declspec(dllimport) void* __stdcall CreateThread(void* sa, size_t stack, unsigned long (__stdcall *fn)(void*), void* arg, unsigned long flags, unsigned long* id);',
+  '__declspec(dllimport) unsigned long __stdcall GetCurrentProcessId(void);',
+  'static unsigned long __stdcall gpu_exit_watch(void* ev) {',
+  '  if (WaitForSingleObject(ev, 0xFFFFFFFFul) == 0) {',
+  '    fprintf(stderr, "bend: exit requested: freeing the GPU corpus\n");',
+  '    gpu_unmap();',
+  '    _exit(3);',
+  '  }',
+  '  return 0;',
+  '}',
+  'static void gpu_exit_arm(void) {',
+  '  char name[64];',
+  '  snprintf(name, sizeof name, "Local\\llb-engine-exit-%lu", GetCurrentProcessId());',
+  '  void* ev = CreateEventA(NULL, 1, 0, name);',
+  '  if (ev == NULL || CreateThread(NULL, 65536, gpu_exit_watch, ev, 0, NULL) == NULL) {',
+  '    fprintf(stderr, "bend: warning: no exit event (%s): a kill would leave the GPU corpus held until a reboot\n", name);',
+  '  }',
+  '}',
   'static Corpus gpu_map(u64 bytes) {',
   '  const char* m = getenv("LLB_CORPUS_PINNED");',
   '  if (m != NULL && strcmp(m, "1") == 0) {',
@@ -155,6 +177,7 @@ $map = @(
   '  atexit(gpu_unmap);',
   '  signal(SIGABRT, gpu_abort);',
   '  SetUnhandledExceptionFilter((void*)gpu_crash);',
+  '  gpu_exit_arm();',
   '  return c;',
   '}',
   ''
@@ -164,6 +187,10 @@ $i = Find-One '  return (Corpus)(uintptr_t)p;' 'gpu_map''s return'
 $lines[$i] = '  gpu_managed = p;' + $nl + $lines[$i]
 $lines.InsertRange($i + 2, [string[]]$map)
 
+# 6. (inside edit 4's gpu_map) the exit request. A kill is the one exit that still leaks the managed corpus, so the
+#    engine names an event, Local\llb-engine-exit-<its pid>; setting it makes a thread free the corpus and end the
+#    process (exit code 3), even mid-request. llb-serve sets it before any TerminateProcess and waits for the exit.
+#
 # 5. the kernel cache. gpu_load maps <exe>.gpu and, when its key is stale, gpu_make rewrites it with fopen("wb") while
 #    the old file is still open and mapped. POSIX allows that; Windows refuses to truncate a mapped file, so the write
 #    failed silently and every start compiled the kernels again (~80 s on an RTX 3090). Unmap and close it first.
