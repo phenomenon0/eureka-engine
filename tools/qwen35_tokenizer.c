@@ -228,45 +228,60 @@ int q35_tok_load(Q35Tokenizer *t, const char *dir) {
     if (rd(f, &n_vocab, 4) || rd(f, &n_merges, 4) || rd(f, &max_len, 4) ||
         rd(f, &bos, 4) || rd(f, &eos, 4) || rd(f, &pad, 4) || rd(f, &add_bos, 4) ||
         rd(f, &n_special, 4)) { free(all); return -1; }
+    // HARDEN E1: every count and length below comes from the file. Bound the counts, size the blob buffers by the bytes the
+    // file still holds (a token or merge can never be longer than what is left to read; the header's max_len is not a bound:
+    // the shipped Qwen3.5 file has a 150-byte token above it), and check each length against
+    // the buffer, so a crafted or truncated tokenizer.bin is refused instead of writing past a heap buffer.
+    size_t left = (size_t)(f->e - f->p);
+    if (n_vocab == 0 || n_vocab > (1u << 24) || n_merges > (1u << 24) ||
+        n_special > n_vocab || (size_t)n_special * 4 > left || (size_t)n_vocab * 3 > left) {
+        fprintf(stderr, "tokenizer: header out of range (vocab %u, merges %u, max_len %u, special %u)\n", n_vocab, n_merges, max_len, n_special);
+        free(all); return -1;
+    }
     t->n_vocab = n_vocab; t->n_merges = n_merges; t->max_token_len = max_len;
     t->bos = bos; t->eos = eos; t->pad = pad; t->add_bos = add_bos; t->mask_id = -1;
 
     t->special = (int32_t *)malloc(sizeof(int32_t) * (n_special ? n_special : 1));
     t->n_special = n_special;
-    if (n_special && rd(f, t->special, 4 * n_special)) { free(all); return -1; }
+    if (!t->special || (n_special && rd(f, t->special, (size_t)4 * n_special))) { free(all); return -1; }
+    for (uint32_t i = 0; i < n_special; i++)
+        if (t->special[i] < 0 || (uint32_t)t->special[i] >= n_vocab) { fprintf(stderr, "tokenizer: special id %d out of range\n", t->special[i]); free(all); return -1; }
 
     // token blobs
-    size_t cap = 0;
-    for (int i = 0; i < (int)n_vocab; i++) cap += max_len + 4;
+    size_t cap = (size_t)(f->e - f->p) + 1;
     t->buf = (unsigned char *)malloc(cap);
-    t->off = (uint32_t *)malloc(4 * n_vocab);
-    t->len = (uint16_t *)malloc(2 * n_vocab);
+    t->off = (uint32_t *)malloc((size_t)4 * n_vocab);
+    t->len = (uint16_t *)malloc((size_t)2 * n_vocab);
     t->type = (uint8_t *)malloc(n_vocab);
+    if (!t->buf || !t->off || !t->len || !t->type) { free(all); return -1; }
     size_t boff = 0;
     for (int i = 0; i < (int)n_vocab; i++) {
         uint16_t l; uint8_t ty;
         if (rd(f, &l, 2) || rd(f, &ty, 1)) { free(all); return -1; }
+        if (boff + l > cap) { fprintf(stderr, "tokenizer: token %d length %u out of range\n", i, l); free(all); return -1; }
         t->off[i] = (uint32_t)boff; t->len[i] = l; t->type[i] = ty;
         if (rd(f, t->buf + boff, l)) { free(all); return -1; }
         boff += l;
     }
 
     // merges
-    size_t mcap = 0;
-    for (int i = 0; i < (int)n_merges; i++) mcap += 2 * (max_len + 2);
+    size_t mcap = (size_t)(f->e - f->p) + 1, nm = n_merges ? n_merges : 1;
     t->mbuf = (unsigned char *)malloc(mcap);
-    t->ml_off = (uint32_t *)malloc(4 * n_merges);
-    t->ml_len = (uint16_t *)malloc(2 * n_merges);
-    t->mr_off = (uint32_t *)malloc(4 * n_merges);
-    t->mr_len = (uint16_t *)malloc(2 * n_merges);
+    t->ml_off = (uint32_t *)malloc(4 * nm);
+    t->ml_len = (uint16_t *)malloc(2 * nm);
+    t->mr_off = (uint32_t *)malloc(4 * nm);
+    t->mr_len = (uint16_t *)malloc(2 * nm);
+    if (!t->mbuf || !t->ml_off || !t->ml_len || !t->mr_off || !t->mr_len) { free(all); return -1; }
     size_t moff = 0;
     for (int i = 0; i < (int)n_merges; i++) {
         uint16_t ll, rl;
         if (rd(f, &ll, 2)) { free(all); return -1; }
+        if (moff + ll > mcap) { fprintf(stderr, "tokenizer: merge %d left length %u out of range\n", i, ll); free(all); return -1; }
         t->ml_off[i] = (uint32_t)moff; t->ml_len[i] = ll;
         if (rd(f, t->mbuf + moff, ll)) { free(all); return -1; }
         moff += ll;
         if (rd(f, &rl, 2)) { free(all); return -1; }
+        if (moff + rl > mcap) { fprintf(stderr, "tokenizer: merge %d right length %u out of range\n", i, rl); free(all); return -1; }
         t->mr_off[i] = (uint32_t)moff; t->mr_len[i] = rl;
         if (rd(f, t->mbuf + moff, rl)) { free(all); return -1; }
         moff += rl;
@@ -276,7 +291,8 @@ int q35_tok_load(Q35Tokenizer *t, const char *dir) {
     int bits = 1;
     while ((1u << bits) < n_vocab * 2u) bits++;
     t->tok_mask = (1u << bits) - 1;
-    t->text_to_id = (int32_t *)malloc(4 * (t->tok_mask + 1));
+    t->text_to_id = (int32_t *)malloc((size_t)4 * (t->tok_mask + 1));
+    if (!t->text_to_id) return -1;
     for (uint32_t i = 0; i <= t->tok_mask; i++) t->text_to_id[i] = -1;
     for (int i = 0; i < (int)n_vocab; i++) {
         uint32_t h = fnv1a(t->buf + t->off[i], t->len[i]) & t->tok_mask;
@@ -287,7 +303,8 @@ int q35_tok_load(Q35Tokenizer *t, const char *dir) {
     int mbits = 1;
     while ((1u << mbits) < n_merges * 2u) mbits++;
     t->hash_mask = (1u << mbits) - 1;
-    t->rank = (int32_t *)malloc(4 * (t->hash_mask + 1));
+    t->rank = (int32_t *)malloc((size_t)4 * (t->hash_mask + 1));
+    if (!t->rank) return -1;
     for (uint32_t i = 0; i <= t->hash_mask; i++) t->rank[i] = -1;
     for (int i = 0; i < (int)n_merges; i++) {
         uint32_t h = (fnv1a(t->mbuf + t->ml_off[i], t->ml_len[i]) * 0x9E3779B1u ^

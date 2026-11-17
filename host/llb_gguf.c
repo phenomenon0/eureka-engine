@@ -242,8 +242,14 @@ static int gg_open(GgFile *g, const char *path, char *err) {
     t->name = gg_str(&r, 1);
     uint32_t nd = gg_u32(&r);
     if (r.bad || nd < 1 || nd > 4) { r.bad = 1; break; }
+    // HARDEN E2: the element count is a product of file values; refuse one that does not fit (a wrapped product made a
+    // small `bytes`, so the truncation check passed and a later read ran past the mapping)
     uint64_t ne[4], n = 1;
-    for (uint32_t j = 0; j < nd; j++) ne[j] = gg_u64(&r), n *= ne[j];
+    for (uint32_t j = 0; j < nd; j++) {
+      ne[j] = gg_u64(&r);
+      if (ne[j] == 0 || ne[j] > ((uint64_t)1 << 40) || n > ((uint64_t)1 << 40) / ne[j]) { free(r.buf); return gg_fail(err, "%s: dimension %u out of range", t->name ? t->name : "?", j); }
+      n *= ne[j];
+    }
     uint32_t ty = gg_u32(&r);
     t->src = gg_u64(&r);
     int bb, el;
@@ -259,14 +265,17 @@ static int gg_open(GgFile *g, const char *path, char *err) {
     }
     unsigned L;
     int c = 0;
-    t->layer = sscanf(t->name, "blk.%u.%n", &L, &c) == 1 && c > 0 ? (int)L : -1;
+    t->layer = sscanf(t->name, "blk.%u.%n", &L, &c) == 1 && c > 0 && L <= 4096 ? (int)L : -1;
+    // HARDEN E4: a layer number from the file sizes the lo/hi tables below
+    if (c > 0 && t->layer < 0 && !strncmp(t->name, "blk.", 4)) { free(r.buf); return gg_fail(err, "%s: layer out of range", t->name); }
     if (t->layer >= g->nl) g->nl = t->layer + 1;
   }
   int bad = r.bad;
   uint64_t data = r.off + r.p;
   free(r.buf);
   if (bad) return gg_fail(err, "%s: header truncated or corrupt", path);
-  if (!align) return gg_fail(err, "general.alignment 0");
+  // HARDEN E4: GGUF alignments are small powers of two; anything else is a corrupt header (and could wrap the rounding)
+  if (!align || align > (1u << 20) || (align & (align - 1))) return gg_fail(err, "general.alignment %llu unsupported", (unsigned long long)align);
   data = (data + align - 1) / align * align;
   g->lo = malloc((size_t)(g->nl ? g->nl : 1) * 8), g->hi = malloc((size_t)(g->nl ? g->nl : 1) * 8);
   if (!g->lo || !g->hi) return gg_fail(err, "out of memory");
@@ -299,8 +308,11 @@ static int gg_open(GgFile *g, const char *path, char *err) {
   }
   for (size_t i = 0; i < g->nt; i++) {
     GgT *t = &g->t[i];
+    // HARDEN E2: compare without sums that can wrap
+    uint64_t size = (uint64_t)st.st_size;
+    if (t->src > size || data > size - t->src || t->bytes > size - t->src - data) { free(ord); return gg_fail(err, "%s: data past the end of %s (truncated)", t->name, path); }
     t->src += data;
-    if (t->src + t->bytes > (uint64_t)st.st_size) { free(ord); return gg_fail(err, "%s: data past the end of %s (truncated)", t->name, path); }
+    if (t->src + t->bytes > size) { free(ord); return gg_fail(err, "%s: data past the end of %s (truncated)", t->name, path); }
   }
   for (size_t k = 0; k < g->nt; k++) {
     GgT *t = &g->t[ord[k]];
@@ -638,7 +650,12 @@ static int gg_mm_open(GgMm *m, const char *path, char *err) {
     if (r.bad || t->nd < 1 || t->nd > GG_MM_MAXDIM) { r.bad = 1; break; }
     uint64_t n = 1;
     for (uint32_t j = 0; j < GG_MM_MAXDIM; j++) t->ne[j] = 1;
-    for (uint32_t j = 0; j < t->nd; j++) t->ne[j] = gg_u64(&r), n *= t->ne[j];
+    // HARDEN E3: bounded dims, so n * 4 (and the F16 widening's n floats) cannot wrap
+    for (uint32_t j = 0; j < t->nd; j++) {
+      t->ne[j] = gg_u64(&r);
+      if (t->ne[j] == 0 || t->ne[j] > ((uint64_t)1 << 36) || n > ((uint64_t)1 << 36) / t->ne[j]) { free(r.buf); return gg_fail(err, "mmproj: %s dimension %u out of range", t->name ? t->name : "?", j); }
+      n *= t->ne[j];
+    }
     t->ty = gg_u32(&r);
     t->rel = gg_u64(&r);
     t->bytes = t->ty == 0 ? n * 4 : t->ty == 1 ? n * 2 : 0;
@@ -650,11 +667,14 @@ static int gg_mm_open(GgMm *m, const char *path, char *err) {
   uint64_t data = r.off + r.p;
   free(r.buf);
   if (bad) return gg_fail(err, "%s: header truncated or corrupt", path);
-  if (!align) return gg_fail(err, "general.alignment 0");
+  // HARDEN E4: GGUF alignments are small powers of two; anything else is a corrupt header (and could wrap the rounding)
+  if (!align || align > (1u << 20) || (align & (align - 1))) return gg_fail(err, "general.alignment %llu unsupported", (unsigned long long)align);
   data = (data + align - 1) / align * align;
   for (size_t i = 0; i < m->nt; i++) {
-    m->t[i].src = data + m->t[i].rel;
-    if (m->t[i].ty <= 1 && m->t[i].src + m->t[i].bytes > (uint64_t)st.st_size) return gg_fail(err, "%s: data past the end of %s", m->t[i].name, path);
+    // HARDEN E3: every typed tensor (BF16 too, which the old check skipped), compared without sums that can wrap
+    uint64_t size = (uint64_t)st.st_size, rel = m->t[i].rel, b = m->t[i].bytes;
+    if (rel > size || data > size - rel || b > size - rel - data) return gg_fail(err, "%s: data past the end of %s", m->t[i].name, path);
+    m->t[i].src = data + rel;
   }
   return 0;
 }

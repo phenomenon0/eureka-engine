@@ -81,3 +81,4 @@ repository.
 | [Inference reliability, 2026-11-04](records/inference-reliability-2026-11-04.md) | Request parsing, cancellation and recovery fixes across the five backends. |
 | [Split-key attention and long-context decode, 2026-11-06](records/sk8-and-long-context-2026-11-06.md) | `LLB_ATTN_SK8` has no measurable NLL cost; 4B decode time at long context is attention-bound. |
 | [CUDA clean-clone proof, 2026-11-06](records/cuda-proof-2026-11-06.md) | This repository's tip built from a clean clone and run on an RTX 3090. |
+| [Hardening review, 2026-11-17](records/hardening-2026-11.md) | Model-file parsing bounds (tokenizer, GGUF, projector) and cancel handling, with a per-platform status. |
