@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # lane D: eureka-engine (Linux) -> the bend-app EUREKA_LINUX_ENGINE contract dir. Scratch only.
-#   SRC  engine clone (default /tmp/lp-engine-build)   APP  bend-app tree for llb-serve's serve.c (read-only)
+#   SRC  engine clone (default /tmp/lp-engine-build)   APP  bend-app tree (branch linux/parity: serve.c with the Linux CUDA tower), read-only; copied to OUT
 #   OUT  build scratch (default /tmp/lp-out)            DEST contract dir (default /tmp/eureka-linux-engine)
 set -euo pipefail
-SRC=${SRC:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}; APP=${APP:-/home/omen/worktrees/bend-app-android}
+SRC=${SRC:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}; APP=${APP:-/home/omen/worktrees/eureka-linux-parity}
 OUT=${OUT:-/tmp/lp-out}; DEST=${DEST:-/tmp/eureka-linux-engine}
 CC=${CC:-/usr/lib64/rocm/llvm/bin/clang-19}   # clang >= 19 (bend cc_find, #embed); Fedora 43 ships clang-18 only
 CUDA=${CUDA_HOME:-/usr/local/cuda}
@@ -54,7 +54,6 @@ s=$OUT/serve; rm -rf "$s"; mkdir -p "$s"; cp -a "$APP/desktop/engine/metal/src/.
 VH=$s/vision; mkdir -p "$VH"; cp -R "$APP/engine-src/vision/host" "$APP/engine-src/vision/third_party" "$VH/"
 (cd "$VH" && patch -s --fuzz=0 -p1 < "$APP/desktop/engine/metal/patches/vision-mintok.patch")
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -w -I"$VH/host" -I"$VH/third_party" -c "$VH/host/vpre.c" -o "$s/vpre.o"
-if [ -n "${SERVE_PATCH:-}" ]; then (cd "$s/src" && patch -p1 --fuzz=0 < "$SERVE_PATCH"); fi
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -pthread -I"$VH/host" "$s/src/serve.c" "$s/src/json.c" "$s/src/speak_route.c" \
   "$s/src/vendor/tools/sys1dual/serve_structured.c" "$s/src/vendor/host/llb_structured.c" "$s/vpre.o" -lm -o "$s/llb-serve"
 
