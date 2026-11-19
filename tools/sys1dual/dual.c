@@ -55,6 +55,11 @@ static char *text;
 static jv *req;
 static Record *rec;
 static int mode,steps,seq,prompt_n,*prompt_ids,prompt_cap;
+/* LINUX-PARITY (GRAMMAR-MASK): this generate request set "grammar" / "json_schema" and the host took it. llb_host.c's
+   smp_pick masks every pick from the first generated position on and fails the engine on a pick the mask refuses, so a
+   completed request's every id went through the mask: the response says "grammar":"on", as sys1mac's dualm.c does
+   (llb-serve --engine-grammar fails a masked request without it: 502 "the engine did not apply the tool grammar") */
+static int gram_req;
 /* tools/payload-anyshape.patch: a generate prompt is bounded by the engine's KV capacity
  * (ctx, prompt + steps fixed at launch), not CLEF_MAX_T (16384, the decide head's budget);
  * the id buffers grow to the request */
@@ -407,6 +412,13 @@ static void init(const char *dir) {
     if (!tmp || !*tmp) clef_fail("set TMPDIR to owned scratch");
     if (snprintf(hidden_path,sizeof hidden_path,"%s/sys1dual-%d.hidden",tmp,(int)getpid())>=(int)sizeof hidden_path) clef_fail("TMPDIR too long");
     if (q35_tok_load(&tok,dir)) clef_fail("sidecar requires tokenizer.bin (llb-tok extract)");
+    /* LINUX-PARITY: the "grammar" mask (llb_host.c) reads LLB_TOKENIZER; llb-serve's --engine-grammar sends masks but the
+       desktop supervisor never sets it, so tool_choice "required" was a 400 ("set LLB_TOKENIZER"). Default: the
+       sidecar's own tokenizer.bin, the one just loaded */
+    if (!getenv("LLB_TOKENIZER")) {
+        char tb[4096];
+        if (snprintf(tb,sizeof tb,"%s/tokenizer.bin",dir)<(int)sizeof tb) setenv("LLB_TOKENIZER",tb,1);
+    }
     const char *ltr=getenv("LLB_LOAD_TRACE");
     if (ltr && *ltr && strcmp(ltr,"0")) fprintf(stderr,"load: tokenizer %.1f ms\n",(now()-t0)*1000);
     const char *nh=getenv("LLB_SYS1_NOHEAD");
@@ -418,6 +430,7 @@ static void init(const char *dir) {
     trunk_d=clef_gguf_width(gguf);
     glue_ok=nohead && trunk_d%256==0 && trunk_d<=8192;
     if (glue_ok) glue_out_open(gguf);
+    if (glue_ok && !glue_out_width()) glue_ok=0; /* LINUX-PARITY: an output matrix glue_out cannot read: readout off, generate on */
     if (glue_ok && glue_out_width()!=trunk_d) clef_fail("sys1: NOHEAD readout rows are not the trunk width (embedding_length)");
     if (nohead) fprintf(stderr,"sys1: NOHEAD (no clef head; decide refused; readout %s, d %d)\n",glue_ok?"from output.weight":"off: glue_out reads rows of 256k cols <= 8192 only",trunk_d);
     else clef_head_open(&head,gguf);
@@ -710,8 +723,10 @@ static int parse(char *line,unsigned ctx,char **cmd,const char **hidden,unsigned
             return free(ids),refuse("sample must be a key=val,... string without spaces"),0;
         /* G1: the first generated position is c (positions 0..c-1 are the prompt, a
            continuation included); no field = the grammar off for this request */
+        gram_req=0;
         if (llb_grammar_configure(gs?"json_schema":gg?"gbnf":NULL,gs?gs->str:gg?gg->str:NULL,(unsigned)c)!=0)
             return free(ids),refuse("bad json_schema / grammar (see stderr)"),0;
+        gram_req=gs||gg;
         if (!sess_check(sid,2,ids,c,(int)k->num)) return free(ids),0;
         mode=2;
         steps=(int)k->num;
@@ -979,6 +994,7 @@ void dual_done(void) {
         sb_add(&o,"],\"text\":");
         json_quote(&o,t);
         if (llb_pfx_on()) sb_fmt(&o,",\"cached_tokens\":%d",cached_n); /* W1-KVPFX */
+        if (gram_req) sb_add(&o,",\"grammar\":\"on\""); /* LINUX-PARITY (GRAMMAR-MASK), see gram_req */
         if (ro_n) { /* G4 F1 readout: last prompt row . output.weight rows (float64 dot, as readout.py) */
             float *h=clef_hidden_read(hidden_path,prompt_n,trunk_d),row[8192];
             const float *last=h+(size_t)(prompt_n-1)*trunk_d;

@@ -62,7 +62,7 @@ step "6. stage $DEST/{cuda,cpu}"
 rm -rf "$DEST"; mkdir -p "$DEST/cuda" "$DEST/cpu"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$DEST/cuda/"; cp "$OUT/gpu/engine_gpu" "$DEST/cuda/engine_gpu"
 # NVRTC: engine_gpu compiles its kernels at first run; DT_RPATH $ORIGIN finds these beside it (a driver-only box has none)
-cp -L "$CUDA"/lib64/libnvrtc.so.13 "$CUDA"/lib64/libnvrtc-builtins.so.13.* "$DEST/cuda/" 2>/dev/null || cp -L "$CUDA"/lib64/libnvrtc.so.13 "$CUDA"/lib64/libnvrtc-builtins.so* "$DEST/cuda/"
+cp -L "$CUDA"/lib64/libnvrtc.so.13 "$CUDA"/lib64/libnvrtc-builtins.so.13.[0-9] "$DEST/cuda/"
 cp "$v/cudavis-cli" "$DEST/cuda/"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$OUT/cpu/engine_cpu" "$DEST/cpu/"
 ls -la "$DEST"/*

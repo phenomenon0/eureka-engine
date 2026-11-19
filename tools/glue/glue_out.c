@@ -51,9 +51,15 @@ void glue_out_open(const char *path) {
         free(name);
     }
     if (r.bad || !found || !align || align > 4096) clef_fail("glue: output.weight missing / corrupt GGUF");
-    if (!out_d || out_d % 256 || (out_type != 0 && out_type != 8 && out_type != 14))
-        clef_fail(found == 2 ? "glue: output.weight wants 256k cols <= 8192, F32/Q8_0/Q6_K"
-                             : "glue: tied token_embd.weight wants 256k cols <= 8192, F32/Q8_0/Q6_K");
+    if (!out_d || out_d % 256 || (out_type != 0 && out_type != 8 && out_type != 14)) {
+        // LINUX-PARITY: an output matrix glue_out cannot read (Kev-4B's tied token_embd.weight is Q4_K) turns the
+        // readout off (glue_out_width() 0; dual.c refuses readout requests), not the whole engine: generate needs none
+        fprintf(stderr, "%s: readout off\n", found == 2 ? "glue: output.weight wants 256k cols <= 8192, F32/Q8_0/Q6_K"
+                                                        : "glue: tied token_embd.weight wants 256k cols <= 8192, F32/Q8_0/Q6_K");
+        close(out_fd), out_fd = -1, out_d = 0;
+        free(r.buf);
+        return;
+    }
     out_rb = out_type == 0 ? (uint64_t)out_d * 4 : out_type == 8 ? (uint64_t)out_d / 32 * 34 : (uint64_t)out_d / 256 * 210;
     out_off += (r.off + r.p + align - 1) / align * align;
     free(r.buf);
