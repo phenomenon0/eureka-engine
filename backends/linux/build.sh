@@ -1,28 +1,49 @@
 #!/usr/bin/env bash
-# lane D: eureka-engine (Linux) -> the bend-app EUREKA_LINUX_ENGINE contract dir. Scratch only.
-#   SRC  engine clone (default /tmp/lp-engine-build)   APP  bend-app tree (branch linux/parity: serve.c with the Linux CUDA tower), read-only; copied to OUT
-#   OUT  build scratch (default /tmp/lp-out)            DEST contract dir (default /tmp/eureka-linux-engine)
+# Linux desktop engine build: eureka-engine -> EUREKA_LINUX_ENGINE contract dir (scratch builds only).
+#   SRC  engine clone (default: repo root of this script)
+#   APP  bend-app tree (serve.c with Linux CUDA tower + SIGUSR1 cancel), read-only; copied to OUT
+#   OUT  build scratch (default /tmp/lp-out)
+#   DEST contract dir (default /tmp/eureka-linux-engine)
 set -euo pipefail
-SRC=${SRC:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}; APP=${APP:-/home/omen/worktrees/eureka-linux-parity}
-OUT=${OUT:-/tmp/lp-out}; DEST=${DEST:-/tmp/eureka-linux-engine}
-CC=${CC:-/usr/lib64/rocm/llvm/bin/clang-19}   # clang >= 19 (bend cc_find, #embed); Fedora 43 ships clang-18 only
+SRC=${SRC:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}
+APP=${APP:-/home/omen/worktrees/eureka-linux-parity}
+OUT=${OUT:-/tmp/lp-out}
+DEST=${DEST:-/tmp/eureka-linux-engine}
+
+# Auto-discover clang >= 19 (needed for #embed in Bend-emitted C)
+if [ -z "${CC:-}" ]; then
+  for c in /usr/lib64/rocm/llvm/bin/clang-19 clang-21 clang-20 clang-19 clang; do
+    if command -v "$c" >/dev/null 2>&1; then
+      ver=$("$c" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 | cut -d. -f1 || true)
+      if [ -n "$ver" ] && [ "$ver" -ge 19 ] 2>/dev/null; then CC="$c"; break; fi
+    fi
+  done
+  : "${CC:?clang >= 19 is required (set CC=/path/to/clang-19)}"
+fi
+
 CUDA=${CUDA_HOME:-/usr/local/cuda}
 export PATH=$HOME/.bun/bin:$CUDA/bin:$PATH CC CUDA_HOME=$CUDA
 mkdir -p "$OUT/libshim"
-# Fedora has libopenblas.so.0 but no -devel symlink: a link-time shim (runtime needs the openblas package)
-ln -sf /usr/lib64/libopenblas.so.0 "$OUT/libshim/libopenblas.so"
+
+# Auto-discover libopenblas.so.0 across Fedora (/usr/lib64) and Debian/Ubuntu (/usr/lib/x86_64-linux-gnu, aarch64)
+OPENBLAS_SO=""
+for p in /usr/lib64/libopenblas.so.0 /usr/lib/x86_64-linux-gnu/libopenblas.so.0 /usr/lib/aarch64-linux-gnu/libopenblas.so.0 /usr/lib/libopenblas.so.0; do
+  if [ -e "$p" ]; then OPENBLAS_SO="$p"; break; fi
+done
+[ -n "$OPENBLAS_SO" ] || { echo "error: libopenblas.so.0 not found (install openblas / libopenblas0)" >&2; exit 1; }
+ln -sf "$OPENBLAS_SO" "$OUT/libshim/libopenblas.so"
 export LIBRARY_PATH=$OUT/libshim${LIBRARY_PATH:+:$LIBRARY_PATH}
+
 step() { echo; echo "=== $* ($(date +%T))"; }
 
-step "1. engine_gpu: build.sh (pinned bend 240ecef4 tree aada4cbf, patch stack, emit, remap_cc)"
+step "1. engine_gpu: build.sh (pinned bend 240ecef4, patch stack, emit, linuxcuda.py, remap_cc)"
 if [ "${SKIP_GPU:-0}" != 1 ]; then
   LLB_BEND=$SRC LLB_OUT=$OUT/gpu bash "$SRC/build.sh"
 fi
-# the served edits every OS needs (wincuda.ps1 edits 2 + 3: LLB_GEN_EOG, the decode run under SYS1), then the same link
 python3 "$SRC/backends/linux/linuxcuda.py" "$OUT/gpu/llb-engine.c" "$OUT/gpu/llb-engine.linux.c"
 (cd "$OUT/gpu" && LLB_CC_EXTRA="$(echo obj/*.o) -lopenblas" bash "$SRC/tools/remap_cc.sh" llb-engine.linux.c engine_gpu)
 
-step "2. engine_cpu (backends/windows/engine_cpu.c, native POSIX: no shim)"
+step "2. engine_cpu (backends/windows/engine_cpu.c, native POSIX)"
 o=$OUT/cpu/obj; mkdir -p "$o"; objs=()
 req=(-std=c11 -O2 -ffp-contract=off -fno-fast-math -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -Wall -Wextra -Wno-unused-function -Wno-unused-parameter)
 for u in tools/sys1dual/dual.c tools/metrics/metrics.c tools/metrics/tokstream.c tools/glue/glue_out.c tools/clef3/head.c \
@@ -36,7 +57,7 @@ step "3. gguf2pack + llb-tok (this engine tree: one pack contract)"
 "$CC" -std=c11 -O2 -Wall -D_GNU_SOURCE -o "$OUT/gguf2pack" "$SRC/tools/gguf2pack.c"
 "$CC" -O2 -o "$OUT/llb-tok" "$SRC/tools/llb/llb-tok.c"
 
-step "4. cudavis-cli (vision/: as build-vision.ps1: VITC_NO_CUBLAS, cudart static; fatbin sm_80..sm_120 (+PTX); the tower needs mma.m16n8k16 = sm_80+ + PTX)"
+step "4. cudavis-cli (VITC_NO_CUBLAS, cudart static; fatbin sm_80..sm_120 + PTX)"
 v=$OUT/vision; mkdir -p "$v"
 CF=(-std=c11 -D_GNU_SOURCE -O3 -ffp-contract=off -I"$SRC/vision" -I"$SRC/host")
 gcc "${CF[@]}" -w -c "$SRC/vision/vpre.c" -o "$v/vpre.o"
@@ -48,9 +69,8 @@ nvcc -O3 -fmad=false "${GENC[@]}" -std=c++17 -DVITC_NO_CUBLAS -Xcompiler -ffp-co
   -c "$SRC/vision/vitc.cu" -o "$v/vitc.o"
 nvcc "${GENC[@]}" -cudart static "$v/cli.o" "$v/vitc.o" "$v/vpre.o" "$v/vmm.o" -lm -lpthread -o "$v/cudavis-cli"
 
-step "5. llb-serve (bend-app desktop/engine/metal/src/serve.c, POSIX build, + vpre.o from the app's vision host)"
+step "5. llb-serve (bend-app desktop/engine/metal/src/serve.c, POSIX build, + vpre.o from app vision host)"
 s=$OUT/serve; rm -rf "$s"; mkdir -p "$s"; cp -a "$APP/desktop/engine/metal/src/." "$s/src/"
-# the app tree's vision host (build-engine.sh: engine-src vision/host + patches/vision-mintok.patch -> obj-vis/vpre.o)
 VH=$s/vision; mkdir -p "$VH"; cp -R "$APP/engine-src/vision/host" "$APP/engine-src/vision/third_party" "$VH/"
 (cd "$VH" && patch -s --fuzz=0 -p1 < "$APP/desktop/engine/metal/patches/vision-mintok.patch")
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -w -I"$VH/host" -I"$VH/third_party" -c "$VH/host/vpre.c" -o "$s/vpre.o"
@@ -59,9 +79,13 @@ VH=$s/vision; mkdir -p "$VH"; cp -R "$APP/engine-src/vision/host" "$APP/engine-s
 
 step "6. stage $DEST/{cuda,cpu}"
 rm -rf "$DEST"; mkdir -p "$DEST/cuda" "$DEST/cpu"
-cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$DEST/cuda/"; cp "$OUT/gpu/engine_gpu" "$DEST/cuda/engine_gpu"
-# NVRTC: engine_gpu compiles its kernels at first run; DT_RPATH $ORIGIN finds these beside it (a driver-only box has none)
-cp -L "$CUDA"/lib64/libnvrtc.so.13 "$CUDA"/lib64/libnvrtc-builtins.so.13.[0-9] "$DEST/cuda/"
+cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$DEST/cuda/"
+cp "$OUT/gpu/engine_gpu" "$DEST/cuda/engine_gpu"
+# Auto-discover NVRTC sonames for the installed CUDA major version
+NVRTC_MAIN=$(ls "$CUDA"/lib64/libnvrtc.so.[0-9]* 2>/dev/null | grep -E 'libnvrtc\.so\.[0-9]+$' | head -n1 || true)
+NVRTC_BUILTINS=$(ls "$CUDA"/lib64/libnvrtc-builtins.so.[0-9]*.[0-9]* 2>/dev/null | grep -E 'libnvrtc-builtins\.so\.[0-9]+\.[0-9]+$' | head -n1 || true)
+[ -n "$NVRTC_MAIN" ] && [ -n "$NVRTC_BUILTINS" ] || { echo "error: NVRTC libs not found in $CUDA/lib64" >&2; exit 1; }
+cp -L "$NVRTC_MAIN" "$NVRTC_BUILTINS" "$DEST/cuda/"
 cp "$v/cudavis-cli" "$DEST/cuda/"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$OUT/cpu/engine_cpu" "$DEST/cpu/"
 ls -la "$DEST"/*
