@@ -418,14 +418,17 @@ static void pf_chunk(u32 T, u32 k, u32 dT, LlbShape sh) {
       llb_dptr cy3[3] = { pf_qkv, pf_kb, pf_vb };
       pf_catq(3, fm + 14, cw3, cn3, cy3, d, T);
       // q rows of 2 qa -> pf_cnv (q heads, then the gates), k -> pf_kn
+      CUfunction slot_fn = llb_kv_type == 1 ? gpu_pfslot_f16 : llb_kv_type == 2 ? gpu_pfslot_q8 : gpu_pfslot;
+      u32 slot_bx = llb_kv_type == 0 ? 1024 : 256;
       if (!LLB_LAUNCH(gpu_pfqkr, nh, T, 256, &pf_qkv, &qn, &pf_cnv, &q2, &one, &pos0)
         || !LLB_LAUNCH(gpu_pfqkr, nkv, T, 256, &pf_kb, &kn, &pf_kn, &kv, &zero, &pos0)
-        || !LLB_LAUNCH(gpu_pfslot, T, 2, 1024, &pf_kn, &pf_vb, &kc, &vc, &pos0, &kv)) {
+        || !LLB_LAUNCH(slot_fn, T, 2, slot_bx, &pf_kn, &pf_vb, &kc, &vc, &pos0, &kv)) {
         err_fail("fast prefill: launch failed");
       }
-      // the chunk's causal attention, tiled (llb_pf.cuh pf_attn; PF_ATT_SM)
+      // the chunk's causal attention, tiled (llb_pf.cuh pf_attn / pf_attn_f16 / pf_attn_q8; PF_ATT_SM)
       u32 asm_ = (32 * 264 + 256 * 40) * 2;
-      if (!LLB_LAUNCH_SM(gpu_pfattn, nkv, (T * grp + 63) / 64, 128, asm_, &pf_cnv, &q2, &kc, &vc, &kv,
+      CUfunction attn_fn = llb_kv_type == 1 ? gpu_pfattn_f16 : llb_kv_type == 2 ? gpu_pfattn_q8 : gpu_pfattn;
+      if (!LLB_LAUNCH_SM(attn_fn, nkv, (T * grp + 63) / 64, 128, asm_, &pf_cnv, &q2, &kc, &vc, &kv,
           &pf_go, &qa, &pos0, &T, &grp)) {
         err_fail("fast prefill: launch failed");
       }

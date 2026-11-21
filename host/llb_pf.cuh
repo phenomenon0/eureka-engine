@@ -223,6 +223,9 @@ __device__ __forceinline__ u32 llb_mrp(u32 s, u32 t) {
 }
 #endif
 
+// YaRN RoPE scaling globals: { factor, mscale, orig_ctx, 0 } (factor <= 1.0f = off, bit-identical)
+__device__ float llb_yarn[4];
+
 // llb_qkr: grid (heads, T), token t at pos0 + t; x rows of stride n (the GEMM's), y rows of
 // stride n too (q: heads at h * 256, gates after all heads; k: n = heads * 256)
 extern "C" __global__ void __launch_bounds__(256) pf_qkr(
@@ -255,9 +258,30 @@ extern "C" __global__ void __launch_bounds__(256) pf_qkr(
   const float s = sv;
   const float v = __fmul_rn(__fmul_rn(xv, s), w[t]);
   if (t < rh) {
-    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)pow((double)__uint_as_float(llb_cfg[1]),
-      (double)__fdiv_rn(-(float)(2 * t), (float)(2 * rh))));
-    const float co = (float)cos((double)th), si = (float)sin((double)th);
+    double freq = pow((double)__uint_as_float(llb_cfg[1]),
+      (double)__fdiv_rn(-(float)(2 * t), (float)(2 * rh)));
+    const float yf = llb_yarn[0];
+    float ms = 1.0f;
+    if (yf > 1.0f) {
+      // YaRN NTK-by-parts (Peng et al. 2023; beta_fast=32, beta_slow=1)
+      const double orig = (double)llb_yarn[2];
+      const double wavelen = 6.283185307179586476925286766559 / freq;
+      const double lo = orig;
+      const double hi = orig * 0.03125;
+      double gamma;
+      if (wavelen < hi) {
+        gamma = 1.0;
+      } else if (wavelen > lo) {
+        gamma = 0.0;
+      } else {
+        gamma = (orig / wavelen - 1.0) / 31.0;
+      }
+      freq = freq * ((1.0 - gamma) / (double)yf + gamma);
+      ms = llb_yarn[1];
+    }
+    const float th = __fmul_rn((float)llb_mrp(pos, t), (float)freq);
+    const float co = __fmul_rn((float)cos((double)th), ms);
+    const float si = __fmul_rn((float)sin((double)th), ms);
     const float b = __fmul_rn(__fmul_rn(xb, s), w[t + rh]);
     yr[2 * t]     = __fsub_rn(__fmul_rn(v, co), __fmul_rn(b, si));
     yr[2 * t + 1] = __fadd_rn(__fmul_rn(v, si), __fmul_rn(b, co));
@@ -275,6 +299,64 @@ extern "C" __global__ void __launch_bounds__(1024) pf_slot(const float* __restri
   const u32 t = blockIdx.x;
   for (u32 i = threadIdx.x; i < kv; i += 1024) {
     (blockIdx.y ? vc : kc)[(u64)(pos0 + t) * kv + i] = (blockIdx.y ? v : k)[(u64)t * kv + i];
+  }
+}
+
+__device__ __forceinline__ unsigned short pf_f2h1(float x) {
+  u32 r;
+  asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(0.0f), "f"(x));
+  return (unsigned short)(r & 0xffffu);
+}
+__device__ __forceinline__ float pf_h2f1(unsigned short h) {
+  float r;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(r) : "h"(h));
+  return r;
+}
+
+// FP16 KV slot writer: grid (T, 2), block 256 (works for T=1 decode and T=1..512 prefill)
+extern "C" __global__ void __launch_bounds__(256) pf_slot_f16(const float* __restrict__ k,
+  const float* __restrict__ v, unsigned short* __restrict__ kc, unsigned short* __restrict__ vc,
+  u32 pos0, u32 kv) {
+  const u32 t = blockIdx.x;
+  const float* src = (blockIdx.y ? v : k) + (u64)t * kv;
+  unsigned short* dst = (blockIdx.y ? vc : kc) + (u64)(pos0 + t) * kv;
+  for (u32 i = threadIdx.x * 2; i < kv; i += 512) {
+    u32 h2;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(h2) : "f"(src[i + 1]), "f"(src[i]));
+    *(u32*)(dst + i) = h2;
+  }
+}
+
+// Q8_0 KV slot writer: split-plane per slot [int8 q[kv], f16 d[kv/32]] (stride = kv + (kv/32)*2)
+// grid (T, 2), block 256 (8 warps, each warp quantizes 32-element blocks)
+extern "C" __global__ void __launch_bounds__(256) pf_slot_q8(const float* __restrict__ k,
+  const float* __restrict__ v, unsigned char* __restrict__ kc, unsigned char* __restrict__ vc,
+  u32 pos0, u32 kv) {
+  const u32 t = blockIdx.x;
+  const u32 w = threadIdx.x >> 5, l = threadIdx.x & 31;
+  const u32 nb = kv >> 5;
+  const u64 stride = (u64)kv + (u64)nb * 2;
+  const float* src = (blockIdx.y ? v : k) + (u64)t * kv;
+  unsigned char* slot = (blockIdx.y ? vc : kc) + (u64)(pos0 + t) * stride;
+  signed char* qs = (signed char*)slot;
+  unsigned short* ds = (unsigned short*)(slot + kv);
+  for (u32 b = w; b < nb; b += 8) {
+    const float x = src[(u64)b * 32 + l];
+    float amax = fabsf(x);
+    #pragma unroll
+    for (u32 m = 16; m > 0; m >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    }
+    const float d = amax * (1.0f / 127.0f);
+    signed char qi = 0;
+    if (amax > 0.0f) {
+      int qv = (int)roundf(x / d);
+      qi = (signed char)(qv > 127 ? 127 : (qv < -127 ? -127 : qv));
+    }
+    qs[(u64)b * 32 + l] = qi;
+    if (l == 0) {
+      ds[b] = pf_f2h1(d);
+    }
   }
 }
 
@@ -436,6 +518,190 @@ extern "C" __global__ void __launch_bounds__(128) pf_attn(const float* __restric
       }
     }
   }
+}
+
+// Fast prefill FlashAttention for compressed KV caches (KVT=1: FP16, KVT=2: Q8_0)
+template <int KVT>
+__device__ __forceinline__ void pf_attn_kv(const float* __restrict__ q, u32 qs,
+  const void* __restrict__ kc, const void* __restrict__ vc, u32 kv, float* __restrict__ out,
+  u32 os, u32 pos0, u32 T, u32 grp) {
+  extern __shared__ u32 pfa_sm[];
+  u32* Ks = pfa_sm;               // 32 keys x 132 (264 halves)
+  u32* Vt = pfa_sm + 32 * 132;    // 256 dims x 20 (40 halves)
+  const u32 tid = threadIdx.x, w = tid >> 5, g = (tid >> 2) & 7, c = tid & 3;
+  const u32 R = T * grp, rb = blockIdx.y * 64, gk = blockIdx.x * 256;
+  const u32 re = R < rb + 64 ? R : rb + 64, kend = pos0 + (re - 1) / grp + 1;
+  const u64 kvs = (u64)kv + (u64)(kv >> 5) * 2;
+  u32 tr[2], qp[2];
+  const float* qr[2];
+#pragma unroll
+  for (u32 j = 0; j < 2; j++) {
+    const u32 i = rb + w * 16 + g + 8 * j, ii = i < R ? i : R - 1;
+    tr[j] = ii / grp;
+    qp[j] = pos0 + tr[j];
+    qr[j] = q + (u64)tr[j] * qs + (blockIdx.x * grp + ii % grp) * 256;
+  }
+  u32 qf[16][4];
+#pragma unroll
+  for (u32 s = 0; s < 16; s++) {
+    const u32 d = s * 16 + 2 * c;
+    qf[s][0] = pf_h2(qr[0][d] * 0.0625f, qr[0][d + 1] * 0.0625f);
+    qf[s][1] = pf_h2(qr[1][d] * 0.0625f, qr[1][d + 1] * 0.0625f);
+    qf[s][2] = pf_h2(qr[0][d + 8] * 0.0625f, qr[0][d + 9] * 0.0625f);
+    qf[s][3] = pf_h2(qr[1][d + 8] * 0.0625f, qr[1][d + 9] * 0.0625f);
+  }
+  float o[32][4];
+#pragma unroll
+  for (u32 n = 0; n < 32; n++) {
+    o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+  }
+  float mx[2] = {__uint_as_float(0xFF800000u), __uint_as_float(0xFF800000u)}, l[2] = {0.0f, 0.0f};
+  for (u32 k0 = 0; k0 < kend; k0 += 32) {
+    __syncthreads();
+    for (u32 i = tid; i < 32 * 64; i += 128) {
+      const u32 r = i >> 6, d = (i & 63) * 4;
+      if (KVT == 1) {
+        uint2 x = make_uint2(0u, 0u);
+        if (k0 + r < kend) x = *(const uint2*)((const unsigned short*)kc + (u64)(k0 + r) * kv + gk + d);
+        Ks[r * 132 + d / 2] = x.x;
+        Ks[r * 132 + d / 2 + 1] = x.y;
+      } else {
+        float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (k0 + r < kend) {
+          const unsigned char* row = (const unsigned char*)kc + (u64)(k0 + r) * kvs;
+          const float sc = pf_h2f1(((const unsigned short*)(row + kv))[(gk + d) >> 5]);
+          const u32 p = *(const u32*)(row + gk + d);
+          x.x = (float)(signed char)(p & 0xffu) * sc;
+          x.y = (float)(signed char)((p >> 8) & 0xffu) * sc;
+          x.z = (float)(signed char)((p >> 16) & 0xffu) * sc;
+          x.w = (float)(signed char)((p >> 24) & 0xffu) * sc;
+        }
+        Ks[r * 132 + d / 2] = pf_h2(x.x, x.y);
+        Ks[r * 132 + d / 2 + 1] = pf_h2(x.z, x.w);
+      }
+    }
+    for (u32 i = tid; i < 16 * 64; i += 128) {
+      const u32 r = (i >> 6) * 2, d = (i & 63) * 4;
+      if (KVT == 1) {
+        uint2 a = make_uint2(0u, 0u), b = a;
+        if (k0 + r < kend) a = *(const uint2*)((const unsigned short*)vc + (u64)(k0 + r) * kv + gk + d);
+        if (k0 + r + 1 < kend) b = *(const uint2*)((const unsigned short*)vc + (u64)(k0 + r + 1) * kv + gk + d);
+        Vt[d * 20 + r / 2]       = (a.x & 0xffffu) | ((b.x & 0xffffu) << 16);
+        Vt[(d + 1) * 20 + r / 2] = (a.x >> 16)     | (b.x & 0xffff0000u);
+        Vt[(d + 2) * 20 + r / 2] = (a.y & 0xffffu) | ((b.y & 0xffffu) << 16);
+        Vt[(d + 3) * 20 + r / 2] = (a.y >> 16)     | (b.y & 0xffff0000u);
+      } else {
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f), b = a;
+        if (k0 + r < kend) {
+          const unsigned char* row = (const unsigned char*)vc + (u64)(k0 + r) * kvs;
+          const float sc = pf_h2f1(((const unsigned short*)(row + kv))[(gk + d) >> 5]);
+          const u32 p = *(const u32*)(row + gk + d);
+          a.x = (float)(signed char)(p & 0xffu) * sc;
+          a.y = (float)(signed char)((p >> 8) & 0xffu) * sc;
+          a.z = (float)(signed char)((p >> 16) & 0xffu) * sc;
+          a.w = (float)(signed char)((p >> 24) & 0xffu) * sc;
+        }
+        if (k0 + r + 1 < kend) {
+          const unsigned char* row = (const unsigned char*)vc + (u64)(k0 + r + 1) * kvs;
+          const float sc = pf_h2f1(((const unsigned short*)(row + kv))[(gk + d) >> 5]);
+          const u32 p = *(const u32*)(row + gk + d);
+          b.x = (float)(signed char)(p & 0xffu) * sc;
+          b.y = (float)(signed char)((p >> 8) & 0xffu) * sc;
+          b.z = (float)(signed char)((p >> 16) & 0xffu) * sc;
+          b.w = (float)(signed char)((p >> 24) & 0xffu) * sc;
+        }
+        Vt[d * 20 + r / 2] = pf_h2(a.x, b.x);
+        Vt[(d + 1) * 20 + r / 2] = pf_h2(a.y, b.y);
+        Vt[(d + 2) * 20 + r / 2] = pf_h2(a.z, b.z);
+        Vt[(d + 3) * 20 + r / 2] = pf_h2(a.w, b.w);
+      }
+    }
+    __syncthreads();
+    float sc[4][4];
+#pragma unroll
+    for (u32 n = 0; n < 4; n++) {
+      sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = 0.0f;
+      const u32* kb = Ks + (n * 8 + g) * 132 + c;
+#pragma unroll
+      for (u32 s = 0; s < 16; s++) {
+        pf_hmma(sc[n], qf[s][0], qf[s][1], qf[s][2], qf[s][3], kb[s * 8], kb[s * 8 + 4]);
+      }
+    }
+    float al[2];
+#pragma unroll
+    for (u32 j = 0; j < 2; j++) {
+      float m = mx[j];
+#pragma unroll
+      for (u32 n = 0; n < 4; n++) {
+#pragma unroll
+        for (u32 e = 0; e < 2; e++) {
+          const u32 key = k0 + n * 8 + 2 * c + e;
+          if (key > qp[j]) sc[n][2 * j + e] = __uint_as_float(0xFF800000u);
+          m = fmaxf(m, sc[n][2 * j + e]);
+        }
+      }
+      m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+      m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+      al[j] = expf(mx[j] - m);
+      mx[j] = m;
+      float sum = 0.0f;
+#pragma unroll
+      for (u32 n = 0; n < 4; n++) {
+#pragma unroll
+        for (u32 e = 0; e < 2; e++) {
+          sc[n][2 * j + e] = expf(sc[n][2 * j + e] - m);
+          sum += sc[n][2 * j + e];
+        }
+      }
+      l[j] = l[j] * al[j] + sum;
+    }
+#pragma unroll
+    for (u32 n = 0; n < 32; n++) {
+      o[n][0] *= al[0];
+      o[n][1] *= al[0];
+      o[n][2] *= al[1];
+      o[n][3] *= al[1];
+    }
+#pragma unroll
+    for (u32 s = 0; s < 2; s++) {
+      const u32 a0 = pf_h2(sc[2 * s][0], sc[2 * s][1]), a1 = pf_h2(sc[2 * s][2], sc[2 * s][3]);
+      const u32 a2 = pf_h2(sc[2 * s + 1][0], sc[2 * s + 1][1]);
+      const u32 a3 = pf_h2(sc[2 * s + 1][2], sc[2 * s + 1][3]);
+#pragma unroll
+      for (u32 n = 0; n < 32; n++) {
+        const u32* vb = Vt + (n * 8 + g) * 20 + s * 8 + c;
+        pf_hmma(o[n], a0, a1, a2, a3, vb[0], vb[4]);
+      }
+    }
+  }
+#pragma unroll
+  for (u32 j = 0; j < 2; j++) {
+    l[j] += __shfl_xor_sync(0xffffffffu, l[j], 1);
+    l[j] += __shfl_xor_sync(0xffffffffu, l[j], 2);
+  }
+#pragma unroll
+  for (u32 j = 0; j < 2; j++) {
+    const u32 i = rb + w * 16 + g + 8 * j;
+    if (i < R) {
+      float* y = out + (u64)tr[j] * os + (blockIdx.x * grp + i % grp) * 256 + 2 * c;
+#pragma unroll
+      for (u32 n = 0; n < 32; n++) {
+        *(float2*)(y + n * 8) = make_float2(o[n][2 * j] / l[j], o[n][2 * j + 1] / l[j]);
+      }
+    }
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(128) pf_attn_f16(const float* __restrict__ q, u32 qs,
+  const void* __restrict__ kc, const void* __restrict__ vc, u32 kv, float* __restrict__ out,
+  u32 os, u32 pos0, u32 T, u32 grp) {
+  pf_attn_kv<1>(q, qs, kc, vc, kv, out, os, pos0, T, grp);
+}
+
+extern "C" __global__ void __launch_bounds__(128) pf_attn_q8(const float* __restrict__ q, u32 qs,
+  const void* __restrict__ kc, const void* __restrict__ vc, u32 kv, float* __restrict__ out,
+  u32 os, u32 pos0, u32 T, u32 grp) {
+  pf_attn_kv<2>(q, qs, kc, vc, kv, out, os, pos0, T, grp);
 }
 
 // the deferred step's answer with the tier on: top-1 id 1e9 (no token's), the prompt loop's
@@ -1072,4 +1338,192 @@ extern "C" __global__ void __launch_bounds__(256) llb_a4s_out(
     attn_push(st, &sp, k, p[(u64)k * 256]);
   }
   att[(u64)h * 256 + j] = T2 < T ? __fadd_rn(st[0], 0.0f) : st[0];
+}
+
+// FlashDecoding: O(1)-scratch online-softmax decode attention for arbitrary context length
+// (1 .. 1M+) and KV cache precision (KVT=0: F32, KVT=1: FP16, KVT=2: Q8_0).
+// Grid: (NC <= 256, nkv), block: 256 threads (8 warps). Each block owns one KV head and its
+// grp query heads (<= 8); 8 warps stripe across keys in the chunk while each warp (32 lanes)
+// owns all 256 dims (8 dims per lane, 100% coalesced across all 3 KV formats).
+template <int KVT>
+__device__ __forceinline__ void llb_fd_split_impl(
+  const float* __restrict__ q, const void* __restrict__ kc, const void* __restrict__ vc,
+  float* __restrict__ pr, u32 n, u32 grp, u32 kv, u32 NC) {
+  __shared__ float qs[A4S_GMAX][256];
+  __shared__ float sm_m[8];
+  __shared__ float sm_l[8];
+  __shared__ float sm_o[8][256];
+  const u32 kvh = blockIdx.y, h0 = kvh * grp, gk = kvh * 256;
+  const u32 w = threadIdx.x >> 5, l = threadIdx.x & 31;
+  const u64 kvs = (u64)kv + (u64)(kv >> 5) * 2;
+  for (u32 i = threadIdx.x; i < grp * 256; i += 256) {
+    const u32 gi = i >> 8, d = i & 255;
+    qs[gi][d] = q[(u64)(h0 + gi) * 256 + d] * 0.0625f;
+  }
+  __syncthreads();
+  const u32 chunk = (n + NC - 1) / NC;
+  const u32 t_beg = blockIdx.x * chunk;
+  const u32 t_end = t_beg + chunk < n ? t_beg + chunk : n;
+  float wm[A4S_GMAX], wl[A4S_GMAX];
+  float acc[A4S_GMAX][8];
+  const float ninf = __uint_as_float(0xFF800000u);
+#pragma unroll
+  for (u32 gi = 0; gi < A4S_GMAX; gi++) {
+    wm[gi] = ninf;
+    wl[gi] = 0.0f;
+#pragma unroll
+    for (u32 b = 0; b < 8; b++) {
+      acc[gi][b] = 0.0f;
+    }
+  }
+  for (u32 t = t_beg + w; t < t_end; t += 8) {
+    float kv8[8];
+    if (KVT == 0) {
+      const float* kr = (const float*)kc + (u64)t * kv + gk;
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) kv8[b] = kr[b * 32 + l];
+    } else if (KVT == 1) {
+      const unsigned short* kr = (const unsigned short*)kc + (u64)t * kv + gk;
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) kv8[b] = pf_h2f1(kr[b * 32 + l]);
+    } else {
+      const unsigned char* row = (const unsigned char*)kc + (u64)t * kvs;
+      const signed char* qr = (const signed char*)(row + gk);
+      const unsigned short* dr = (const unsigned short*)(row + kv) + (gk >> 5);
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) kv8[b] = (float)qr[b * 32 + l] * pf_h2f1(dr[b]);
+    }
+    float al_w[A4S_GMAX], p_w[A4S_GMAX];
+    for (u32 gi = 0; gi < grp; gi++) {
+      float dot = 0.0f;
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) {
+        dot = fmaf(kv8[b], qs[gi][b * 32 + l], dot);
+      }
+#pragma unroll
+      for (u32 m = 16; m > 0; m >>= 1) {
+        dot += __shfl_xor_sync(0xffffffffu, dot, m);
+      }
+      const float nm = fmaxf(wm[gi], dot);
+      const float al = wl[gi] > 0.0f ? expf(wm[gi] - nm) : 0.0f;
+      const float pv = expf(dot - nm);
+      wl[gi] = wl[gi] * al + pv;
+      wm[gi] = nm;
+      al_w[gi] = al;
+      p_w[gi] = pv;
+    }
+    float vv8[8];
+    if (KVT == 0) {
+      const float* vr = (const float*)vc + (u64)t * kv + gk;
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) vv8[b] = vr[b * 32 + l];
+    } else if (KVT == 1) {
+      const unsigned short* vr = (const unsigned short*)vc + (u64)t * kv + gk;
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) vv8[b] = pf_h2f1(vr[b * 32 + l]);
+    } else {
+      const unsigned char* row = (const unsigned char*)vc + (u64)t * kvs;
+      const signed char* qr = (const signed char*)(row + gk);
+      const unsigned short* dr = (const unsigned short*)(row + kv) + (gk >> 5);
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) vv8[b] = (float)qr[b * 32 + l] * pf_h2f1(dr[b]);
+    }
+    for (u32 gi = 0; gi < grp; gi++) {
+      const float al = al_w[gi], pv = p_w[gi];
+#pragma unroll
+      for (u32 b = 0; b < 8; b++) {
+        acc[gi][b] = fmaf(pv, vv8[b], acc[gi][b] * al);
+      }
+    }
+  }
+  for (u32 gi = 0; gi < grp; gi++) {
+    if (l == 0) {
+      sm_m[w] = wm[gi];
+      sm_l[w] = wl[gi];
+    }
+#pragma unroll
+    for (u32 b = 0; b < 8; b++) {
+      sm_o[w][b * 32 + l] = acc[gi][b];
+    }
+    __syncthreads();
+    const u32 j = threadIdx.x;
+    float gm = ninf;
+#pragma unroll
+    for (u32 kw = 0; kw < 8; kw++) {
+      if (sm_l[kw] > 0.0f) gm = fmaxf(gm, sm_m[kw]);
+    }
+    float gl = 0.0f, go = 0.0f;
+#pragma unroll
+    for (u32 kw = 0; kw < 8; kw++) {
+      if (sm_l[kw] > 0.0f) {
+        const float wt = expf(sm_m[kw] - gm);
+        gl += sm_l[kw] * wt;
+        go = fmaf(sm_o[kw][j], wt, go);
+      }
+    }
+    float* dst = pr + ((u64)(h0 + gi) * NC + blockIdx.x) * 260;
+    dst[j] = go;
+    if (j == 0) {
+      dst[256] = gm;
+      dst[257] = gl;
+    }
+    __syncthreads();
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256) llb_fd_split_f32(
+  const float* __restrict__ q, const void* __restrict__ kc, const void* __restrict__ vc,
+  float* __restrict__ pr, u32 n, u32 grp, u32 kv, u32 NC) {
+  llb_fd_split_impl<0>(q, kc, vc, pr, n, grp, kv, NC);
+}
+extern "C" __global__ void __launch_bounds__(256) llb_fd_split_f16(
+  const float* __restrict__ q, const void* __restrict__ kc, const void* __restrict__ vc,
+  float* __restrict__ pr, u32 n, u32 grp, u32 kv, u32 NC) {
+  llb_fd_split_impl<1>(q, kc, vc, pr, n, grp, kv, NC);
+}
+extern "C" __global__ void __launch_bounds__(256) llb_fd_split_q8(
+  const float* __restrict__ q, const void* __restrict__ kc, const void* __restrict__ vc,
+  float* __restrict__ pr, u32 n, u32 grp, u32 kv, u32 NC) {
+  llb_fd_split_impl<2>(q, kc, vc, pr, n, grp, kv, NC);
+}
+
+extern "C" __global__ void __launch_bounds__(256) llb_fd_combine(
+  float* __restrict__ att, const float* __restrict__ pr, u32 NC) {
+  __shared__ float sm_m[256];
+  __shared__ float sm_l[256];
+  __shared__ float sm_w[256];
+  __shared__ float sm_gl;
+  const u32 h = blockIdx.x, j = threadIdx.x;
+  const float* base = pr + (u64)h * NC * 260;
+  if (j < NC) {
+    sm_m[j] = base[(u64)j * 260 + 256];
+    sm_l[j] = base[(u64)j * 260 + 257];
+  }
+  __syncthreads();
+  if (j == 0) {
+    float gm = __uint_as_float(0xFF800000u);
+    for (u32 k = 0; k < NC; k++) {
+      if (sm_l[k] > 0.0f) gm = fmaxf(gm, sm_m[k]);
+    }
+    float gl = 0.0f;
+    for (u32 k = 0; k < NC; k++) {
+      if (sm_l[k] > 0.0f) {
+        const float wt = expf(sm_m[k] - gm);
+        sm_w[k] = wt;
+        gl += sm_l[k] * wt;
+      } else {
+        sm_w[k] = 0.0f;
+      }
+    }
+    sm_gl = gl;
+  }
+  __syncthreads();
+  float sum = 0.0f;
+  for (u32 k = 0; k < NC; k++) {
+    const float wt = sm_w[k];
+    if (wt != 0.0f) {
+      sum = fmaf(base[(u64)k * 260 + j], wt, sum);
+    }
+  }
+  att[(u64)h * 256 + j] = sm_gl > 0.0f ? (sum / sm_gl) : 0.0f;
 }

@@ -91,10 +91,10 @@ lines[i + 1:i + 1] = """    if (gen_eog(id) || gen_cancel()) {  // LINUX-CUDA-V2
       return;
     }""".split("\n")
 
-# 3: gen_ok under SYS1
+# 3: gen_ok under SYS1 (and with LLB_PREFIX_CACHE=1: pfx_restore/pfx_take only touch pos <= pfx_n and bail the graph on those 1-2 boundary steps)
 i = one("    && !llb_hidden_path && !llb_img_dump && !llb_img_req && llb_img_state == 1 && !llb_pfx_on()", "gen_ok")
 lines[i] = ("    && !llb_hidden_path && !llb_img_dump && (!llb_img_req || llb_img_spec[0] == 0) && llb_img_state == 1"
-            " && !llb_pfx_on() /* LINUX-PARITY: linuxcuda.py (wincuda.ps1 edit 3) */")
+            " /* LINUX-PARITY: linuxcuda.py (wincuda.ps1 edit 3 + prefix-cache gen_run) */")
 
 # 4: Writable XDG NVRTC kernel cache (reads user cache -> bundled <exe>.gpu -> compiles once to writable user cache)
 i = one("  cuDeviceTotalMem(&span, gpu_dev);", "gpu_span body")

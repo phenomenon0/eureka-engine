@@ -29,6 +29,7 @@ static bool llb_sk8_launch(CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdevice
 #include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <math.h>
 // The fbn / linb / fulb chains (tools/payload-fbn, -linb, -fulb.patch) as
 // functions of the op, its output y and the GEMV grid: their warp_serve
 // branches and the pass bang (tools/payload-pass.patch) run the same launches
@@ -848,6 +849,47 @@ static bool llb_attn4_run(u32 nh, u64 q, u64 kc, u64 vc, u64 att, u64 s, u64 p, 
     && (NC == 1 || LLB_LAUNCH(gpu_a4s_out, nh, 1, 256, &att, &p, &c));
 }
 
+// Long-context KV cache precision (0=f32, 1=f16, 2=q8), YaRN RoPE scaling (>256K -> 1M),
+// and O(1)-scratch FlashDecoding (arbitrary context length, all 3 KV formats).
+static u32 llb_kv_type;  // 0 = f32, 1 = f16, 2 = q8
+static bool llb_yarn_on;
+static CUfunction gpu_pfslot_f16, gpu_pfslot_q8, gpu_pfattn_f16, gpu_pfattn_q8;
+static CUfunction gpu_fd_f32, gpu_fd_f16, gpu_fd_q8, gpu_fd_comb;
+static bool llb_kv_loaded;
+
+static size_t llb_kv_row_bytes(size_t kv) {
+  return llb_kv_type == 1 ? kv * 2 : llb_kv_type == 2 ? kv + (kv / 32) * 2 : kv * 4;
+}
+
+static void llb_kv_load_kernels(void) {
+  if (llb_kv_loaded) return;
+  if (cuModuleGetFunction(&gpu_pfslot_f16, gpu_lib, "pf_slot_f16") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_pfslot_q8, gpu_lib, "pf_slot_q8") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_pfattn_f16, gpu_lib, "pf_attn_f16") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_pfattn_q8, gpu_lib, "pf_attn_q8") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_fd_f32, gpu_lib, "llb_fd_split_f32") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_fd_f16, gpu_lib, "llb_fd_split_f16") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_fd_q8, gpu_lib, "llb_fd_split_q8") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_fd_comb, gpu_lib, "llb_fd_combine") != CUDA_SUCCESS
+    || cuFuncSetAttribute(gpu_pfattn_f16, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 99 * 1024) != CUDA_SUCCESS
+    || cuFuncSetAttribute(gpu_pfattn_q8, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 99 * 1024) != CUDA_SUCCESS) {
+    err_fail("warp pass: cannot load long-context KV / FlashDecoding CUDA kernels");
+  }
+  llb_kv_loaded = true;
+}
+
+static bool llb_fd_run(u32 nh, u64 q, u64 kc, u64 vc, u64 att, u64 pr, u32 c, u32 grp) {
+  llb_kv_load_kernels();
+  u32 dT = c & 31, pos = c >> 5, T = 1u << dT, n = pos < T ? pos + 1 : T;
+  u32 nkv = nh / grp, kv = nkv * 256;
+  u32 NC = (n + 63) / 64;
+  if (NC < 1) NC = 1;
+  if (NC > 256) NC = 256;
+  CUfunction fn = llb_kv_type == 1 ? gpu_fd_f16 : llb_kv_type == 2 ? gpu_fd_q8 : gpu_fd_f32;
+  return LLB_LAUNCH(fn, NC, nkv, 256, &q, &kc, &vc, &pr, &n, &grp, &kv, &NC)
+    && LLB_LAUNCH(gpu_fd_comb, nh, 1, 256, &att, &pr, &NC);
+}
+
 static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u32* tw) {
   u64 base22 = o->w, xp22 = o->x, kcp22 = o->k, vcp22 = o->v;
   u64 anp22 = base22 + o->ban, wqp22 = base22 + o->bq, wkp22 = base22 + o->bg;
@@ -894,15 +936,18 @@ static void llb_fulb_run(volatile WarpOp* o, u64 yp, u32 grid, const volatile u3
     llb_kgemv(fk, wkp22, n4, h22, kb22, n1024, grid);
     llb_kgemv(fv, wvp22, n4, h22, vb22, n1024, grid);
   }
-  if (!LLB_LAUNCH(gpu_qkr, rq22, 1, 256, &qgn22, &wqnp22, &qg22, &n8192, &one, &pos22)
-    || !LLB_LAUNCH(gpu_qkr, rk22, 1, 256, &kb22, &wknp22, &kn22, &n1024, &zero, &pos22)
-    // a slot is kv floats: 1024 every 4-kv-head model, 512 the 0.8B (tools/payload-w1024.patch);
-    // past 1024, blocks of 256 (tools/payload-anyshape.patch)
-    || !LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &kn22, &kslot22)
-    || !LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &vb22, &vslot22)
-    // LLB_ATTN_SK8=1: split-key decode attention (tools/payload-sk8add.patch), where it fits
-    || !(llb_sk8_enabled() && llb_sk8_fits(c22, ah22) ? llb_sk8_launch(qg22, kcp22, vcp22, attn22, c22, grp22, ah22) :
-      llb_attn4_run(ah22, qg22, kcp22, vcp22, attn22, s22, p22, c22, grp22))
+  CUfunction qkr_fn = llb_yarn_on ? gpu_pfqkr : gpu_qkr;
+  bool use_fd = llb_kv_type != 0 || (c22 & 31) > 17;
+  bool slot_ok = llb_kv_type == 0
+    ? (LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &kn22, &kslot22)
+      && LLB_LAUNCH(gpu_slot, kv > 1024 ? kv / 256 : 1, 1, kv > 1024 ? 256 : kv, &vb22, &vslot22))
+    : LLB_LAUNCH(llb_kv_type == 1 ? gpu_pfslot_f16 : gpu_pfslot_q8, 1, 2, 256, &kn22, &vb22, &kcp22, &vcp22, &pos22, &n1024);
+  if (!LLB_LAUNCH(qkr_fn, rq22, 1, 256, &qgn22, &wqnp22, &qg22, &n8192, &one, &pos22)
+    || !LLB_LAUNCH(qkr_fn, rk22, 1, 256, &kb22, &wknp22, &kn22, &n1024, &zero, &pos22)
+    || !slot_ok
+    || !(use_fd ? llb_fd_run(ah22, qg22, kcp22, vcp22, attn22, gpu_atts, c22, grp22)
+      : (llb_sk8_enabled() && llb_sk8_fits(c22, ah22) ? llb_sk8_launch(qg22, kcp22, vcp22, attn22, c22, grp22, ah22)
+        : llb_attn4_run(ah22, qg22, kcp22, vcp22, attn22, s22, p22, c22, grp22)))
     || !LLB_LAUNCH(gpu_og, gog22, 1, 1024, &attn22, &gate22, &gated22, &nqa)
     || (fo == 1 && llb_tuned(fo, qa) && !LLB_LAUNCH(gpu_warpq, grid, 1, 128, &wop22, &ro22, &co22, &gated22, &yp, &n4, &dqa))) {
     err_fail("device launch failed");
@@ -1014,15 +1059,22 @@ unsigned llb_pfx_begin(const int* ids, unsigned n, unsigned start, int reuse) {
   }
   pfx_arm = -1;
   if (reuse && start == 0) {
-    static u32 q[65536];
-    u32 m = n < 65536 ? n : 65536;
-    for (u32 t = 0; t < m; t += 1) {
-      q[t] = (u32)ids[t];
+    static u32* pfx_q;
+    static u32 pfx_qcap;
+    if (n > pfx_qcap) {
+      pfx_qcap = n < 4096 ? 4096 : n;
+      pfx_q = realloc(pfx_q, (size_t)pfx_qcap * 4);
+      if (!pfx_q) {
+        err_fail("prefix cache: cannot allocate the compare ids");
+      }
+    }
+    for (u32 t = 0; t < n; t += 1) {
+      pfx_q[t] = (u32)ids[t];
     }
     for (u32 j = 0; j < pfx_ns; j += 1) {
       PfxSnap* s = &pfx_s[j];
-      if (pfx_valid(s) && s->pos + 1 <= m && s->pos <= pfx_n && s->pos > start
-          && s->h == pfx_hash(q, s->pos) && memcmp(q, pfx_ids, (size_t)s->pos * 4) == 0) {
+      if (pfx_valid(s) && s->pos + 1 <= n && s->pos <= pfx_n && s->pos > start
+          && s->h == pfx_hash(pfx_q, s->pos) && memcmp(pfx_q, pfx_ids, (size_t)s->pos * 4) == 0) {
         start = s->pos;
         pfx_arm = (int)j;
       }
@@ -1176,7 +1228,7 @@ int llb_bx_max(void);
 // at a time. LLB_SPEC / LLB_MTP / LLB_BATCH (whose kernels read every slot of the 2^dT tree)
 // take all of pass_cap at once.
 static void pass_kv(u32 i, u32 pos, LlbShape sh) {
-  size_t row = (size_t)sh.nkv * sh.hd, need = (size_t)pos + 4096 + 64;
+  size_t row = (size_t)sh.nkv * sh.hd, rbytes = llb_kv_row_bytes(row), need = (size_t)pos + 4096 + 64;
   if (spec_k >= 0 || spec_mtp || llb_bx_max() >= 2 || need > pass_cap) {
     need = pass_cap;
   }
@@ -1185,19 +1237,30 @@ static void pass_kv(u32 i, u32 pos, LlbShape sh) {
   }
   size_t n = 2 * pass_kcap[i] > need ? 2 * pass_kcap[i] : need;
   n = n < pass_cap ? n : pass_cap;
-  llb_dptr k = llb_alloc_zero(n * row * 4), v = llb_alloc_zero(n * row * 4);
-  if (!k || !v) {
+  // Grow K then free old K, then grow V then free old V to halve transient peak VRAM during resize.
+  llb_dptr k = llb_alloc_zero(n * rbytes);
+  if (!k) {
     fprintf(stderr, "warp pass: cannot allocate %zu KV slots (%.1f MiB) for layer %u; free VRAM or lower the context\n",
-      n, 2.0 * n * row * 4 / 1048576.0, i);
+      n, 2.0 * n * rbytes / 1048576.0, i);
     err_fail("warp pass: out of device memory for the KV cache");
   }
   if (pass_kcap[i] != 0) {
-    if (!llb_copy(k, pass_kc[i], pass_kcap[i] * row * 4) || !llb_copy(v, pass_vc[i], pass_kcap[i] * row * 4)
-      || !llb_sync() || cuMemFree(pass_kc[i]) != CUDA_SUCCESS || cuMemFree(pass_vc[i]) != CUDA_SUCCESS) {
+    if (!llb_copy(k, pass_kc[i], pass_kcap[i] * rbytes) || !llb_sync() || cuMemFree(pass_kc[i]) != CUDA_SUCCESS) {
       err_fail("warp pass: cannot grow the KV cache");
     }
   }
   pass_kc[i] = k;
+  llb_dptr v = llb_alloc_zero(n * rbytes);
+  if (!v) {
+    fprintf(stderr, "warp pass: cannot allocate %zu KV slots (%.1f MiB) for layer %u; free VRAM or lower the context\n",
+      n, 2.0 * n * rbytes / 1048576.0, i);
+    err_fail("warp pass: out of device memory for the KV cache");
+  }
+  if (pass_kcap[i] != 0) {
+    if (!llb_copy(v, pass_vc[i], pass_kcap[i] * rbytes) || !llb_sync() || cuMemFree(pass_vc[i]) != CUDA_SUCCESS) {
+      err_fail("warp pass: cannot grow the KV cache");
+    }
+  }
   pass_vc[i] = v;
   pass_kcap[i] = n;
 }
@@ -1230,8 +1293,8 @@ static void pass_layer(u32 i, bool full, u32 pos, u32 dT, LlbShape sh) {
     // at the retained pos + 1 and skips this branch, passing the guard below
     // unchanged (pass_pos[i] + 1 == pos). Served request-side today in
     // tools/sys1dual/dual.c (retained session record). === end S2 SOURCE-SPEC ===
-    bool z = full ? llb_zero(pass_kc[i], pass_kcap[i] * sh.nkv * sh.hd * 4)
-        && llb_zero(pass_vc[i], pass_kcap[i] * sh.nkv * sh.hd * 4)
+    bool z = full ? llb_zero(pass_kc[i], pass_kcap[i] * llb_kv_row_bytes((size_t)sh.nkv * sh.hd))
+        && llb_zero(pass_vc[i], pass_kcap[i] * llb_kv_row_bytes((size_t)sh.nkv * sh.hd))
       : llb_zero(pass_b[i], 4 * (size_t)cv * 4) && llb_zero(pass_S[i], (size_t)sh.lvh * sh.sd * sh.sd * 4);
     if (!z) {
       err_fail("warp pass: cannot reset the layer state");
@@ -2841,6 +2904,40 @@ static void llb_pass_init(LlbShape sh, u32 dT, u32 nl) {
     err_fail("warp pass: cannot set the model config on the device");
   }
   pass_cap = cf[3];
+  // Parse LLB_KV_TYPE (f32 default when unset; auto -> q8 past 256K else f16; f16; q8 / q8_0)
+  const char* kve = getenv("LLB_KV_TYPE");
+  if (kve == NULL || kve[0] == 0 || strcmp(kve, "f32") == 0) {
+    llb_kv_type = 0;
+  } else if (strcmp(kve, "f16") == 0) {
+    llb_kv_type = 1;
+  } else if (strcmp(kve, "q8") == 0 || strcmp(kve, "q8_0") == 0) {
+    llb_kv_type = 2;
+  } else if (strcmp(kve, "auto") == 0) {
+    llb_kv_type = pass_cap > 262144 ? 2 : 1;
+  } else {
+    err_fail("warp pass: LLB_KV_TYPE must be f32, f16, q8, or auto");
+  }
+  if (llb_kv_type != 0 || dT > 17) {
+    llb_kv_load_kernels();
+  }
+  // YaRN RoPE scaling for contexts past native 256K (Peng et al. 2023)
+  const char* yo = getenv("LLB_YARN_ORIG_CTX");
+  u32 orig_ctx = yo != NULL && atoi(yo) >= 4096 ? (u32)atoi(yo) : 262144u;
+  const char* yf_env = getenv("LLB_YARN_FACTOR");
+  float yfac = (yf_env != NULL && atof(yf_env) > 0.0) ? (float)atof(yf_env)
+    : (pass_cap > orig_ctx ? (float)pass_cap / (float)orig_ctx : 1.0f);
+  float ymscale = yfac > 1.0f ? (0.1f * logf(yfac) + 1.0f) : 1.0f;
+  llb_yarn_on = yfac > 1.0f;
+  float ybuf[4] = { llb_yarn_on ? yfac : 0.0f, ymscale, (float)orig_ctx, 0.0f };
+  CUdeviceptr yp_g;
+  size_t yz;
+  if (cuModuleGetGlobal(&yp_g, &yz, gpu_lib, "llb_yarn") == CUDA_SUCCESS && yz == 16) {
+    if (!llb_write(yp_g, ybuf, 16)) {
+      err_fail("warp pass: cannot set YaRN config on the device");
+    }
+  } else if (llb_yarn_on) {
+    err_fail("warp pass: llb_yarn device global missing");
+  }
   u64 d = sh.d, f = sh.f, qa = (u64)sh.nh * sh.hd, kv = (u64)sh.nkv * sh.hd, lv = (u64)sh.lvh * sh.sd;
   u64 lvh = sh.lvh, cv = 2 * (u64)sh.lkh * sh.sd + lv, e18 = 4 * lv + 4 * lvh + cv, hb = e18 > 39040 ? e18 : 39040;
   // gpu_blk (floats): fbn x1 h2 g u silu (+ silu's pad), linb's rows to normed and hb18 (+ pads),
@@ -2862,10 +2959,15 @@ static void llb_pass_init(LlbShape sh, u32 dT, u32 nl) {
   llb_scratch(&gpu_q8b, &hq8b, mc + mc / 32 * 4 + 256, "gpu_q8b");
   llb_scratch(&gpu_q8c, &hq8c, 2 * mc + mc / 32 * 4 + 256, "gpu_q8c");
   llb_scratch(&gpu_headh, &hhead, llb_p2(d) * 4, "gpu_headh");
-  llb_scratch(&gpu_atts, &hatts, (size_t)2 * sh.nh * ((size_t)1 << (dT > 17 ? dT : 17)) * 4, "gpu_atts");
+  // FlashDecoding (kv_type != f32 or dT > 17) needs only O(1) scratch: nh * 256 * 260 floats (~4-6 MiB)
+  size_t fd_bytes = (size_t)sh.nh * 256 * 260 * 4;
+  size_t atts_bytes = (llb_kv_type != 0 || dT > 17) ? fd_bytes : (size_t)2 * sh.nh * ((size_t)1 << (dT > 17 ? dT : 17)) * 4;
+  llb_scratch(&gpu_atts, &hatts, atts_bytes, "gpu_atts");
   union { u32 u; float f; } ep = { cf[0] }, rb = { cf[1] };
-  fprintf(stderr, "shape d_model %u d_ff %u heads %u kv %u layers %u lin %u/%u sd %u eps %g rope %g/%u kv_cap %u (dT %u)%s\n",
+  static const char* kv_nm[3] = { "f32", "f16", "q8" };
+  fprintf(stderr, "shape d_model %u d_ff %u heads %u kv %u layers %u lin %u/%u sd %u eps %g rope %g/%u kv_cap %u (dT %u) kv=%s(%zuB) yarn=%.2f(ms=%.4f)%s\n",
     sh.d, sh.f, sh.nh, sh.nkv, nl, sh.lkh, sh.lvh, sh.sd, (double)ep.f, (double)rb.f, cf[2], cf[3], dT,
+    kv_nm[llb_kv_type], llb_kv_row_bytes(kv), (double)yfac, (double)ymscale,
     llb_legacy(sh, dT, nl) ? "" : " [generic shape: spec / batch off]");
 }
 
@@ -2941,9 +3043,9 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
   }
   // LLB_SPEC / LLB_MTP / LLB_BATCH keep the shapes they were gated on (llb_legacy; the 0.8B,
   // d_model 1024, was refused here before tools/payload-anyshape.patch too)
-  if ((spec_k >= 0 || spec_mtp || llb_bx_max() >= 2) && !llb_legacy(sh, dT, s + k)) {
+  if ((spec_k >= 0 || spec_mtp || llb_bx_max() >= 2) && (!llb_legacy(sh, dT, s + k) || llb_kv_type != 0)) {
     err_fail("LLB_SPEC / LLB_MTP / LLB_BATCH: gated on the 9B / 27B shapes only (d_model 4096 / 5120, 4 kv heads, "
-      "full_attention_interval 4, context <= 131072); run without them");
+      "full_attention_interval 4, context <= 131072, f32 KV); run without them");
   }
   llb_hidden_init();
   if (llb_hidden_path && !o->w) err_fail("LLB_DUMP_HIDDEN: folded pass required");
