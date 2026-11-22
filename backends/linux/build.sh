@@ -77,10 +77,22 @@ VH=$s/vision; mkdir -p "$VH"; cp -R "$APP/engine-src/vision/host" "$APP/engine-s
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -pthread -I"$VH/host" "$s/src/serve.c" "$s/src/json.c" "$s/src/speak_route.c" \
   "$s/src/vendor/tools/sys1dual/serve_structured.c" "$s/src/vendor/host/llb_structured.c" "$s/vpre.o" -lm -o "$s/llb-serve"
 
+step "5b. engine_inkling_gpu + engine_inkling_cpu (native Inkling 2 Mini CUDA/CPU shape engine)"
+INK_SRC="$SRC/inkling2/engine/src/inkling2"
+if [ -f "$INK_SRC/CMakeLists.txt" ] && command -v cmake >/dev/null 2>&1; then
+  rm -rf "$OUT/inkling-cuda" "$OUT/inkling-cpu"
+  cmake -S "$INK_SRC" -B "$OUT/inkling-cuda" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
+    -DSTRATA_INK_CUDA_ARCHS="80;86;89;120" -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc"
+  cmake --build "$OUT/inkling-cuda" --target strata-inkling -j"$(nproc)"
+  cmake -S "$INK_SRC" -B "$OUT/inkling-cpu" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF
+  cmake --build "$OUT/inkling-cpu" --target strata-inkling -j"$(nproc)"
+fi
+
 step "6. stage $DEST/{cuda,cpu}"
 rm -rf "$DEST"; mkdir -p "$DEST/cuda" "$DEST/cpu"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$DEST/cuda/"
 cp "$OUT/gpu/engine_gpu" "$DEST/cuda/engine_gpu"
+[ -x "$OUT/inkling-cuda/strata-inkling" ] && install -m 0755 "$OUT/inkling-cuda/strata-inkling" "$DEST/cuda/engine_inkling_gpu"
 # Auto-discover NVRTC sonames for the installed CUDA major version
 NVRTC_MAIN=$(ls "$CUDA"/lib64/libnvrtc.so.[0-9]* 2>/dev/null | grep -E 'libnvrtc\.so\.[0-9]+$' | head -n1 || true)
 NVRTC_BUILTINS=$(ls "$CUDA"/lib64/libnvrtc-builtins.so.[0-9]*.[0-9]* 2>/dev/null | grep -E 'libnvrtc-builtins\.so\.[0-9]+\.[0-9]+$' | head -n1 || true)
@@ -88,4 +100,5 @@ NVRTC_BUILTINS=$(ls "$CUDA"/lib64/libnvrtc-builtins.so.[0-9]*.[0-9]* 2>/dev/null
 cp -L "$NVRTC_MAIN" "$NVRTC_BUILTINS" "$DEST/cuda/"
 cp "$v/cudavis-cli" "$DEST/cuda/"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$OUT/cpu/engine_cpu" "$DEST/cpu/"
+[ -x "$OUT/inkling-cpu/strata-inkling" ] && install -m 0755 "$OUT/inkling-cpu/strata-inkling" "$DEST/cpu/engine_inkling_cpu"
 ls -la "$DEST"/*

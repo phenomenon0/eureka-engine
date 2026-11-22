@@ -185,12 +185,23 @@ if ($Cc -ne 'clang') {
   if ($rc -eq 0 -and -not (Test-Path $out)) { $rc = 1 }
   Record 'engine_cpu.exe' $rc 'tools/qwen35_engine.c + dual.c'
 
+  # Inkling 2 Mini native CPU shape engine (optional when cmake + inkling2/ are present)
+  $InkSrc = Join-Path $Root 'inkling2\engine\src\inkling2'
+  if ((Test-Path (Join-Path $InkSrc 'CMakeLists.txt')) -and (Have 'cmake')) {
+    $inkCpuBuild = Join-Path $CpuOut 'inkling-build'
+    $rcInk = Run 'cmake' @('-S', $InkSrc, '-B', $inkCpuBuild, '-DCMAKE_BUILD_TYPE=Release', '-DSTRATA_ENABLE_CUDA=OFF')
+    if ($rcInk -eq 0) { $rcInk = Run 'cmake' @('--build', $inkCpuBuild, '--config', 'Release', '--target', 'strata-inkling', '--parallel') }
+    $inkBin = @(Join-Path $inkCpuBuild 'Release\strata-inkling.exe'; Join-Path $inkCpuBuild 'strata-inkling.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($rcInk -eq 0 -and $inkBin) { Copy-Item $inkBin (Join-Path $CpuOut 'engine_inkling_cpu.exe') -Force }
+    Record 'engine_inkling_cpu.exe' $(if ($inkBin) { $rcInk } else { 1 }) 'Inkling 2 Mini CPU'
+  }
+
   # the desktop contract's cpu\ dir (bend-app desktop/engine/build.sh stages EUREKA_WINDOWS_ENGINE\cpu):
   # engine_cpu.exe, gguf2pack.exe, llb-tok.exe from here; llb-serve.exe from the llb-serve build
   # (-LlbServe PATH), else it is named as missing
   $stage = Join-Path $CpuOut 'engine\cpu'
   if (-not (Test-Path $stage)) { New-Item -ItemType Directory -Path $stage | Out-Null }
-  foreach ($n in @('engine_cpu.exe', 'gguf2pack.exe', 'llb-tok.exe')) {
+  foreach ($n in @('engine_cpu.exe', 'gguf2pack.exe', 'llb-tok.exe', 'engine_inkling_cpu.exe')) {
     $p = Join-Path $CpuOut $n
     if (Test-Path $p) { Copy-Item $p (Join-Path $stage $n) -Force }
   }
@@ -474,11 +485,22 @@ if ($NoCuda) {
     }
     Record 'engine_gpu.exe' $rc $(if ($rc -eq 0) { 'Bend CUDA engine, NVRTC: ' + ($dlls -join ', ') } else { $why })
 
+    # Inkling 2 Mini native CUDA shape engine (optional when cmake + inkling2/ + VS are present)
+    $InkSrc = Join-Path $Root 'inkling2\engine\src\inkling2'
+    if ((Test-Path (Join-Path $InkSrc 'CMakeLists.txt')) -and (Have 'cmake') -and (Import-VsEnv)) {
+      $inkCudaBuild = Join-Path $CudaOut 'inkling-build'
+      $rcInk = Run 'cmake' @('-S', $InkSrc, '-B', $inkCudaBuild, '-DCMAKE_BUILD_TYPE=Release', '-DSTRATA_ENABLE_CUDA=ON', '-DSTRATA_INK_CUDA_ARCHS=75;80;86;89;120')
+      if ($rcInk -eq 0) { $rcInk = Run 'cmake' @('--build', $inkCudaBuild, '--config', 'Release', '--target', 'strata-inkling', '--parallel') }
+      $inkBin = @(Join-Path $inkCudaBuild 'Release\strata-inkling.exe'; Join-Path $inkCudaBuild 'strata-inkling.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
+      if ($rcInk -eq 0 -and $inkBin) { Copy-Item $inkBin (Join-Path $CudaOut 'engine_inkling_gpu.exe') -Force }
+      Record 'engine_inkling_gpu.exe' $(if ($inkBin) { $rcInk } else { 1 }) 'Inkling 2 Mini CUDA'
+    }
+
     # the desktop contract's cuda\ dir (bend-app desktop/engine/build.sh stages EUREKA_WINDOWS_ENGINE\cuda)
     $stage = Join-Path $CudaOut 'engine\cuda'
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
     New-Item -ItemType Directory -Path $stage | Out-Null
-    foreach ($n in @('engine_gpu.exe') + $dlls) {
+    foreach ($n in @('engine_gpu.exe', 'engine_inkling_gpu.exe') + $dlls) {
       $p = Join-Path $CudaOut $n
       if (Test-Path $p) { Copy-Item $p (Join-Path $stage $n) -Force }
     }

@@ -126,4 +126,9 @@ done
 (cd "$O" && clang -DBEND_METAL=1 -x objective-c -fobjc-arc -fmodules -fmodules-cache-path="$O/modules" \
   -std=c11 -O3 -ffp-contract=off sys1mac.c -x none obj/*.o -L/opt/homebrew/opt/openblas/lib -lopenblas -lpthread -lm \
   -o sys1mac)
+if [ -f "$LLB_ROOT/inkling2/engine/src/inkling2/CMakeLists.txt" ] && command -v cmake >/dev/null 2>&1; then
+  cmake -S "$LLB_ROOT/inkling2/engine/src/inkling2" -B "$O/inkling-metal" -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$O/inkling-metal" --target strata-inkling -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+  install -m 0755 "$O/inkling-metal/strata-inkling" "$O/engine_inkling_metal"
+fi
 shasum -a 256 "$O/sys1mac.c" "$O/sys1mac" "$O"/obj/*.o
