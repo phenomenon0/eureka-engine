@@ -1665,4 +1665,160 @@ extern "C" __global__ void __launch_bounds__(128) llb_dp4a_gemv_t(
   }
 }
 
+// ============================================================================
+// GPU-Native Exact Temperature Sampler + Leviathan Alg. 1 Speculative Verifier
+// Eliminates the ~1 MB D2H logit copy and 248K CPU expf() loop per token on
+// live temperature-sampled chats, and runs 100% INSIDE CUDA Graph replay!
+// ============================================================================
+extern "C" __global__ void __launch_bounds__(256) llb_smp_part(
+  const float* __restrict__ lg, const float* __restrict__ yp,
+  double* __restrict__ part, u32 nv, float inv_t) {
+  __shared__ double sm[256];
+  const float mx = yp[0];
+  const u32 chunk = (nv + 255u) >> 8;
+  const u32 lo = blockIdx.x * chunk;
+  const u32 hi = lo + chunk < nv ? lo + chunk : nv;
+  double acc = 0.0;
+  for (u32 i = lo + threadIdx.x; i < hi; i += 256u) {
+    acc += (double)expf((lg[i] - mx) * inv_t);
+  }
+  sm[threadIdx.x] = acc;
+  __syncthreads();
+  for (u32 s = 128u; s > 0u; s >>= 1) {
+    if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) part[blockIdx.x] = sm[0];
+}
+
+extern "C" __global__ void __launch_bounds__(256) llb_smp_pick_gpu(
+  const float* __restrict__ lg, const double* __restrict__ part,
+  float* __restrict__ yp, u32 nv, float inv_t, double rnd) {
+  __shared__ float sm_w[1024];
+  __shared__ u32 sm_bhit;
+  __shared__ double sm_rem;
+  __shared__ int sm_done;
+  const float mx = yp[0];
+  const u32 chunk = (nv + 255u) >> 8;
+  if (threadIdx.x == 0) {
+    double total = 0.0;
+    for (u32 b = 0; b < 256u; b++) total += part[b];
+    double tgt = total * rnd, run = 0.0;
+    u32 bh = 255u;
+    for (u32 b = 0; b < 256u; b++) {
+      if (b * chunk >= nv) { bh = b > 0 ? b - 1 : 0; break; }
+      if (run + part[b] >= tgt) { bh = b; break; }
+      run += part[b];
+    }
+    sm_bhit = bh;
+    sm_rem = tgt - run;
+    sm_done = 0;
+  }
+  __syncthreads();
+  const u32 lo = sm_bhit * chunk;
+  const u32 hi = lo + chunk < nv ? lo + chunk : nv;
+  u32 picked = hi > 0 ? hi - 1 : 0;
+  double run = 0.0;
+  for (u32 base = lo; base < hi && !sm_done; base += 1024u) {
+    const u32 cnt = hi - base < 1024u ? hi - base : 1024u;
+    for (u32 k = threadIdx.x; k < cnt; k += 256u) {
+      sm_w[k] = expf((lg[base + k] - mx) * inv_t);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      for (u32 k = 0; k < cnt; k++) {
+        run += (double)sm_w[k];
+        if (run >= sm_rem) { picked = base + k; sm_done = 1; break; }
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    yp[0] = lg[picked];
+    yp[1] = (float)picked;
+  }
+}
+
+// Exact Leviathan-Kalman-Matias Algorithm 1 verify for deterministic draft q = 1[draft]:
+// Accept draft w.p. p(draft); else draw from exact residual p(i)/(1-p(draft)) for i != draft.
+// Writes out[0..3] = { lg[picked], (float)picked, accepted ? 1.0f : 0.0f, yp[2] }.
+extern "C" __global__ void __launch_bounds__(256) llb_smp_vpick_gpu(
+  const float* __restrict__ lg, const double* __restrict__ part,
+  const float* __restrict__ yp, float* __restrict__ out,
+  u32 nv, float inv_t, u32 draft, double u1, double u2) {
+  __shared__ float sm_w[1024];
+  __shared__ u32 sm_bhit;
+  __shared__ double sm_rem;
+  __shared__ int sm_done;
+  const float mx = yp[0];
+  const u32 chunk = (nv + 255u) >> 8;
+  if (threadIdx.x == 0) {
+    double total = 0.0;
+    for (u32 b = 0; b < 256u; b++) total += part[b];
+    const double wd = draft < nv ? (double)expf((lg[draft] - mx) * inv_t) : 0.0;
+    if (draft < nv && total > 0.0 && u1 * total < wd) {
+      out[0] = lg[draft];
+      out[1] = (float)draft;
+      out[2] = 1.0f;
+      out[3] = yp[3];
+      sm_done = 2;
+    } else {
+      const double rem_tot = total - wd;
+      if (!(rem_tot > 0.0)) {
+        const u32 fb = draft < nv ? draft : 0u;
+        out[0] = lg[fb];
+        out[1] = (float)fb;
+        out[2] = 0.0f;
+        out[3] = yp[3];
+        sm_done = 2;
+      } else {
+        const u32 db = draft / chunk;
+        const double tgt = rem_tot * u2;
+        double run = 0.0;
+        u32 bh = 255u;
+        for (u32 b = 0; b < 256u; b++) {
+          if (b * chunk >= nv) { bh = b > 0 ? b - 1 : 0; break; }
+          double pb = part[b] - (b == db ? wd : 0.0);
+          if (pb < 0.0) pb = 0.0;
+          if (run + pb >= tgt) { bh = b; break; }
+          run += pb;
+        }
+        sm_bhit = bh;
+        sm_rem = tgt - run;
+        sm_done = 0;
+      }
+    }
+  }
+  __syncthreads();
+  if (sm_done == 2) return;
+  const u32 lo = sm_bhit * chunk;
+  const u32 hi = lo + chunk < nv ? lo + chunk : nv;
+  u32 picked = hi > 0 ? hi - 1 : 0;
+  if (picked == draft && hi > 1) picked = picked > 0 ? picked - 1 : 1;
+  double run = 0.0;
+  for (u32 base = lo; base < hi && !sm_done; base += 1024u) {
+    const u32 cnt = hi - base < 1024u ? hi - base : 1024u;
+    for (u32 k = threadIdx.x; k < cnt; k += 256u) {
+      const u32 idx = base + k;
+      sm_w[k] = idx == draft ? 0.0f : expf((lg[idx] - mx) * inv_t);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      for (u32 k = 0; k < cnt; k++) {
+        if (base + k == draft) continue;
+        run += (double)sm_w[k];
+        if (run >= sm_rem) { picked = base + k; sm_done = 1; break; }
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    out[0] = lg[picked];
+    out[1] = (float)picked;
+    out[2] = 0.0f;
+    out[3] = yp[3];
+  }
+}
+
+
 

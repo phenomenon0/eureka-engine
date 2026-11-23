@@ -1494,6 +1494,36 @@ static bool smp_on(void) {
   return !(llb_smp_is_argmax(&smp_par) && smp_par.n_logprobs == 0) || gr_on();
 }
 
+// GPU-native exact temperature sampling (zero 1MB D2H copy, runs inside CUDA Graph!)
+static CUfunction gpu_smp_part, gpu_smp_pick, gpu_smp_vpick;
+static llb_dptr gpu_smp_buf, gpu_smp_vout;
+static bool gpu_smp_loaded;
+static bool smp_gpu_temp_ok(void) {
+  return smp_on() && !gr_on() && smp_par.temp > 0.0f
+    && smp_par.top_k <= 0 && smp_par.top_p >= 1.0f && smp_par.min_p <= 0.0f
+    && smp_par.n_bias == 0 && llb_smp_pen_off(&smp_par) && smp_par.n_logprobs == 0;
+}
+static double smp_draw_seed(uint64_t seed, uint64_t pos, uint32_t k) {
+  uint64_t z = seed ^ 0x6A09E667F3BCC909ull;
+  z += (pos * 4 + k + 1) * 0x9E3779B97F4A7C15ull;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  z ^= z >> 31;
+  return (double)(z >> 11) * (1.0 / 9007199254740992.0);
+}
+static void smp_gpu_init(void) {
+  if (gpu_smp_loaded) return;
+  if (cuModuleGetFunction(&gpu_smp_part, gpu_lib, "llb_smp_part") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_smp_pick, gpu_lib, "llb_smp_pick_gpu") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_smp_vpick, gpu_lib, "llb_smp_vpick_gpu") != CUDA_SUCCESS) {
+    err_fail("LLB_SAMPLE: cannot load GPU sampling kernels");
+  }
+  gpu_smp_buf = llb_alloc_zero(256 * sizeof(double));
+  gpu_smp_vout = llb_alloc_zero(16 * 16);
+  if (!gpu_smp_buf || !gpu_smp_vout) err_fail("LLB_SAMPLE: cannot alloc GPU sampling scratch");
+  gpu_smp_loaded = true;
+}
+
 // position pos's input token (prompt or generated) into the penalty history
 static void smp_note(u32 pos, u32 tok) {
   if (!smp_env) {
@@ -1526,7 +1556,9 @@ static void smp_pick(u64 yp, llb_dptr lg, u32 nv, u32 pos, int draft) {
   if (!smp || nv != smp_nv) {
     llb_smp_free(smp);
     smp = llb_smp_new(&smp_par, (int)nv);
-    smp_lg = realloc(smp_lg, (size_t)nv * 4);
+    if (smp_lg) cuMemFreeHost(smp_lg);
+    smp_lg = NULL;
+    if (cuMemHostAlloc((void**)&smp_lg, (size_t)nv * 4, 0) != CUDA_SUCCESS) smp_lg = NULL;
     smp_nv = nv;
     if (!smp || !smp_lg) err_fail("LLB_SAMPLE: cannot allocate the sampler");
   }
@@ -3273,14 +3305,57 @@ static u32 sa_verify_and_commit(WarpOp* o, LlbShape sh, u32 dT, u32 pos0, u32 T,
   sa_q8(sa_h, d, T);
   sa_mm(o->bg, wh, nh, d, T, sa_lg, ys_lg, nul);
   if (!LLB_LAUNCH(gpu_tamaxp, AMAX_G, T, AMAX_T, &sa_lg, &nh)
-    || !LLB_LAUNCH(gpu_tamax, 1, T, AMAX_G, &sa_lg, &nh, &sa_y)
-    || !llb_read(y_out, sa_y, (size_t)T * 16)) {
-    err_fail("LLB_SPEC_AUTO: head/read failed");
+    || !LLB_LAUNCH(gpu_tamax, 1, T, AMAX_G, &sa_lg, &nh, &sa_y)) {
+    err_fail("LLB_SPEC_AUTO: head failed");
   }
-  // Exact greedy acceptance along the draft chain
   u32 n_acc = 1;
-  while (n_acc < T && (u32)y_out[(n_acc - 1) * 4 + 1] == tin[n_acc]) {
-    n_acc += 1;
+  if (smp_gpu_temp_ok()) {
+    smp_gpu_init();
+    float inv_t = 1.0f / smp_par.temp;
+    float vbuf[SA_MAXT * 4];
+    for (u32 r = 0; r < T; r++) {
+      llb_dptr rlg = sa_lg + ((u64)r << 18) * 4;
+      llb_dptr ryp = sa_y + (u64)r * 16;
+      llb_dptr rout = gpu_smp_vout + (u64)r * 16;
+      if (!LLB_LAUNCH(gpu_smp_part, 256, 1, 256, &rlg, &ryp, &gpu_smp_buf, &nh, &inv_t)) {
+        err_fail("LLB_SPEC_AUTO: gpu_smp_part failed");
+      }
+      if (r + 1 < T) {
+        u32 draft = tin[r + 1];
+        double u1 = smp_draw_seed(smp_par.seed, (uint64_t)(pos0 + r) + 1, 1);
+        double u2 = smp_draw_seed(smp_par.seed, (uint64_t)(pos0 + r) + 1, 2);
+        if (!LLB_LAUNCH(gpu_smp_vpick, 1, 1, 256, &rlg, &gpu_smp_buf, &ryp, &rout, &nh, &inv_t, &draft, &u1, &u2)) {
+          err_fail("LLB_SPEC_AUTO: gpu_smp_vpick failed");
+        }
+      } else {
+        double rnd = smp_draw_seed(smp_par.seed, (uint64_t)(pos0 + r) + 1, 0);
+        if (!llb_copy(rout, ryp, 16)
+          || !LLB_LAUNCH(gpu_smp_pick, 1, 1, 256, &rlg, &gpu_smp_buf, &rout, &nh, &inv_t, &rnd)) {
+          err_fail("LLB_SPEC_AUTO: gpu_smp_pick failed");
+        }
+      }
+    }
+    if (!llb_read(vbuf, gpu_smp_vout, (size_t)T * 16)) {
+      err_fail("LLB_SPEC_AUTO: read verify failed");
+    }
+    // Exact Leviathan Alg. 1 chain acceptance
+    while (n_acc < T && vbuf[(n_acc - 1) * 4 + 2] > 0.5f) {
+      n_acc += 1;
+    }
+    for (u32 r = 0; r < n_acc; r++) {
+      y_out[r * 4 + 0] = vbuf[r * 4 + 0];
+      y_out[r * 4 + 1] = vbuf[r * 4 + 1];
+      y_out[r * 4 + 2] = vbuf[r * 4 + 0];
+      y_out[r * 4 + 3] = vbuf[r * 4 + 1];
+    }
+  } else {
+    if (!llb_read(y_out, sa_y, (size_t)T * 16)) {
+      err_fail("LLB_SPEC_AUTO: read failed");
+    }
+    // Exact greedy acceptance along the draft chain
+    while (n_acc < T && (u32)y_out[(n_acc - 1) * 4 + 1] == tin[n_acc]) {
+      n_acc += 1;
+    }
   }
   // Commit EXACT accepted state (n_acc tokens) into pass_* across all nl layers!
   u32 rx = (cv + 255) / 256, rt = n_acc < 4 ? n_acc : 4;
@@ -3582,24 +3657,37 @@ static void pass_fold(WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos,
     || !LLB_LAUNCH(gpu_amax, 1, 1, AMAX_G, &lg, &nh, &yp)) {
     err_fail("device launch failed");
   }
-  if (smp_on()) {
-    smp_pick(yp, lg, nh, pos, -1);
+  if (smp_gpu_temp_ok()) {
+    // Runs INSIDE CUDA Graph replay: zero 1MB D2H copy, zero graph bail!
+    if (!gpu_smp_loaded) {
+      llb_graph_bail();
+      smp_gpu_init();
+    }
+    float inv_t = 1.0f / smp_par.temp;
+    double rnd = smp_draw_seed(smp_par.seed, (uint64_t)pos + 1, 0);
+    if (!LLB_LAUNCH(gpu_smp_part, 256, 1, 256, &lg, &yp, &gpu_smp_buf, &nh, &inv_t)
+      || !LLB_LAUNCH(gpu_smp_pick, 1, 1, 256, &lg, &gpu_smp_buf, &yp, &nh, &inv_t, &rnd)) {
+      err_fail("device launch failed");
+    }
+    llb_graph_end();
+  } else {
+    // End CUDA Graph BEFORE host smp_pick so non-greedy/grammar steps STILL replay the graph!
+    llb_graph_end();
+    if (smp_on()) {
+      smp_pick(yp, lg, nh, pos, -1);
+    }
   }
   if (llb_dump) {
     llb_dptr lgp = lg;
     llb_dump_put("l", pos, -1, "wb", &lgp, &nh, 1);
   }
-  llb_graph_end();
 }
 
-// reports/cuda-catchup: the decode run. gen's bang asks for up to n greedy steps (pos, pos + 1,
-// ...); the host serves them back to back -- every step the folded step above, the next one's
-// token the device's pick -- so the Bend loop (its host evaluation, unified-memory page traffic
-// and device interpreter rounds, ~0.8 ms a token) runs once a run instead of once a token. It
-// prints what gen would have printed for every step but the last (stdout: the ids; stderr: the
-// logits and step lines, stdout flushed first as io_errs does), and leaves the last step's four
-// words in y with the count in word 4; gen prints the rest. Only plain greedy decode takes it:
-// any feature that reads or changes the token on the host keeps one step a bang.
+// reports/cuda-catchup: the decode run. gen's bang asks for up to n steps (pos, pos + 1, ...);
+// the host serves them back to back -- every step the folded step above -- so the Bend loop
+// (~0.8 ms/token) runs once a run instead of once a token. Supports greedy, GPU-native
+// temperature sampling (with 1-step-ahead pipelining AND LLB_SPEC_AUTO), AND host sampling/
+// grammar (with CUDA Graph replay + LLB_GEN_EOG + SIGUSR1 cancel).
 // LLB_GEN=0 turns it off (one step a bang, as before).
 static bool gen_ok(volatile WarpOp* o) {
   static int env = -1;
@@ -3607,7 +3695,7 @@ static bool gen_ok(volatile WarpOp* o) {
     const char* e = getenv("LLB_GEN");
     env = e == NULL || atoi(e) != 0;
   }
-  return env && !smp_on() && !gr_on() && spec_k < 0 && !spec_mtp && llb_bx_max() < 2 && !llb_dump
+  return env && spec_k < 0 && !spec_mtp && llb_bx_max() < 2 && !llb_dump
     && !llb_hidden_path && !llb_img_dump && !llb_img_req && llb_img_state == 1 && !llb_pfx_on()
     && o->n == 0;
 }
@@ -3639,7 +3727,8 @@ static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u
   }
   struct timespec t0;
   clock_gettime(CLOCK_MONOTONIC, &t0);
-  if (sa_can_run(sh, o->d, o->bb, o->bg)) {
+  if (sa_can_run(sh, o->d, o->bb, o->bg) && (!smp_on() || smp_gpu_temp_ok())) {
+    if (smp_gpu_temp_ok()) smp_gpu_init();
     u32 rbe = LLB_FM_RB(op.bb, sh.d);
     u32 cur_tok = (u32)((op.w - op.r) / rbe);
     u32 q = 0;
@@ -3714,6 +3803,69 @@ static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u
     }
     return;
   }
+  if (smp_on() && !smp_gpu_temp_ok()) {
+    // Host-sampled / grammar decode run: full CUDA Graph replay per step + instant EOG/cancel!
+    u32 rbe = LLB_FM_RB(op.bb, sh.d);
+    u32 cur_tok = (u32)((op.w - op.r) / rbe);
+    for (u32 q = 0; q < cnt; q += 1) {
+      if (q > 0) {
+        step_us(pos + q);
+        smp_note(pos + q, cur_tok);
+        sa_hist_note(pos + q, cur_tok);
+      }
+      op.w = op.r + (u64)cur_tok * rbe;
+      llb_gforce = 1;
+      pass_fold(&op, gy, grid, sh, dT, pos + q, false);
+      llb_gforce = 0;
+      float t[4];
+      if (!llb_read(t, gy, 16)) err_fail("decode run: host sample read failed");
+      union { float f; u32 u; } v = { t[0] }, w = { t[2] };
+      bool fin = (v.u & 0x7f800000u) != 0x7f800000u && (w.u & 0x7f800000u) != 0x7f800000u;
+      u32 id = (u32)t[1], j = (u32)t[3];
+      if (q + 1 == cnt || !fin) {
+        if (cuCtxSynchronize() != CUDA_SUCCESS || cuMemcpyHtoD(yp, t, 16) != CUDA_SUCCESS) {
+          err_fail("device fault");
+        }
+        union { float f; u32 u; } cf = { (float)(q + 1) };
+        if (cuMemsetD32Async(yp + 16, cf.u, 1, NULL) != CUDA_SUCCESS) {
+          err_fail("decode run: cannot set the count");
+        }
+        return;
+      }
+      char b[160];
+      struct timespec t1;
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      long long ms = ((long long)t1.tv_sec * 1000 + t1.tv_nsec / 1000000) - ((long long)t0.tv_sec * 1000 + t0.tv_nsec / 1000000);
+      t0 = t1;
+      if (fflush(stdout) != 0) err_fail("a short write on a standard stream");
+#ifdef LLB_HAS_GEN_EOG
+      if (gen_eog(id) || gen_cancel()) {
+        gen_cancelled = 0;
+        for (u32 r = q; r + 1 < cnt; r += 1) {
+          int pm = snprintf(b, sizeof b, "%u\n", id);
+          gen_line(stdout, b, (u64)pm);
+        }
+        if (cuCtxSynchronize() != CUDA_SUCCESS || cuMemcpyHtoD(yp, t, 16) != CUDA_SUCCESS) {
+          err_fail("device fault");
+        }
+        union { float f; u32 u; } pc = { (float)cnt };
+        if (cuMemsetD32Async(yp + 16, pc.u, 1, NULL) != CUDA_SUCCESS) {
+          err_fail("decode run: cannot set the count");
+        }
+        return;
+      }
+#endif
+      int m = snprintf(b, sizeof b, "logits %u %u %u %u %u\n", pos + q, id, v.u, j, w.u);
+      gen_line(stderr, b, (u64)m);
+      m = snprintf(b, sizeof b, "step %u %lld\n", pos + q, ms);
+      gen_line(stderr, b, (u64)m);
+      m = snprintf(b, sizeof b, "%u\n", id);
+      gen_line(stdout, b, (u64)m);
+      cur_tok = id;
+    }
+    return;
+  }
+  if (smp_gpu_temp_ok()) smp_gpu_init();
   for (u32 s = 0; s <= cnt; s += 1) {
     if (s < cnt) {
       if (s > 0) {
