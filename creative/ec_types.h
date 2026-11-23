@@ -29,6 +29,8 @@ typedef enum {
   EC_DTYPE_Q4_K    = 9,
   EC_DTYPE_Q6_K    = 10,
   EC_DTYPE_SVD4    = 11,  // W4A4 + FP16 low-rank outlier branch (100% native)
+  EC_DTYPE_I64     = 12,
+  EC_DTYPE_F64     = 13,
 } ec_dtype_t;
 
 typedef enum {
@@ -145,6 +147,7 @@ typedef struct {
 
 static inline size_t ec_dtype_size(ec_dtype_t dt) {
   switch (dt) {
+    case EC_DTYPE_I64: case EC_DTYPE_F64: return 8;
     case EC_DTYPE_F32: case EC_DTYPE_I32: case EC_DTYPE_U32: return 4;
     case EC_DTYPE_F16: case EC_DTYPE_BF16: return 2;
     case EC_DTYPE_FP8_E4M3: case EC_DTYPE_I8: case EC_DTYPE_U8: return 1;

@@ -88,11 +88,17 @@ if [ -f "$INK_SRC/CMakeLists.txt" ] && command -v cmake >/dev/null 2>&1; then
   cmake --build "$OUT/inkling-cpu" --target strata-inkling -j"$(nproc)"
 fi
 
+step "5c. eureka-creative-serve (100% native Eureka Creative Studio CUDA/C11 engine)"
+if [ -x "$SRC/creative/build.sh" ]; then
+  OUT="$OUT/creative" bash "$SRC/creative/build.sh"
+fi
+
 step "6. stage $DEST/{cuda,cpu}"
 rm -rf "$DEST"; mkdir -p "$DEST/cuda" "$DEST/cpu"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$DEST/cuda/"
 cp "$OUT/gpu/engine_gpu" "$DEST/cuda/engine_gpu"
 [ -x "$OUT/inkling-cuda/strata-inkling" ] && install -m 0755 "$OUT/inkling-cuda/strata-inkling" "$DEST/cuda/engine_inkling_gpu"
+[ -x "$OUT/creative/eureka-creative-serve" ] && install -m 0755 "$OUT/creative/eureka-creative-serve" "$DEST/cuda/eureka-creative-serve"
 # Auto-discover NVRTC sonames for the installed CUDA major version
 NVRTC_MAIN=$(ls "$CUDA"/lib64/libnvrtc.so.[0-9]* 2>/dev/null | grep -E 'libnvrtc\.so\.[0-9]+$' | head -n1 || true)
 NVRTC_BUILTINS=$(ls "$CUDA"/lib64/libnvrtc-builtins.so.[0-9]*.[0-9]* 2>/dev/null | grep -E 'libnvrtc-builtins\.so\.[0-9]+\.[0-9]+$' | head -n1 || true)

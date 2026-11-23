@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scratch-only build for 100% Native Eureka Creative Engine (creative/).
+# Scratch-only build for 100% Native Eureka Creative Engine (creative/ v2).
 # Zero cuBLAS, zero ggml, zero external ML frameworks.
 # All build outputs live strictly under OUT (default /tmp/eureka-creative-build).
 set -euo pipefail
@@ -16,25 +16,31 @@ GENC=(-gencode arch=compute_80,code=sm_80
       -gencode arch=compute_90,code=sm_90
       -gencode arch=compute_120,code=[sm_120,compute_120])
 
-echo "=== Building 100% Native Eureka Creative Engine in $OUT ==="
+echo "=== Building 100% Native Eureka Creative Engine v2 in $OUT ==="
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_safetensors.c" -o "$OUT/obj/ec_safetensors.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_flow.c"        -o "$OUT/obj/ec_flow.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_media.c"       -o "$OUT/obj/ec_media.o"
+"$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_nvenc.c"       -o "$OUT/obj/ec_nvenc.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_serve.c"       -o "$OUT/obj/ec_serve.o"
 
-"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_kernels.cu"   -o "$OUT/obj/ec_kernels.o"
-"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_dit.cu"       -o "$OUT/obj/ec_dit.o"
-"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_vram_pool.cu" -o "$OUT/obj/ec_vram_pool.o"
-"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_studio.cu"    -o "$OUT/obj/ec_studio.o"
-"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_bench.cu"     -o "$OUT/obj/ec_bench.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_kernels.cu"    -o "$OUT/obj/ec_kernels.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_kernels_v2.cu" -o "$OUT/obj/ec_kernels_v2.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_dit.cu"        -o "$OUT/obj/ec_dit.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_vram_pool.cu"  -o "$OUT/obj/ec_vram_pool.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_models.cu"     -o "$OUT/obj/ec_models.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_studio.cu"     -o "$OUT/obj/ec_studio.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_bench.cu"      -o "$OUT/obj/ec_bench.o"
 
 COMMON_OBJS=(
   "$OUT/obj/ec_safetensors.o"
   "$OUT/obj/ec_flow.o"
   "$OUT/obj/ec_media.o"
+  "$OUT/obj/ec_nvenc.o"
   "$OUT/obj/ec_kernels.o"
+  "$OUT/obj/ec_kernels_v2.o"
   "$OUT/obj/ec_dit.o"
   "$OUT/obj/ec_vram_pool.o"
+  "$OUT/obj/ec_models.o"
 )
 
 "$NVCC" -O3 "${GENC[@]}" -cudart static \

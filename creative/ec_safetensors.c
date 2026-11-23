@@ -24,6 +24,8 @@ static int parse_dtype(const char *s, ec_dtype_t *out) {
   if (!strcmp(s, "U8"))     { *out = EC_DTYPE_U8; return 0; }
   if (!strcmp(s, "I32"))    { *out = EC_DTYPE_I32; return 0; }
   if (!strcmp(s, "U32"))    { *out = EC_DTYPE_U32; return 0; }
+  if (!strcmp(s, "I64"))    { *out = EC_DTYPE_I64; return 0; }
+  if (!strcmp(s, "F64"))    { *out = EC_DTYPE_F64; return 0; }
   return -1;
 }
 
