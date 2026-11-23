@@ -37,7 +37,8 @@ typedef struct {
   char            class_type[64];
   ec_flow_input_t inputs[EC_FLOW_MAX_INPUTS];
   int32_t         n_inputs;
-  uint64_t        merkle_hash;      // content-addressed execution identity
+  uint64_t        merkle_hash;      // content-addressed execution identity (canonical key-sorted)
+  char            merkle_cid[65];   // canonical 64-hex SHA-256 node identity (Cowrie SHA-NI)
   int32_t         last_consumer;    // topo step after which this output can be evicted from VRAM
 } ec_flow_node_t;
 
@@ -93,6 +94,12 @@ int ec_flow_execute_ex(
     ec_flow_graph_t *g, ec_node_exec_fn exec_fn, ec_flow_node_event_fn event_fn,
     void *user_ctx, char *err, size_t err_cap);
 void ec_flow_clear_cache(ec_flow_graph_t *g);
+
+// Injects a verified persistent cache payload (e.g. from Cowrie StatePage on disk) into RAM cache.
+int ec_flow_preload_cache_entry(
+    ec_flow_graph_t *g, uint64_t hash, uint64_t result_tag,
+    const void *payload, size_t payload_bytes);
+int ec_flow_cache_has(const ec_flow_graph_t *g, uint64_t hash);
 
 // Helper lookups
 const ec_flow_input_t *ec_flow_get_input(const ec_flow_node_t *n, const char *key);

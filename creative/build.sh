@@ -16,8 +16,9 @@ GENC=(-gencode arch=compute_80,code=sm_80
       -gencode arch=compute_90,code=sm_90
       -gencode arch=compute_120,code=[sm_120,compute_120])
 
-echo "=== Building 100% Native Eureka Creative Engine v5 (Unified ec_ops + FLUX.2 + ACE-Step 1.5 + TRELLIS.2 + Wan 2.2) in $OUT ==="
+echo "=== Building 100% Native Eureka Creative Engine v7 (Unified ec_ops + Cowrie v2 SHA-NI + FLUX.2 + ACE-Step 1.5 + TRELLIS.2 + Wan 2.2) in $OUT ==="
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_safetensors.c" -o "$OUT/obj/ec_safetensors.o"
+"$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_cowrie.c"      -o "$OUT/obj/ec_cowrie.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_flow.c"        -o "$OUT/obj/ec_flow.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_media.c"       -o "$OUT/obj/ec_media.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_nvenc.c"       -o "$OUT/obj/ec_nvenc.o"
@@ -43,6 +44,7 @@ echo "=== Building 100% Native Eureka Creative Engine v5 (Unified ec_ops + FLUX.
 
 COMMON_OBJS=(
   "$OUT/obj/ec_safetensors.o"
+  "$OUT/obj/ec_cowrie.o"
   "$OUT/obj/ec_flow.o"
   "$OUT/obj/ec_media.o"
   "$OUT/obj/ec_nvenc.o"
@@ -65,11 +67,11 @@ COMMON_OBJS=(
 
 "$NVCC" -O3 "${GENC[@]}" -cudart static \
   "${COMMON_OBJS[@]}" "$OUT/obj/ec_bench.o" \
-  -lm -lrt -lpthread -o "$OUT/ec-bench"
+  -lm -lrt -lpthread -ldl -o "$OUT/ec-bench"
 
 "$NVCC" -O3 "${GENC[@]}" -cudart static \
   "${COMMON_OBJS[@]}" "$OUT/obj/ec_studio.o" "$OUT/obj/ec_serve.o" \
-  -lm -lrt -lpthread -o "$OUT/eureka-creative-serve"
+  -lm -lrt -lpthread -ldl -o "$OUT/eureka-creative-serve"
 
 echo "=== Built $OUT/ec-bench ($(stat -c%s "$OUT/ec-bench") bytes) ==="
 echo "=== Built $OUT/eureka-creative-serve ($(stat -c%s "$OUT/eureka-creative-serve") bytes) ==="

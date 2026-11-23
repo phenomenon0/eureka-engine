@@ -4,6 +4,7 @@
 //   G-C0.2: Paired Performance Fly-Stack (Exact FP16 FA2 vs Fast SageAttention INT8 + CUDA Graph + MagCache)
 //   G-C0.3: Safetensors hardening + ComfyUI JSON Compiled DAG + GLB/PLY/WAV/PPM + Zero-Copy SHM 60+ FPS Ring
 
+#include "ec_cowrie.h"
 #include "ec_dit.h"
 #include "ec_flow.h"
 #include "ec_kernels.cuh"
@@ -1464,6 +1465,63 @@ static void test_v2_kernels_and_models(const char *art_dir) {
     cudaEventDestroy(ev0); cudaEventDestroy(ev1);
     snprintf(buf, sizeof buf, "H=12 L=4096 D=128: %.1f TF (%.2fms) GQA_cos=%.6f rel=%.4f", tf_a, ms_a, ma.cos_sim, ma.rel_l2);
     check_gate("G-C5 ec_ops BF16 FA2 D=128 (GQA + Self/Cross)", ma.cos_sim >= 0.9999 && ma.rel_l2 <= 5e-3 && tf_a >= 25.0, buf);
+  }
+
+  // 6. G-C6: Tessera / Cowrie v2 SHA-NI StatePage + Canonical COWR + Trust Membrane
+  {
+    ec_cowrie_init();
+    int avail = ec_cowrie_available();
+    int shani = ec_cowrie_has_shani();
+
+    // 6a. Canonical bijective JSON key-order invariance (both COWR CID & ec_flow DAG Merkle CID!)
+    const char *j1 = "{\"z\":2,\"a\":1,\"nested\":{\"k2\":\"v2\",\"k1\":\"v1\"}}";
+    const char *j2 = "{\"nested\":{\"k1\":\"v1\",\"k2\":\"v2\"},\"a\":1,\"z\":2}";
+    char cid1[69] = {0}, cid2[69] = {0};
+    size_t clen1 = 0, clen2 = 0;
+    int c1_rc = ec_cowrie_canonical_json_cid(j1, strlen(j1), EC_COWRIE_AUTH_VERIFIED_TOOL, cid1, &clen1);
+    int c2_rc = ec_cowrie_canonical_json_cid(j2, strlen(j2), EC_COWRIE_AUTH_VERIFIED_TOOL, cid2, &clen2);
+    int canon_ok = (c1_rc == 0 && c2_rc == 0 && strcmp(cid1, cid2) == 0 && clen1 == clen2 && clen1 > 0);
+
+    // 6b. 16 KB-aligned StatePage roundtrip + ERR_MODEL_MISMATCH (-23) contract enforcement
+    const size_t SP_BYTES = 1024 * 1024; // 1 MiB BF16 state tensor
+    uint8_t *src_buf = (uint8_t *)malloc(SP_BYTES);
+    uint8_t *dst_buf = (uint8_t *)malloc(SP_BYTES);
+    for (size_t i = 0; i < SP_BYTES; i++) src_buf[i] = (uint8_t)((i * 131u + 17u) & 0xFFu);
+    char msha_a[65], msha_b[65], dcid[65];
+    ec_cowrie_sha256_hex("model_weights_v1", 16, msha_a);
+    ec_cowrie_sha256_hex("model_weights_v2", 16, msha_b);
+    ec_cowrie_sha256_hex("prompt_state_key", 16, dcid);
+    char sp_path[384];
+    snprintf(sp_path, sizeof sp_path, "%s/bench_gc6_test.state.cowrie", art_dir);
+    double t_sv0 = now_ms();
+    int sv_rc = ec_cowrie_sp_save_file(sp_path, msha_a, dcid, 512u, EC_COWRIE_KV_BF16, src_buf, SP_BYTES);
+    double sv_ms = now_ms() - t_sv0;
+    size_t got_len = 0;
+    double t_ld0 = now_ms();
+    int ld_rc = ec_cowrie_sp_load_file(sp_path, msha_a, EC_COWRIE_KV_BF16, dst_buf, SP_BYTES, &got_len);
+    double ld_ms = now_ms() - t_ld0;
+    int bad_rc = ec_cowrie_sp_load_file(sp_path, msha_b, EC_COWRIE_KV_BF16, dst_buf, SP_BYTES, &got_len);
+    int sp_ok = (sv_rc == 0 && ld_rc == 0 && got_len == SP_BYTES && memcmp(src_buf, dst_buf, SP_BYTES) == 0 &&
+                 bad_rc == -EC_COWRIE_ERR_MODEL_MISMATCH);
+    free(src_buf);
+    free(dst_buf);
+
+    // 6c. Sticky BIT_TAINTED = 0x80 causal propagation + Trust Gate 403 fail-closed
+    uint8_t parents[2] = { EC_COWRIE_AUTH_VERIFIED_TOOL, EC_COWRIE_AUTH_UNTRUSTED_EXT };
+    uint8_t derived = ec_cowrie_propagate_authority(EC_COWRIE_AUTH_MODEL_SYNTH, parents, 2);
+    ec_cowrie_trust_meta_t tmeta = {};
+    ec_cowrie_trust_register_json(j1, strlen(j1), EC_COWRIE_AUTH_UNTRUSTED_EXT, "external_url", "bench_wf", NULL, 0, &tmeta);
+    const char *gate_args[1] = { tmeta.handle };
+    char gate_out[512];
+    int g_block = ec_cowrie_trust_gate_json("shell_exec", gate_args, 1, 0, gate_out, sizeof gate_out);
+    int g_ro    = ec_cowrie_trust_gate_json("read_only",  gate_args, 1, 0, gate_out, sizeof gate_out);
+    int g_ov    = ec_cowrie_trust_gate_json("shell_exec", gate_args, 1, 1, gate_out, sizeof gate_out);
+    int trust_ok = (ec_cowrie_is_tainted(derived) == 1 && tmeta.tainted == 1 &&
+                    g_block == 403 && g_ro == 200 && g_ov == 200);
+
+    snprintf(buf, sizeof buf, "shani=%d canon=%d sp_1MB(sv=%.2fms ld=%.2fms err23=%d) trust(403/200/200)=%d",
+             shani, canon_ok, sv_ms, ld_ms, bad_rc, trust_ok);
+    check_gate("G-C6 Cowrie v2 SHA-NI StatePage + COWR + Trust", avail && canon_ok && sp_ok && trust_ok, buf);
   }
 }
 

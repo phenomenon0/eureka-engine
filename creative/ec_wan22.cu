@@ -10,6 +10,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "ec_wan22.h"
+#include "ec_cowrie.h"
 #include "ec_media.h"
 #include "ec_nvenc.h"
 #include "ec_ops.h"
@@ -779,11 +780,12 @@ struct ec_wan22 {
   int              dit_open, vae_open, te_open;
   wn_dit_res_t     dit;
   wn_vae_res_t     vae;
-  // 4-slot Host RAM UMT5-XXL Prompt Embedding Cache (16 MB host RAM -> 0.5 ms warm hits!)
+  // 4-slot Host RAM UMT5-XXL Prompt Embedding Cache + persistent Cowrie SHA-NI StatePage
   char             t5_keys[WN_T5_CACHE_SLOTS][1024];
   uint16_t        *t5_vals[WN_T5_CACHE_SLOTS];
   int              t5_valid[WN_T5_CACHE_SLOTS];
   int              t5_next_slot;
+  char             te_sha[65];
 };
 
 static void free_dit_res(wn_dit_res_t *d) {
@@ -989,6 +991,22 @@ static int run_umt5_xxl(
       return 0;
     }
   }
+  // Persistent cross-restart Cowrie v2 SHA-NI StatePage lookup (4.19 MB -> ~1.9 ms instead of ~2.5 s!)
+  if (w->te_sha[0] && ec_cowrie_available()) {
+    int slot = w->t5_next_slot % WN_T5_CACHE_SLOTS;
+    if (!w->t5_vals[slot]) w->t5_vals[slot] = (uint16_t *)malloc(512L * 4096 * 2);
+    if (w->t5_vals[slot] &&
+        ec_cowrie_sp_load("wan22_umt5", w->te_sha, pkey, strlen(pkey),
+                          EC_COWRIE_KV_BF16, w->t5_vals[slot], 512L * 4096 * 2) == 0) {
+      snprintf(w->t5_keys[slot], sizeof(w->t5_keys[slot]), "%s", pkey);
+      w->t5_valid[slot] = 1;
+      w->t5_next_slot = (slot + 1) % WN_T5_CACHE_SLOTS;
+      cudaMemcpyAsync(out_512_bf16_d, w->t5_vals[slot], 512L * 4096 * 2, cudaMemcpyHostToDevice, w->stream);
+      cudaStreamSynchronize(w->stream);
+      if (out_ms) *out_ms = wn_now_ms() - t0;
+      return 0;
+    }
+  }
   wn_init_fp8_lut();
   const ec_safetensors_t *st = &w->te_st;
   const int DIM = 4096, H = 64, FFN = 10240;
@@ -1086,7 +1104,7 @@ static int run_umt5_xxl(
   k_wn_rmsnorm<<<L, 256, 0, w->stream>>>(x_d, fnorm, NULL, out_512_bf16_d, L, DIM, 1e-6f, 0);
   cudaStreamSynchronize(w->stream);
 
-  // Store host copy in 4-slot UMT5-XXL prompt cache (eliminates ~2.5s neg-prompt re-encode on every run!)
+  // Store host copy in 4-slot UMT5-XXL prompt cache + persist Cowrie SHA-NI StatePage across restarts!
   if (strlen(pkey) < sizeof(w->t5_keys[0])) {
     int slot = w->t5_next_slot % WN_T5_CACHE_SLOTS;
     if (!w->t5_vals[slot]) w->t5_vals[slot] = (uint16_t *)malloc(512L * DIM * 2);
@@ -1095,6 +1113,10 @@ static int run_umt5_xxl(
       snprintf(w->t5_keys[slot], sizeof(w->t5_keys[slot]), "%s", pkey);
       w->t5_valid[slot] = 1;
       w->t5_next_slot = (slot + 1) % WN_T5_CACHE_SLOTS;
+      if (w->te_sha[0] && ec_cowrie_available()) {
+        ec_cowrie_sp_save("wan22_umt5", w->te_sha, pkey, strlen(pkey),
+                          512u, EC_COWRIE_KV_BF16, w->t5_vals[slot], 512L * DIM * 2);
+      }
     }
   }
 
@@ -1693,6 +1715,7 @@ extern "C" ec_wan22_t *ec_wan22_create(const ec_wan22_paths_t *paths) {
   w->vae_open = 1;
   if (ec_st_open(&w->te_st, paths->text_encoder_path, err, sizeof err) != 0)  { ec_wan22_destroy(w); return NULL; }
   w->te_open = 1;
+  ec_cowrie_file_fingerprint(paths->text_encoder_path, w->te_sha);
   return w;
 }
 

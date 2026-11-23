@@ -3,6 +3,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "ec_flow.h"
+#include "ec_cowrie.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -306,34 +307,73 @@ int ec_flow_compile(ec_flow_graph_t *g, char *err, size_t err_cap) {
     return -1;
   }
 
-  // Static VRAM liveness planner + content-addressed Merkle hashing in topo order
+  // Static VRAM liveness planner + canonical key-order-invariant SHA-256 Merkle hashing
   for (int32_t step = 0; step < g->n_nodes; step++) {
     int32_t idx = g->topo_order[step];
     ec_flow_node_t *nd = &g->nodes[idx];
     nd->last_consumer = step; // if leaf, stays live until end
 
+    // Sort input indices lexicographically by key so {"a":1,"b":2} == {"b":2,"a":1} (Cowrie canonical parity!)
+    int32_t ord[EC_FLOW_MAX_INPUTS];
+    for (int32_t k = 0; k < nd->n_inputs; k++) ord[k] = k;
+    for (int32_t a = 1; a < nd->n_inputs; a++) {
+      int32_t key_idx = ord[a];
+      int32_t b = a - 1;
+      while (b >= 0 && strcmp(nd->inputs[ord[b]].key, nd->inputs[key_idx].key) > 0) {
+        ord[b + 1] = ord[b];
+        b--;
+      }
+      ord[b + 1] = key_idx;
+    }
+
+    char canon[8192];
+    size_t cpos = (size_t)snprintf(canon, sizeof canon, "v7|%s|", nd->class_type);
     uint64_t h = fnv1a_init();
     h = fnv1a_str(h, nd->class_type);
-    for (int32_t k = 0; k < nd->n_inputs; k++) {
-      const ec_flow_input_t *in = &nd->inputs[k];
+    for (int32_t oi = 0; oi < nd->n_inputs; oi++) {
+      const ec_flow_input_t *in = &nd->inputs[ord[oi]];
       h = fnv1a_str(h, in->key);
       uint8_t kbyte = (uint8_t)in->kind;
       h = fnv1a_mix(h, &kbyte, 1);
       if (in->kind == EC_VAL_LINK) {
-        uint64_t up_h = g->nodes[in->link_node_idx].merkle_hash;
+        const ec_flow_node_t *up = &g->nodes[in->link_node_idx];
+        uint64_t up_h = up->merkle_hash;
         h = fnv1a_mix(h, &up_h, sizeof up_h);
         h = fnv1a_mix(h, &in->link_slot, sizeof in->link_slot);
+        if (cpos + 160 < sizeof canon) {
+          cpos += (size_t)snprintf(canon + cpos, sizeof canon - cpos, "%s=L:%s:%d;",
+                                   in->key, up->merkle_cid, in->link_slot);
+        }
         // Extend upstream node's liveness to at least this step
         if (step > g->nodes[in->link_node_idx].last_consumer) {
           g->nodes[in->link_node_idx].last_consumer = step;
         }
       } else if (in->kind == EC_VAL_STRING) {
         h = fnv1a_str(h, in->str_val);
+        if (cpos + 128 < sizeof canon) {
+          cpos += (size_t)snprintf(canon + cpos, sizeof canon - cpos, "%s=S:%.*s;",
+                                   in->key, (int)(sizeof canon - cpos - 96), in->str_val);
+        }
       } else if (in->kind == EC_VAL_NUMBER) {
-        h = fnv1a_mix(h, &in->num_val, sizeof in->num_val);
+        // Canonicalize -0.0 -> +0.0 per Cowrie float rules
+        double v = (in->num_val == 0.0) ? 0.0 : in->num_val;
+        h = fnv1a_mix(h, &v, sizeof v);
+        if (cpos + 96 < sizeof canon) {
+          cpos += (size_t)snprintf(canon + cpos, sizeof canon - cpos, "%s=N:%.12g;", in->key, v);
+        }
       }
     }
-    nd->merkle_hash = h;
+    ec_cowrie_sha256_hex(canon, cpos, nd->merkle_cid);
+    if (ec_cowrie_available()) {
+      // Mix high + low 64 bits of SHA-256 for 64-bit fast slot lookup
+      char hi16[17];
+      memcpy(hi16, nd->merkle_cid, 16); hi16[16] = '\0';
+      char lo16[17];
+      memcpy(lo16, nd->merkle_cid + 16, 16); lo16[16] = '\0';
+      nd->merkle_hash = (uint64_t)strtoull(hi16, NULL, 16) ^ ((uint64_t)strtoull(lo16, NULL, 16) * 0x9E3779B97F4A7C15ULL);
+    } else {
+      nd->merkle_hash = h;
+    }
   }
 
   g->compiled = 1;
@@ -354,6 +394,37 @@ void ec_flow_clear_cache(ec_flow_graph_t *g) {
     g->cache[i].payload = NULL;
   }
   g->n_cache = 0;
+}
+
+int ec_flow_cache_has(const ec_flow_graph_t *g, uint64_t hash) {
+  if (!g) return 0;
+  for (int32_t i = 0; i < g->n_cache; i++) {
+    if (g->cache[i].hash == hash) return 1;
+  }
+  return 0;
+}
+
+int ec_flow_preload_cache_entry(
+    ec_flow_graph_t *g, uint64_t hash, uint64_t result_tag,
+    const void *payload, size_t payload_bytes) {
+  if (!g || !payload || payload_bytes == 0) return -1;
+  if (ec_flow_cache_has(g, hash)) return 0;
+  if (g->n_cache >= EC_FLOW_MAX_CACHE) {
+    int32_t drop = EC_FLOW_MAX_CACHE / 2;
+    for (int32_t c = 0; c < drop; c++) free(g->cache[c].payload);
+    memmove(g->cache, g->cache + drop, (size_t)(g->n_cache - drop) * sizeof(ec_flow_cache_entry_t));
+    g->n_cache -= drop;
+  }
+  void *copy = malloc(payload_bytes);
+  if (!copy) return -1;
+  memcpy(copy, payload, payload_bytes);
+  ec_flow_cache_entry_t *slot = &g->cache[g->n_cache++];
+  memset(slot, 0, sizeof *slot);
+  slot->hash          = hash;
+  slot->result_tag    = result_tag;
+  slot->payload       = copy;
+  slot->payload_bytes = payload_bytes;
+  return 0;
 }
 
 int ec_flow_execute_ex(

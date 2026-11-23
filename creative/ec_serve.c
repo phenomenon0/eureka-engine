@@ -48,7 +48,8 @@ static void send_all(int fd, const void *buf, size_t len) {
 
 static void send_json(int fd, int code, const char *body) {
   const char *reason = code == 200 ? "OK" : code == 202 ? "Accepted" :
-                       code == 401 ? "Unauthorized" : code == 404 ? "Not Found" :
+                       code == 401 ? "Unauthorized" : code == 403 ? "Forbidden" :
+                       code == 404 ? "Not Found" :
                        code == 500 ? "Internal Server Error" : "Bad Request";
   char hdr[512];
   size_t blen = strlen(body);
@@ -133,6 +134,47 @@ static int json_get_bool(const char *j, const char *key, int def) {
   if (!strncmp(p, "true", 4)) return 1;
   if (!strncmp(p, "false", 5)) return 0;
   return def;
+}
+
+static void query_get_param(const char *q, const char *key, char *out, size_t cap, const char *def) {
+  snprintf(out, cap, "%s", def ? def : "");
+  if (!q || !q[0] || !key || !key[0]) return;
+  size_t klen = strlen(key);
+  const char *p = q;
+  while (*p) {
+    if (!strncmp(p, key, klen) && p[klen] == '=') {
+      const char *v = p + klen + 1;
+      size_t n = 0;
+      while (v[n] && v[n] != '&' && n + 1 < cap) { out[n] = v[n]; n++; }
+      out[n] = '\0';
+      return;
+    }
+    const char *amp = strchr(p, '&');
+    if (!amp) break;
+    p = amp + 1;
+  }
+}
+
+static int json_get_str_array(const char *j, const char *key, char vals[][96], int max_n) {
+  char pat[64];
+  snprintf(pat, sizeof pat, "\"%s\"", key);
+  const char *p = strstr(j, pat);
+  if (!p) return 0;
+  p = strchr(p + strlen(pat), '[');
+  if (!p) return 0;
+  p++;
+  int cnt = 0;
+  while (*p && *p != ']' && cnt < max_n) {
+    while (*p && *p != '"' && *p != ']') p++;
+    if (*p != '"') break;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < 96) vals[cnt][n++] = *p++;
+    vals[cnt][n] = '\0';
+    if (*p == '"') p++;
+    if (n > 0) cnt++;
+  }
+  return cnt;
 }
 
 // Auth check matching supervisor.mjs (X-Api-Key or Authorization: Bearer <key>)
@@ -534,20 +576,29 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/health")) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v6\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v7\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
         "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
         "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,"
+        "\"cowrie_enabled\":%s,\"cowrie_shani\":%s,"
+        "\"cowrie_sp_hits\":%llu,\"cowrie_sp_saves\":%llu,"
+        "\"cowrie_sp_mismatches\":%llu,\"cowrie_trust_entries\":%d,"
         "\"gpu\":\"%s\",\"sm\":\"sm_%d%d\",\"vram_total_gb\":%.2f,"
         "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,"
         "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
         "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
-        "\"modalities\":[\"flux2_photoreal\",\"acestep_1.5_music\",\"trellis2_3d\",\"wan2.2_video\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\"]}",
+        "\"modalities\":[\"flux2_photoreal\",\"acestep_1.5_music\",\"trellis2_3d\",\"wan2.2_video\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
         g_api_key[0] ? "true" : "false",
         info.photoreal_ready ? "true" : "false",
         info.acestep_ready   ? "true" : "false",
         info.trellis2_ready  ? "true" : "false",
         info.wan22_ready     ? "true" : "false",
+        info.cowrie_enabled  ? "true" : "false",
+        info.cowrie_shani    ? "true" : "false",
+        (unsigned long long)info.cowrie_sp_hits,
+        (unsigned long long)info.cowrie_sp_saves,
+        (unsigned long long)info.cowrie_sp_mismatches,
+        info.cowrie_trust_entries,
         info.gpu_name, info.sm_major, info.sm_minor, info.vram_total_gb,
         info.vram_pool_used_mb, info.vram_pool_budget_mb,
         info.models_discovered, info.storage_roots, info.loras_discovered,
@@ -771,10 +822,36 @@ static void *client_thread(void *arg) {
   } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/prompts")) {
     ec_studio_prompts_json(resp, RESP_CAP);
     send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/lens")) {
+    char target[32], tier_s[16];
+    query_get_param(query, "target", target, sizeof target, "vault");
+    query_get_param(query, "tier",   tier_s, sizeof tier_s, "r2");
+    int tier = (!strcmp(tier_s, "r0") || !strcmp(tier_s, "0")) ? 0 :
+               (!strcmp(tier_s, "r1") || !strcmp(tier_s, "1")) ? 1 : 2;
+    if (ec_studio_cowrie_lens_json(st, target, tier, resp, RESP_CAP) == 0) {
+      send_json(cfd, 200, resp);
+    } else {
+      send_json(cfd, 400, resp);
+    }
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/creative/trust/gate")) {
+    char action[96];
+    char arg_vals[32][96];
+    const char *arg_ptrs[32];
+    json_get_str(body, "action", action, sizeof action, "unknown");
+    int n_args = json_get_str_array(body, "arg_ids", arg_vals, 32);
+    for (int i = 0; i < n_args; i++) arg_ptrs[i] = arg_vals[i];
+    int ov = json_get_bool(body, "owner_override", 0);
+    int http_code = ec_studio_cowrie_trust_gate_json(st, action, arg_ptrs, n_args, ov, resp, RESP_CAP);
+    send_json(cfd, http_code, resp);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/trust/triage")) {
+    ec_studio_cowrie_trust_triage_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/import")) {
     int is_png = (body_len >= 8 && (uint8_t)body[0] == 137 && body[1] == 'P' && body[2] == 'N' && body[3] == 'G') ? 1 : 0;
     int exec_now = (strstr(query, "execute=1") || strstr(query, "execute=true")) ? 1 : 0;
-    if (ec_studio_import_comfy(st, (const uint8_t *)body, body_len, is_png, exec_now, resp, RESP_CAP) == 0) {
+    char source_tag[48];
+    query_get_param(query, "source", source_tag, sizeof source_tag, "external");
+    if (ec_studio_import_comfy_ex(st, (const uint8_t *)body, body_len, is_png, exec_now, source_tag, resp, RESP_CAP) == 0) {
       send_json(cfd, 200, resp);
     } else {
       send_json(cfd, 400, resp);

@@ -6,6 +6,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ec_studio.h"
 #include "ec_acestep.h"
+#include "ec_cowrie.h"
 #include "ec_dit.h"
 #include "ec_flow.h"
 #include "ec_flux2.h"
@@ -26,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 struct ec_studio {
   char   artifact_dir[256];
@@ -56,6 +58,7 @@ struct ec_studio {
   ec_acestep_t       *acestep;
   ec_trellis2_t      *trellis2;
   ec_wan22_t         *wan22;
+  char                dag_model_sha[65];
   int                 initialized;
 };
 
@@ -139,6 +142,19 @@ static void studio_try_init_all_engines_locked(ec_studio_t *st) {
       st->wan22 = ec_wan22_create(&p);
     }
   }
+
+  // Compute composite 64-hex model contract SHA for persistent Cowrie ComfyUI DAG StatePages
+  char fp_flux[65] = "none", fp_ace[65] = "none", fp_tr[65] = "none", fp_wan[65] = "none";
+  const ec_storage_asset_t *a_fl = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "flux2_klein_4b");
+  const ec_storage_asset_t *a_ac = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "acestep_v15_turbo");
+  const ec_storage_asset_t *a_tr = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_ss_flow");
+  const ec_storage_asset_t *a_wn = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "wan2.2_ti2v_5b");
+  if (a_fl) ec_cowrie_file_fingerprint(a_fl->path, fp_flux);
+  if (a_ac) ec_cowrie_file_fingerprint(a_ac->path, fp_ace);
+  if (a_tr) ec_cowrie_file_fingerprint(a_tr->path, fp_tr);
+  if (a_wn) ec_cowrie_file_fingerprint(a_wn->path, fp_wan);
+  const char *parts[5] = { "eureka_dag_v7", fp_flux, fp_ace, fp_tr, fp_wan };
+  ec_cowrie_composite_sha(parts, 5, st->dag_model_sha);
 }
 
 static double st_now_ms(void) {
@@ -229,9 +245,12 @@ static int ec_studio_init_impl(ec_studio_t *st, const char *artifact_dir, const 
   ec_registry_init(&st->registry, st->models_dir);
   if (st->models_dir[0]) ec_registry_scan(&st->registry);
 
-  char cfg_storage[512], cfg_recipes[512];
+  char cfg_storage[512], cfg_recipes[512], cw_cache[512];
   snprintf(cfg_storage, sizeof cfg_storage, "%s/storage_roots.json", st->artifact_dir);
   snprintf(cfg_recipes, sizeof cfg_recipes, "%s/recipes_user.json", st->artifact_dir);
+  snprintf(cw_cache,    sizeof cw_cache,    "%s/cowrie_cache",       st->artifact_dir);
+  ec_cowrie_init();
+  ec_cowrie_set_cache_dir(cw_cache);
   ec_storage_init(&st->vault, st->models_dir, cfg_storage);
   ec_recipes_init(&st->recipes, cfg_recipes);
   studio_try_init_all_engines_locked(st);
@@ -292,6 +311,14 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
     if (st->vault.assets[i].kind == EC_ASSET_LORA) out->loras_discovered++;
     else if (st->vault.assets[i].kind == EC_ASSET_CHECKPOINT) out->checkpoints_discovered++;
   }
+  ec_cowrie_stats_t cws;
+  ec_cowrie_get_stats(&cws);
+  out->cowrie_enabled       = cws.enabled;
+  out->cowrie_shani         = cws.shani;
+  out->cowrie_sp_hits       = cws.sp_hits;
+  out->cowrie_sp_saves      = cws.sp_saves;
+  out->cowrie_sp_mismatches = cws.sp_mismatches;
+  out->cowrie_trust_entries = cws.trust_entries;
 }
 
 typedef struct {
@@ -1546,6 +1573,16 @@ static int studio_dag_cb(
 
 static void st_json_esc(const char *s, char *d, size_t cap);
 
+static int flow_val_artifacts_exist(const ec_node_val_t *v) {
+  if (!v) return 0;
+  if (v->image_path[0] && access(v->image_path, R_OK) != 0) return 0;
+  if (v->audio_path[0] && access(v->audio_path, R_OK) != 0) return 0;
+  if (v->video_path[0] && access(v->video_path, R_OK) != 0) return 0;
+  if (v->glb_path[0]   && access(v->glb_path,   R_OK) != 0) return 0;
+  if (v->ply_path[0]   && access(v->ply_path,   R_OK) != 0) return 0;
+  return 1;
+}
+
 static int studio_dag_event_cb(
     const ec_flow_graph_t *g, int32_t step, int32_t total_steps, int32_t node_idx,
     const char *status, const ec_flow_cache_entry_t *entry, double node_ms, void *uctx) {
@@ -1555,6 +1592,12 @@ static int studio_dag_event_cb(
                            ? (const ec_node_val_t *)entry->payload : NULL;
   char art_url[300] = {0};
   flow_primary_artifact_url(v, art_url, sizeof art_url);
+
+  // Persist freshly executed DAG node into 16 KB SHA-NI Cowrie StatePage for cross-restart hits!
+  if (v && !strcmp(status, "done") && nd->merkle_cid[0] && fc->st->dag_model_sha[0] && ec_cowrie_available()) {
+    ec_cowrie_sp_save("dag", fc->st->dag_model_sha, nd->merkle_cid, strlen(nd->merkle_cid),
+                      1u, EC_COWRIE_KV_DAG_NODEVAL, v, sizeof(ec_node_val_t));
+  }
 
   // Sync top-level outputs even on cached hits!
   if (v && (!strcmp(status, "cached") || !strcmp(status, "done"))) {
@@ -1615,6 +1658,21 @@ extern "C" int ec_studio_run_flow_ex(
   if (ec_flow_parse_comfy_json(&st->flow_graph, api_src, err, err_cap) != 0) { free(norm_buf); return -1; }
   if (ec_flow_compile(&st->flow_graph, err, err_cap) != 0) { free(norm_buf); return -1; }
 
+  // Hydrate missing RAM Merkle slots from persistent 16 KB SHA-NI Cowrie StatePages (cross-restart hits!)
+  if (ec_cowrie_available() && st->dag_model_sha[0]) {
+    for (int32_t step = 0; step < st->flow_graph.n_nodes; step++) {
+      int32_t idx = st->flow_graph.topo_order[step];
+      const ec_flow_node_t *nd = &st->flow_graph.nodes[idx];
+      if (!nd->merkle_cid[0] || ec_flow_cache_has(&st->flow_graph, nd->merkle_hash)) continue;
+      ec_node_val_t disk_v;
+      if (ec_cowrie_sp_load("dag", st->dag_model_sha, nd->merkle_cid, strlen(nd->merkle_cid),
+                            EC_COWRIE_KV_DAG_NODEVAL, &disk_v, sizeof disk_v) == 0 &&
+          flow_val_artifacts_exist(&disk_v)) {
+        ec_flow_preload_cache_entry(&st->flow_graph, nd->merkle_hash, nd->merkle_hash, &disk_v, sizeof disk_v);
+      }
+    }
+  }
+
   flow_exec_ctx_t fc = {};
   fc.st = st;
   fc.res = res;
@@ -1651,6 +1709,7 @@ extern "C" void ec_studio_flow_clear_cache(ec_studio_t *st) {
   if (!st || !st->initialized) return;
   pthread_mutex_lock(&st->gpu_mu);
   ec_flow_clear_cache(&st->flow_graph);
+  ec_cowrie_sp_purge_prefix("dag_");
   pthread_mutex_unlock(&st->gpu_mu);
 }
 
@@ -1984,9 +2043,9 @@ static void st_json_esc(const char *src, char *dst, size_t cap) {
   dst[ej] = '\0';
 }
 
-extern "C" int ec_studio_import_comfy(
+extern "C" int ec_studio_import_comfy_ex(
     ec_studio_t *st, const uint8_t *payload, size_t payload_len, int is_png, int execute_now,
-    char *out_json, size_t out_cap) {
+    const char *source_tag, char *out_json, size_t out_cap) {
   if (!st || !st->initialized || !payload || !payload_len || !out_json) return -1;
   char *raw_json = (char *)malloc(262144);
   char *api_json = (char *)malloc(262144);
@@ -2101,10 +2160,90 @@ extern "C" int ec_studio_import_comfy(
         "%s{\"name\":\"%s\",\"resolved\":\"%s\",\"strength\":%.2f}",
         i ? "," : "", info.extracted_loras[i], info.resolved_loras[i], info.extracted_lora_strengths[i]);
   }
+  // Frame normalized ComfyUI workflow under Cowrie v2 Trust Membrane (UNTRUSTED_EXT = 0x04 unless local verified)
+  const char *src_t = (source_tag && source_tag[0]) ? source_tag : "external";
+  uint8_t base_auth = (!strcmp(src_t, "local") || !strcmp(src_t, "template"))
+                      ? EC_COWRIE_AUTH_VERIFIED_TOOL : EC_COWRIE_AUTH_UNTRUSTED_EXT;
+  char cw_label[96];
+  snprintf(cw_label, sizeof cw_label, "%s:%s", info.source_format, info.modality);
+  ec_cowrie_trust_meta_t cw_meta = {};
+  ec_cowrie_trust_register_json(api_json, strlen(api_json), base_auth, src_t, cw_label, NULL, 0, &cw_meta);
+  char e_r0[320], e_r1[1536], e_src_t[64];
+  st_json_esc(cw_meta.r0, e_r0, sizeof e_r0);
+  st_json_esc(cw_meta.r1, e_r1, sizeof e_r1);
+  st_json_esc(src_t, e_src_t, sizeof e_src_t);
+
   pos += snprintf(out_json + pos, out_cap - (size_t)pos,
-      "]},\"executed\":%s,\"artifact_url\":\"%s\",\"engine_mode\":\"%s\",\"gpu_ms\":%.2f,\"api_workflow\":%s}",
+      "]},\"executed\":%s,\"artifact_url\":\"%s\",\"engine_mode\":\"%s\",\"gpu_ms\":%.2f,"
+      "\"cowrie\":{\"enabled\":%s,\"shani\":%s,\"cid\":\"%s\",\"handle\":\"%s\","
+      "\"authority\":%u,\"tainted\":%s,\"source\":\"%s\",\"raw_bytes\":%zu,\"cowr_bytes\":%zu,"
+      "\"r0\":\"%s\",\"r1\":\"%s\"},"
+      "\"api_workflow\":%s}",
       artifact_url[0] ? "true" : "false", artifact_url, exec_mode, exec_ms,
+      ec_cowrie_available() ? "true" : "false",
+      ec_cowrie_has_shani() ? "true" : "false",
+      cw_meta.cid_hex, cw_meta.handle, (unsigned)cw_meta.authority,
+      cw_meta.tainted ? "true" : "false", e_src_t, cw_meta.raw_bytes, cw_meta.cowr_bytes,
+      e_r0, e_r1,
       strlen(api_json) < (out_cap - (size_t)pos - 32) ? api_json : "{}");
   free(api_json);
   return 0;
+}
+
+extern "C" int ec_studio_import_comfy(
+    ec_studio_t *st, const uint8_t *payload, size_t payload_len, int is_png, int execute_now,
+    char *out_json, size_t out_cap) {
+  return ec_studio_import_comfy_ex(st, payload, payload_len, is_png, execute_now, "external", out_json, out_cap);
+}
+
+// ===========================================================================
+// 10. Tessera / Cowrie v2 Director LLM Lenses (R0/R1/R2) & Trust Membrane Gate
+// ===========================================================================
+extern "C" int ec_studio_cowrie_lens_json(
+    ec_studio_t *st, const char *target, int tier, char *out_json, size_t out_cap) {
+  if (!st || !st->initialized || !out_json || out_cap < 512) return -1;
+  const char *tgt = (target && target[0]) ? target : "vault";
+  char *raw = (char *)malloc(262144);
+  if (!raw) return -1;
+  raw[0] = '\0';
+
+  int rc = -1;
+  if (!strcmp(tgt, "vault") || !strcmp(tgt, "storage")) {
+    rc = ec_studio_storage_json(st, raw, 262144) >= 0 ? 0 : -1;
+  } else if (!strcmp(tgt, "recipes")) {
+    rc = ec_studio_recipes_json(st, raw, 262144) >= 0 ? 0 : -1;
+  } else if (!strcmp(tgt, "models")) {
+    rc = ec_studio_models_json(st, raw, 262144) >= 0 ? 0 : -1;
+  } else if (!strcmp(tgt, "templates")) {
+    rc = ec_studio_flow_templates_json(st, raw, 262144) >= 0 ? 0 : -1;
+  } else if (!strcmp(tgt, "prompts")) {
+    rc = ec_studio_prompts_json(raw, 262144) >= 0 ? 0 : -1;
+  } else if (!strcmp(tgt, "triage")) {
+    rc = ec_cowrie_trust_triage_json(raw, 262144) >= 0 ? 0 : -1;
+  } else {
+    free(raw);
+    snprintf(out_json, out_cap, "{\"ok\":false,\"error\":\"unknown lens target (use vault|recipes|models|templates|prompts|triage)\"}");
+    return -1;
+  }
+
+  if (rc != 0 || !raw[0]) {
+    free(raw);
+    snprintf(out_json, out_cap, "{\"ok\":false,\"error\":\"failed to gather lens target payload\"}");
+    return -1;
+  }
+  int n = ec_cowrie_lens_response_json(tgt, raw, strlen(raw), EC_COWRIE_AUTH_VERIFIED_TOOL, tier, out_json, out_cap);
+  free(raw);
+  return n >= 0 ? 0 : -1;
+}
+
+extern "C" int ec_studio_cowrie_trust_gate_json(
+    ec_studio_t *st, const char *action, const char *const *arg_ids, int n_args,
+    int owner_override, char *out_json, size_t out_cap) {
+  (void)st;
+  return ec_cowrie_trust_gate_json(action, arg_ids, n_args, owner_override, out_json, out_cap);
+}
+
+extern "C" int ec_studio_cowrie_trust_triage_json(ec_studio_t *st, char *out_json, size_t out_cap) {
+  (void)st;
+  return ec_cowrie_trust_triage_json(out_json, out_cap);
 }

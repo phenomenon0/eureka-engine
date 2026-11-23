@@ -38,10 +38,10 @@ for _ in $(seq 1 50); do
 done
 [ -n "$PORT" ] || { echo "error: eureka-creative-serve did not print ready port"; cat "$OUT/receipts/serve.log"; exit 1; }
 
-python3 - "$PORT" "$ART" "$API_KEY" <<'PY' | tee "$RECEIPT"
+python3 - "$PORT" "$ART" "$API_KEY" "$OUT/eureka-creative-serve" "$MODELS" <<'PY' | tee "$RECEIPT"
 import concurrent.futures, json, math, os, struct, subprocess, sys, time, urllib.request, urllib.error, wave
 
-port, art_dir, api_key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+port, art_dir, api_key, serve_bin, models_dir = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 base = f"http://127.0.0.1:{port}"
 fails = 0
 
@@ -504,8 +504,107 @@ check("E2E.17 ComfyUI Node Graph (SSE+Merkle+PNG tEXt)",
       flow_v6_ok,
       f"nodes_schema={len(oi)} tpls={len(tpls)} cold={fin1['executed']}/8 warm_tweak=hits:{fin2['cache_hits']}+exec:{fin2['executed']}({t_mk_ms:.0f}ms!) png_roundtrip=OK(8n)")
 
+# 18. v7 Tessera / Cowrie v2 Phase A+B: Cold Process Restart Persistent StatePages + Trust Gate 403 + R0/R1/R2 Lenses!
+proc2 = subprocess.Popen(
+    [serve_bin, "--port", "0", "--artifacts", art_dir, "--models-dir", models_dir, "--api-key", api_key],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+try:
+    ready_line = proc2.stdout.readline()
+    port2 = json.loads(ready_line)["port"]
+    base2 = f"http://127.0.0.1:{port2}"
+    def req2(method, path, payload=None, timeout=60):
+        data = json.dumps(payload).encode() if isinstance(payload, dict) else (payload.encode() if isinstance(payload, str) else None)
+        hdrs = {"Content-Type": "application/json", "X-Api-Key": api_key}
+        r = urllib.request.Request(base2 + path, data=data, method=method, headers=hdrs)
+        try:
+            with urllib.request.urlopen(r, timeout=timeout) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as he:
+            return he.code, he.read()
+
+    # 18a. Health reports v7 Cowrie SHA-NI enabled
+    _, h2_b = req2("GET", "/v1/creative/health")
+    h2 = json.loads(h2_b)
+
+    # 18b. Cold restart persistent ComfyUI DAG hit (8/8 nodes from 16 KB SHA-NI StatePages, 0 RAM cache!)
+    t_cr0 = time.time()
+    _, q_cr_b = req2("POST", "/v1/flows/queue", wf_flux2)
+    q_cr = json.loads(q_cr_b)
+    _, sse_cr_b = req2("GET", q_cr["events_url"], timeout=30)
+    t_cr_ms = (time.time() - t_cr0) * 1000.0
+    fin_cr = [json.loads(l[5:].strip()) for l in sse_cr_b.decode("utf-8", "replace").splitlines() if l.startswith("data:")][-1]["result"]
+
+    # 18c. Canonical key-order-shuffled tweak on cold server (hits 6/8 upstream FLUX.2 nodes!)
+    wf_shuf = json.loads(json.dumps(wf_flux2))
+    wf_shuf["7"]["inputs"] = {
+        "sharpen": 0.25, "vignette": 0.20, "saturation": 1.10, "warmth": -0.10, "contrast": 1.33, "image": ["6", 0]
+    }
+    t_sh0 = time.time()
+    _, q_sh_b = req2("POST", "/v1/flows/queue", wf_shuf)
+    q_sh = json.loads(q_sh_b)
+    _, sse_sh_b = req2("GET", q_sh["events_url"], timeout=30)
+    t_sh_ms = (time.time() - t_sh0) * 1000.0
+    fin_sh = [json.loads(l[5:].strip()) for l in sse_sh_b.decode("utf-8", "replace").splitlines() if l.startswith("data:")][-1]["result"]
+
+    # 18d. Cold restart FLUX.2 Qwen3-4B StatePage hit (new seed, same prompt -> <50 ms text encode vs ~1200 ms!)
+    flux_prompt = wf_flux["3"]["inputs"]["text"]
+    _, img_sp_b = req2("POST", "/v1/images/generations", {
+        "prompt": flux_prompt, "seed": 9911, "width": 512, "height": 512, "steps": 4, "photoreal": True
+    }, timeout=60)
+    img_sp = json.loads(img_sp_b)
+
+    # 18e. Phase B Trust Membrane: External URL import tagged UNTRUSTED_EXT (0x04) + 403 Trust Gate
+    _, imp_cw_b = req2("POST", "/v1/flows/import?source=external_url", sg_wf)
+    imp_cw = json.loads(imp_cw_b)
+    cw_meta = imp_cw.get("cowrie", {})
+    cw_handle = cw_meta.get("handle", "")
+    st_blk, blk_b = req2("POST", "/v1/creative/trust/gate", {"action": "shell_exec", "arg_ids": [cw_handle]})
+    st_ro,  ro_b  = req2("POST", "/v1/creative/trust/gate", {"action": "read_only",  "arg_ids": [cw_handle]})
+    st_ov,  ov_b  = req2("POST", "/v1/creative/trust/gate", {"action": "shell_exec", "arg_ids": [cw_handle], "owner_override": True})
+    blk_j, ro_j, ov_j = json.loads(blk_b), json.loads(ro_b), json.loads(ov_b)
+    _, tri_b = req2("GET", "/v1/creative/trust/triage")
+    tri_j = json.loads(tri_b)
+
+    # 18f. Phase B Director LLM R0/R1/R2 Lenses
+    _, lr2_b = req2("GET", "/v1/creative/lens?target=recipes&tier=r2")
+    _, lr1_b = req2("GET", "/v1/creative/lens?target=vault&tier=r1")
+    _, lr0_b = req2("GET", "/v1/creative/lens?target=templates&tier=r0")
+    lr2, lr1, lr0 = json.loads(lr2_b), json.loads(lr1_b), json.loads(lr0_b)
+
+    _, h2_after_b = req2("GET", "/v1/creative/health")
+    h2_after = json.loads(h2_after_b)
+
+    cowrie_v7_ok = (
+        h2.get("engine") == "eureka-creative-native-v7"
+        and h2.get("cowrie_enabled") is True and h2.get("cowrie_shani") is True
+        and fin_cr["ok"] and fin_cr["cache_hits"] == 8 and fin_cr["executed"] == 0
+        and fin_sh["ok"] and fin_sh["cache_hits"] == 6 and fin_sh["executed"] == 2
+        and img_sp["ok"] and img_sp.get("text_enc_ms", 9999) < 80.0
+        and h2_after.get("cowrie_sp_hits", 0) >= 9
+        and cw_meta.get("tainted") is True and cw_meta.get("authority") == 0x84 and cw_handle.startswith("@")
+        and len(cw_meta.get("cid", "")) == 68
+        and st_blk == 403 and blk_j.get("error") == "ERR_TAINTED_EXECUTION_BLOCKED" and blk_j.get("allowed") is False
+        and st_ro == 200 and ro_j.get("allowed") is True
+        and st_ov == 200 and ov_j.get("allowed") is True
+        and tri_j.get("count", 0) >= 1
+        and lr2.get("ok") is True and lr2.get("reduction_pct", 0) >= 20.0
+        and lr1.get("ok") is True and lr1.get("reduction_pct", 0) >= 85.0
+        and lr0.get("ok") is True and lr0.get("reduction_pct", 0) >= 98.0
+    )
+    check("E2E.18 Cowrie v2 (ColdRestart+Trust403+Lens)",
+          cowrie_v7_ok,
+          f"cold_dag={fin_cr['cache_hits']}/8({t_cr_ms:.0f}ms) shuf={fin_sh['cache_hits']}/8({t_sh_ms:.0f}ms) qwen3_sp={img_sp.get('text_enc_ms',0):.1f}ms sp_hits={h2_after.get('cowrie_sp_hits',0)} gate={st_blk}/{st_ro}/{st_ov} lens=-{lr2.get('reduction_pct',0):.1f}%/-{lr1.get('reduction_pct',0):.1f}%/-{lr0.get('reduction_pct',0):.1f}%")
+finally:
+    proc2.terminate()
+    try:
+        proc2.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc2.kill()
+        proc2.wait()
+
 print("===========================================================================")
-print(f"E2E v6 VERDICT: {'ALL 17 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
+print(f"E2E v7 VERDICT: {'ALL 18 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
 print("===========================================================================")
 sys.exit(0 if fails == 0 else 1)
 PY

@@ -39,6 +39,12 @@ typedef struct {
   int    loras_discovered;
   int    checkpoints_discovered;
   int    recipes_count;
+  int    cowrie_enabled;
+  int    cowrie_shani;
+  uint64_t cowrie_sp_hits;
+  uint64_t cowrie_sp_saves;
+  uint64_t cowrie_sp_mismatches;
+  int    cowrie_trust_entries;
 } ec_studio_info_t;
 
 typedef struct {
@@ -156,10 +162,21 @@ int ec_studio_recipe_save(
 int ec_studio_recipe_delete(ec_studio_t *st, const char *id);
 
 // Import ComfyUI API JSON, LiteGraph UI JSON, OR raw PNG bytes (if is_png=1), resolve models
-// across all local/network storage roots, and optionally execute photoreal generation.
+// across all local/network storage roots, frame under Cowrie v2 Trust Membrane, and optionally execute.
 int ec_studio_import_comfy(
     ec_studio_t *st, const uint8_t *payload, size_t payload_len, int is_png, int execute_now,
     char *out_json, size_t out_cap);
+int ec_studio_import_comfy_ex(
+    ec_studio_t *st, const uint8_t *payload, size_t payload_len, int is_png, int execute_now,
+    const char *source_tag, char *out_json, size_t out_cap);
+
+// 10. Tessera / Cowrie v2 Director LLM Lenses (R0/R1/R2) & Trust Membrane Gate
+int ec_studio_cowrie_lens_json(
+    ec_studio_t *st, const char *target, int tier, char *out_json, size_t out_cap);
+int ec_studio_cowrie_trust_gate_json(
+    ec_studio_t *st, const char *action, const char *const *arg_ids, int n_args,
+    int owner_override, char *out_json, size_t out_cap);
+int ec_studio_cowrie_trust_triage_json(ec_studio_t *st, char *out_json, size_t out_cap);
 
 #ifdef __cplusplus
 }
