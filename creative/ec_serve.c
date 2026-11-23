@@ -461,7 +461,7 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/health")) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v4\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v5\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
         "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
         "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,"

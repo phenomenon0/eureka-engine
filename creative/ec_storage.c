@@ -345,6 +345,32 @@ const ec_storage_asset_t *ec_storage_find(const ec_storage_vault_t *v, ec_asset_
       if (strstr(acan, qcan) || strstr(qcan, acan)) return a;
     }
   }
+  // 4. Model-family alias fallback (handles ComfyUI AIO / quantized / naming-variant templates)
+  if (strlen(qcan) >= 4) {
+    const char *alias = NULL;
+    if (strstr(qcan, "acestep")) {
+      alias = (kind == EC_ASSET_VAE) ? "acestep_v15_vae" : "acestep_v15_turbo";
+    } else if (strstr(qcan, "flux2") && (strstr(qcan, "klein") || strstr(qcan, "4b") || strstr(qcan, "vae"))) {
+      alias = (kind == EC_ASSET_VAE || strstr(qcan, "vae")) ? "flux2_klein_vae" : "flux2_klein_4b";
+    } else if ((strstr(qcan, "wan22") || (strstr(qcan, "wan") && strstr(qcan, "5b")))) {
+      alias = (kind == EC_ASSET_VAE || strstr(qcan, "vae")) ? "wan2.2_vae" : "wan2.2_ti2v_5b";
+    } else if (strstr(qcan, "trellis2") || strstr(qcan, "trellis")) {
+      alias = (kind == EC_ASSET_VAE || strstr(qcan, "dec")) ? "trellis2_ss_dec" : "trellis2_ss_flow";
+    } else if (strstr(qcan, "dino") && strstr(qcan, "v3")) {
+      alias = "dinov3_vitl16";
+    } else if (strstr(qcan, "umt5")) {
+      alias = "umt5_xxl";
+    } else if (strstr(qcan, "qwen3") && strstr(qcan, "4b")) {
+      alias = "qwen_3_4b";
+    }
+    if (alias) {
+      for (int i = 0; i < v->n_assets; i++) {
+        const ec_storage_asset_t *a = &v->assets[i];
+        if (kind != EC_ASSET_OTHER && a->kind != kind) continue;
+        if (ci_contains(a->id, alias) || ci_contains(a->name, alias)) return a;
+      }
+    }
+  }
   return NULL;
 }
 

@@ -10,6 +10,7 @@
 #include "ec_kernels_v2.cuh"
 #include "ec_media.h"
 #include "ec_models.h"
+#include "ec_ops.h"
 #include "ec_safetensors.h"
 #include "ec_vram_pool.h"
 
@@ -1345,6 +1346,124 @@ static void test_v2_kernels_and_models(const char *art_dir) {
     snprintf(buf, sizeof buf, "written=%d discovered=%d/5 loaded_and_probed=%d/5", wrc == 0, found, loaded_ok);
     check_gate("G-C1..C4 All 5 Flagship HF Arch Loaders", wrc == 0 && found == 5 && loaded_ok == 5, buf);
     ec_registry_free(&reg);
+  }
+
+  // 5. Sprint 1 Unified Native Fast Core (ec_ops.cu): BM=128 cp.async BF16 GEMM + BF16 FA2 D=128 + GPU Rescale Euler
+  {
+    auto f32_to_bf16_u = [](float f) -> uint16_t {
+      uint32_t u; memcpy(&u, &f, 4);
+      u += 0x7FFFU + ((u >> 16) & 1U);
+      return (uint16_t)(u >> 16);
+    };
+    auto bf16_to_f32_u = [](uint16_t b) -> float {
+      uint32_t u = ((uint32_t)b) << 16; float f; memcpy(&f, &u, 4); return f;
+    };
+
+    // 5a. BM=128 cp.async BF16 GEMM numerical accuracy vs CPU F64 (odd edge 277x313x128) + Peak TFLOPS (4096x4096x4096)
+    const int Mo = 277, No = 313, Ko = 128;
+    uint16_t *Xh = (uint16_t *)malloc((size_t)Mo * Ko * 2), *Wh = (uint16_t *)malloc((size_t)No * Ko * 2);
+    float *bh = (float *)malloc((size_t)No * 4), *Yg = (float *)malloc((size_t)Mo * No * 4);
+    double *Yref = (double *)malloc((size_t)Mo * No * 8);
+    for (int i = 0; i < Mo * Ko; i++) Xh[i] = f32_to_bf16_u(randf_sym(1.0f));
+    for (int i = 0; i < No * Ko; i++) Wh[i] = f32_to_bf16_u(randf_sym(0.5f));
+    for (int i = 0; i < No; i++) bh[i] = randf_sym(0.25f);
+    for (int m = 0; m < Mo; m++)
+      for (int n = 0; n < No; n++) {
+        double s = bh[n];
+        for (int k = 0; k < Ko; k++) s += (double)bf16_to_f32_u(Xh[m * Ko + k]) * (double)bf16_to_f32_u(Wh[n * Ko + k]);
+        Yref[m * No + n] = s;
+      }
+    uint16_t *Xd, *Wd; float *bd, *Yd;
+    cudaMalloc(&Xd, (size_t)Mo * Ko * 2); cudaMalloc(&Wd, (size_t)No * Ko * 2);
+    cudaMalloc(&bd, (size_t)No * 4);      cudaMalloc(&Yd, (size_t)Mo * No * 4);
+    cudaMemcpy(Xd, Xh, (size_t)Mo * Ko * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(Wd, Wh, (size_t)No * Ko * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(bd, bh, (size_t)No * 4, cudaMemcpyHostToDevice);
+    ec_ops_gemm_bf16(Xd, Wd, bd, Yd, nullptr, Mo, No, Ko, 0);
+    cudaMemcpy(Yg, Yd, (size_t)Mo * No * 4, cudaMemcpyDeviceToHost);
+    err_metrics_t mg = compare_arrays(Yg, Yref, (size_t)Mo * No);
+
+    // Also verify M=1 GEMV tier!
+    ec_ops_gemm_bf16(Xd, Wd, bd, Yd, nullptr, 1, No, Ko, 0);
+    cudaMemcpy(Yg, Yd, (size_t)No * 4, cudaMemcpyDeviceToHost);
+    err_metrics_t mv = compare_arrays(Yg, Yref, (size_t)No);
+    cudaFree(Xd); cudaFree(Wd); cudaFree(bd); cudaFree(Yd);
+    free(Xh); free(Wh); free(bh); free(Yg); free(Yref);
+
+    // Benchmark 4096x4096x4096 BM=128 cp.async BF16 GEMM throughput
+    const int MB = 4096, NB = 4096, KB = 4096;
+    uint16_t *Xb, *Wb; float *Yb;
+    cudaMalloc(&Xb, (size_t)MB * KB * 2); cudaMalloc(&Wb, (size_t)NB * KB * 2); cudaMalloc(&Yb, (size_t)MB * NB * 4);
+    cudaMemset(Xb, 0x3F, (size_t)MB * KB * 2); cudaMemset(Wb, 0x3E, (size_t)NB * KB * 2);
+    ec_ops_gemm_bf16(Xb, Wb, nullptr, Yb, nullptr, MB, NB, KB, 0);
+    cudaDeviceSynchronize();
+    cudaEvent_t ev0, ev1; cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+    cudaEventRecord(ev0);
+    for (int it = 0; it < 12; it++) ec_ops_gemm_bf16(Xb, Wb, nullptr, Yb, nullptr, MB, NB, KB, 0);
+    cudaEventRecord(ev1); cudaEventSynchronize(ev1);
+    float ms_g = 0.0f; cudaEventElapsedTime(&ms_g, ev0, ev1); ms_g /= 12.0f;
+    double tf_g = (2.0 * MB * NB * KB) / (ms_g * 1e9);
+    cudaFree(Xb); cudaFree(Wb); cudaFree(Yb);
+    snprintf(buf, sizeof buf, "128x128 cp.async: %.1f TF (%.2fms) rel=%.2e gemv_rel=%.2e", tf_g, ms_g, mg.rel_l2, mv.rel_l2);
+    check_gate("G-C5 ec_ops BM=128 cp.async BF16 GEMM", mg.rel_l2 < 1e-4 && mv.rel_l2 < 1e-4 && tf_g >= 40.0, buf);
+
+    // 5b. Native BF16 FA2 D=128 (asymmetric Lq=195 != Lkv=133, GQA Hq=8/Hkv=4, full + window=32) + TFLOPS (H=12, L=4096)
+    const int Lq = 195, Lkv = 133, Hq = 8, Hkv = 4, Da = 128;
+    const float sc = 1.0f / sqrtf((float)Da);
+    uint16_t *Qh = (uint16_t *)malloc((size_t)Hq * Lq * Da * 2);
+    uint16_t *Kh = (uint16_t *)malloc((size_t)Hkv * Lkv * Da * 2);
+    uint16_t *Vh = (uint16_t *)malloc((size_t)Hkv * Lkv * Da * 2);
+    for (size_t i = 0; i < (size_t)Hq * Lq * Da; i++) Qh[i] = f32_to_bf16_u(randf_sym(0.7f));
+    for (size_t i = 0; i < (size_t)Hkv * Lkv * Da; i++) { Kh[i] = f32_to_bf16_u(randf_sym(0.7f)); Vh[i] = f32_to_bf16_u(randf_sym(0.7f)); }
+    double *Oref = (double *)malloc((size_t)Lq * Hq * Da * 8);
+    for (int h = 0; h < Hq; h++) {
+      int hk = h / (Hq / Hkv);
+      for (int q = 0; q < Lq; q++) {
+        double scs[133], mx = -1e30;
+        for (int k = 0; k < Lkv; k++) {
+          double dot = 0.0;
+          for (int d = 0; d < Da; d++) dot += (double)bf16_to_f32_u(Qh[(h * Lq + q) * Da + d]) * (double)bf16_to_f32_u(Kh[(hk * Lkv + k) * Da + d]);
+          scs[k] = dot * sc;
+          if (scs[k] > mx) mx = scs[k];
+        }
+        double ls = 0.0;
+        for (int k = 0; k < Lkv; k++) { scs[k] = exp(scs[k] - mx); ls += scs[k]; }
+        for (int d = 0; d < Da; d++) {
+          double acc = 0.0;
+          for (int k = 0; k < Lkv; k++) acc += (scs[k] / ls) * (double)bf16_to_f32_u(Vh[(hk * Lkv + k) * Da + d]);
+          Oref[(q * Hq + h) * Da + d] = acc;
+        }
+      }
+    }
+    uint16_t *Qd, *Kd, *Vd, *Obd; float *Ofd;
+    cudaMalloc(&Qd, (size_t)Hq * Lq * Da * 2); cudaMalloc(&Kd, (size_t)Hkv * Lkv * Da * 2); cudaMalloc(&Vd, (size_t)Hkv * Lkv * Da * 2);
+    cudaMalloc(&Ofd, (size_t)Lq * Hq * Da * 4); cudaMalloc(&Obd, (size_t)Lq * Hq * Da * 2);
+    cudaMemcpy(Qd, Qh, (size_t)Hq * Lq * Da * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(Kd, Kh, (size_t)Hkv * Lkv * Da * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(Vd, Vh, (size_t)Hkv * Lkv * Da * 2, cudaMemcpyHostToDevice);
+    ec_ops_fa2_bf16(Qd, Kd, Vd, Ofd, Obd, Lq, Lkv, Lq, Lkv, Hq, Hkv, Da, sc, 0, 0);
+    float *Og = (float *)malloc((size_t)Lq * Hq * Da * 4);
+    cudaMemcpy(Og, Ofd, (size_t)Lq * Hq * Da * 4, cudaMemcpyDeviceToHost);
+    err_metrics_t ma = compare_arrays(Og, Oref, (size_t)Lq * Hq * Da);
+    cudaFree(Qd); cudaFree(Kd); cudaFree(Vd); cudaFree(Ofd); cudaFree(Obd);
+    free(Qh); free(Kh); free(Vh); free(Oref); free(Og);
+
+    // Benchmark TRELLIS.2 exact self-attn shape: H=12, L=4096, D=128
+    const int Lb = 4096, Hb = 12;
+    cudaMalloc(&Qd, (size_t)Hb * Lb * Da * 2); cudaMalloc(&Kd, (size_t)Hb * Lb * Da * 2);
+    cudaMalloc(&Vd, (size_t)Hb * Lb * Da * 2); cudaMalloc(&Obd, (size_t)Lb * Hb * Da * 2);
+    cudaMemset(Qd, 0x3E, (size_t)Hb * Lb * Da * 2); cudaMemset(Kd, 0x3E, (size_t)Hb * Lb * Da * 2); cudaMemset(Vd, 0x3E, (size_t)Hb * Lb * Da * 2);
+    ec_ops_fa2_bf16(Qd, Kd, Vd, nullptr, Obd, Lb, Lb, Lb, Lb, Hb, Hb, Da, sc, 0, 0);
+    cudaDeviceSynchronize();
+    cudaEventRecord(ev0);
+    for (int it = 0; it < 10; it++) ec_ops_fa2_bf16(Qd, Kd, Vd, nullptr, Obd, Lb, Lb, Lb, Lb, Hb, Hb, Da, sc, 0, 0);
+    cudaEventRecord(ev1); cudaEventSynchronize(ev1);
+    float ms_a = 0.0f; cudaEventElapsedTime(&ms_a, ev0, ev1); ms_a /= 10.0f;
+    double tf_a = (4.0 * Hb * Lb * Lb * Da) / (ms_a * 1e9);
+    cudaFree(Qd); cudaFree(Kd); cudaFree(Vd); cudaFree(Obd);
+    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+    snprintf(buf, sizeof buf, "H=12 L=4096 D=128: %.1f TF (%.2fms) GQA_cos=%.6f rel=%.4f", tf_a, ms_a, ma.cos_sim, ma.rel_l2);
+    check_gate("G-C5 ec_ops BF16 FA2 D=128 (GQA + Self/Cross)", ma.cos_sim >= 0.9999 && ma.rel_l2 <= 5e-3 && tf_a >= 25.0, buf);
   }
 }
 

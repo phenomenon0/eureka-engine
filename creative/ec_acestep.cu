@@ -12,6 +12,7 @@
 #include "ec_acestep.h"
 #include "ec_bpe.h"
 #include "ec_media.h"
+#include "ec_ops.h"
 #include "ec_safetensors.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -54,118 +55,13 @@ static __device__ __forceinline__ float as_warp_sum(float v) {
   for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
   return v;
 }
-static __device__ __forceinline__ void as_mma_bf16(
-    float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
 // ===========================================================================
-// 1. Native PTX BF16 TensorCore GEMM: Y[M, N] = X_bf16[M, K] @ W_bf16[N, K]^T + bias
+// 1. Unified High-Throughput BF16 TensorCore GEMM (via shared ec_ops.cu)
 // ===========================================================================
-__global__ void __launch_bounds__(128) k_as_gemm_bf16(
-    const uint16_t *__restrict__ X, const uint16_t *__restrict__ W,
-    const float *__restrict__ bias,
-    float *__restrict__ Y_f32, uint16_t *__restrict__ Y_bf16,
-    int M, int N, int K) {
-  constexpr int BM = 64, BN = 64, BK = 32, STRIDE = 40;
-  __shared__ __align__(16) uint16_t sX[BM * STRIDE];
-  __shared__ __align__(16) uint16_t sW[BN * STRIDE];
-
-  const int warp = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  const int g = lane >> 2;
-  const int t = lane & 3;
-  const int wm = (warp >> 1) * 32;
-  const int wn = (warp & 1) * 32;
-  const int m0 = blockIdx.y * BM;
-  const int n0 = blockIdx.x * BN;
-
-  float acc[2][4][4];
-  #pragma unroll
-  for (int mi = 0; mi < 2; mi++)
-    #pragma unroll
-    for (int ni = 0; ni < 4; ni++)
-      acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
-
-  const bool fast_k = ((K & 7) == 0);
-  for (int kb = 0; kb < K; kb += BK) {
-    if (fast_k && (kb + BK <= K)) {
-      #pragma unroll
-      for (int iter = 0; iter < 2; iter++) {
-        const int idx = threadIdx.x + iter * 128;
-        const int r = idx >> 2;
-        const int c = (idx & 3) * 8;
-        uint4 vx = make_uint4(0, 0, 0, 0);
-        if (m0 + r < M) vx = *(const uint4 *)(X + (long)(m0 + r) * K + kb + c);
-        *(uint4 *)(sX + r * STRIDE + c) = vx;
-        uint4 vw = make_uint4(0, 0, 0, 0);
-        if (n0 + r < N) vw = *(const uint4 *)(W + (long)(n0 + r) * K + kb + c);
-        *(uint4 *)(sW + r * STRIDE + c) = vw;
-      }
-    } else {
-      for (int idx = threadIdx.x; idx < BM * BK; idx += 128) {
-        const int r = idx / BK, c = idx % BK;
-        sX[r * STRIDE + c] = (m0 + r < M && kb + c < K) ? X[(long)(m0 + r) * K + kb + c] : 0;
-        sW[r * STRIDE + c] = (n0 + r < N && kb + c < K) ? W[(long)(n0 + r) * K + kb + c] : 0;
-      }
-    }
-    __syncthreads();
-
-    #pragma unroll
-    for (int ks = 0; ks < 2; ks++) {
-      const int ko = ks * 16;
-      uint32_t a_frag[2][4];
-      #pragma unroll
-      for (int mi = 0; mi < 2; mi++) {
-        const uint16_t *xr0 = sX + (wm + mi * 16 + g) * STRIDE + ko;
-        const uint16_t *xr8 = xr0 + 8 * STRIDE;
-        a_frag[mi][0] = *(const uint32_t *)(xr0 + 2 * t);
-        a_frag[mi][1] = *(const uint32_t *)(xr8 + 2 * t);
-        a_frag[mi][2] = *(const uint32_t *)(xr0 + 8 + 2 * t);
-        a_frag[mi][3] = *(const uint32_t *)(xr8 + 8 + 2 * t);
-      }
-      #pragma unroll
-      for (int ni = 0; ni < 4; ni++) {
-        const uint16_t *wr = sW + (wn + ni * 8 + g) * STRIDE + ko;
-        const uint32_t b0 = *(const uint32_t *)(wr + 2 * t);
-        const uint32_t b1 = *(const uint32_t *)(wr + 8 + 2 * t);
-        #pragma unroll
-        for (int mi = 0; mi < 2; mi++) {
-          as_mma_bf16(acc[mi][ni], a_frag[mi], b0, b1);
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  #pragma unroll
-  for (int mi = 0; mi < 2; mi++) {
-    #pragma unroll
-    for (int ni = 0; ni < 4; ni++) {
-      #pragma unroll
-      for (int e = 0; e < 4; e++) {
-        const int r = m0 + wm + mi * 16 + g + 8 * (e >> 1);
-        const int c = n0 + wn + ni * 8 + 2 * t + (e & 1);
-        if (r < M && c < N) {
-          float v = acc[mi][ni][e] + (bias ? bias[c] : 0.0f);
-          if (Y_f32) Y_f32[(long)r * N + c] = v;
-          if (Y_bf16) Y_bf16[(long)r * N + c] = as_f32_to_bf16(v);
-        }
-      }
-    }
-  }
-}
-
 static void as_gemm(
     const uint16_t *X, const uint16_t *W, const float *bias,
     float *Y_f32, uint16_t *Y_bf16, int M, int N, int K, cudaStream_t s) {
-  if (M <= 0 || N <= 0 || K <= 0) return;
-  dim3 grd((N + 63) / 64, (M + 63) / 64);
-  k_as_gemm_bf16<<<grd, 128, 0, s>>>(X, W, bias, Y_f32, Y_bf16, M, N, K);
+  ec_ops_gemm_bf16(X, W, bias, Y_f32, Y_bf16, M, N, K, s);
 }
 
 // ===========================================================================
@@ -220,6 +116,68 @@ __global__ void k_as_rmsnorm_adaln(
     if (scale) v = v * (1.0f + scale[c]) + shift[c];
     if (yf) yf[c] = v;
     if (yb) yb[c] = as_f32_to_bf16(v);
+  }
+}
+
+// QK-RMSNorm + Split-Half 1D RoPE + Transpose [L, H, D] -> [H, L, D] BF16 (direct TensorCore FA2 input!)
+__global__ void k_as_qk_norm_rope_bf16(
+    const float *__restrict__ q_in, const float *__restrict__ k_in, const float *__restrict__ v_in,
+    const float *__restrict__ q_norm_w, const float *__restrict__ k_norm_w,
+    uint16_t *__restrict__ q_out, uint16_t *__restrict__ k_out, uint16_t *__restrict__ v_out,
+    int Lq, int Lkv, int Hq, int Hkv, int D, float theta, float eps, int apply_rope) {
+  int idx = (int)(((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+  int lane = threadIdx.x & 31;
+  int total_q = q_in ? (Lq * Hq) : 0;
+  int total_kv = k_in ? (Lkv * Hkv) : 0;
+  int half = D >> 1;
+
+  if (idx < total_q) {
+    int pos = idx / Hq, h = idx % Hq;
+    const float *qs = q_in + ((long)pos * Hq + h) * D;
+    uint16_t *qo = q_out + ((long)h * Lq + pos) * D;
+    float sq = 0.0f;
+    for (int d = lane; d < D; d += 32) { float v = qs[d]; sq += v * v; }
+    sq = as_warp_sum(sq);
+    float inv = rsqrtf(sq / (float)D + eps);
+    for (int j = lane; j < half; j += 32) {
+      float x0 = qs[j] * inv * q_norm_w[j];
+      float x1 = qs[j + half] * inv * q_norm_w[j + half];
+      if (apply_rope) {
+        double ang = (double)pos / pow((double)theta, (double)(2 * j) / (double)D);
+        float cs = (float)cos(ang), sn = (float)sin(ang);
+        qo[j]        = as_f32_to_bf16(x0 * cs - x1 * sn);
+        qo[j + half] = as_f32_to_bf16(x1 * cs + x0 * sn);
+      } else {
+        qo[j]        = as_f32_to_bf16(x0);
+        qo[j + half] = as_f32_to_bf16(x1);
+      }
+    }
+  } else if (idx < total_q + total_kv) {
+    int kidx = idx - total_q;
+    int pos = kidx / Hkv, h = kidx % Hkv;
+    const float *ks = k_in + ((long)pos * Hkv + h) * D;
+    const float *vs = v_in + ((long)pos * Hkv + h) * D;
+    uint16_t *ko = k_out + ((long)h * Lkv + pos) * D;
+    uint16_t *vo = v_out + ((long)h * Lkv + pos) * D;
+    float sk = 0.0f;
+    for (int d = lane; d < D; d += 32) { float v = ks[d]; sk += v * v; }
+    sk = as_warp_sum(sk);
+    float inv = rsqrtf(sk / (float)D + eps);
+    for (int j = lane; j < half; j += 32) {
+      float x0 = ks[j] * inv * k_norm_w[j];
+      float x1 = ks[j + half] * inv * k_norm_w[j + half];
+      if (apply_rope) {
+        double ang = (double)pos / pow((double)theta, (double)(2 * j) / (double)D);
+        float cs = (float)cos(ang), sn = (float)sin(ang);
+        ko[j]        = as_f32_to_bf16(x0 * cs - x1 * sn);
+        ko[j + half] = as_f32_to_bf16(x1 * cs + x0 * sn);
+      } else {
+        ko[j]        = as_f32_to_bf16(x0);
+        ko[j + half] = as_f32_to_bf16(x1);
+      }
+      vo[j]        = as_f32_to_bf16(vs[j]);
+      vo[j + half] = as_f32_to_bf16(vs[j + half]);
+    }
   }
 }
 
@@ -1112,45 +1070,22 @@ static int run_condition_encoder(
 // ===========================================================================
 static void compute_time_embed_gpu(
     ec_acestep_t *as, const as_time_emb_t *te, float t_val,
+    uint16_t *f_d, float *h_f32, uint16_t *h_bf16,
     float *out_temb_d, float *out_tproj_d) {
-  float freq_h[256];
+  uint16_t freq_bf16_h[256];
   double scaled = (double)t_val * 1000.0;
   for (int i = 0; i < 128; i++) {
     double f = exp(-log(10000.0) * (double)i / 128.0);
     double a = scaled * f;
-    freq_h[i]       = (float)cos(a);
-    freq_h[128 + i] = (float)sin(a);
+    freq_bf16_h[i]       = as_f32_to_bf16_host((float)cos(a));
+    freq_bf16_h[128 + i] = as_f32_to_bf16_host((float)sin(a));
   }
-  uint16_t freq_bf16_h[256];
-  for (int i = 0; i < 256; i++) freq_bf16_h[i] = as_f32_to_bf16_host(freq_h[i]);
-
-  uint16_t *f_d = NULL, *h_bf16 = NULL;
-  float *h_f32 = NULL;
-  cudaMalloc(&f_d, 256 * 2);
-  cudaMalloc(&h_f32, 2048 * 4);
-  cudaMalloc(&h_bf16, 2048 * 2);
   cudaMemcpyAsync(f_d, freq_bf16_h, 256 * 2, cudaMemcpyHostToDevice, as->stream);
-
   as_gemm(f_d, te->l1_w, te->l1_b, h_f32, NULL, 1, 2048, 256, as->stream);
-  // SiLU(h_f32) -> h_bf16
-  // Use a tiny host round-trip? No, run directly on GPU!
-  // Let's write a 1-block lambda-free helper via k_as_swiglu? Better: compute SiLU directly below.
-  float h1[2048];
-  cudaMemcpyAsync(h1, h_f32, 2048 * 4, cudaMemcpyDeviceToHost, as->stream);
-  cudaStreamSynchronize(as->stream);
-  uint16_t h1_b[2048];
-  for (int i = 0; i < 2048; i++) h1_b[i] = as_f32_to_bf16_host(h1[i] / (1.0f + expf(-h1[i])));
-  cudaMemcpyAsync(h_bf16, h1_b, 2048 * 2, cudaMemcpyHostToDevice, as->stream);
-
+  ec_ops_silu_f32_to_bf16(h_f32, h_bf16, 2048, as->stream);
   as_gemm(h_bf16, te->l2_w, te->l2_b, out_temb_d, NULL, 1, 2048, 2048, as->stream);
-  cudaMemcpyAsync(h1, out_temb_d, 2048 * 4, cudaMemcpyDeviceToHost, as->stream);
-  cudaStreamSynchronize(as->stream);
-  for (int i = 0; i < 2048; i++) h1_b[i] = as_f32_to_bf16_host(h1[i] / (1.0f + expf(-h1[i])));
-  cudaMemcpyAsync(h_bf16, h1_b, 2048 * 2, cudaMemcpyHostToDevice, as->stream);
-
+  ec_ops_silu_f32_to_bf16(out_temb_d, h_bf16, 2048, as->stream);
   as_gemm(h_bf16, te->proj_w, te->proj_b, out_tproj_d, NULL, 1, 12288, 2048, as->stream);
-  cudaStreamSynchronize(as->stream);
-  cudaFree(f_d); cudaFree(h_f32); cudaFree(h_bf16);
 }
 
 __global__ void k_as_add_vec(const float *a, const float *b, float *out, int n) {
@@ -1208,27 +1143,28 @@ static int run_acestep_dit(
   cudaMalloc(&cond_bf16_d, (size_t)L_enc * DIM * 2);
   as_gemm(enc_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, cond_bf16_d, L_enc, DIM, DIM, as->stream);
 
-  // Precompute & cache cross-attention K/V for all 24 layers!
-  float *ck_cache[24] = {0}, *cv_cache[24] = {0};
+  // Precompute & cache cross-attention K/V in BF16 for all 24 layers (direct TensorCore FA2!)
+  uint16_t *ck_cache[24] = {0}, *cv_cache[24] = {0};
   float *ck_tmp = NULL, *cv_tmp = NULL;
   cudaMalloc(&ck_tmp, (size_t)L_enc * HKV * D * 4);
   cudaMalloc(&cv_tmp, (size_t)L_enc * HKV * D * 4);
   for (int l = 0; l < 24; l++) {
-    cudaMalloc(&ck_cache[l], (size_t)HKV * L_enc * D * 4);
-    cudaMalloc(&cv_cache[l], (size_t)HKV * L_enc * D * 4);
+    cudaMalloc(&ck_cache[l], (size_t)HKV * L_enc * D * 2);
+    cudaMalloc(&cv_cache[l], (size_t)HKV * L_enc * D * 2);
     as_gemm(cond_bf16_d, d->layers[l].cross_k, NULL, ck_tmp, NULL, L_enc, HKV * D, DIM, as->stream);
     as_gemm(cond_bf16_d, d->layers[l].cross_v, NULL, cv_tmp, NULL, L_enc, HKV * D, DIM, as->stream);
     int kv_warps = L_enc * HKV;
-    k_as_qk_norm_rope<<<(kv_warps + 7) / 8, 256, 0, as->stream>>>(
+    k_as_qk_norm_rope_bf16<<<(kv_warps + 7) / 8, 256, 0, as->stream>>>(
         NULL, ck_tmp, cv_tmp, NULL, d->layers[l].cross_k_norm,
         NULL, ck_cache[l], cv_cache[l], 0, L_enc, HQ, HKV, D, 1e6f, 1e-6f, 0);
   }
   cudaFree(ck_tmp); cudaFree(cv_tmp); cudaFree(cond_bf16_d);
 
-  // Precompute constant time_embed_r(0.0)
+  // Precompute constant time_embed_r(0.0) using pre-allocated zero-sync scratch
   float *temb_r_d = NULL, *tproj_r_d = NULL;
   float *temb_t_d = NULL, *tproj_t_d = NULL;
   float *temb_d = NULL, *tproj_d = NULL, *mod_d = NULL, *out_mod_d = NULL;
+  uint16_t *te_f_d = NULL, *te_hb_d = NULL; float *te_hf_d = NULL;
   cudaMalloc(&temb_r_d,  DIM * 4);
   cudaMalloc(&tproj_r_d, 6 * DIM * 4);
   cudaMalloc(&temb_t_d,  DIM * 4);
@@ -1237,7 +1173,10 @@ static int run_acestep_dit(
   cudaMalloc(&tproj_d,   6 * DIM * 4);
   cudaMalloc(&mod_d,     6 * DIM * 4);
   cudaMalloc(&out_mod_d, 2 * DIM * 4);
-  compute_time_embed_gpu(as, &d->time_embed_r, 0.0f, temb_r_d, tproj_r_d);
+  cudaMalloc(&te_f_d,    256 * 2);
+  cudaMalloc(&te_hf_d,   2048 * 4);
+  cudaMalloc(&te_hb_d,   2048 * 2);
+  compute_time_embed_gpu(as, &d->time_embed_r, 0.0f, te_f_d, te_hf_d, te_hb_d, temb_r_d, tproj_r_d);
 
   // Prepare context_latents [T, 128] = cat(silence_latent[0..T-1], ones) and initial noise xt [T, 64]
   float *ctx_h = (float *)malloc((size_t)T * 128 * 4);
@@ -1257,25 +1196,27 @@ static int run_acestep_dit(
   cudaMemcpyAsync(xt_d,  xt_h,  (size_t)T * 64 * 4,  cudaMemcpyHostToDevice, as->stream);
   free(ctx_h); free(xt_h);
 
-  // Working buffers for DiT forward [T_p, DIM]
+  // Working buffers for DiT forward [T_p, DIM] (BF16 Q/K/V for TensorCore FA2!)
   uint16_t *patch_in_bf16 = NULL, *xn_bf16 = NULL, *ao_bf16 = NULL, *mlp_bf16 = NULL;
+  uint16_t *qr_b = NULL, *kr_b = NULL, *vr_b = NULL;
   float *x_d = NULL, *q_d = NULL, *k_d = NULL, *v_d = NULL;
-  float *qr_d = NULL, *kr_d = NULL, *vr_d = NULL, *tmp_d = NULL, *gate_d = NULL, *up_d = NULL;
+  float *tmp_d = NULL, *gate_d = NULL, *up_d = NULL;
   cudaMalloc(&patch_in_bf16, (size_t)T_p * 384 * 2);
   cudaMalloc(&x_d,           (size_t)T_p * DIM * 4);
   cudaMalloc(&xn_bf16,       (size_t)T_p * DIM * 2);
   cudaMalloc(&q_d,           (size_t)T_p * HQ * D * 4);
   cudaMalloc(&k_d,           (size_t)T_p * HKV * D * 4);
   cudaMalloc(&v_d,           (size_t)T_p * HKV * D * 4);
-  cudaMalloc(&qr_d,          (size_t)T_p * HQ * D * 4);
-  cudaMalloc(&kr_d,          (size_t)T_p * HKV * D * 4);
-  cudaMalloc(&vr_d,          (size_t)T_p * HKV * D * 4);
+  cudaMalloc(&qr_b,          (size_t)T_p * HQ * D * 2);
+  cudaMalloc(&kr_b,          (size_t)T_p * HKV * D * 2);
+  cudaMalloc(&vr_b,          (size_t)T_p * HKV * D * 2);
   cudaMalloc(&ao_bf16,       (size_t)T_p * HQ * D * 2);
   cudaMalloc(&tmp_d,         (size_t)T_p * DIM * 4);
   cudaMalloc(&gate_d,        (size_t)T_p * FFN * 4);
   cudaMalloc(&up_d,          (size_t)T_p * FFN * 4);
   cudaMalloc(&mlp_bf16,      (size_t)T_p * FFN * 2);
 
+  const float attn_scale = 1.0f / sqrtf((float)D);
   int cancelled = 0;
   for (int step = 0; step < n_steps; step++) {
     if (cb && cb(step + 2, n_steps + 3, "acestep_dit_step", cb_ctx) != 0) {
@@ -1283,7 +1224,7 @@ static int run_acestep_dit(
       break;
     }
     float t_cur = sched[step];
-    compute_time_embed_gpu(as, &d->time_embed, t_cur, temb_t_d, tproj_t_d);
+    compute_time_embed_gpu(as, &d->time_embed, t_cur, te_f_d, te_hf_d, te_hb_d, temb_t_d, tproj_t_d);
     k_as_add_vec<<<(DIM + 255) / 256, 256, 0, as->stream>>>(temb_t_d, temb_r_d, temb_d, DIM);
     k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(tproj_t_d, tproj_r_d, tproj_d, 6 * DIM);
 
@@ -1303,32 +1244,30 @@ static int run_acestep_dit(
       const float *c_scale   = mod_d + 4 * DIM;
       const float *c_gate    = mod_d + 5 * DIM;
 
-      // 1. Self-Attention (AdaLN -> GQA w/ RoPE -> gated residual)
+      // 1. Self-Attention (AdaLN -> GQA w/ RoPE -> TensorCore BF16 FA2 -> gated residual)
       k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
           x_d, L->self_norm_w, scale_msa, shift_msa, NULL, xn_bf16, T_p, DIM, 1e-6f);
       as_gemm(xn_bf16, L->self_q, NULL, q_d, NULL, T_p, HQ * D,  DIM, as->stream);
       as_gemm(xn_bf16, L->self_k, NULL, k_d, NULL, T_p, HKV * D, DIM, as->stream);
       as_gemm(xn_bf16, L->self_v, NULL, v_d, NULL, T_p, HKV * D, DIM, as->stream);
       int n_warps = T_p * (HQ + HKV);
-      k_as_qk_norm_rope<<<(n_warps + 7) / 8, 256, 0, as->stream>>>(
-          q_d, k_d, v_d, L->self_q_norm, L->self_k_norm, qr_d, kr_d, vr_d,
+      k_as_qk_norm_rope_bf16<<<(n_warps + 7) / 8, 256, 0, as->stream>>>(
+          q_d, k_d, v_d, L->self_q_norm, L->self_k_norm, qr_b, kr_b, vr_b,
           T_p, T_p, HQ, HKV, D, 1e6f, 1e-6f, 1);
-      int q_warps = T_p * HQ;
-      int mode = (l % 2 == 0) ? 2 : 1; // even: sliding W=128, odd: full
-      k_as_gqa_attn<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
-          qr_d, kr_d, vr_d, ao_bf16, T_p, T_p, HQ, HKV, D, 1.0f / sqrtf((float)D), mode, 128);
+      int win = (l % 2 == 0) ? 128 : 0; // even: sliding W=128, odd: full
+      ec_ops_fa2_bf16(qr_b, kr_b, vr_b, NULL, ao_bf16, T_p, T_p, T_p, T_p, HQ, HKV, D, attn_scale, win, as->stream);
       as_gemm(ao_bf16, L->self_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
       k_as_add_gated<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, gate_msa, T_p, DIM);
 
-      // 2. Cross-Attention (RMSNorm -> GQA against cached K/V, NO RoPE, NO gate)
+      // 2. Cross-Attention (RMSNorm -> TensorCore BF16 GQA FA2 against cached K/V)
       k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
           x_d, L->cross_norm_w, NULL, NULL, NULL, xn_bf16, T_p, DIM, 1e-6f);
       as_gemm(xn_bf16, L->cross_q, NULL, q_d, NULL, T_p, HQ * D, DIM, as->stream);
-      k_as_qk_norm_rope<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
-          q_d, NULL, NULL, L->cross_q_norm, NULL, qr_d, NULL, NULL,
+      int q_warps = T_p * HQ;
+      k_as_qk_norm_rope_bf16<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
+          q_d, NULL, NULL, L->cross_q_norm, NULL, qr_b, NULL, NULL,
           T_p, 0, HQ, HKV, D, 1e6f, 1e-6f, 0);
-      k_as_gqa_attn<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
-          qr_d, ck_cache[l], cv_cache[l], ao_bf16, T_p, L_enc, HQ, HKV, D, 1.0f / sqrtf((float)D), 1, 0);
+      ec_ops_fa2_bf16(qr_b, ck_cache[l], cv_cache[l], NULL, ao_bf16, T_p, L_enc, T_p, L_enc, HQ, HKV, D, attn_scale, 0, as->stream);
       as_gemm(ao_bf16, L->cross_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
       k_as_add_inplace<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)T_p * DIM);
 
@@ -1361,9 +1300,10 @@ static int run_acestep_dit(
   for (int l = 0; l < 24; l++) { cudaFree(ck_cache[l]); cudaFree(cv_cache[l]); }
   cudaFree(temb_r_d); cudaFree(tproj_r_d); cudaFree(temb_t_d); cudaFree(tproj_t_d);
   cudaFree(temb_d); cudaFree(tproj_d); cudaFree(mod_d); cudaFree(out_mod_d);
+  cudaFree(te_f_d); cudaFree(te_hf_d); cudaFree(te_hb_d);
   cudaFree(ctx_d); cudaFree(xt_d); cudaFree(vt_d);
   cudaFree(patch_in_bf16); cudaFree(x_d); cudaFree(xn_bf16);
-  cudaFree(q_d); cudaFree(k_d); cudaFree(v_d); cudaFree(qr_d); cudaFree(kr_d); cudaFree(vr_d);
+  cudaFree(q_d); cudaFree(k_d); cudaFree(v_d); cudaFree(qr_b); cudaFree(kr_b); cudaFree(vr_b);
   cudaFree(ao_bf16); cudaFree(tmp_d); cudaFree(gate_d); cudaFree(up_d); cudaFree(mlp_bf16);
 
   if (out_ms) *out_ms = as_now_ms() - t0;

@@ -371,8 +371,84 @@ if h.get("wan22_ready"):
 else:
     check("E2E.15 Real Wan 2.2 TI2V-5B + Synced Audio MP4", False, "wan22_ready=false")
 
+# 16. Sprint 2 Universal ComfyUI Importer v2: Subgraph Flattening + Pos/Neg Tracing + 4-Modality + Alias Resolution!
+sg_wf = {
+    "nodes": [
+        {"id": 76, "type": "PrimitiveStringMultiline", "widgets_values": ["A hedgehog wearing a tiny party hat surrounded by confetti, 2000s digicam flash"]},
+        {"id": 75, "type": "sub-flux2-4step-uuid", "inputs": [{"name": "text", "link": 155}], "widgets_values": []},
+        {"id": 9, "type": "SaveImage", "inputs": [{"name": "images", "link": 154}], "widgets_values": ["Flux2"]}
+    ],
+    "links": [[155, 76, 0, 75, 0, "STRING"], [154, 75, 0, 9, 0, "IMAGE"]],
+    "definitions": {"subgraphs": [{
+        "id": "sub-flux2-4step-uuid",
+        "inputs": [{"name": "text", "type": "STRING"}],
+        "nodes": [
+            {"id": 70, "type": "UNETLoader", "widgets_values": ["flux-2-klein-4b.safetensors", "default"]},
+            {"id": 74, "type": "CLIPTextEncode", "inputs": [{"name": "text", "link": 162}], "widgets_values": [""]},
+            {"id": 62, "type": "Flux2Scheduler", "widgets_values": [4, 1024, 1024]},
+            {"id": 63, "type": "CFGGuider", "inputs": [{"name": "positive", "link": 140}], "widgets_values": [1]},
+            {"id": 66, "type": "EmptyFlux2LatentImage", "widgets_values": [1024, 1024, 1]}
+        ],
+        "links": [
+            {"id": 162, "origin_id": -10, "origin_slot": 0, "target_id": 74, "target_slot": 0},
+            {"id": 140, "origin_id": 74, "origin_slot": 0, "target_id": 63, "target_slot": 0}
+        ]
+    }]}
+}
+wan_wf = {
+    "nodes": [
+        {"id": 37, "type": "UNETLoader", "widgets_values": ["wan2.2_ti2v_5B_fp16.safetensors", "default"]},
+        {"id": 7, "type": "CLIPTextEncode", "widgets_values": ["VERY LONG NEGATIVE PROMPT: blurry, ugly, static, distorted, bad anatomy, extra fingers, low quality, jpeg artifacts, watermark, text, deformed limbs, three legs"]},
+        {"id": 6, "type": "CLIPTextEncode", "widgets_values": ["1970s subway street musician playing guitar, slow dolly right"]},
+        {"id": 55, "type": "Wan22ImageToVideoLatent", "widgets_values": [1280, 704, 121, 1]},
+        {"id": 56, "type": "LoadImage", "widgets_values": ["example.png", "image"]},
+        {"id": 3, "type": "KSampler", "inputs": [{"name": "positive", "link": 46}, {"name": "negative", "link": 52}], "widgets_values": [999, "fixed", 20, 5]},
+        {"id": 58, "type": "SaveVideo", "widgets_values": ["video/ComfyUI"]}
+    ],
+    "links": [[46, 6, 0, 3, 1, "CONDITIONING"], [52, 7, 0, 3, 2, "CONDITIONING"]]
+}
+ace_wf = {
+    "nodes": [
+        {"id": 97, "type": "CheckpointLoaderSimple", "widgets_values": ["ace_step_1.5_turbo_aio.safetensors"]},
+        {"id": 94, "type": "TextEncodeAceStepAudio1.5", "widgets_values": ["Neo-Soul warm groove with rhodes", "[Verse 1] Late night glow", 31, "fixed", 118, 90]},
+        {"id": 98, "type": "EmptyAceStep1.5LatentAudio", "widgets_values": [90, 1]},
+        {"id": 3, "type": "KSampler", "inputs": [{"name": "positive", "link": 254}], "widgets_values": [31, "fixed", 8, 1]},
+        {"id": 106, "type": "SaveAudioAdvanced", "widgets_values": ["audio/ComfyUI"]}
+    ],
+    "links": [[254, 94, 0, 3, 1, "CONDITIONING"]]
+}
+tr_wf = {
+    "nodes": [
+        {"id": 40, "type": "UNETLoader", "widgets_values": ["trellis_2_int8_convrot.safetensors", "default"]},
+        {"id": 122, "type": "LoadImage", "widgets_values": ["viking_axe.png", "image"]},
+        {"id": 91, "type": "Trellis2ShapeStage", "widgets_values": []},
+        {"id": 12, "type": "KSampler", "widgets_values": [43, "fixed", 12, 7.5]}
+    ],
+    "links": []
+}
+r_sg  = json.loads(req("POST", "/v1/flows/import", sg_wf)[1])
+r_wan = json.loads(req("POST", "/v1/flows/import", wan_wf)[1])
+r_ace = json.loads(req("POST", "/v1/flows/import", ace_wf)[1])
+r_tr  = json.loads(req("POST", "/v1/flows/import", tr_wf)[1])
+imp_v2_ok = (
+    r_sg["ok"] and r_sg["modality"] == "image" and r_sg["subgraph_count"] == 1
+    and "hedgehog" in r_sg["extracted"]["prompt"] and r_sg["extracted"]["width"] == 1024
+    and r_sg["extracted"]["steps"] == 4 and bool(r_sg["extracted"]["resolved_checkpoint"])
+    and r_wan["ok"] and r_wan["modality"] == "video" and "subway" in r_wan["extracted"]["prompt"]
+    and "NEGATIVE" in r_wan["extracted"]["neg_prompt"] and r_wan["extracted"]["frames"] == 121
+    and r_wan["extracted"]["needs_image_input"] and bool(r_wan["extracted"]["resolved_checkpoint"])
+    and r_ace["ok"] and r_ace["modality"] == "music" and "Neo-Soul" in r_ace["extracted"]["prompt"]
+    and "Verse 1" in r_ace["extracted"]["lyrics"] and r_ace["extracted"]["bpm"] == 118
+    and r_ace["extracted"]["duration_sec"] == 90.0 and bool(r_ace["extracted"]["resolved_checkpoint"])
+    and r_tr["ok"] and r_tr["modality"] == "3d" and r_tr["extracted"]["needs_image_input"]
+    and bool(r_tr["extracted"]["resolved_checkpoint"])
+)
+check("E2E.16 ComfyUI Importer v2 (Subgraph+4-Modality)",
+      imp_v2_ok,
+      f"sg_flux2=OK wan_pos_vs_neg=OK(121f) ace_audio=OK(118bpm,90s,alias) trellis_3d=OK(alias)")
+
 print("===========================================================================")
-print(f"E2E v4 VERDICT: {'ALL 15 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
+print(f"E2E v5 VERDICT: {'ALL 16 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
 print("===========================================================================")
 sys.exit(0 if fails == 0 else 1)
 PY

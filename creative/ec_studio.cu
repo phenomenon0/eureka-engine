@@ -1308,6 +1308,19 @@ extern "C" int ec_studio_recipe_delete(ec_studio_t *st, const char *id) {
   return rc;
 }
 
+static void st_json_esc(const char *src, char *dst, size_t cap) {
+  size_t ej = 0;
+  for (size_t i = 0; src && src[i] && ej + 2 < cap; i++) {
+    unsigned char c = (unsigned char)src[i];
+    if (c == '"' || c == '\\') { dst[ej++] = '\\'; dst[ej++] = (char)c; }
+    else if (c == '\n') { dst[ej++] = '\\'; dst[ej++] = 'n'; }
+    else if (c == '\r') { dst[ej++] = '\\'; dst[ej++] = 'r'; }
+    else if (c == '\t') { dst[ej++] = '\\'; dst[ej++] = 't'; }
+    else if (c >= 0x20) dst[ej++] = (char)c;
+  }
+  dst[ej] = '\0';
+}
+
 extern "C" int ec_studio_import_comfy(
     ec_studio_t *st, const uint8_t *payload, size_t payload_len, int is_png, int execute_now,
     char *out_json, size_t out_cap) {
@@ -1344,50 +1357,82 @@ extern "C" int ec_studio_import_comfy(
   char artifact_url[256] = {0};
   double exec_ms = 0.0;
   char exec_mode[32] = "";
-  if (execute_now && info.extracted_prompt[0]) {
-    ec_studio_lora_t loras[4] = {};
-    int nl = 0;
-    for (int i = 0; i < info.n_loras && nl < 4; i++) {
-      if (info.resolved_loras[i][0]) {
-        snprintf(loras[nl].path, sizeof loras[nl].path, "%s", info.resolved_loras[i]);
-        loras[nl].strength = info.extracted_lora_strengths[i];
-        nl++;
+  if (execute_now) {
+    ec_studio_result_t r = {};
+    int grc = -1;
+    const char *run_prompt = info.extracted_prompt[0] ? info.extracted_prompt
+                             : (info.input_image_hint[0] ? info.input_image_hint : "eureka imported studio scene");
+    if (strcmp(info.modality, "music") == 0) {
+      float dur = (info.duration_sec >= 2.0f && info.duration_sec <= 15.0f) ? info.duration_sec : 10.0f;
+      int bpm = (info.bpm >= 40 && info.bpm <= 240) ? info.bpm : 124;
+      grc = ec_studio_gen_music_ex(st, run_prompt, info.extracted_lyrics, info.seed, bpm, dur, EC_TIER_FAST, 1, NULL, NULL, &r);
+      if (grc == 0) {
+        const char *bn = strrchr(r.file_main, '/');
+        snprintf(artifact_url, sizeof artifact_url, "/artifacts/%s", bn ? bn + 1 : r.file_main);
+      }
+    } else if (strcmp(info.modality, "video") == 0) {
+      int vw = (info.width >= 640 && info.width <= 1280) ? info.width : 832;
+      int vh = (info.height >= 384 && info.height <= 768) ? info.height : 480;
+      if (vw > 832) { vw = 832; vh = 480; }
+      int vf = (info.frames >= 5 && info.frames <= 33) ? info.frames : 17;
+      int vs = (info.steps >= 8 && info.steps <= 24) ? info.steps : 20;
+      grc = ec_studio_gen_video_ex(st, run_prompt, info.seed, vf, vw, vh, 16, vs, 1, EC_TIER_FAST, 1, NULL, NULL, &r);
+      if (grc == 0) {
+        const char *bn = strrchr(r.file_mp4, '/');
+        snprintf(artifact_url, sizeof artifact_url, "/artifacts/%s", bn ? bn + 1 : r.file_mp4);
+      }
+    } else if (strcmp(info.modality, "3d") == 0) {
+      grc = ec_studio_gen_3d_ex(st, run_prompt, info.seed, 64, EC_TIER_FAST, 1, NULL, NULL, &r);
+      if (grc == 0) {
+        const char *bn = strrchr(r.file_main, '/');
+        snprintf(artifact_url, sizeof artifact_url, "/artifacts/%s", bn ? bn + 1 : r.file_main);
+      }
+    } else if (info.extracted_prompt[0]) {
+      ec_studio_lora_t loras[4] = {};
+      int nl = 0;
+      for (int i = 0; i < info.n_loras && nl < 4; i++) {
+        if (info.resolved_loras[i][0]) {
+          snprintf(loras[nl].path, sizeof loras[nl].path, "%s", info.resolved_loras[i]);
+          loras[nl].strength = info.extracted_lora_strengths[i];
+          nl++;
+        }
+      }
+      grc = ec_studio_gen_image_ex(
+          st, info.extracted_prompt, info.seed,
+          info.width >= 256 ? info.width : 512,
+          info.height >= 256 ? info.height : 512,
+          info.steps > 0 && info.steps <= 12 ? info.steps : 4,
+          EC_TIER_FAST, 1,
+          info.resolved_checkpoint[0] ? info.resolved_checkpoint : NULL,
+          nl > 0 ? loras : NULL, nl, NULL, NULL, &r);
+      if (grc == 0) {
+        const char *bn = strrchr(r.file_main, '/');
+        snprintf(artifact_url, sizeof artifact_url, "/artifacts/%s", bn ? bn + 1 : r.file_main);
       }
     }
-    ec_studio_result_t r = {};
-    int grc = ec_studio_gen_image_ex(
-        st, info.extracted_prompt, info.seed,
-        info.width >= 256 ? info.width : 512,
-        info.height >= 256 ? info.height : 512,
-        info.steps > 0 && info.steps <= 12 ? info.steps : 4,
-        EC_TIER_FAST, 1,
-        info.resolved_checkpoint[0] ? info.resolved_checkpoint : NULL,
-        nl > 0 ? loras : NULL, nl, NULL, NULL, &r);
     if (grc == 0) {
-      const char *bn = strrchr(r.file_main, '/');
-      snprintf(artifact_url, sizeof artifact_url, "/artifacts/%s", bn ? bn + 1 : r.file_main);
       exec_ms = r.gpu_ms;
       snprintf(exec_mode, sizeof exec_mode, "%s", r.engine_mode);
     }
   }
 
-  // Escape extracted prompt for JSON response
-  char ep[1536] = {0};
-  size_t ej = 0;
-  for (size_t i = 0; info.extracted_prompt[i] && ej + 2 < sizeof ep; i++) {
-    char c = info.extracted_prompt[i];
-    if (c == '"' || c == '\\') { ep[ej++] = '\\'; ep[ej++] = c; }
-    else if (c == '\n') { ep[ej++] = '\\'; ep[ej++] = 'n'; }
-    else if ((unsigned char)c >= 0x20) ep[ej++] = c;
-  }
+  char ep[1536], eneg[1536], elyr[2048], ehint[384];
+  st_json_esc(info.extracted_prompt, ep, sizeof ep);
+  st_json_esc(info.extracted_neg_prompt, eneg, sizeof eneg);
+  st_json_esc(info.extracted_lyrics, elyr, sizeof elyr);
+  st_json_esc(info.input_image_hint, ehint, sizeof ehint);
 
   int pos = snprintf(out_json, out_cap,
-      "{\"ok\":true,\"source_format\":\"%s\",\"node_count\":%d,"
-      "\"extracted\":{\"prompt\":\"%s\",\"checkpoint\":\"%s\",\"resolved_checkpoint\":\"%s\","
-      "\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%u,\"loras\":[",
-      info.source_format, info.node_count, ep,
+      "{\"ok\":true,\"source_format\":\"%s\",\"modality\":\"%s\",\"node_count\":%d,\"subgraph_count\":%d,"
+      "\"extracted\":{\"modality\":\"%s\",\"prompt\":\"%s\",\"neg_prompt\":\"%s\",\"lyrics\":\"%s\","
+      "\"checkpoint\":\"%s\",\"resolved_checkpoint\":\"%s\","
+      "\"width\":%d,\"height\":%d,\"steps\":%d,\"frames\":%d,\"bpm\":%d,\"duration_sec\":%.1f,"
+      "\"needs_image_input\":%s,\"input_image_hint\":\"%s\",\"seed\":%u,\"loras\":[",
+      info.source_format, info.modality, info.node_count, info.subgraph_count,
+      info.modality, ep, eneg, elyr,
       info.extracted_checkpoint, info.resolved_checkpoint,
-      info.width, info.height, info.steps, info.seed);
+      info.width, info.height, info.steps, info.frames, info.bpm, info.duration_sec,
+      info.needs_image_input ? "true" : "false", ehint, info.seed);
   for (int i = 0; i < info.n_loras && (size_t)pos < out_cap - 512; i++) {
     pos += snprintf(out_json + pos, out_cap - (size_t)pos,
         "%s{\"name\":\"%s\",\"resolved\":\"%s\",\"strength\":%.2f}",

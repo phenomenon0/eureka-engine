@@ -50,15 +50,22 @@ int ec_png_extract_comfy_json(const uint8_t *png_bytes, size_t png_len, char *ou
 typedef struct {
   int  ok;
   char source_format[32];    // "comfy_api" or "comfy_litegraph_ui"
+  char modality[24];         // "image", "video", "music", "3d"
   int  node_count;
+  int  subgraph_count;
   char extracted_prompt[768];
+  char extracted_neg_prompt[768];
+  char extracted_lyrics[1024];
   char extracted_checkpoint[192];
   char resolved_checkpoint[512];
   char extracted_loras[4][192];
   char resolved_loras[4][512];
   float extracted_lora_strengths[4];
   int  n_loras;
-  int  width, height, steps;
+  int  width, height, steps, frames, bpm;
+  float duration_sec;
+  int  needs_image_input;
+  char input_image_hint[192];
   uint32_t seed;
   char error[256];
 } ec_comfy_import_info_t;

@@ -13,6 +13,7 @@
 #include "ec_kernels.cuh"
 #include "ec_kernels_v2.cuh"
 #include "ec_media.h"
+#include "ec_ops.h"
 #include "ec_safetensors.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -46,118 +47,13 @@ static __device__ __forceinline__ float warp_sum_dev(float v) {
   return v;
 }
 
-static __device__ __forceinline__ void mma_bf16_m16n8k16(
-    float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
 // ===========================================================================
-// 1. Native PTX BF16 TensorCore GEMM: Y[M, N] = X_bf16[M, K] @ W_bf16[N, K]^T + bias
-//    Zero cuBLAS, zero FP16 65504 overflow, exact F32 accumulation!
+// 1. Unified High-Throughput BF16 TensorCore GEMM (via shared ec_ops.cu)
 // ===========================================================================
-__global__ void __launch_bounds__(128) k_gemm_bf16_tc(
-    const uint16_t *__restrict__ X, const uint16_t *__restrict__ W,
-    const float *__restrict__ bias,
-    float *__restrict__ Y_f32, uint16_t *__restrict__ Y_bf16,
-    int M, int N, int K) {
-  constexpr int BM = 64, BN = 64, BK = 32, STRIDE = 40;
-  __shared__ __align__(16) uint16_t sX[BM * STRIDE];
-  __shared__ __align__(16) uint16_t sW[BN * STRIDE];
-
-  const int warp = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  const int g = lane >> 2;
-  const int t = lane & 3;
-  const int wm = (warp >> 1) * 32;
-  const int wn = (warp & 1) * 32;
-  const int m0 = blockIdx.y * BM;
-  const int n0 = blockIdx.x * BN;
-
-  float acc[2][4][4];
-  #pragma unroll
-  for (int mi = 0; mi < 2; mi++)
-    #pragma unroll
-    for (int ni = 0; ni < 4; ni++)
-      acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
-
-  const bool fast_k = ((K & 7) == 0);
-  for (int kb = 0; kb < K; kb += BK) {
-    if (fast_k && (kb + BK <= K)) {
-      #pragma unroll
-      for (int iter = 0; iter < 2; iter++) {
-        const int idx = threadIdx.x + iter * 128;
-        const int r = idx >> 2;
-        const int c = (idx & 3) * 8;
-        uint4 vx = make_uint4(0, 0, 0, 0);
-        if (m0 + r < M) vx = *(const uint4 *)(X + (long)(m0 + r) * K + kb + c);
-        *(uint4 *)(sX + r * STRIDE + c) = vx;
-        uint4 vw = make_uint4(0, 0, 0, 0);
-        if (n0 + r < N) vw = *(const uint4 *)(W + (long)(n0 + r) * K + kb + c);
-        *(uint4 *)(sW + r * STRIDE + c) = vw;
-      }
-    } else {
-      for (int idx = threadIdx.x; idx < BM * BK; idx += 128) {
-        const int r = idx / BK, c = idx % BK;
-        sX[r * STRIDE + c] = (m0 + r < M && kb + c < K) ? X[(long)(m0 + r) * K + kb + c] : 0;
-        sW[r * STRIDE + c] = (n0 + r < N && kb + c < K) ? W[(long)(n0 + r) * K + kb + c] : 0;
-      }
-    }
-    __syncthreads();
-
-    #pragma unroll
-    for (int ks = 0; ks < 2; ks++) {
-      const int ko = ks * 16;
-      uint32_t a_frag[2][4];
-      #pragma unroll
-      for (int mi = 0; mi < 2; mi++) {
-        const uint16_t *xr0 = sX + (wm + mi * 16 + g) * STRIDE + ko;
-        const uint16_t *xr8 = xr0 + 8 * STRIDE;
-        a_frag[mi][0] = *(const uint32_t *)(xr0 + 2 * t);
-        a_frag[mi][1] = *(const uint32_t *)(xr8 + 2 * t);
-        a_frag[mi][2] = *(const uint32_t *)(xr0 + 8 + 2 * t);
-        a_frag[mi][3] = *(const uint32_t *)(xr8 + 8 + 2 * t);
-      }
-      #pragma unroll
-      for (int ni = 0; ni < 4; ni++) {
-        const uint16_t *wr = sW + (wn + ni * 8 + g) * STRIDE + ko;
-        const uint32_t b0 = *(const uint32_t *)(wr + 2 * t);
-        const uint32_t b1 = *(const uint32_t *)(wr + 8 + 2 * t);
-        #pragma unroll
-        for (int mi = 0; mi < 2; mi++) {
-          mma_bf16_m16n8k16(acc[mi][ni], a_frag[mi], b0, b1);
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  #pragma unroll
-  for (int mi = 0; mi < 2; mi++) {
-    #pragma unroll
-    for (int ni = 0; ni < 4; ni++) {
-      #pragma unroll
-      for (int e = 0; e < 4; e++) {
-        const int r = m0 + wm + mi * 16 + g + 8 * (e >> 1);
-        const int c = n0 + wn + ni * 8 + 2 * t + (e & 1);
-        if (r < M && c < N) {
-          float v = acc[mi][ni][e] + (bias ? bias[c] : 0.0f);
-          if (Y_f32) Y_f32[(long)r * N + c] = v;
-          if (Y_bf16) Y_bf16[(long)r * N + c] = f32_to_bf16_dev(v);
-        }
-      }
-    }
-  }
-}
-
 static void gemm_bf16(
     const uint16_t *X, const uint16_t *W, const float *bias,
     float *Y_f32, uint16_t *Y_bf16, int M, int N, int K, cudaStream_t s) {
-  dim3 grd((N + 63) / 64, (M + 63) / 64);
-  k_gemm_bf16_tc<<<grd, 128, 0, s>>>(X, W, bias, Y_f32, Y_bf16, M, N, K);
+  ec_ops_gemm_bf16(X, W, bias, Y_f32, Y_bf16, M, N, K, s);
 }
 
 // Elementwise helpers

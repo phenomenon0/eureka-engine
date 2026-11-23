@@ -16,7 +16,7 @@ GENC=(-gencode arch=compute_80,code=sm_80
       -gencode arch=compute_90,code=sm_90
       -gencode arch=compute_120,code=[sm_120,compute_120])
 
-echo "=== Building 100% Native Eureka Creative Engine v4 (FLUX.2 + ACE-Step 1.5 + TRELLIS.2 + Wan 2.2) in $OUT ==="
+echo "=== Building 100% Native Eureka Creative Engine v5 (Unified ec_ops + FLUX.2 + ACE-Step 1.5 + TRELLIS.2 + Wan 2.2) in $OUT ==="
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_safetensors.c" -o "$OUT/obj/ec_safetensors.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_flow.c"        -o "$OUT/obj/ec_flow.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_media.c"       -o "$OUT/obj/ec_media.o"
@@ -29,6 +29,7 @@ echo "=== Building 100% Native Eureka Creative Engine v4 (FLUX.2 + ACE-Step 1.5 
 
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_kernels.cu"    -o "$OUT/obj/ec_kernels.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_kernels_v2.cu" -o "$OUT/obj/ec_kernels_v2.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_ops.cu"        -o "$OUT/obj/ec_ops.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_dit.cu"        -o "$OUT/obj/ec_dit.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_vram_pool.cu"  -o "$OUT/obj/ec_vram_pool.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_models.cu"     -o "$OUT/obj/ec_models.o"
@@ -51,6 +52,7 @@ COMMON_OBJS=(
   "$OUT/obj/ec_recipes.o"
   "$OUT/obj/ec_kernels.o"
   "$OUT/obj/ec_kernels_v2.o"
+  "$OUT/obj/ec_ops.o"
   "$OUT/obj/ec_dit.o"
   "$OUT/obj/ec_vram_pool.o"
   "$OUT/obj/ec_models.o"
