@@ -75,7 +75,7 @@ VH=$s/vision; mkdir -p "$VH"; cp -R "$APP/engine-src/vision/host" "$APP/engine-s
 (cd "$VH" && patch -s --fuzz=0 -p1 < "$APP/desktop/engine/metal/patches/vision-mintok.patch")
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -w -I"$VH/host" -I"$VH/third_party" -c "$VH/host/vpre.c" -o "$s/vpre.o"
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -pthread -I"$VH/host" "$s/src/serve.c" "$s/src/json.c" "$s/src/speak_route.c" \
-  "$s/src/vendor/tools/sys1dual/serve_structured.c" "$s/src/vendor/host/llb_structured.c" "$s/vpre.o" -lm -o "$s/llb-serve"
+  "$s/src/vendor/tools/sys1dual/serve_structured.c" "$s/src/vendor/host/llb_structured.c" "$s/vpre.o" -lm -ldl -o "$s/llb-serve"
 
 step "5b. engine_inkling_gpu + engine_inkling_cpu (native Inkling 2 Mini CUDA/CPU shape engine)"
 INK_SRC="$SRC/inkling2/engine/src/inkling2"

@@ -1006,9 +1006,10 @@ static PfxSnap pfx_s[64];
 int llb_pfx_on(void) {
   if (pfx_on < 0) {
     const char* e = getenv("LLB_PREFIX_CACHE");
+    const char* td = getenv("LLB_COWRIE_STATE_DIR");
     const char* c = getenv("LLB_PREFIX_CHUNK");
     const char* s = getenv("LLB_PREFIX_SLOTS");
-    pfx_on = e != NULL && strcmp(e, "1") == 0 && !getenv("LLB_SPEC") && !getenv("LLB_MTP");
+    pfx_on = ((e != NULL && strcmp(e, "1") == 0) || (td != NULL && td[0] != 0)) && !getenv("LLB_SPEC") && !getenv("LLB_MTP");
     if (c != NULL && atoi(c) >= 16) {
       pfx_C = (u32)atoi(c);
     }
@@ -1016,7 +1017,7 @@ int llb_pfx_on(void) {
       pfx_ns = (u32)atoi(s);
     }
     if (pfx_on) {
-      fprintf(stderr, "prefix_cache on chunk %u slots %u\n", pfx_C, pfx_ns);
+      fprintf(stderr, "prefix_cache on chunk %u slots %u%s\n", pfx_C, pfx_ns, (td && td[0]) ? " (cowrie StatePages on)" : "");
     }
   }
   return pfx_on;
@@ -1044,6 +1045,9 @@ static bool pfx_valid(const PfxSnap* s) {
   }
   return true;
 }
+
+static unsigned cowrie_pfx_try_load(const u32* ids, u32 n);
+static void cowrie_pfx_plan_save(const u32* ids, u32 n, u32 restored_start);
 
 // before the engine runs ids[0, n) from start: returns the start it should use (the cached count)
 unsigned llb_pfx_begin(const int* ids, unsigned n, unsigned start, int reuse) {
@@ -1079,6 +1083,9 @@ unsigned llb_pfx_begin(const int* ids, unsigned n, unsigned start, int reuse) {
         pfx_arm = (int)j;
       }
     }
+    if (start == 0) {
+      start = cowrie_pfx_try_load(pfx_q, n);
+    }
     pfx_K = start;
   }
   for (u32 j = 0; j < pfx_ns; j += 1) {
@@ -1090,6 +1097,7 @@ unsigned llb_pfx_begin(const int* ids, unsigned n, unsigned start, int reuse) {
     pfx_ids[t] = (u32)ids[t];
   }
   pfx_n = n;
+  cowrie_pfx_plan_save(pfx_ids, n, start);
   return start;
 }
 
@@ -1265,11 +1273,14 @@ static void pass_kv(u32 i, u32 pos, LlbShape sh) {
   pass_kcap[i] = n;
 }
 
+#include "llb_cowrie.h"
+
 static void pass_layer(u32 i, bool full, u32 pos, u32 dT, LlbShape sh) {
   u32 cv = 2 * sh.lkh * sh.sd + sh.lvh * sh.sd;
   (void)dT;
   pf_dump(i, full, pos, sh);
   pfx_restore(i, full, pos, sh);  // W1-KVPFX
+  cowrie_restore_layer(i, full, pos, sh);  // Cowrie persistent StatePage restore
   if (i >= LLB_MAXL) {
     err_fail("warp pass: more layers than LLB_MAXL");
   }
@@ -1305,6 +1316,7 @@ static void pass_layer(u32 i, bool full, u32 pos, u32 dT, LlbShape sh) {
   pass_pos[i] = pos;
 
   pfx_take(i, full, pos, sh);  // W1-KVPFX
+  cowrie_save_layer(i, full, pos, sh);  // Cowrie persistent StatePage save
 }
 
 #include "llb_sampler_impl.h"
@@ -2897,6 +2909,7 @@ static bool llb_legacy(LlbShape sh, u32 dT, u32 nl) {
 // the first pass: the config words to the device (llb_cfg: eps, rope base, rope dims), the
 // scratch sized from the shape, one stderr line naming both
 static void llb_pass_init(LlbShape sh, u32 dT, u32 nl) {
+  cowrie_nl = nl;
   u32 cf[4] = { gpu_mail->cfg[0], gpu_mail->cfg[1], gpu_mail->cfg[2], gpu_mail->cfg[3] };
   CUdeviceptr cp;
   size_t cz;

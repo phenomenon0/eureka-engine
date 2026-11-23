@@ -8,4 +8,4 @@ C=${CUDA_HOME:-/usr/local/cuda} t=$(cd "$(dirname "$0")" && pwd)/pkg2
 inc=(-include "$t/glibc234.h")
 [ "$(awk '/#define CUDA_VERSION/ { print $3; exit }' "$C/include/cuda.h")" -ge 13000 ] || inc+=(-include "$t/cu12.h")
 ${CC:-clang} "${inc[@]}" -DBEND_CUDA=1 -I"$C/include" -L"$C/lib64" -std=c11 -O3 -ffp-contract=off \
-  "$1" ${LLB_CC_EXTRA:-} -lpthread -lm -lcuda -lnvrtc -Wl,--disable-new-dtags,-rpath,'$ORIGIN' -o "$2"
+  "$1" ${LLB_CC_EXTRA:-} -lpthread -lm -ldl -lcuda -lnvrtc -Wl,--disable-new-dtags,-rpath,'$ORIGIN' -o "$2"
