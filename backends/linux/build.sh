@@ -77,10 +77,16 @@ VH=$s/vision; mkdir -p "$VH"; cp -R "$APP/engine-src/vision/host" "$APP/engine-s
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -pthread -I"$VH/host" "$s/src/serve.c" "$s/src/json.c" "$s/src/speak_route.c" \
   "$s/src/vendor/tools/sys1dual/serve_structured.c" "$s/src/vendor/host/llb_structured.c" "$s/vpre.o" -lm -o "$s/llb-serve"
 
+step "5b. eureka-creative-serve (100% native Eureka Creative Studio CUDA/C11 engine)"
+if [ -x "$SRC/creative/build.sh" ]; then
+  OUT="$OUT/creative" bash "$SRC/creative/build.sh"
+fi
+
 step "6. stage $DEST/{cuda,cpu} (SINGLE-ENGINE PURITY: one engine_gpu + one engine_cpu + one llb-serve for Qwen AND Inkling!)"
 rm -rf "$DEST"; mkdir -p "$DEST/cuda" "$DEST/cpu"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$DEST/cuda/"
 cp "$OUT/gpu/engine_gpu" "$DEST/cuda/engine_gpu"
+[ -x "$OUT/creative/eureka-creative-serve" ] && install -m 0755 "$OUT/creative/eureka-creative-serve" "$DEST/cuda/eureka-creative-serve"
 # Auto-discover NVRTC sonames for the installed CUDA major version
 NVRTC_MAIN=$(ls "$CUDA"/lib64/libnvrtc.so.[0-9]* 2>/dev/null | grep -E 'libnvrtc\.so\.[0-9]+$' | head -n1 || true)
 NVRTC_BUILTINS=$(ls "$CUDA"/lib64/libnvrtc-builtins.so.[0-9]*.[0-9]* 2>/dev/null | grep -E 'libnvrtc-builtins\.so\.[0-9]+\.[0-9]+$' | head -n1 || true)
