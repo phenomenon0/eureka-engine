@@ -1539,10 +1539,15 @@ extern "C" ec_flux2_t *ec_flux2_create(const ec_flux2_paths_t *paths) {
   return fx;
 }
 
-extern "C" void ec_flux2_destroy(ec_flux2_t *fx) {
+extern "C" void ec_flux2_unload_vram(ec_flux2_t *fx) {
   if (!fx) return;
   free_dit_resident(&fx->dit);
   free_qwen3_resident(&fx->qwen_res);
+}
+
+extern "C" void ec_flux2_destroy(ec_flux2_t *fx) {
+  if (!fx) return;
+  ec_flux2_unload_vram(fx);
   if (fx->te_open) ec_st_close(&fx->te_st);
   if (fx->vae_open) ec_st_close(&fx->vae_st);
   if (fx->bpe) ec_bpe_free(fx->bpe);
@@ -1555,11 +1560,12 @@ extern "C" int ec_flux2_is_ready(const ec_flux2_t *fx) {
   return (fx && fx->bpe && fx->te_open && fx->vae_open) ? 1 : 0;
 }
 
-extern "C" int ec_flux2_generate_png(
-    ec_flux2_t *fx, const ec_flux2_req_t *req, const char *out_png_path,
+extern "C" int ec_flux2_generate_rgb(
+    ec_flux2_t *fx, const ec_flux2_req_t *req, uint8_t **out_rgb, const char *out_png_path,
     ec_flux2_progress_fn cb, void *cb_ctx, ec_flux2_res_t *res) {
   memset(res, 0, sizeof *res);
-  if (!ec_flux2_is_ready(fx) || !req || !out_png_path) {
+  if (out_rgb) *out_rgb = NULL;
+  if (!ec_flux2_is_ready(fx) || !req) {
     snprintf(res->error, sizeof res->error, "flux2 engine not initialized");
     return -1;
   }
@@ -1600,7 +1606,7 @@ extern "C" int ec_flux2_generate_png(
   }
   cudaFree(prompt_emb_d);
 
-  // 4. VAE Decode -> RFC 2083 PNG
+  // 4. VAE Decode -> RGB24 (+ optional RFC 2083 PNG)
   if (cb) cb(steps + 1, steps + 2, "vae_decode_png", cb_ctx);
   uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
   if (run_flux2_vae_decode(fx, latents_d, H_p, W_p, rgb, &res->vae_ms) != 0) {
@@ -1610,12 +1616,15 @@ extern "C" int ec_flux2_generate_png(
   }
   cudaFree(latents_d);
 
-  int wr = ec_export_png(out_png_path, rgb, (uint32_t)W, (uint32_t)H);
-  free(rgb);
-  if (wr != 0) {
-    snprintf(res->error, sizeof res->error, "png write failed");
-    return -1;
+  if (out_png_path && out_png_path[0]) {
+    if (ec_export_png(out_png_path, rgb, (uint32_t)W, (uint32_t)H) != 0) {
+      free(rgb);
+      snprintf(res->error, sizeof res->error, "png write failed");
+      return -1;
+    }
   }
+  if (out_rgb) *out_rgb = rgb;
+  else free(rgb);
 
   res->ok = 1;
   res->width = W;
@@ -1625,4 +1634,10 @@ extern "C" int ec_flux2_generate_png(
   res->total_ms = fx_now_ms() - t_all;
   snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "%s", ckpt);
   return 0;
+}
+
+extern "C" int ec_flux2_generate_png(
+    ec_flux2_t *fx, const ec_flux2_req_t *req, const char *out_png_path,
+    ec_flux2_progress_fn cb, void *cb_ctx, ec_flux2_res_t *res) {
+  return ec_flux2_generate_rgb(fx, req, NULL, out_png_path, cb, cb_ctx, res);
 }

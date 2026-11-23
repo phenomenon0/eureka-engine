@@ -179,14 +179,16 @@ typedef struct {
   int           id;
   char          kind[24];
   char          prompt[1024];
+  char          lyrics[1024];
   char          tier[16];
   char          stage[32];
   char          checkpoint[256];
   ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
   int           n_loras;
   int           photoreal;
+  int           full_model;
   uint32_t      seed;
-  int           width, height, steps, frames, bpm, with_audio;
+  int           width, height, steps, frames, bpm, with_audio, grid_res, fps;
   float         duration_sec;
   job_state_t   state;
   _Atomic int   cancel_req;
@@ -277,21 +279,42 @@ static void *job_runner_thread(void *arg) {
           r.steps_run, r.steps_skipped, r.lora_tensors_fused,
           r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
   } else if (!strcmp(j->kind, "3d")) {
-    rc = ec_studio_gen_3d(j->st, j->prompt, j->seed, 20, tier, job_progress_cb, j, &r);
+    rc = ec_studio_gen_3d_ex(j->st, j->prompt, j->seed, j->grid_res, tier, j->full_model, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
-      snprintf(out, sizeof out, "{\"glb_url\":\"/artifacts/%s\",\"splat_ply_url\":\"/artifacts/%s\",\"n_verts\":%d,\"n_tris\":%d,\"n_splats\":%d,\"gpu_ms\":%.2f}",
-               basename_safe(r.file_main), basename_safe(r.file_aux), r.n_verts, r.n_tris, r.n_splats, r.gpu_ms);
+      snprintf(out, sizeof out,
+          "{\"ok\":true,\"glb_url\":\"/artifacts/%s\",\"splat_ply_url\":\"/artifacts/%s\","
+          "\"engine_mode\":\"%s\",\"n_verts\":%d,\"n_tris\":%d,\"n_splats\":%d,"
+          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
+          basename_safe(r.file_main), basename_safe(r.file_aux),
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke",
+          r.n_verts, r.n_tris, r.n_splats, r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
   } else if (!strcmp(j->kind, "music")) {
-    rc = ec_studio_gen_music(j->st, j->prompt, j->seed, j->bpm, j->duration_sec, tier, job_progress_cb, j, &r);
+    rc = ec_studio_gen_music_ex(j->st, j->prompt, j->lyrics, j->seed, j->bpm, j->duration_sec, tier, j->full_model, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
-      snprintf(out, sizeof out, "{\"master_wav_url\":\"/artifacts/%s\",\"bpm\":%d,\"gpu_ms\":%.2f}",
-               basename_safe(r.file_main), j->bpm, r.gpu_ms);
+      snprintf(out, sizeof out,
+          "{\"ok\":true,\"master_wav_url\":\"/artifacts/%s\","
+          "\"stems\":{\"drums\":\"/artifacts/%s\",\"bass\":\"/artifacts/%s\","
+          "\"harmony\":\"/artifacts/%s\",\"lead\":\"/artifacts/%s\"},"
+          "\"engine_mode\":\"%s\",\"bpm\":%d,\"frames\":%d,\"sample_rate\":%d,"
+          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
+          basename_safe(r.file_main),
+          basename_safe(r.stem_files[0]), basename_safe(r.stem_files[1]),
+          basename_safe(r.stem_files[2]), basename_safe(r.stem_files[3]),
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke",
+          j->bpm, r.frames, r.sample_rate ? r.sample_rate : 44100,
+          r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
   } else if (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av")) {
     int wa = (!strcmp(j->kind, "video_av") || j->with_audio) ? 1 : 0;
-    rc = ec_studio_gen_video(j->st, j->prompt, j->seed, j->frames, j->width, j->height, 24, wa, tier, job_progress_cb, j, &r);
+    rc = ec_studio_gen_video_ex(j->st, j->prompt, j->seed, j->frames, j->width, j->height, j->fps, j->steps, wa, tier, j->full_model, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
-      snprintf(out, sizeof out, "{\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\",\"encoder\":\"%s\",\"frames\":%d,\"with_audio\":%s,\"gpu_ms\":%.2f}",
-               basename_safe(r.file_mp4), basename_safe(r.file_aux), r.encoder_used, r.frames, wa ? "true" : "false", r.gpu_ms);
+      snprintf(out, sizeof out,
+          "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\","
+          "\"engine_mode\":\"%s\",\"encoder\":\"%s\",\"width\":%d,\"height\":%d,"
+          "\"frames\":%d,\"with_audio\":%s,\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f,\"fps\":%.1f}",
+          basename_safe(r.file_mp4), basename_safe(r.file_aux),
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke", r.encoder_used,
+          r.width, r.height, r.frames, wa ? "true" : "false",
+          r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms, r.fps);
   } else if (!strcmp(j->kind, "realtime")) {
     rc = ec_studio_realtime_burst(j->st, j->prompt, j->seed, j->frames, "/eureka_rt_job_burst", job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
@@ -438,16 +461,20 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/health")) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v3\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v4\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
         "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
+        "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,"
         "\"gpu\":\"%s\",\"sm\":\"sm_%d%d\",\"vram_total_gb\":%.2f,"
         "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,"
         "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
         "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
-        "\"modalities\":[\"flux2_photoreal\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\"]}",
+        "\"modalities\":[\"flux2_photoreal\",\"acestep_1.5_music\",\"trellis2_3d\",\"wan2.2_video\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\"]}",
         g_api_key[0] ? "true" : "false",
         info.photoreal_ready ? "true" : "false",
+        info.acestep_ready   ? "true" : "false",
+        info.trellis2_ready  ? "true" : "false",
+        info.wan22_ready     ? "true" : "false",
         info.gpu_name, info.sm_major, info.sm_minor, info.vram_total_gb,
         info.vram_pool_used_mb, info.vram_pool_budget_mb,
         info.models_discovered, info.storage_roots, info.loras_discovered,
@@ -473,19 +500,36 @@ static void *client_thread(void *arg) {
     atomic_init(&j->cancel_req, 0);
     json_get_str(body, "kind", j->kind, sizeof j->kind, "image");
     json_get_str(body, "prompt", j->prompt, sizeof j->prompt, "eureka async studio");
+    json_get_str(body, "lyrics", j->lyrics, sizeof j->lyrics, "");
     json_get_str(body, "tier", j->tier, sizeof j->tier, "fast");
     json_get_str(body, "checkpoint", j->checkpoint, sizeof j->checkpoint, "");
     j->n_loras = json_get_loras(body, j->loras, EC_STUDIO_MAX_LORAS);
     j->seed = (uint32_t)json_get_num(body, "seed", 42 + j->id);
-    int def_w = (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av")) ? 320 : 512;
-    int def_h = (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av")) ? 180 : 512;
+    int is_vid = (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av"));
+    int req_full = json_get_bool(body, "full_model", -1);
+    int def_w = is_vid ? (req_full == 1 ? 832 : 320) : 512;
+    int def_h = is_vid ? (req_full == 1 ? 480 : 180) : 512;
     j->width = (int)json_get_num(body, "width", def_w);
     j->height = (int)json_get_num(body, "height", def_h);
-    j->photoreal = json_get_bool(body, "photoreal", (j->width >= 512 || j->height >= 512 || j->checkpoint[0] || j->n_loras > 0) ? 1 : 0);
-    j->steps = (int)json_get_num(body, "steps", j->photoreal ? 4 : 12);
-    j->frames = (int)json_get_num(body, "frames", 24);
+    j->grid_res = (int)json_get_num(body, "grid_res", 20);
     j->bpm = (int)json_get_num(body, "bpm", 124);
-    j->duration_sec = (float)json_get_num(body, "duration_sec", 2.0);
+    j->duration_sec = (float)json_get_num(body, "duration_sec", req_full == 1 ? 10.0 : 2.0);
+    j->photoreal = json_get_bool(body, "photoreal", (j->width >= 512 || j->height >= 512 || j->checkpoint[0] || j->n_loras > 0) ? 1 : 0);
+    if (req_full >= 0) {
+      j->full_model = req_full;
+    } else if (!strcmp(j->kind, "3d")) {
+      j->full_model = (j->grid_res >= 32) ? 1 : 0;
+    } else if (!strcmp(j->kind, "music")) {
+      j->full_model = (j->duration_sec >= 5.0f || j->lyrics[0]) ? 1 : 0;
+    } else if (is_vid) {
+      j->full_model = (j->width >= 640 || j->height >= 384) ? 1 : 0;
+    } else {
+      j->full_model = j->photoreal;
+    }
+    int def_steps = is_vid ? (j->full_model ? 20 : 4) : (j->photoreal ? 4 : 12);
+    j->steps = (int)json_get_num(body, "steps", def_steps);
+    j->frames = (int)json_get_num(body, "frames", (is_vid && j->full_model) ? 17 : 24);
+    j->fps = (int)json_get_num(body, "fps", (is_vid && j->full_model) ? 16 : 24);
     j->with_audio = json_get_bool(body, "with_audio", !strcmp(j->kind, "video_av") ? 1 : 0);
     snprintf(j->stage, sizeof j->stage, "queued");
     int jid = j->id;
@@ -663,50 +707,66 @@ static void *client_thread(void *arg) {
       send_json(cfd, 400, resp);
     }
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/3d/generations")) {
-    char prompt[256]; json_get_str(body, "prompt", prompt, sizeof prompt, "sculptural torus");
+    char prompt[1024]; json_get_str(body, "prompt", prompt, sizeof prompt, "sculptural matte-white porcelain teapot");
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 77);
     int res_g = (int)json_get_num(body, "grid_res", 20);
+    int full_m = json_get_bool(body, "full_model", (res_g >= 32) ? 1 : 0);
     ec_studio_result_t r;
-    if (ec_studio_gen_3d(st, prompt, seed, res_g, EC_TIER_FAST, NULL, NULL, &r) == 0) {
+    if (ec_studio_gen_3d_ex(st, prompt, seed, res_g, EC_TIER_FAST, full_m, NULL, NULL, &r) == 0) {
       snprintf(resp, 32768,
           "{\"ok\":true,\"glb_url\":\"/artifacts/%s\",\"splat_ply_url\":\"/artifacts/%s\","
-          "\"n_verts\":%d,\"n_tris\":%d,\"n_splats\":%d,\"gpu_ms\":%.2f}",
-          basename_safe(r.file_main), basename_safe(r.file_aux), r.n_verts, r.n_tris, r.n_splats, r.gpu_ms);
+          "\"engine_mode\":\"%s\",\"n_verts\":%d,\"n_tris\":%d,\"n_splats\":%d,"
+          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
+          basename_safe(r.file_main), basename_safe(r.file_aux),
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke",
+          r.n_verts, r.n_tris, r.n_splats, r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"3d generation failed\"}");
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/audio/music")) {
-    char prompt[256]; json_get_str(body, "prompt", prompt, sizeof prompt, "ambient electronic pulse");
+    char prompt[1024], lyrics[1024];
+    json_get_str(body, "prompt", prompt, sizeof prompt, "ambient electronic pulse");
+    json_get_str(body, "lyrics", lyrics, sizeof lyrics, "");
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 101);
     int bpm = (int)json_get_num(body, "bpm", 122);
     float dur = (float)json_get_num(body, "duration_sec", 3.0);
+    int full_m = json_get_bool(body, "full_model", (dur >= 5.0f || lyrics[0]) ? 1 : 0);
     ec_studio_result_t r;
-    if (ec_studio_gen_music(st, prompt, seed, bpm, dur, EC_TIER_FAST, NULL, NULL, &r) == 0) {
+    if (ec_studio_gen_music_ex(st, prompt, lyrics, seed, bpm, dur, EC_TIER_FAST, full_m, NULL, NULL, &r) == 0) {
       snprintf(resp, 32768,
           "{\"ok\":true,\"master_wav_url\":\"/artifacts/%s\","
           "\"stems\":{\"drums\":\"/artifacts/%s\",\"bass\":\"/artifacts/%s\","
           "\"harmony\":\"/artifacts/%s\",\"lead\":\"/artifacts/%s\"},"
-          "\"bpm\":%d,\"frames\":%d,\"sample_rate\":44100,\"gpu_ms\":%.2f}",
+          "\"engine_mode\":\"%s\",\"bpm\":%d,\"frames\":%d,\"sample_rate\":%d,"
+          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
           basename_safe(r.file_main),
           basename_safe(r.stem_files[0]), basename_safe(r.stem_files[1]),
           basename_safe(r.stem_files[2]), basename_safe(r.stem_files[3]),
-          bpm, r.frames, r.gpu_ms);
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke",
+          bpm, r.frames, r.sample_rate ? r.sample_rate : 44100,
+          r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"music generation failed\"}");
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/videos/generations")) {
-    char prompt[256]; json_get_str(body, "prompt", prompt, sizeof prompt, "cinematic studio motion");
+    char prompt[1024]; json_get_str(body, "prompt", prompt, sizeof prompt, "cinematic studio motion");
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 303);
-    int n_frames = (int)json_get_num(body, "frames", 24);
-    int w = (int)json_get_num(body, "width", 320), h = (int)json_get_num(body, "height", 180);
-    int fps = (int)json_get_num(body, "fps", 24);
+    int req_full = json_get_bool(body, "full_model", -1);
+    int w = (int)json_get_num(body, "width", req_full == 1 ? 832 : 320);
+    int h = (int)json_get_num(body, "height", req_full == 1 ? 480 : 180);
+    int full_m = (req_full >= 0) ? req_full : ((w >= 640 || h >= 384) ? 1 : 0);
+    int n_frames = (int)json_get_num(body, "frames", full_m ? 17 : 24);
+    int fps = (int)json_get_num(body, "fps", full_m ? 16 : 24);
+    int steps = (int)json_get_num(body, "steps", full_m ? 20 : 4);
     int with_audio = json_get_bool(body, "with_audio", 1);
     ec_studio_result_t r;
-    if (ec_studio_gen_video(st, prompt, seed, n_frames, w, h, fps, with_audio, EC_TIER_FAST, NULL, NULL, &r) == 0) {
+    if (ec_studio_gen_video_ex(st, prompt, seed, n_frames, w, h, fps, steps, with_audio, EC_TIER_FAST, full_m, NULL, NULL, &r) == 0) {
       snprintf(resp, 32768,
           "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\","
-          "\"encoder\":\"%s\",\"with_audio\":%s,\"frames\":%d,\"width\":%d,\"height\":%d,"
-          "\"gpu_ms\":%.2f,\"fps\":%.1f}",
-          basename_safe(r.file_mp4), basename_safe(r.file_aux), r.encoder_used,
-          with_audio ? "true" : "false", r.frames, r.width, r.height, r.gpu_ms, r.fps);
+          "\"engine_mode\":\"%s\",\"encoder\":\"%s\",\"with_audio\":%s,\"frames\":%d,\"width\":%d,\"height\":%d,"
+          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f,\"fps\":%.1f}",
+          basename_safe(r.file_mp4), basename_safe(r.file_aux),
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke", r.encoder_used,
+          with_audio ? "true" : "false", r.frames, r.width, r.height,
+          r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms, r.fps);
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"video generation failed\"}");
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/videos/realtime/burst")) {

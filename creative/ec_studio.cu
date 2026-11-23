@@ -5,6 +5,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "ec_studio.h"
+#include "ec_acestep.h"
 #include "ec_dit.h"
 #include "ec_flow.h"
 #include "ec_flux2.h"
@@ -15,7 +16,9 @@
 #include "ec_nvenc.h"
 #include "ec_recipes.h"
 #include "ec_storage.h"
+#include "ec_trellis2.h"
 #include "ec_vram_pool.h"
+#include "ec_wan22.h"
 #include <cuda_fp16.h>
 #include <math.h>
 #include <pthread.h>
@@ -50,27 +53,92 @@ struct ec_studio {
   ec_storage_vault_t  vault;
   ec_recipe_lib_t     recipes;
   ec_flux2_t         *flux2;
+  ec_acestep_t       *acestep;
+  ec_trellis2_t      *trellis2;
+  ec_wan22_t         *wan22;
   int                 initialized;
 };
 
-static void studio_try_init_flux2_locked(ec_studio_t *st) {
-  if (st->flux2 && ec_flux2_is_ready(st->flux2)) return;
-  const ec_storage_asset_t *ckpt = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "flux2_klein_4b");
-  const ec_storage_asset_t *vae  = ec_storage_find(&st->vault, EC_ASSET_VAE, "flux2_klein_vae");
-  if (!vae) vae = ec_storage_find(&st->vault, EC_ASSET_VAE, "flux2");
-  const ec_storage_asset_t *te   = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen_3_4b");
-  if (!te) te = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen3_4b");
-  const ec_storage_asset_t *tok  = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "qwen3_tokenizer");
-  if (!tok) tok = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "tokenizer");
-  if (!ckpt || !vae || !te || !tok) return;
+// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2).
+// Lightweight mmap handles & tokenizers stay open so switching modalities incurs zero file re-parsing!
+static void studio_evict_other_engines_locked(ec_studio_t *st, int keep_id) {
+  if (keep_id != 1 && st->flux2)    ec_flux2_unload_vram(st->flux2);
+  if (keep_id != 2 && st->acestep)  ec_acestep_unload_vram(st->acestep);
+  if (keep_id != 3 && st->trellis2) ec_trellis2_unload_vram(st->trellis2);
+  if (keep_id != 4 && st->wan22)    ec_wan22_unload_vram(st->wan22);
+}
 
-  ec_flux2_paths_t p = {};
-  snprintf(p.checkpoint_path,   sizeof p.checkpoint_path,   "%s", ckpt->path);
-  snprintf(p.vae_path,          sizeof p.vae_path,          "%s", vae->path);
-  snprintf(p.text_encoder_path, sizeof p.text_encoder_path, "%s", te->path);
-  snprintf(p.tokenizer_path,    sizeof p.tokenizer_path,    "%s", tok->path);
-  if (st->flux2) { ec_flux2_destroy(st->flux2); st->flux2 = NULL; }
-  st->flux2 = ec_flux2_create(&p);
+static void studio_try_init_all_engines_locked(ec_studio_t *st) {
+  // 1. Photoreal Image: FLUX.2-klein-4B
+  if (!st->flux2 || !ec_flux2_is_ready(st->flux2)) {
+    const ec_storage_asset_t *ckpt = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "flux2_klein_4b");
+    const ec_storage_asset_t *vae  = ec_storage_find(&st->vault, EC_ASSET_VAE, "flux2_klein_vae");
+    if (!vae) vae = ec_storage_find(&st->vault, EC_ASSET_VAE, "flux2");
+    const ec_storage_asset_t *te   = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen_3_4b");
+    if (!te) te = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen3_4b");
+    const ec_storage_asset_t *tok  = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "qwen3_tokenizer");
+    if (!tok) tok = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "tokenizer");
+    if (ckpt && vae && te && tok) {
+      ec_flux2_paths_t p = {};
+      snprintf(p.checkpoint_path,   sizeof p.checkpoint_path,   "%s", ckpt->path);
+      snprintf(p.vae_path,          sizeof p.vae_path,          "%s", vae->path);
+      snprintf(p.text_encoder_path, sizeof p.text_encoder_path, "%s", te->path);
+      snprintf(p.tokenizer_path,    sizeof p.tokenizer_path,    "%s", tok->path);
+      if (st->flux2) { ec_flux2_destroy(st->flux2); st->flux2 = NULL; }
+      st->flux2 = ec_flux2_create(&p);
+    }
+  }
+
+  // 2. AI Music + 4 Stems: ACE-Step 1.5 Turbo
+  if (!st->acestep || !ec_acestep_is_ready(st->acestep)) {
+    const ec_storage_asset_t *dit = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "acestep_v15_turbo");
+    const ec_storage_asset_t *vae = ec_storage_find(&st->vault, EC_ASSET_VAE, "acestep_v15_vae");
+    const ec_storage_asset_t *te  = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "acestep_qwen3_0.6b");
+    const ec_storage_asset_t *sil = ec_storage_find(&st->vault, EC_ASSET_OTHER, "acestep_silence_latent");
+    const ec_storage_asset_t *tok = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "qwen3_tokenizer");
+    if (dit && vae && te && sil && tok) {
+      ec_acestep_paths_t p = {};
+      snprintf(p.dit_path,            sizeof p.dit_path,            "%s", dit->path);
+      snprintf(p.vae_path,            sizeof p.vae_path,            "%s", vae->path);
+      snprintf(p.text_encoder_path,   sizeof p.text_encoder_path,   "%s", te->path);
+      snprintf(p.silence_latent_path, sizeof p.silence_latent_path, "%s", sil->path);
+      snprintf(p.tokenizer_path,      sizeof p.tokenizer_path,      "%s", tok->path);
+      if (st->acestep) { ec_acestep_destroy(st->acestep); st->acestep = NULL; }
+      st->acestep = ec_acestep_create(&p);
+    }
+  }
+
+  // 3. Native 3D Asset Generation: TRELLIS.2 (DINOv3-L/16 + 1.3B Flow + 64^3 3D Conv Decoder)
+  if (!st->trellis2 || !ec_trellis2_is_ready(st->trellis2)) {
+    const ec_storage_asset_t *dino = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "dinov3_vitl16");
+    const ec_storage_asset_t *flow = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_ss_flow");
+    const ec_storage_asset_t *dec  = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_ss_dec");
+    if (dino && flow && dec) {
+      ec_trellis2_paths_t p = {};
+      snprintf(p.dino_path,    sizeof p.dino_path,    "%s", dino->path);
+      snprintf(p.ss_flow_path, sizeof p.ss_flow_path, "%s", flow->path);
+      snprintf(p.ss_dec_path,  sizeof p.ss_dec_path,  "%s", dec->path);
+      if (st->trellis2) { ec_trellis2_destroy(st->trellis2); st->trellis2 = NULL; }
+      st->trellis2 = ec_trellis2_create(&p);
+    }
+  }
+
+  // 4. Native Cinema Video: Wan 2.2 TI2V-5B (UMT5-XXL FP8 + 30L 3D RoPE DiT + Causal 3D VAE)
+  if (!st->wan22 || !ec_wan22_is_ready(st->wan22)) {
+    const ec_storage_asset_t *dit = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "wan2.2_ti2v_5b");
+    const ec_storage_asset_t *vae = ec_storage_find(&st->vault, EC_ASSET_VAE, "wan2.2_vae");
+    const ec_storage_asset_t *te  = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "umt5_xxl");
+    const ec_storage_asset_t *tok = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "umt5_tokenizer");
+    if (dit && vae && te && tok) {
+      ec_wan22_paths_t p = {};
+      snprintf(p.dit_path,          sizeof p.dit_path,          "%s", dit->path);
+      snprintf(p.vae_path,          sizeof p.vae_path,          "%s", vae->path);
+      snprintf(p.text_encoder_path, sizeof p.text_encoder_path, "%s", te->path);
+      snprintf(p.tokenizer_path,    sizeof p.tokenizer_path,    "%s", tok->path);
+      if (st->wan22) { ec_wan22_destroy(st->wan22); st->wan22 = NULL; }
+      st->wan22 = ec_wan22_create(&p);
+    }
+  }
 }
 
 static double st_now_ms(void) {
@@ -166,7 +234,7 @@ static int ec_studio_init_impl(ec_studio_t *st, const char *artifact_dir, const 
   snprintf(cfg_recipes, sizeof cfg_recipes, "%s/recipes_user.json", st->artifact_dir);
   ec_storage_init(&st->vault, st->models_dir, cfg_storage);
   ec_recipes_init(&st->recipes, cfg_recipes);
-  studio_try_init_flux2_locked(st);
+  studio_try_init_all_engines_locked(st);
 
   st->initialized = 1;
   return 0;
@@ -183,7 +251,10 @@ extern "C" void ec_studio_destroy(ec_studio_t *st) {
   if (!st) return;
   if (st->initialized) {
     pthread_mutex_lock(&st->gpu_mu);
-    if (st->flux2) { ec_flux2_destroy(st->flux2); st->flux2 = NULL; }
+    if (st->flux2)    { ec_flux2_destroy(st->flux2);       st->flux2 = NULL; }
+    if (st->acestep)  { ec_acestep_destroy(st->acestep);   st->acestep = NULL; }
+    if (st->trellis2) { ec_trellis2_destroy(st->trellis2); st->trellis2 = NULL; }
+    if (st->wan22)    { ec_wan22_destroy(st->wan22);       st->wan22 = NULL; }
     ec_registry_free(&st->registry);
     ec_flow_free(&st->flow_graph);
     ec_vram_pool_free(&st->vram_pool);
@@ -211,7 +282,10 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
   out->vram_pool_used_mb = (double)st->vram_pool.used_bytes / (1024.0 * 1024.0);
   out->vram_pool_budget_mb = (double)st->vram_pool.budget_bytes / (1024.0 * 1024.0);
   out->models_discovered = st->registry.n_models;
-  out->photoreal_ready = (st->flux2 && ec_flux2_is_ready(st->flux2)) ? 1 : 0;
+  out->photoreal_ready = (st->flux2    && ec_flux2_is_ready(st->flux2))       ? 1 : 0;
+  out->acestep_ready   = (st->acestep  && ec_acestep_is_ready(st->acestep))   ? 1 : 0;
+  out->trellis2_ready  = (st->trellis2 && ec_trellis2_is_ready(st->trellis2)) ? 1 : 0;
+  out->wan22_ready     = (st->wan22    && ec_wan22_is_ready(st->wan22))       ? 1 : 0;
   out->storage_roots = st->vault.n_roots;
   out->recipes_count = st->recipes.count;
   for (int i = 0; i < st->vault.n_assets; i++) {
@@ -274,6 +348,7 @@ extern "C" int ec_studio_gen_image_ex(
     fx_cb_bridge_t bridge = { cb, cb_ctx };
     ec_flux2_res_t fres = {};
     pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 1);
     int rc = ec_flux2_generate_png(st->flux2, &freq, res->file_main, cb ? fx_progress_bridge : NULL, &bridge, &fres);
     pthread_mutex_unlock(&st->gpu_mu);
     if (rc == 0 && fres.ok) {
@@ -413,8 +488,101 @@ extern "C" int ec_studio_gen_image(
 }
 
 // ===========================================================================
-// 2. 3D Object Generation: GPU Sparse O-Voxel + 3D DiT -> GLB 2.0 + 3DGS PLY
+// 2. 3D Object Generation: TRELLIS.2 1.3B (FLUX.2 Hero -> DINOv3 -> 30L Flow -> 64^3 3D Conv -> GLB + PLY)
 // ===========================================================================
+static int tr_ref_progress_bridge(int step, int total, const char *stage, void *ctx) {
+  fx_cb_bridge_t *b = (fx_cb_bridge_t *)ctx;
+  (void)total;
+  return (b && b->cb) ? b->cb(step, 20, 0, stage ? stage : "flux2_3d_ref", b->cb_ctx) : 0;
+}
+
+static int tr_flow_progress_bridge(int step, int total, const char *stage, void *ctx) {
+  fx_cb_bridge_t *b = (fx_cb_bridge_t *)ctx;
+  return (b && b->cb) ? b->cb(5 + step, 5 + total, 0, stage ? stage : "trellis2_flow", b->cb_ctx) : 0;
+}
+
+extern "C" int ec_studio_gen_3d_ex(
+    ec_studio_t *st, const char *prompt, uint32_t seed, int grid_res,
+    ec_tier_t tier, int full_model, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized) return -1;
+
+  if (full_model && st->trellis2 && ec_trellis2_is_ready(st->trellis2) &&
+      st->flux2 && ec_flux2_is_ready(st->flux2)) {
+    uint64_t tag = hash_prompt_seed(prompt, seed);
+    char hero_prompt[1536];
+    snprintf(hero_prompt, sizeof hero_prompt,
+        "Isolated centered 3D studio product render of %s, single object floating centered on pure solid matte black background, even neutral softbox studio lighting, full object visible in frame, no room, no table, no background clutter",
+        (prompt && prompt[0]) ? prompt : "sculptural matte-white porcelain teapot with bamboo handle");
+
+    char ref_png[256];
+    snprintf(ref_png, sizeof ref_png, "%s/trellis2_%u_%04x_ref.png",
+             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
+    snprintf(res->file_main, sizeof res->file_main, "%s/trellis2_%u_%04x.glb",
+             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
+    snprintf(res->file_aux, sizeof res->file_aux, "%s/trellis2_%u_%04x.ply",
+             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
+
+    ec_flux2_req_t freq = {};
+    freq.prompt = hero_prompt;
+    freq.seed = seed;
+    freq.width = 512;
+    freq.height = 512;
+    freq.steps = 4;
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    uint8_t *ref_rgb = NULL;
+    ec_flux2_res_t fres = {};
+    ec_trellis2_res_t tres = {};
+
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 1);
+    int rc_ref = ec_flux2_generate_rgb(st->flux2, &freq, &ref_rgb, ref_png,
+                                       cb ? tr_ref_progress_bridge : NULL, &bridge, &fres);
+    // Evict FLUX.2 immediately so TRELLIS.2 DINOv3 + 30-block Flow + 3D Conv Decoder run with ample VRAM!
+    ec_flux2_unload_vram(st->flux2);
+    if (rc_ref != 0 || !ref_rgb) {
+      pthread_mutex_unlock(&st->gpu_mu);
+      if (ref_rgb) free(ref_rgb);
+      if (rc_ref == -2) { res->cancelled = 1; return 0; }
+      return -1;
+    }
+
+    ec_trellis2_req_t treq = {};
+    treq.rgb = ref_rgb;
+    treq.img_w = fres.width;
+    treq.img_h = fres.height;
+    treq.seed = seed;
+    treq.steps = 12;
+    treq.cfg_scale = 7.5f;
+    treq.rescale_t = 5.0f;
+
+    int rc_3d = ec_trellis2_generate_3d(st->trellis2, &treq, res->file_main, res->file_aux,
+                                        cb ? tr_flow_progress_bridge : NULL, &bridge, &tres);
+    pthread_mutex_unlock(&st->gpu_mu);
+    free(ref_rgb);
+
+    if (rc_3d == -2) { res->cancelled = 1; return 0; }
+    if (rc_3d == 0 && tres.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "trellis2_1.3b");
+      res->n_verts = tres.n_verts;
+      res->n_tris = tres.n_tris;
+      res->n_splats = tres.n_splats;
+      res->steps_run = tres.steps_run;
+      res->text_enc_ms = fres.total_ms;
+      res->dit_ms = tres.dino_ms + tres.flow_ms;
+      res->vae_ms = tres.dec_ms + tres.mesh_ms;
+      res->gpu_ms = fres.total_ms + tres.total_ms;
+      return 0;
+    }
+    return -1;
+  }
+
+  int rc = ec_studio_gen_3d(st, prompt, seed, grid_res, tier, cb, cb_ctx, res);
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  return rc;
+}
+
 extern "C" int ec_studio_gen_3d(
     ec_studio_t *st, const char *prompt, uint32_t seed, int grid_res,
     ec_tier_t tier, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
@@ -502,8 +670,64 @@ extern "C" int ec_studio_gen_3d(
 }
 
 // ===========================================================================
-// 3. Music + 4 Stems: 1D RoPE DiT + Causal Conv1D Audio DCAE -> Stereo WAV + 4 Stems
+// 3. Music + 4 Stems: ACE-Step 1.5 Turbo (48 kHz Stereo + 4 Stems) / Fast Smoke
 // ===========================================================================
+extern "C" int ec_studio_gen_music_ex(
+    ec_studio_t *st, const char *prompt, const char *lyrics, uint32_t seed, int bpm, float duration_sec,
+    ec_tier_t tier, int full_model, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized) return -1;
+
+  if (full_model && st->acestep && ec_acestep_is_ready(st->acestep)) {
+    uint64_t tag = hash_prompt_seed(prompt, seed);
+    static const char *snames[4] = { "drums", "bass", "harmony", "lead" };
+    snprintf(res->file_main, sizeof res->file_main, "%s/acestep_%u_%04x_master.wav",
+             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
+    const char *spaths[4];
+    for (int i = 0; i < 4; i++) {
+      snprintf(res->stem_files[i], sizeof res->stem_files[i], "%s/acestep_%u_%04x_stem_%s.wav",
+               st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu), snames[i]);
+      spaths[i] = res->stem_files[i];
+    }
+
+    ec_acestep_req_t areq = {};
+    areq.prompt = (prompt && prompt[0]) ? prompt : "warm jazz house groove, electric rhodes piano, crisp percussion, analog bassline";
+    areq.lyrics = (lyrics && lyrics[0]) ? lyrics : "";
+    areq.seed = seed;
+    areq.bpm = (bpm >= 40 && bpm <= 240) ? bpm : 120;
+    areq.duration_sec = (duration_sec >= 4.0f && duration_sec <= 60.0f) ? duration_sec : 10.0f;
+    areq.steps = 8;
+    areq.shift = 3.0f;
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_acestep_res_t ares = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 2);
+    int rc = ec_acestep_generate_wav(st->acestep, &areq, res->file_main, spaths, NULL,
+                                     cb ? fx_progress_bridge : NULL, &bridge, &ares);
+    pthread_mutex_unlock(&st->gpu_mu);
+
+    if (rc == -2) { res->cancelled = 1; return 0; }
+    if (rc == 0 && ares.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "acestep_1.5_turbo");
+      res->sample_rate = ares.sample_rate;
+      res->frames = ares.num_samples;
+      res->steps_run = ares.steps_run;
+      res->text_enc_ms = ares.text_enc_ms + ares.cond_enc_ms;
+      res->dit_ms = ares.dit_ms;
+      res->vae_ms = ares.vae_ms;
+      res->gpu_ms = ares.total_ms;
+      return 0;
+    }
+    return -1;
+  }
+
+  int rc = ec_studio_gen_music(st, prompt, seed, bpm, duration_sec, tier, cb, cb_ctx, res);
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  res->sample_rate = 44100;
+  return rc;
+}
+
 extern "C" int ec_studio_gen_music(
     ec_studio_t *st, const char *prompt, uint32_t seed, int bpm, float duration_sec,
     ec_tier_t tier, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
@@ -605,12 +829,102 @@ extern "C" int ec_studio_gen_music(
   rc |= ec_export_wav(res->file_main, &ma);
   free(master); free(stem_buf);
   res->frames = (int)NF;
+  res->sample_rate = (int)SR;
+  if (!res->engine_mode[0]) snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
   return rc;
 }
 
 // ===========================================================================
-// 4. Video + Joint A/V (Wan 2.2 / LTX-2.5) -> Hardware NVENC H.264 (+AAC) .mp4!
+// 4. Video + Joint A/V: Wan 2.2 TI2V-5B (+ ACE-Step 1.5 Synced AAC Audio) -> NVENC H.264 MP4!
 // ===========================================================================
+extern "C" int ec_studio_gen_video_ex(
+    ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames, int width, int height,
+    int fps, int steps, int with_audio, ec_tier_t tier, int full_model,
+    ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized) return -1;
+
+  if (full_model && st->wan22 && ec_wan22_is_ready(st->wan22)) {
+    int W = (width >= 640) ? ((width + 31) & ~31) : 832;
+    if (W > 1280) W = 1280;
+    int H = (height >= 384) ? ((height + 31) & ~31) : 480;
+    if (H > 768) H = 768;
+    int req_f = (n_frames >= 5) ? n_frames : 17;
+    int F_lat = (req_f - 1) / 4 + 1;
+    if (F_lat < 2) F_lat = 2;
+    if (F_lat > 21) F_lat = 21;
+    int actual_f = 1 + 4 * (F_lat - 1);
+    int afps = (fps >= 8 && fps <= 60) ? fps : 16;
+    int asteps = (steps >= 4 && steps <= 50) ? steps : 20;
+
+    // Optional synced stereo audio track via native ACE-Step 1.5 Turbo FIRST (evicts cleanly before Wan 2.2!)
+    char wav_path[256] = {0};
+    double audio_ms = 0.0;
+    if (with_audio) {
+      if (cb && cb(0, asteps + 4, 0, "acestep_synced_audio", cb_ctx) != 0) {
+        res->cancelled = 1;
+        return 0;
+      }
+      ec_studio_result_t ares = {};
+      float dur = (float)actual_f / (float)afps;
+      if (dur < 4.0f) dur = 4.0f;
+      int use_acestep = (st->acestep && ec_acestep_is_ready(st->acestep)) ? 1 : 0;
+      if (ec_studio_gen_music_ex(st, prompt, "", seed + 17, 116, dur, tier, use_acestep, NULL, NULL, &ares) == 0 && !ares.cancelled) {
+        snprintf(wav_path, sizeof wav_path, "%s", ares.file_main);
+        audio_ms = ares.gpu_ms;
+      }
+    }
+
+    uint64_t tag = hash_prompt_seed(prompt, seed);
+    snprintf(res->file_mp4, sizeof res->file_mp4, "%s/wan22_%u_%04x%s.mp4",
+             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu), with_audio ? "_av" : "");
+    snprintf(res->file_aux, sizeof res->file_aux, "%s/wan22_%u_%04x_kf0.png",
+             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
+    snprintf(res->file_main, sizeof res->file_main, "%s", res->file_mp4);
+
+    ec_wan22_req_t wreq = {};
+    wreq.prompt = (prompt && prompt[0]) ? prompt : "Aerial drone footage flying slowly along dramatic black volcanic sea cliffs in Iceland at golden sunset, turquoise ocean waves crashing on shore, cinema 35mm";
+    wreq.seed = seed;
+    wreq.width = W;
+    wreq.height = H;
+    wreq.num_frames = actual_f;
+    wreq.fps = afps;
+    wreq.steps = asteps;
+    wreq.cfg_scale = 5.0f;
+    wreq.shift = (W * H <= 832 * 480) ? 3.0f : 5.0f;
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_wan22_res_t wres = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 4);
+    int rc = ec_wan22_generate_mp4(st->wan22, &wreq, res->file_mp4, res->file_aux,
+                                   wav_path[0] ? wav_path : NULL,
+                                   cb ? fx_progress_bridge : NULL, &bridge, &wres);
+    pthread_mutex_unlock(&st->gpu_mu);
+
+    if (rc == -2) { res->cancelled = 1; return 0; }
+    if (rc == 0 && wres.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "wan2.2_ti2v_5b");
+      snprintf(res->encoder_used, sizeof res->encoder_used, "%s", wres.encoder_used);
+      res->width = wres.width;
+      res->height = wres.height;
+      res->frames = wres.num_frames;
+      res->steps_run = wres.steps_run;
+      res->text_enc_ms = wres.text_enc_ms;
+      res->dit_ms = wres.dit_ms;
+      res->vae_ms = wres.vae_ms;
+      res->gpu_ms = wres.total_ms + audio_ms;
+      res->fps = (double)wres.num_frames / ((wres.total_ms > 1.0 ? wres.total_ms : 1.0) * 1e-3);
+      return 0;
+    }
+    return -1;
+  }
+
+  int rc = ec_studio_gen_video(st, prompt, seed, n_frames, width, height, fps, with_audio, tier, cb, cb_ctx, res);
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  return rc;
+}
+
 extern "C" int ec_studio_gen_video(
     ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames, int width, int height,
     int fps, int with_audio, ec_tier_t tier, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
@@ -878,7 +1192,7 @@ extern "C" int ec_studio_storage_add_root(ec_studio_t *st, const char *path, con
   int rc = ec_storage_add_root(&st->vault, path, label, 1);
   if (rc >= 0) {
     ec_storage_scan(&st->vault);
-    studio_try_init_flux2_locked(st);
+    studio_try_init_all_engines_locked(st);
   }
   pthread_mutex_unlock(&st->gpu_mu);
   return rc >= 0 ? 0 : -1;
@@ -897,7 +1211,7 @@ extern "C" int ec_studio_storage_rescan(ec_studio_t *st) {
   if (!st || !st->initialized) return -1;
   pthread_mutex_lock(&st->gpu_mu);
   int n = ec_storage_scan(&st->vault);
-  studio_try_init_flux2_locked(st);
+  studio_try_init_all_engines_locked(st);
   pthread_mutex_unlock(&st->gpu_mu);
   return n;
 }

@@ -16,13 +16,14 @@ GENC=(-gencode arch=compute_80,code=sm_80
       -gencode arch=compute_90,code=sm_90
       -gencode arch=compute_120,code=[sm_120,compute_120])
 
-echo "=== Building 100% Native Eureka Creative Engine v3 (Photoreal FLUX.2 + LoRA + Vault + Comfy Import) in $OUT ==="
+echo "=== Building 100% Native Eureka Creative Engine v4 (FLUX.2 + ACE-Step 1.5 + TRELLIS.2 + Wan 2.2) in $OUT ==="
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_safetensors.c" -o "$OUT/obj/ec_safetensors.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_flow.c"        -o "$OUT/obj/ec_flow.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_media.c"       -o "$OUT/obj/ec_media.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_nvenc.c"       -o "$OUT/obj/ec_nvenc.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_storage.c"     -o "$OUT/obj/ec_storage.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_bpe.c"         -o "$OUT/obj/ec_bpe.o"
+"$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_unigram.c"     -o "$OUT/obj/ec_unigram.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_recipes.c"     -o "$OUT/obj/ec_recipes.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_serve.c"       -o "$OUT/obj/ec_serve.o"
 
@@ -33,6 +34,9 @@ echo "=== Building 100% Native Eureka Creative Engine v3 (Photoreal FLUX.2 + LoR
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_models.cu"     -o "$OUT/obj/ec_models.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_lora.cu"       -o "$OUT/obj/ec_lora.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_flux2.cu"      -o "$OUT/obj/ec_flux2.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_acestep.cu"    -o "$OUT/obj/ec_acestep.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_trellis2.cu"   -o "$OUT/obj/ec_trellis2.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_wan22.cu"      -o "$OUT/obj/ec_wan22.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_studio.cu"     -o "$OUT/obj/ec_studio.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_bench.cu"      -o "$OUT/obj/ec_bench.o"
 
@@ -43,6 +47,7 @@ COMMON_OBJS=(
   "$OUT/obj/ec_nvenc.o"
   "$OUT/obj/ec_storage.o"
   "$OUT/obj/ec_bpe.o"
+  "$OUT/obj/ec_unigram.o"
   "$OUT/obj/ec_recipes.o"
   "$OUT/obj/ec_kernels.o"
   "$OUT/obj/ec_kernels_v2.o"
@@ -51,6 +56,9 @@ COMMON_OBJS=(
   "$OUT/obj/ec_models.o"
   "$OUT/obj/ec_lora.o"
   "$OUT/obj/ec_flux2.o"
+  "$OUT/obj/ec_acestep.o"
+  "$OUT/obj/ec_trellis2.o"
+  "$OUT/obj/ec_wan22.o"
 )
 
 "$NVCC" -O3 "${GENC[@]}" -cudart static \
