@@ -55,10 +55,22 @@ ec_flux2_t *ec_flux2_create(const ec_flux2_paths_t *paths);
 void        ec_flux2_destroy(ec_flux2_t *fx);
 int         ec_flux2_is_ready(const ec_flux2_t *fx);
 
+// Releases resident GPU weights (keeps lightweight mmap & BPE open) so VRAM shares cleanly across engines.
+void ec_flux2_unload_vram(ec_flux2_t *fx);
+
 // Generates a real photorealistic RGB image into out_png_path (RFC 2083 PNG).
 int ec_flux2_generate_png(
     ec_flux2_t *fx,
     const ec_flux2_req_t *req,
+    const char *out_png_path,
+    ec_flux2_progress_fn cb, void *cb_ctx,
+    ec_flux2_res_t *res);
+
+// Generates photoreal RGB24 buffer (out_rgb allocated via malloc, caller frees) and optionally writes out_png_path.
+int ec_flux2_generate_rgb(
+    ec_flux2_t *fx,
+    const ec_flux2_req_t *req,
+    uint8_t **out_rgb,
     const char *out_png_path,
     ec_flux2_progress_fn cb, void *cb_ctx,
     ec_flux2_res_t *res);

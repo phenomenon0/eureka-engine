@@ -61,7 +61,7 @@ def check(name, cond, detail):
         fails += 1
 
 print("===========================================================================")
-print(f"Eureka Creative Studio v2 — Parallel API, NVENC MP4, SSE & Model Proof (:{port})")
+print(f"Eureka Creative Studio v4 — 4 Flagship Native CUDA Engines Proof (:{port})")
 print("===========================================================================")
 
 # 1. Auth Enforcement (401 without key, 200 with X-Api-Key)
@@ -72,9 +72,10 @@ except urllib.error.HTTPError as e:
     unauth_401 = (e.code == 401)
 st, body = req("GET", "/v1/creative/health")
 h = json.loads(body)
-check("E2E.1 Auth + /v1/creative/health (random port)",
-      unauth_401 and st == 200 and h["parallel"] and h["auth_enabled"] and h["models_discovered"] >= 5,
-      f"401_enforced={unauth_401} GPU={h['gpu']} models={h['models_discovered']}")
+check("E2E.1 Auth + /v1/creative/health (v4 4-Engine)",
+      unauth_401 and st == 200 and h["parallel"] and h["auth_enabled"] and h["models_discovered"] >= 5
+      and h.get("photoreal_ready") and h.get("acestep_ready") and h.get("trellis2_ready") and h.get("wan22_ready"),
+      f"GPU={h['gpu']} flux2={h.get('photoreal_ready')} acestep={h.get('acestep_ready')} trellis2={h.get('trellis2_ready')} wan22={h.get('wan22_ready')}")
 
 # 2. 5-WAY CONCURRENT PARALLEL GENERATION BURST (All 5 Modalities Simultaneously!)
 t0 = time.monotonic()
@@ -305,8 +306,73 @@ if h.get("photoreal_ready"):
 else:
     check("E2E.12 Photoreal FLUX.2-klein-4B + LoRA Fusion", False, "photoreal_ready=false (models missing)")
 
+# 13. Real Native ACE-Step 1.5 Turbo 48 kHz Stereo AI Music + 4 Mixer Stems
+if h.get("acestep_ready"):
+    _, as_b = req("POST", "/v1/audio/music", {
+        "prompt": "warm upbeat jazz house groove, electric rhodes chords, funky bassline, crisp acoustic percussion, studio mix",
+        "seed": 4242, "bpm": 124, "duration_sec": 10.0, "full_model": True
+    }, timeout=120)
+    as_r = json.loads(as_b)
+    _, as_wav = req("GET", as_r["master_wav_url"])
+    as_wp = os.path.join(art_dir, "proof_acestep_master.wav")
+    open(as_wp, "wb").write(as_wav)
+    with wave.open(as_wp, "rb") as wf:
+        ach, asr, anf = wf.getnchannels(), wf.getframerate(), wf.getnframes()
+        apcm = wf.readframes(min(anf, 48000 * 4))
+    arms = math.sqrt(sum(s*s for s in struct.unpack(f"<{len(apcm)//2}h", apcm)) / (len(apcm)//2)) / 32768.0
+    as_stems_ok = all(req("GET", u)[0] == 200 for u in as_r["stems"].values())
+    check("E2E.13 Real ACE-Step 1.5 Turbo (48kHz + 4 Stems)",
+          as_r["ok"] and as_r.get("engine_mode") == "acestep_1.5_turbo" and ach == 2 and asr == 48000
+          and anf >= 450000 and arms > 0.01 and as_stems_ok,
+          f"sr={asr}Hz ch={ach} dur={anf/asr:.1f}s rms={arms:.3f} dit={as_r['dit_ms']:.0f}ms vae={as_r['vae_ms']:.0f}ms total={as_r['gpu_ms']:.0f}ms")
+else:
+    check("E2E.13 Real ACE-Step 1.5 Turbo (48kHz + 4 Stems)", False, "acestep_ready=false")
+
+# 14. Real Native TRELLIS.2 1.3B Text-to-3D (FLUX.2 Isolated Render -> DINOv3 -> 30L Flow -> 64^3 3D Conv -> GLB + PLY)
+if h.get("trellis2_ready") and h.get("photoreal_ready"):
+    _, tr_b = req("POST", "/v1/3d/generations", {
+        "prompt": "sculptural matte-white porcelain teapot with curved spout and warm bamboo handle",
+        "seed": 777, "grid_res": 64, "full_model": True
+    }, timeout=240)
+    tr_r = json.loads(tr_b)
+    _, tr_glb = req("GET", tr_r["glb_url"])
+    _, tr_ply = req("GET", tr_r["splat_ply_url"])
+    open(os.path.join(art_dir, "proof_trellis2_teapot.glb"), "wb").write(tr_glb)
+    open(os.path.join(art_dir, "proof_trellis2_teapot.ply"), "wb").write(tr_ply)
+    tr_glb_ok = struct.unpack("<II", tr_glb[:8]) == (0x46546C67, 2)
+    tr_ply_ok = tr_ply.startswith(b"ply\nformat binary_little_endian 1.0")
+    check("E2E.14 Real TRELLIS.2 1.3B 3D (GLB 2.0 + PLY)",
+          tr_r["ok"] and tr_r.get("engine_mode") == "trellis2_1.3b" and tr_glb_ok and tr_ply_ok and tr_r["n_tris"] >= 3000,
+          f"verts={tr_r['n_verts']} tris={tr_r['n_tris']} glb={len(tr_glb)}B flow={tr_r['dit_ms']:.0f}ms dec={tr_r['vae_ms']:.0f}ms")
+else:
+    check("E2E.14 Real TRELLIS.2 1.3B 3D (GLB 2.0 + PLY)", False, "trellis2_ready=false")
+
+# 15. Real Native Wan 2.2 TI2V-5B Cinema Video (832x480) + Synced ACE-Step 1.5 Audio NVENC H.264/AAC MP4!
+if h.get("wan22_ready"):
+    _, wn_b = req("POST", "/v1/videos/generations", {
+        "prompt": "Aerial drone footage flying slowly along dramatic black volcanic basalt sea cliffs in Iceland at golden sunset, turquoise ocean waves crashing gently onto black sand shore, misty green cliffs, cinematic 35mm film",
+        "seed": 42, "width": 832, "height": 480, "frames": 17, "fps": 16, "steps": 20, "with_audio": True, "full_model": True
+    }, timeout=360)
+    wn_r = json.loads(wn_b)
+    _, wn_mp4 = req("GET", wn_r["mp4_url"])
+    _, wn_kf0 = req("GET", wn_r["keyframe0_url"])
+    wn_mp4_path = os.path.join(art_dir, "proof_wan22_iceland.mp4")
+    open(wn_mp4_path, "wb").write(wn_mp4)
+    open(os.path.join(art_dir, "proof_wan22_iceland_kf0.png"), "wb").write(wn_kf0)
+    wpr = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", wn_mp4_path], capture_output=True, text=True)
+    wpinfo = json.loads(wpr.stdout)
+    wvs = [s for s in wpinfo["streams"] if s["codec_type"] == "video"]
+    was = [s for s in wpinfo["streams"] if s["codec_type"] == "audio"]
+    check("E2E.15 Real Wan 2.2 TI2V-5B + Synced Audio MP4",
+          wn_r["ok"] and wn_r.get("engine_mode") == "wan2.2_ti2v_5b"
+          and len(wvs) == 1 and wvs[0]["codec_name"] == "h264" and wvs[0]["width"] == 832 and wvs[0]["height"] == 480
+          and len(was) == 1 and was[0]["codec_name"] == "aac" and int(was[0]["sample_rate"]) == 48000,
+          f"enc={wn_r['encoder']} 832x480x{wn_r['frames']}f h264+aac(48kHz) dit={wn_r['dit_ms']:.0f}ms vae={wn_r['vae_ms']:.0f}ms mp4={len(wn_mp4)}B")
+else:
+    check("E2E.15 Real Wan 2.2 TI2V-5B + Synced Audio MP4", False, "wan22_ready=false")
+
 print("===========================================================================")
-print(f"E2E v3 VERDICT: {'ALL 12 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
+print(f"E2E v4 VERDICT: {'ALL 15 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
 print("===========================================================================")
 sys.exit(0 if fails == 0 else 1)
 PY

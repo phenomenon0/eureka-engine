@@ -32,6 +32,9 @@ typedef struct {
   double vram_pool_budget_mb;
   int    models_discovered;
   int    photoreal_ready;
+  int    acestep_ready;
+  int    trellis2_ready;
+  int    wan22_ready;
   int    storage_roots;
   int    loras_discovered;
   int    checkpoints_discovered;
@@ -44,9 +47,10 @@ typedef struct {
   char   file_mp4[256];       // hardware NVENC H.264 (+AAC) .mp4 for video / video_av
   char   encoder_used[32];    // "h264_nvenc" or "libx264"
   char   stem_files[4][256];  // music: drums, bass, harmony, lead
-  char   engine_mode[32];     // "flux2_photoreal" or "dit_smoke"
+  char   engine_mode[32];     // "flux2_photoreal", "acestep_1.5_turbo", "trellis2_1.3b", "wan2.2_ti2v_5b", or "dit_smoke"
   char   checkpoint_used[256];
   int    width, height, frames;
+  int    sample_rate;         // 48000 for ACE-Step 1.5, 44100 for smoke
   int    n_verts, n_tris, n_splats;
   int    steps_run, steps_skipped;
   int    lora_tensors_fused;
@@ -81,14 +85,27 @@ int ec_studio_gen_3d(
     ec_studio_t *st, const char *prompt, uint32_t seed, int grid_res,
     ec_tier_t tier, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
 
+int ec_studio_gen_3d_ex(
+    ec_studio_t *st, const char *prompt, uint32_t seed, int grid_res,
+    ec_tier_t tier, int full_model, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+
 int ec_studio_gen_music(
     ec_studio_t *st, const char *prompt, uint32_t seed, int bpm, float duration_sec,
     ec_tier_t tier, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
 
-// with_audio=1 runs LTX-2.5 style synced stereo audio + NVENC H.264/AAC MP4 mux!
+int ec_studio_gen_music_ex(
+    ec_studio_t *st, const char *prompt, const char *lyrics, uint32_t seed, int bpm, float duration_sec,
+    ec_tier_t tier, int full_model, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+
+// with_audio=1 runs synced stereo audio (ACE-Step 1.5 in full_model) + NVENC H.264/AAC MP4 mux!
 int ec_studio_gen_video(
     ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames, int width, int height,
     int fps, int with_audio, ec_tier_t tier, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+
+int ec_studio_gen_video_ex(
+    ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames, int width, int height,
+    int fps, int steps, int with_audio, ec_tier_t tier, int full_model,
+    ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
 
 int ec_studio_realtime_burst(
     ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames,
