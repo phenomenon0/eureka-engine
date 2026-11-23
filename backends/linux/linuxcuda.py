@@ -31,6 +31,7 @@ def one(line, what):
 # 1 + 2: LLB_GEN_EOG early stop + SIGUSR1 mid-generation cancel
 i = one("static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, u32 n) {", "gen_run")
 lines[i:i] = """// LINUX-PARITY (backends/linux/linuxcuda.py): LLB_GEN_EOG + SIGUSR1 mid-generation cancel
+#define LLB_HAS_GEN_EOG 1
 static bool gen_eog(u32 id) {
   static int ne = -1;
   static u32 eog[8];
@@ -176,5 +177,13 @@ lines[i_path:i_make + 2] = """  const char* cache = gpu_user_cache_path();
 i = one("#define io_big(n) (io_gpu && (n) >= 1ull << 24)", "io_put's threshold")
 lines[i] = "#define io_big(n) (io_gpu && (n) >= 1ull << 16)  /* LINUX-CUDA-V2 (wincuda.ps1 edit 7): copy engine from 64 KiB */"
 
+# 6: Native Single-Engine Purity — Inkling 2 Mini (`inkling2_loop`) built right into `engine_gpu`
+i = one("int main(int argc, char** argv) {", "main() entry")
+lines[i:i] = [
+    "// SINGLE-ENGINE PURITY: native Inkling 2 Mini (`inkling2_loop`) CUDA runtime (lazy NVRTC, zero cost for Qwen)",
+    '#include "llb_inkling.h"',
+]
+lines.insert(i + 3, '  for (int ik = 1; ik < argc; ik += 1) { if (strcmp(argv[ik], "--inkling") == 0 || strstr(argv[ik], ".strata") != NULL) return llb_inkling_main(argc, argv); }')
+
 open(dst, "w", encoding="utf-8").write("\n".join(lines))
-print(f"linuxcuda: {src} -> {dst} (LLB_GEN_EOG + SIGUSR1 cancel + SYS1 gen_run + XDG NVRTC cache + 64K io_big)")
+print(f"linuxcuda: {src} -> {dst} (LLB_GEN_EOG + SIGUSR1 cancel + SYS1 gen_run + XDG NVRTC cache + 64K io_big + native Inkling)")

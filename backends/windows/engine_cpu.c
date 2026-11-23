@@ -44,6 +44,9 @@ static int ecpu_gemv_rows(int fmt, const uint8_t *W, int rb, int rows, int cols,
 #undef main
 #include "../../host/llb_sampler.h"
 #include "../../tools/clef3/json.h"
+#ifndef _WIN32
+#include "../../host/llb_inkling_cpu.h"
+#endif
 #include <errno.h>
 #include <pthread.h>
 
@@ -443,6 +446,13 @@ static void run_request(char *cmd, const char *hidden, unsigned n) {
 /* ---------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
+#ifndef _WIN32
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--inkling") || strstr(argv[i], ".strata") != NULL) {
+      return llb_inkling_cpu_main(argc, argv);
+    }
+  }
+#endif
   int threads = 0, gpu_note = 0;
   char **pa = malloc(sizeof *pa * (size_t)(argc + 1));
   int pn = 0;

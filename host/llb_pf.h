@@ -32,6 +32,7 @@ static u32* pf_tk;
 static u64* pf_er;
 static u64 pf_wn;
 static void spec_pf(u32 T, llb_dptr x, LlbShape sh);  // llb_host.c: LLB_SPEC after a fast chunk
+static void sa_hist_note(u32 pos, u32 tok);  // llb_host.c: LLB_SPEC_AUTO prompt n-gram history
 
 static llb_dptr pf_alloc(size_t bytes) {
   llb_dptr p = llb_alloc_zero(bytes);
@@ -525,6 +526,7 @@ static void pf_timed(u32 T, u32 k, u32 dT, LlbShape sh) {
 // token row er (format fm) at pos into the chunk; a full chunk runs
 static void pf_push(u64 er, u32 fm, u32 pos, u32 tok, u32 k, u32 dT, LlbShape sh) {
   smp_note(pos, tok);
+  sa_hist_note(pos, tok);
   if (pfx_on == 1 && pf_n != 0 && pos % pfx_C == 0 && pos <= pfx_n) {
     pf_chunk(pf_n, k, dT, sh);  // W1-KVPFX: a chunk starts at each boundary (its snapshot)
     pf_n = 0;

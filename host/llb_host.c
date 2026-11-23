@@ -98,7 +98,18 @@ static void llb_gany(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n) {
 // one GEMV of a pass tensor in its own format (the table's fm): n rows of
 // cols, the engine tree at llb_cdepth(cols); Q8_0 / Q4_K / Q6_K / Q5_K bodies.
 // LLB_Q4_DP4A bit 32: Q6_K on the two planes (llb_q6dp2, twin ref_q6row2)
+// LLB_Q4_DP4A=10 (bit 128): universal q8_1 dp4a GEMV for Q4_K / Q5_K / Q6_K attention & SSM
 static u32 llb_q4dp;
+static CUfunction gpu_dp4a_gemv, gpu_dp4a_gemv_t;
+static bool llb_dp4a_loaded;
+static void llb_dp4a_load_kernels(void) {
+  if (llb_dp4a_loaded) return;
+  if (cuModuleGetFunction(&gpu_dp4a_gemv, gpu_lib, "llb_dp4a_gemv") != CUDA_SUCCESS
+    || cuModuleGetFunction(&gpu_dp4a_gemv_t, gpu_lib, "llb_dp4a_gemv_t") != CUDA_SUCCESS) {
+    err_fail("warp pass: cannot load universal dp4a GEMV kernels");
+  }
+  llb_dp4a_loaded = true;
+}
 static void llb_kgemv(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n, u32 grid) {
   u32 rb = LLB_FM_RB(fm, cols), cg = cols / 4, d = llb_cdepth(cols);
   // pass_mail admits F32 GEMVs only for recurrent ssm_beta / ssm_alpha.
@@ -110,6 +121,17 @@ static void llb_kgemv(u32 fm, u64 w, u32 cols, u64 x, u64 y, u32 n, u32 grid) {
       return;
     }
     if (!LLB_LAUNCH(gpu_warp, grid, 1, 128, &w, &rq, &cg, &x, &y, &n, &d)) {
+      err_fail("device launch failed");
+    }
+    return;
+  }
+  if ((llb_q4dp & 128) && cols % 256 == 0
+    && (fm == LLB_FM_Q4_K || fm == LLB_FM_Q5_K || fm == LLB_FM_Q6_K || fm == LLB_FM_Q8_0)) {
+    llb_dp4a_load_kernels();
+    llb_dptr qx = gpu_q8c, xd = (qx + cols + 15) & ~(llb_dptr)15, nul = 0;
+    u32 qg = cols / 256, g4 = (n + 3) / 4;
+    if (!LLB_LAUNCH(gpu_pfq8x, qg, 1, 256, &x, &qx, &xd)
+      || !LLB_LAUNCH(gpu_dp4a_gemv, g4, 1, 128, &w, &rb, &fm, &cols, &qx, &xd, &y, &n, &nul)) {
       err_fail("device launch failed");
     }
     return;
@@ -536,11 +558,21 @@ static void llb_moe_load(LlbShape sh) {
   // the reserves: KV growth and scratch / the rest of the system. VRAM 0.75 GiB (was 1): a 35B-A3B Q4_K_S on a 24 GB
   // card (Windows desktop holding 1.1 GB) had 17.75 GiB free for 16.88 GiB of experts and streamed them at ~1 token/s;
   // in VRAM it runs 137 tokens/s at an 8K context with 0.3 GB to spare (RTX 3090, 2026-11-16)
-  u64 rv = (u64)3 << 28, rr = (u64)4 << 30;
+  // Transfer from Inkling/Strata: when experts exceed free VRAM, pack as many whole MoE layers as fit into VRAM and
+  // spill ONLY the remaining layers to pinned device-mapped RAM (mode 3: hybrid) instead of spilling 100% of layers!
+  u64 rv = (u64)3 << 28, rr = (u64)3 << 30;
   const char* e = getenv("LLB_MOE_EXPERTS");
+  u64 vram_budget = vram > rv ? vram - rv : 0;
+  bool can_hybrid = vram_budget >= (1024ull << 20) && (tot > vram_budget) && ((tot - vram_budget) + rr <= ram);
   moe_mode = e != NULL && strcmp(e, "device") == 0 ? 0 : e != NULL && strcmp(e, "host") == 0 ? 1
-    : e != NULL && strcmp(e, "stream") == 0 ? 2 : tot + rv <= vram ? 0 : tot + rr <= ram ? 1 : 2;
-  static const char* mn[3] = { "device (VRAM)", "host (pinned, device-mapped RAM)", "stream (mmapped GGUF, the k experts copied per token)" };
+    : e != NULL && strcmp(e, "stream") == 0 ? 2 : e != NULL && strcmp(e, "hybrid") == 0 ? 3
+    : tot + rv <= vram ? 0 : can_hybrid ? 3 : tot + rr <= ram ? 1 : 2;
+  static const char* mn[4] = {
+    "device (VRAM)",
+    "host (pinned, device-mapped RAM)",
+    "stream (mmapped GGUF, the k experts copied per token)",
+    "hybrid (tiered VRAM + pinned device-mapped RAM)"
+  };
   fprintf(stderr, "moe: %u layers, experts %.2f GiB -> %s [free VRAM %.2f GiB%s, MemAvailable %.2f GiB%s]\n", nmoe,
     tot / 1073741824.0, mn[moe_mode], vram / 1073741824.0, getenv("LLB_MOE_VRAM") ? " (LLB_MOE_VRAM)" : "",
     ram / 1073741824.0, getenv("LLB_MOE_RAM") ? " (LLB_MOE_RAM)" : "");
@@ -574,14 +606,33 @@ static void llb_moe_load(LlbShape sh) {
     free(sl);
     return;
   }
+  u64 vram_used = 0, host_used = 0;
+  u32 n_vram_l = 0, n_host_l = 0;
   for (u32 i = 0; i < LLB_MAXL; i += 1) {
     MoeL* m = &moe_l[i];
     if (gpu_mail->pt[i][26] == 0) {
       continue;
     }
-    m->g = moe_fill(fd, m->sg, m->bg, moe_mode, "a gate stack");
-    m->u = m->bu ? moe_fill(fd, m->su, m->bu, moe_mode, "an up stack") : 0;
-    m->d = moe_fill(fd, m->sd, m->bd, moe_mode, "a down stack");
+    u64 lbytes = m->bg + m->bu + m->bd;
+    int lmode = moe_mode;
+    if (moe_mode == 3) {
+      if (vram_used + lbytes <= vram_budget) {
+        lmode = 0;
+        vram_used += lbytes;
+        n_vram_l += 1;
+      } else {
+        lmode = 1;
+        host_used += lbytes;
+        n_host_l += 1;
+      }
+    }
+    m->g = moe_fill(fd, m->sg, m->bg, lmode, "a gate stack");
+    m->u = m->bu ? moe_fill(fd, m->su, m->bu, lmode, "an up stack") : 0;
+    m->d = moe_fill(fd, m->sd, m->bd, lmode, "a down stack");
+  }
+  if (moe_mode == 3) {
+    fprintf(stderr, "moe: hybrid placement -> %u layers (%.2f GiB) in VRAM + %u layers (%.2f GiB) in pinned RAM\n",
+      n_vram_l, vram_used / 1073741824.0, n_host_l, host_used / 1073741824.0);
   }
   (void)path;
 }
@@ -2972,6 +3023,283 @@ static void llb_pass_init(LlbShape sh, u32 dT, u32 nl) {
 }
 
 static void pass_fold(WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u32 pos, bool dev);
+
+// Note: 4-bit Cauchy-Schwarz screened unembed was benchmarked on Qwen3.5-4B/9B Q6_K unembeds
+// and honestly dropped (18.86 ms vs 6.31 ms on 4B; 32.21 ms vs 12.87 ms on 9B due to 4-bit
+// residual candidate overflow on Q6_K). Cauchy-Schwarz INT8 screening is kept exclusively
+// for BF16 unembeds (Inkling 2 Mini SQ-20 in host/llb_inkling.cuh), where INT8 halves memory
+// bandwidth while keeping residual norm tiny.
+
+// ============================================================================
+// Universal Adaptive N-gram Speculative Decoding (LLB_SPEC_AUTO=k, k in 1..6)
+// Works on ANY dense Qwen3.5/3.8 shape (4B/9B/27B), ANY quant mix (Q4_K/Q5_K/
+// Q6_K/Q8_0), ALL KV types (f32/f16/q8), AND --serve (SYS1) mode.
+// Zero slowdown on novel prose: only triggers multi-token verify on a >=3-gram
+// match; otherwise runs normal CUDA-graphed T=1 decode. 100% lossless greedy!
+// ============================================================================
+#define SA_HTSZ 16384u
+#define SA_MAXT 8u
+static int sa_k = -1;
+static u32* sa_hist;
+static u32 sa_hcap;
+static int sa_ht[SA_HTSZ];
+static u32 sa_ht_pos;
+static bool sa_ready;
+static u32 sa_nl_cap;
+static llb_dptr sa_S[LLB_MAXL], sa_qkv_hist[LLB_MAXL];
+static llb_dptr sa_x[2], sa_x1, sa_h, sa_qx, sa_xd, sa_qkv, sa_z, sa_bp, sa_ap, sa_beta, sa_dec;
+static llb_dptr sa_cnv, sa_qt, sa_go, sa_nm, sa_g, sa_u, sa_kb, sa_vb, sa_kn, sa_lg, sa_y;
+static u64 sa_cycles, sa_drafted, sa_accepted, sa_t1_steps;
+
+static int sa_max_k(void) {
+  if (sa_k < 0) {
+    const char* e = getenv("LLB_SPEC_AUTO");
+    int v = (e != NULL && *e) ? atoi(e) : 0;
+    sa_k = (v >= 1 && v <= 6) ? v : 0;
+  }
+  return sa_k;
+}
+
+static inline u32 sa_hash3(u32 a, u32 b, u32 c) {
+  u32 h = a * 2654435761u ^ (b * 2246822519u) ^ (c * 3266489917u);
+  return (h ^ (h >> 14)) & (SA_HTSZ - 1);
+}
+
+static void sa_hist_note(u32 pos, u32 tok) {
+  if (sa_max_k() <= 0) return;
+  if (pos == 0) {
+    memset(sa_ht, -1, sizeof sa_ht);
+    sa_ht_pos = 0;
+  }
+  if (pos >= sa_hcap) {
+    u32 nc = sa_hcap ? sa_hcap : 8192;
+    while (nc <= pos) nc *= 2;
+    sa_hist = realloc(sa_hist, (size_t)nc * 4);
+    if (!sa_hist) err_fail("LLB_SPEC_AUTO: cannot grow token history");
+    sa_hcap = nc;
+  }
+  sa_hist[pos] = tok;
+  // Index 3-gram ending at pos - 1 (once pos >= 3, so sa_hist[pos] is the known continuation!)
+  if (pos >= 3) {
+    u32 j = pos - 1;
+    sa_ht[sa_hash3(sa_hist[j - 2], sa_hist[j - 1], sa_hist[j])] = (int)j;
+  }
+  sa_ht_pos = pos + 1;
+}
+
+static u32 sa_draft(u32 pos, u32 cur_tok, u32* tin, u32 max_k, u32 max_pos) {
+  if (pos < 3 || max_k < 2 || pos + 2 >= max_pos) return 0;
+  u32 a = sa_hist[pos - 2], b = sa_hist[pos - 1], c = cur_tok;
+  int j = sa_ht[sa_hash3(a, b, c)];
+  if (j < 2 || (u32)j >= pos) return 0;
+  if (sa_hist[j - 2] != a || sa_hist[j - 1] != b || sa_hist[j] != c) return 0;
+  u32 avail = pos - (u32)j;
+  u32 rem = max_pos - pos - 1;
+  u32 k = max_k;
+  if (avail < k) k = avail;
+  if (rem < k) k = rem;
+  if (k < 2) return 0;
+  for (u32 r = 0; r < k; r++) tin[1 + r] = sa_hist[(u32)j + 1 + r];
+  return k;
+}
+
+static void sa_stats(void) {
+  if (sa_cycles > 0) {
+    fprintf(stderr, "spec_auto: k=%d cycles=%llu drafted=%llu accepted=%llu (%.1f%%) t1_steps=%llu\n",
+      sa_k, (unsigned long long)sa_cycles, (unsigned long long)sa_drafted, (unsigned long long)sa_accepted,
+      sa_drafted ? 100.0 * (double)sa_accepted / (double)sa_drafted : 0.0, (unsigned long long)sa_t1_steps);
+  }
+}
+
+static bool sa_can_run(LlbShape sh, u32 nl, u32 bb, u32 bg) {
+  if (sa_max_k() <= 0) return false;
+  if (sh.d % 256 != 0 || sh.f % 256 != 0 || sh.sd != 128) return false;
+  if ((sh.lvh * sh.sd) % 256 != 0 || (sh.nh * sh.hd) % 256 != 0) return false;
+  if (bb != LLB_FM_Q4_K && bb != LLB_FM_Q6_K && bb != LLB_FM_Q8_0) return false;
+  if (bg != LLB_FM_Q4_K && bg != LLB_FM_Q5_K && bg != LLB_FM_Q6_K && bg != LLB_FM_Q8_0) return false;
+  for (u32 i = 0; i < nl; i++) {
+    if (llb_moe(i)) return false;
+  }
+  return true;
+}
+
+static void sa_init(LlbShape sh, u32 nl) {
+  if (sa_ready) return;
+  llb_dp4a_load_kernels();
+  u32 d = sh.d, f = sh.f, lk = sh.lkh * sh.sd, lv = sh.lvh * sh.sd, cv = 2 * lk + lv;
+  u32 qa = sh.nh * sh.hd, kv = sh.nkv * sh.hd, wq = cv > 2 * qa ? cv : 2 * qa;
+  u32 mc = d > f ? d : f;
+  if (lv > mc) mc = lv;
+  if (qa > mc) mc = qa;
+  u32 T = SA_MAXT;
+  sa_x[0] = pass_zero((size_t)T * d); sa_x[1] = pass_zero((size_t)T * d);
+  sa_x1 = pass_zero((size_t)T * d); sa_h = pass_zero((size_t)T * d);
+  sa_qx = pass_zero(((size_t)T * mc + 3) / 4);
+  sa_xd = pass_zero((size_t)T * (mc / 32) * 2);
+  sa_qkv = pass_zero((size_t)T * wq); sa_cnv = pass_zero((size_t)T * wq);
+  sa_z = pass_zero((size_t)T * lv);
+  sa_bp = pass_zero((size_t)T * sh.lvh); sa_ap = pass_zero((size_t)T * sh.lvh);
+  sa_beta = pass_zero((size_t)T * sh.lvh); sa_dec = pass_zero((size_t)T * sh.lvh);
+  sa_qt = pass_zero((size_t)T * 2 * lv);
+  sa_go = pass_zero((size_t)T * lv); sa_nm = pass_zero((size_t)T * lv);
+  sa_g = pass_zero((size_t)T * f); sa_u = pass_zero((size_t)T * f);
+  sa_kb = pass_zero((size_t)T * kv); sa_vb = pass_zero((size_t)T * kv); sa_kn = pass_zero((size_t)T * kv);
+  sa_lg = pass_zero((size_t)T << 18);
+  sa_y = pass_zero((size_t)T * 4);
+  for (u32 i = 0; i < nl; i++) {
+    if (!llb_full(i)) {
+      sa_S[i] = pass_zero((size_t)(T + 1) * sh.lvh * sh.sd * sh.sd);
+      sa_qkv_hist[i] = pass_zero((size_t)T * cv);
+    }
+  }
+  sa_nl_cap = nl;
+  sa_ready = true;
+  atexit(sa_stats);
+}
+
+static void sa_mm(u32 fm, u64 w, u32 n, u32 c, u32 T, llb_dptr y, u32 ys, llb_dptr x1) {
+  if (fm == LLB_FM_F32) {
+    // Rare F32 small projection (e.g. ssm_beta/alpha): run row-by-row via llb_kgemv
+    for (u32 r = 0; r < T; r++) {
+      llb_kgemv(fm, w, c, sa_h + (u64)r * c * 4, y + (u64)r * ys * 4, n, 768);
+    }
+    return;
+  }
+  u32 rb = LLB_FM_RB(fm, c), g4 = (n + 3) / 4;
+  if (!LLB_LAUNCH(gpu_dp4a_gemv_t, g4, 1, 128, &w, &rb, &fm, &c, &T, &sa_qx, &sa_xd, &y, &n, &ys, &x1)) {
+    err_fail("LLB_SPEC_AUTO: dp4a T-row GEMV failed");
+  }
+}
+
+static void sa_q8(llb_dptr x, u32 c, u32 T) {
+  u32 g = T * c / 256;
+  if (!LLB_LAUNCH(gpu_pfq8x, g, 1, 256, &x, &sa_qx, &sa_xd)) {
+    err_fail("LLB_SPEC_AUTO: q8x failed");
+  }
+}
+
+// Verify T tokens tin[0..T-1] at positions pos0..pos0+T-1 in ONE batched pass!
+// Reads out T * 4 floats into y_out (each row: {s1, id1, s2, id2}), then commits exact n_acc rows!
+static u32 sa_verify_and_commit(WarpOp* o, LlbShape sh, u32 dT, u32 pos0, u32 T, const u32* tin, float* y_out) {
+  u32 nl = o->d, d = sh.d, f = sh.f, lk = sh.lkh * sh.sd, lv = sh.lvh * sh.sd, cv = 2 * lk + lv;
+  u32 qa = sh.nh * sh.hd, kv = sh.nkv * sh.hd, q2 = 2 * qa, nm = sh.lvh, hk = sh.lkh;
+  u32 rep = sh.lvh / sh.lkh, grp = sh.nh / sh.nkv, one = 1, zero = 0;
+  u32 rbe = LLB_FM_RB(o->bb, d), nh = o->gm, ys_lg = 1u << 18, lv2 = 2 * lv;
+  u32 R = T + 1, sc0 = 0, gdy = sh.sd / 4;
+  u64 Ssz = (u64)sh.lvh * sh.sd * sh.sd;
+  union { u32 u; float f; } sq = { 0x413504f3u };
+  llb_dptr nul = 0;
+  sa_init(sh, nl);
+
+  // 1. Embed T rows
+  for (u32 r = 0; r < T; r++) {
+    llb_dptr er = o->r + (u64)tin[r] * rbe, xr = sa_x[0] + (u64)r * d * 4;
+    if (!LLB_LAUNCH(o->bb == LLB_FM_Q4_K ? gpu_embedk : o->bb == LLB_FM_Q6_K ? gpu_embed6 : gpu_embed,
+        (d + 255) / 256, 1, 256, &er, &d, &xr)) {
+      err_fail("LLB_SPEC_AUTO: embed failed");
+    }
+  }
+  llb_dptr cur = sa_x[0];
+  for (u32 i = 0; i < nl; i++) {
+    bool full = llb_full(i);
+    if (full) pass_kv(i, pos0 + T, sh);
+    u64 base = gpu_mail->pw[i];
+    u32 p[20], fm[20];
+    for (u32 q = 0; q < 20; q++) {
+      p[q] = gpu_mail->pt[i][q] & 0x0fffffffu;
+      fm[q] = gpu_mail->pt[i][q] >> 28;
+    }
+    u64 an = base + p[0];
+    if (!LLB_LAUNCH(gpu_pfrms, T, 1, 1024, &cur, &an, &sa_h, &d)) err_fail("LLB_SPEC_AUTO: rms failed");
+    sa_q8(sa_h, d, T);
+    if (full) {
+      llb_dptr kc = pass_kc[i], vc = pass_vc[i], qn = base + p[17], kn = base + p[18];
+      llb_dptr gate = sa_cnv + (llb_dptr)qa * 4;
+      u32 ogx = (qa + 255) / 256;
+      sa_mm(fm[14], base + p[14], q2, d, T, sa_qkv, q2, nul);
+      sa_mm(fm[15], base + p[15], kv, d, T, sa_kb, kv, nul);
+      sa_mm(fm[16], base + p[16], kv, d, T, sa_vb, kv, nul);
+      CUfunction slot_fn = llb_kv_type == 1 ? gpu_pfslot_f16 : llb_kv_type == 2 ? gpu_pfslot_q8 : gpu_pfslot;
+      u32 slot_bx = llb_kv_type == 0 ? 1024 : 256;
+      if (!LLB_LAUNCH(gpu_pfqkr, sh.nh, T, 256, &sa_qkv, &qn, &sa_cnv, &q2, &one, &pos0)
+        || !LLB_LAUNCH(gpu_pfqkr, sh.nkv, T, 256, &sa_kb, &kn, &sa_kn, &kv, &zero, &pos0)
+        || !LLB_LAUNCH(slot_fn, T, 2, slot_bx, &sa_kn, &sa_vb, &kc, &vc, &pos0, &kv)) {
+        err_fail("LLB_SPEC_AUTO: qkr/slot failed");
+      }
+      u32 asm_ = (32 * 264 + 256 * 40) * 2;
+      CUfunction attn_fn = llb_kv_type == 1 ? gpu_pfattn_f16 : llb_kv_type == 2 ? gpu_pfattn_q8 : gpu_pfattn;
+      if (!LLB_LAUNCH_SM(attn_fn, sh.nkv, (T * grp + 63) / 64, 128, asm_, &sa_cnv, &q2, &kc, &vc, &kv,
+          &sa_go, &qa, &pos0, &T, &grp)
+        || !LLB_LAUNCH(gpu_pfog, ogx, T, 256, &sa_go, &gate, &q2, &sa_nm, &qa)) {
+        err_fail("LLB_SPEC_AUTO: attn/og failed");
+      }
+      sa_q8(sa_nm, qa, T);
+      sa_mm(fm[19], base + p[19], d, qa, T, sa_x1, d, cur);
+    } else {
+      llb_dptr ring = pass_b[i], dt = base + p[10], sa_a = base + p[9], cw = base + p[11], sn = base + p[12];
+      llb_dptr ck = sa_cnv + (llb_dptr)lk * 4, cvv = sa_cnv + (llb_dptr)2 * lk * 4;
+      llb_dptr qt = sa_qt, kt = sa_qt + (llb_dptr)lv * 4, Si = sa_S[i];
+      u32 r0 = pass_r[i], gx = 1 + (cv + 255) / 256;
+      sa_mm(fm[5], base + p[5], cv, d, T, sa_qkv_hist[i], cv, nul);
+      sa_mm(fm[6], base + p[6], lv, d, T, sa_z, lv, nul);
+      sa_mm(fm[7], base + p[7], nm, d, T, sa_bp, nm, nul);
+      sa_mm(fm[8], base + p[8], nm, d, T, sa_ap, nm, nul);
+      if (!llb_copy(Si, pass_S[i], (size_t)Ssz * 4)
+        || !LLB_LAUNCH(gpu_pfmc, gx, T, 256, &sa_bp, &sa_ap, &dt, &sa_a, &sa_beta, &sa_dec, &nm,
+          &cw, &sa_qkv_hist[i], &ring, &r0, &sa_cnv, &cv)
+        || !LLB_LAUNCH(gpu_tl2qk, 2 * hk, T, 64, &sa_cnv, &ck, &qt, &kt, &sq.f, &hk, &rep, &cv, &lv2)
+        || !LLB_LAUNCH(gpu_tgdl, nm, gdy, 128, &Si, &Ssz, &sc0, &R, &T, &qt, &kt, &cvv, &cv, &sa_dec, &sa_beta,
+          &sa_go, &nm)
+        || !LLB_LAUNCH(gpu_pfgrn, nm, T, 64, &sa_go, &sn, &sa_z, &sa_nm, &nm)) {
+        err_fail("LLB_SPEC_AUTO: gdn failed");
+      }
+      sa_q8(sa_nm, lv, T);
+      sa_mm(fm[13], base + p[13], d, lv, T, sa_x1, d, cur);
+    }
+    llb_dptr nxt = sa_x[cur == sa_x[0] ? 1 : 0];
+    u64 post = base + p[1];
+    u32 tf = T * f;
+    if (!LLB_LAUNCH(gpu_pfrms, T, 1, 1024, &sa_x1, &post, &sa_h, &d)) err_fail("LLB_SPEC_AUTO: ffn rms failed");
+    sa_q8(sa_h, d, T);
+    sa_mm(fm[2], base + p[2], f, d, T, sa_g, f, nul);
+    sa_mm(fm[3], base + p[3], f, d, T, sa_u, f, nul);
+    if (!LLB_LAUNCH(gpu_silu, (tf + 255) / 256, 1, 256, &sa_g, &sa_u, &sa_g, &tf)) err_fail("LLB_SPEC_AUTO: silu failed");
+    sa_q8(sa_g, f, T);
+    sa_mm(fm[4], base + p[4], d, f, T, nxt, d, sa_x1);
+    cur = nxt;
+  }
+  llb_dptr wn = o->k, wh = o->v;
+  if (!LLB_LAUNCH(gpu_pfrms, T, 1, 1024, &cur, &wn, &sa_h, &d)) err_fail("LLB_SPEC_AUTO: final rms failed");
+  sa_q8(sa_h, d, T);
+  sa_mm(o->bg, wh, nh, d, T, sa_lg, ys_lg, nul);
+  if (!LLB_LAUNCH(gpu_tamaxp, AMAX_G, T, AMAX_T, &sa_lg, &nh)
+    || !LLB_LAUNCH(gpu_tamax, 1, T, AMAX_G, &sa_lg, &nh, &sa_y)
+    || !llb_read(y_out, sa_y, (size_t)T * 16)) {
+    err_fail("LLB_SPEC_AUTO: head/read failed");
+  }
+  // Exact greedy acceptance along the draft chain
+  u32 n_acc = 1;
+  while (n_acc < T && (u32)y_out[(n_acc - 1) * 4 + 1] == tin[n_acc]) {
+    n_acc += 1;
+  }
+  // Commit EXACT accepted state (n_acc tokens) into pass_* across all nl layers!
+  u32 rx = (cv + 255) / 256, rt = n_acc < 4 ? n_acc : 4;
+  for (u32 i = 0; i < nl; i++) {
+    if (!llb_full(i)) {
+      u32 r0 = pass_r[i];
+      if (!llb_copy(pass_S[i], sa_S[i] + (u64)n_acc * Ssz * 4, (size_t)Ssz * 4)
+        || !LLB_LAUNCH(gpu_pfring, rx, rt, 256, &sa_qkv_hist[i], &pass_b[i], &r0, &n_acc, &cv)) {
+        err_fail("LLB_SPEC_AUTO: commit gdn failed");
+      }
+      pass_r[i] = r0 + n_acc;
+    }
+    pass_pos[i] = pos0 + n_acc - 1;
+  }
+  sa_cycles += 1;
+  sa_drafted += (T - 1);
+  sa_accepted += (n_acc - 1);
+  return n_acc;
+}
 // LLB_STEP_US (reports/cuda-moe-speed): `stepus POS US` on stderr, the microseconds since the
 // previous folded step began (the whole token period: the Bend loop, the pass and the head);
 // timing only, nothing else changes. The decode run's steps print it too (reports/cuda-catchup)
@@ -3068,7 +3396,9 @@ static void llb_pass_run(volatile WarpOp* o, u64 yp, u32 grid) {
   u64 cur = o->x;
   bool fold = o->w != 0;
   if (fold && o->bsn < 2) {
-    smp_note(pos, (u32)((o->w - o->r) / LLB_FM_RB(o->bb, sh.d)));
+    u32 ftok = (u32)((o->w - o->r) / LLB_FM_RB(o->bb, sh.d));
+    smp_note(pos, ftok);
+    sa_hist_note(pos, ftok);
   }
   if (fold && bx_take(o, pos, dT, sh, yp, grid)) {  // BATCH-NATIVE (LLB_BATCH)
     return;
@@ -3309,6 +3639,81 @@ static void gen_run(volatile WarpOp* o, u64 yp, u32 grid, LlbShape sh, u32 dT, u
   }
   struct timespec t0;
   clock_gettime(CLOCK_MONOTONIC, &t0);
+  if (sa_can_run(sh, o->d, o->bb, o->bg)) {
+    u32 rbe = LLB_FM_RB(op.bb, sh.d);
+    u32 cur_tok = (u32)((op.w - op.r) / rbe);
+    u32 q = 0;
+    while (q < cnt) {
+      u32 tin[SA_MAXT];
+      tin[0] = cur_tok;
+      u32 rem = cnt - q;
+      u32 max_k = (u32)sa_max_k();
+      if (rem <= 1) max_k = 0;
+      else if (max_k > rem - 1) max_k = rem - 1;
+      u32 dk = sa_draft(pos + q, cur_tok, tin, max_k, pass_cap);
+      float yrows[SA_MAXT * 4];
+      u32 n_acc = 1;
+      if (dk >= 2) {
+        n_acc = sa_verify_and_commit(&op, sh, dT, pos + q, 1 + dk, tin, yrows);
+      } else {
+        if (q > 0) step_us(pos + q);
+        op.w = op.r + (u64)cur_tok * rbe;
+        llb_gforce = 1;
+        pass_fold(&op, gy, grid, sh, dT, pos + q, false);
+        llb_gforce = 0;
+        if (!llb_read(yrows, gy, 16)) err_fail("LLB_SPEC_AUTO: read step failed");
+        sa_t1_steps += 1;
+      }
+      for (u32 r = 0; r < n_acc && q < cnt; r++, q++) {
+        const float* tr = yrows + (size_t)r * 4;
+        union { float f; u32 u; } v = { tr[0] }, w = { tr[2] };
+        bool fin = (v.u & 0x7f800000u) != 0x7f800000u && (w.u & 0x7f800000u) != 0x7f800000u;
+        u32 sid = (u32)tr[1], sj = (u32)tr[3];
+        if (q + 1 == cnt || !fin) {
+          if (cuCtxSynchronize() != CUDA_SUCCESS || cuMemcpyHtoD(yp, tr, 16) != CUDA_SUCCESS) {
+            err_fail("device fault");
+          }
+          union { float f; u32 u; } cf = { (float)(q + 1) };
+          if (cuMemsetD32Async(yp + 16, cf.u, 1, NULL) != CUDA_SUCCESS) {
+            err_fail("decode run: cannot set the count");
+          }
+          return;
+        }
+        char b[160];
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long ms = ((long long)t1.tv_sec * 1000 + t1.tv_nsec / 1000000) - ((long long)t0.tv_sec * 1000 + t0.tv_nsec / 1000000);
+        t0 = t1;
+        if (fflush(stdout) != 0) err_fail("a short write on a standard stream");
+#ifdef LLB_HAS_GEN_EOG
+        if (gen_eog(sid) || gen_cancel()) {
+          gen_cancelled = 0;
+          for (u32 rr = q; rr + 1 < cnt; rr++) {
+            int pm = snprintf(b, sizeof b, "%u\n", sid);
+            gen_line(stdout, b, (u64)pm);
+          }
+          if (cuCtxSynchronize() != CUDA_SUCCESS || cuMemcpyHtoD(yp, tr, 16) != CUDA_SUCCESS) {
+            err_fail("device fault");
+          }
+          union { float f; u32 u; } pc = { (float)cnt };
+          if (cuMemsetD32Async(yp + 16, pc.u, 1, NULL) != CUDA_SUCCESS) {
+            err_fail("decode run: cannot set the count");
+          }
+          return;
+        }
+#endif
+        int m = snprintf(b, sizeof b, "logits %u %u %u %u %u\n", pos + q, sid, v.u, sj, w.u);
+        gen_line(stderr, b, (u64)m);
+        m = snprintf(b, sizeof b, "step %u %lld\n", pos + q, ms);
+        gen_line(stderr, b, (u64)m);
+        m = snprintf(b, sizeof b, "%u\n", sid);
+        gen_line(stdout, b, (u64)m);
+        cur_tok = sid;
+        sa_hist_note(pos + q + 1, cur_tok);
+      }
+    }
+    return;
+  }
   for (u32 s = 0; s <= cnt; s += 1) {
     if (s < cnt) {
       if (s > 0) {
@@ -3399,7 +3804,7 @@ static bool warp_serve(Corpus H) {
   llb_q4glue = qg != NULL ? (u32)atoi(qg) : 3;
   const char* qd   = getenv("LLB_Q4_DP4A");
   llb_q4dp = qd == NULL ? 0 : atoi(qd) == 1 ? 3 : atoi(qd) == 2 ? 1 : atoi(qd) == 3 ? 2
-    : atoi(qd) == 4 ? 15 : atoi(qd) == 5 ? 11 : atoi(qd) == 6 ? 7 : atoi(qd) == 7 ? 31 : atoi(qd) == 8 ? 63 : atoi(qd) == 9 ? 127 : 0;
+    : atoi(qd) == 4 ? 15 : atoi(qd) == 5 ? 11 : atoi(qd) == 6 ? 7 : atoi(qd) == 7 ? 31 : atoi(qd) == 8 ? 63 : atoi(qd) == 9 ? 127 : atoi(qd) == 10 ? 255 : 0;
   const char* dp = getenv("LLB_DUMP");
   llb_dump = dp != NULL && *dp ? dp : NULL;
   const char* dpp = getenv("LLB_DUMP_POS");

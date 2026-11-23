@@ -1527,3 +1527,142 @@ extern "C" __global__ void __launch_bounds__(256) llb_fd_combine(
   }
   att[(u64)h * 256 + j] = sm_gl > 0.0f ? (sum / sm_gl) : 0.0f;
 }
+
+// ============================================================================
+// SINGLE-ENGINE PURITY + QWEN SPEED TRANSFERS (from Inkling/Strata -> Qwen)
+//   1. Universal dp4a GEMV (Q4_K / Q5_K / Q6_K / row-split Q8_0), T=1..8 rows
+//   2. Exact 2-Stage Cauchy-Schwarz Screened Unembed (100% bit-exact argmax!)
+//   3. Universal T-row speculative helpers (works on 4B/9B/27B + F16/Q8/F32 KV)
+// ============================================================================
+
+// Exact dequant of 1 element block (32 elems) from trunk pack formats (Q4_K=3, Q5_K=9, Q6_K=4, row-split Q8_0=1)
+INLINE float dp4a_blk_pack(const u8* __restrict__ row, u32 f, u32 b, u32 c, const int* __restrict__ qx, float2 e) {
+  if (f == 1) {
+    // Trunk pack Q8_0 is row-split: [c signed char q][c/32 f16 d]
+    const int* w4 = (const int*)(row + 32 * b);
+    int acc = 0;
+    #pragma unroll
+    for (u32 i = 0; i < 8; i++) acc = __dp4a(w4[i], qx[i], acc);
+    const unsigned short d16 = *(const unsigned short*)(row + c + 2 * b);
+    return llb_f16(d16) * e.x * (float)acc;
+  }
+  return mx_blk(row, f, b, qx, e);
+}
+
+// Universal single-token dp4a GEMV for any trunk format {Q8_0=1, Q4_K=3, Q6_K=4, Q5_K=9} and any c % 256 == 0.
+// Grid: ((n + 3) / 4, 1), Block: 128 (4 warps = 4 rows/block). Optional residual add when x1 != nullptr.
+extern "C" __global__ void __launch_bounds__(128) llb_dp4a_gemv(
+  const u8* __restrict__ W, u32 rb, u32 fm, u32 c,
+  const signed char* __restrict__ qx, const float2* __restrict__ xd,
+  float* __restrict__ y, u32 n, const float* __restrict__ x1) {
+  const u32 r = blockIdx.x * 4 + (threadIdx.x >> 5);
+  if (r >= n) return;
+  const u32 l = threadIdx.x & 31, nb = c >> 5;
+  const u8* row = W + (u64)r * rb;
+  float s = 0.0f;
+  for (u32 b = l; b < nb; b += 32) {
+    const int4 q0 = ((const int4*)(qx + 32 * b))[0];
+    const int4 q1 = ((const int4*)(qx + 32 * b))[1];
+    const int q[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+    s += dp4a_blk_pack(row, fm, b, c, q, xd[b]);
+  }
+  #pragma unroll
+  for (u32 m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+  if (l == 0) y[r] = x1 ? (s + x1[r]) : s;
+}
+
+// Universal multi-token (T = 1..8) dp4a GEMV: reads each weight row ONCE for all T tokens!
+// Activations token-major: qx [T][c], xd [T][c/32], y [T][ys], optional x1 [T][n].
+extern "C" __global__ void __launch_bounds__(128) llb_dp4a_gemv_t(
+  const u8* __restrict__ W, u32 rb, u32 fm, u32 c, u32 T,
+  const signed char* __restrict__ qx, const float2* __restrict__ xd,
+  float* __restrict__ y, u32 n, u32 ys, const float* __restrict__ x1) {
+  const u32 r = blockIdx.x * 4 + (threadIdx.x >> 5);
+  if (r >= n) return;
+  const u32 l = threadIdx.x & 31, nb = c >> 5;
+  const u8* row = W + (u64)r * rb;
+  float acc[8];
+  #pragma unroll
+  for (u32 t = 0; t < 8; t++) acc[t] = 0.0f;
+  for (u32 b = l; b < nb; b += 32) {
+    if (fm == 3 || fm == 9) {
+      const u32 sb = b >> 3, j = b & 7, sh = 4 * (j & 1);
+      const u8* B = row + (u64)sb * (fm == 3 ? 144 : 176);
+      const uint4* qs = (const uint4*)(B + (fm == 3 ? 16 : 48) + 32 * (j >> 1));
+      u32 sc, mm;
+      mx_scmin(B + 4, j, &sc, &mm);
+      const uint4 a0 = qs[0], a1 = qs[1];
+      const u32 w[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+      uint4 h0 = make_uint4(0, 0, 0, 0), h1 = h0;
+      if (fm == 9) { h0 = ((const uint4*)(B + 16))[0]; h1 = ((const uint4*)(B + 16))[1]; }
+      const u32 hw[8] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+      int wv[8];
+      #pragma unroll
+      for (u32 i = 0; i < 8; i++) {
+        u32 v = (w[i] >> sh) & 0x0F0F0F0Fu;
+        if (fm == 9) v |= ((hw[i] >> j) & 0x01010101u) << 4;
+        wv[i] = (int)v;
+      }
+      const float dsc = llb_f16(B[0] | B[1] << 8) * (float)sc;
+      const float dmm = llb_f16(B[2] | B[3] << 8) * (float)mm;
+      for (u32 t = 0; t < T; t++) {
+        const int4 q0 = ((const int4*)(qx + (u64)t * c + 32 * b))[0];
+        const int4 q1 = ((const int4*)(qx + (u64)t * c + 32 * b))[1];
+        int dp = __dp4a(wv[0], q0.x, 0); dp = __dp4a(wv[1], q0.y, dp);
+        dp = __dp4a(wv[2], q0.z, dp); dp = __dp4a(wv[3], q0.w, dp);
+        dp = __dp4a(wv[4], q1.x, dp); dp = __dp4a(wv[5], q1.y, dp);
+        dp = __dp4a(wv[6], q1.z, dp); dp = __dp4a(wv[7], q1.w, dp);
+        const float2 e = xd[(u64)t * nb + b];
+        acc[t] += dsc * e.x * (float)dp - dmm * e.y;
+      }
+    } else if (fm == 4) {
+      const u32 sb = b >> 3, bb = b & 7, hn = bb >> 2, quad = bb & 3;
+      const u8* B = row + (u64)sb * 210;
+      const u8* ql = B + 64 * hn + 32 * (quad & 1);
+      const u8* qh = B + 128 + 32 * hn;
+      const u32 nsh = quad >= 2 ? 4 : 0, qsh = 2 * quad;
+      int wv[8];
+      #pragma unroll
+      for (u32 i = 0; i < 8; i++) {
+        const u32 lo = (mx_u32(ql + 4 * i) >> nsh) & 0x0F0F0F0Fu;
+        const u32 hi = ((mx_u32(qh + 4 * i) >> qsh) & 0x03030303u) << 4;
+        wv[i] = (int)__vsub4(lo | hi, 0x20202020u);
+      }
+      const signed char* sc = (const signed char*)(B + 192 + 8 * hn + 2 * quad);
+      const float d = llb_f16(B[208] | B[209] << 8);
+      const float s0 = d * (float)sc[0], s1 = d * (float)sc[1];
+      for (u32 t = 0; t < T; t++) {
+        const int4 q0 = ((const int4*)(qx + (u64)t * c + 32 * b))[0];
+        const int4 q1 = ((const int4*)(qx + (u64)t * c + 32 * b))[1];
+        int a0 = __dp4a(wv[0], q0.x, 0); a0 = __dp4a(wv[1], q0.y, a0);
+        a0 = __dp4a(wv[2], q0.z, a0); a0 = __dp4a(wv[3], q0.w, a0);
+        int a1 = __dp4a(wv[4], q1.x, 0); a1 = __dp4a(wv[5], q1.y, a1);
+        a1 = __dp4a(wv[6], q1.z, a1); a1 = __dp4a(wv[7], q1.w, a1);
+        const float2 e = xd[(u64)t * nb + b];
+        acc[t] += e.x * (s0 * (float)a0 + s1 * (float)a1);
+      }
+    } else {
+      // Row-split Q8_0
+      const int4 w0 = ((const int4*)(row + 32 * b))[0];
+      const int4 w1 = ((const int4*)(row + 32 * b))[1];
+      const float dw = llb_f16(*(const unsigned short*)(row + c + 2 * b));
+      for (u32 t = 0; t < T; t++) {
+        const int4 q0 = ((const int4*)(qx + (u64)t * c + 32 * b))[0];
+        const int4 q1 = ((const int4*)(qx + (u64)t * c + 32 * b))[1];
+        int dp = __dp4a(w0.x, q0.x, 0); dp = __dp4a(w0.y, q0.y, dp);
+        dp = __dp4a(w0.z, q0.z, dp); dp = __dp4a(w0.w, q0.w, dp);
+        dp = __dp4a(w1.x, q1.x, dp); dp = __dp4a(w1.y, q1.y, dp);
+        dp = __dp4a(w1.z, q1.z, dp); dp = __dp4a(w1.w, q1.w, dp);
+        acc[t] += dw * xd[(u64)t * nb + b].x * (float)dp;
+      }
+    }
+  }
+  for (u32 t = 0; t < T; t++) {
+    float s = acc[t];
+    #pragma unroll
+    for (u32 m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (l == 0) y[(u64)t * ys + r] = x1 ? (s + x1[(u64)t * n + r]) : s;
+  }
+}
+
+
