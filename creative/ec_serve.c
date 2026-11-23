@@ -178,9 +178,13 @@ typedef enum {
 typedef struct {
   int           id;
   char          kind[24];
-  char          prompt[256];
+  char          prompt[1024];
   char          tier[16];
   char          stage[32];
+  char          checkpoint[256];
+  ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
+  int           n_loras;
+  int           photoreal;
   uint32_t      seed;
   int           width, height, steps, frames, bpm, with_audio;
   float         duration_sec;
@@ -190,6 +194,35 @@ typedef struct {
   char          result_json[2048];
   ec_studio_t  *st;
 } ec_job_t;
+
+// Parse JSON array "loras": [ { "path": "...", "strength": 0.8 }, ... ]
+static int json_get_loras(const char *j, ec_studio_lora_t *out, int max_n) {
+  const char *p = strstr(j, "\"loras\"");
+  if (!p) return 0;
+  p = strchr(p, '[');
+  if (!p) return 0;
+  p++;
+  int cnt = 0;
+  while (*p && *p != ']' && cnt < max_n) {
+    const char *obj = strchr(p, '{');
+    const char *arr_end = strchr(p, ']');
+    if (!obj || (arr_end && obj > arr_end)) break;
+    const char *end = strchr(obj, '}');
+    if (!end) break;
+    char tmp[640];
+    size_t len = (size_t)(end - obj + 1);
+    if (len >= sizeof tmp) len = sizeof tmp - 1;
+    memcpy(tmp, obj, len);
+    tmp[len] = '\0';
+    memset(&out[cnt], 0, sizeof out[cnt]);
+    json_get_str(tmp, "path", out[cnt].path, sizeof out[cnt].path, "");
+    if (!out[cnt].path[0]) json_get_str(tmp, "id", out[cnt].path, sizeof out[cnt].path, "");
+    out[cnt].strength = (float)json_get_num(tmp, "strength", 0.85);
+    if (out[cnt].path[0]) cnt++;
+    p = end + 1;
+  }
+  return cnt;
+}
 
 static pthread_mutex_t g_jobs_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_jobs_cv = PTHREAD_COND_INITIALIZER;
@@ -231,10 +264,18 @@ static void *job_runner_thread(void *arg) {
   char out[2048] = {0};
 
   if (!strcmp(j->kind, "image")) {
-    rc = ec_studio_gen_image(j->st, j->prompt, j->seed, j->width, j->height, j->steps, tier, job_progress_cb, j, &r);
+    rc = ec_studio_gen_image_ex(
+        j->st, j->prompt, j->seed, j->width, j->height, j->steps, tier, j->photoreal,
+        j->checkpoint[0] ? j->checkpoint : NULL, j->loras, j->n_loras, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
-      snprintf(out, sizeof out, "{\"artifact_url\":\"/artifacts/%s\",\"width\":%d,\"height\":%d,\"steps_run\":%d,\"steps_skipped\":%d,\"gpu_ms\":%.2f}",
-               basename_safe(r.file_main), r.width, r.height, r.steps_run, r.steps_skipped, r.gpu_ms);
+      snprintf(out, sizeof out,
+          "{\"artifact_url\":\"/artifacts/%s\",\"width\":%d,\"height\":%d,"
+          "\"engine_mode\":\"%s\",\"steps_run\":%d,\"steps_skipped\":%d,"
+          "\"lora_tensors_fused\":%d,\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
+          basename_safe(r.file_main), r.width, r.height,
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke",
+          r.steps_run, r.steps_skipped, r.lora_tensors_fused,
+          r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
   } else if (!strcmp(j->kind, "3d")) {
     rc = ec_studio_gen_3d(j->st, j->prompt, j->seed, 20, tier, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
@@ -346,11 +387,12 @@ static void *client_thread(void *arg) {
   ec_studio_t *st = ca->st;
   free(ca);
 
-  char *req = (char *)calloc(1, 262144);
+  const size_t REQ_CAP = 8 * 1024 * 1024; // 8 MiB (supports ComfyUI PNG & large workflow uploads)
+  char *req = (char *)calloc(1, REQ_CAP);
   if (!req) { close(cfd); return NULL; }
   size_t got = 0, hdr_end = 0, content_len = 0;
-  while (got < 262143) {
-    ssize_t r = read(cfd, req + got, 262143 - got);
+  while (got < REQ_CAP - 1) {
+    ssize_t r = read(cfd, req + got, REQ_CAP - 1 - got);
     if (r <= 0) break;
     got += (size_t)r;
     req[got] = '\0';
@@ -369,15 +411,16 @@ static void *client_thread(void *arg) {
 
   char method[16] = {0}, path[256] = {0};
   if (sscanf(req, "%15s %255s", method, path) != 2) { free(req); close(cfd); return NULL; }
-  // Strip query string if present
+  char query[256] = {0};
   char *qmark = strchr(path, '?');
-  if (qmark) *qmark = '\0';
+  if (qmark) { snprintf(query, sizeof query, "%s", qmark + 1); *qmark = '\0'; }
   const char *body = hdr_end ? (req + hdr_end) : "";
+  size_t body_len = (hdr_end && got >= hdr_end) ? (got - hdr_end) : 0;
 
   if (!strcmp(method, "OPTIONS")) {
     const char *opt =
         "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
         "Access-Control-Allow-Headers: Content-Type, Authorization, X-Api-Key\r\nConnection: close\r\n\r\n";
     send_all(cfd, opt, strlen(opt));
     free(req); close(cfd); return NULL;
@@ -388,21 +431,27 @@ static void *client_thread(void *arg) {
     free(req); close(cfd); return NULL;
   }
 
-  char *resp = (char *)malloc(32768);
+  const size_t RESP_CAP = 262144;
+  char *resp = (char *)malloc(RESP_CAP);
   ec_studio_info_t info;
   ec_studio_get_info(st, &info);
 
   if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/health")) {
-    snprintf(resp, 32768,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v2\","
+    snprintf(resp, RESP_CAP,
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v3\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
-        "\"parallel\":true,\"auth_enabled\":%s,"
+        "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
         "\"gpu\":\"%s\",\"sm\":\"sm_%d%d\",\"vram_total_gb\":%.2f,"
-        "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,\"models_discovered\":%d,"
-        "\"modalities\":[\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"async_jobs_sse\",\"model_registry\",\"director_plan\"]}",
+        "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,"
+        "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
+        "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
+        "\"modalities\":[\"flux2_photoreal\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\"]}",
         g_api_key[0] ? "true" : "false",
+        info.photoreal_ready ? "true" : "false",
         info.gpu_name, info.sm_major, info.sm_minor, info.vram_total_gb,
-        info.vram_pool_used_mb, info.vram_pool_budget_mb, info.models_discovered);
+        info.vram_pool_used_mb, info.vram_pool_budget_mb,
+        info.models_discovered, info.storage_roots, info.loras_discovered,
+        info.checkpoints_discovered, info.recipes_count);
     send_json(cfd, 200, resp);
   } else if (!strcmp(method, "GET") && !strncmp(path, "/artifacts/", 11)) {
     const char *fname = path + 11;
@@ -425,10 +474,15 @@ static void *client_thread(void *arg) {
     json_get_str(body, "kind", j->kind, sizeof j->kind, "image");
     json_get_str(body, "prompt", j->prompt, sizeof j->prompt, "eureka async studio");
     json_get_str(body, "tier", j->tier, sizeof j->tier, "fast");
+    json_get_str(body, "checkpoint", j->checkpoint, sizeof j->checkpoint, "");
+    j->n_loras = json_get_loras(body, j->loras, EC_STUDIO_MAX_LORAS);
     j->seed = (uint32_t)json_get_num(body, "seed", 42 + j->id);
-    j->width = (int)json_get_num(body, "width", !strcmp(j->kind, "video") || !strcmp(j->kind, "video_av") ? 320 : 256);
-    j->height = (int)json_get_num(body, "height", !strcmp(j->kind, "video") || !strcmp(j->kind, "video_av") ? 180 : 256);
-    j->steps = (int)json_get_num(body, "steps", 12);
+    int def_w = (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av")) ? 320 : 512;
+    int def_h = (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av")) ? 180 : 512;
+    j->width = (int)json_get_num(body, "width", def_w);
+    j->height = (int)json_get_num(body, "height", def_h);
+    j->photoreal = json_get_bool(body, "photoreal", (j->width >= 512 || j->height >= 512 || j->checkpoint[0] || j->n_loras > 0) ? 1 : 0);
+    j->steps = (int)json_get_num(body, "steps", j->photoreal ? 4 : 12);
     j->frames = (int)json_get_num(body, "frames", 24);
     j->bpm = (int)json_get_num(body, "bpm", 124);
     j->duration_sec = (float)json_get_num(body, "duration_sec", 2.0);
@@ -517,22 +571,97 @@ static void *client_thread(void *arg) {
       send_json(cfd, 200, resp);
     }
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/images/generations")) {
-    char prompt[256], tier_s[16];
-    json_get_str(body, "prompt", prompt, sizeof prompt, "eureka studio art");
+    char prompt[1024], tier_s[16], ckpt[256];
+    ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
+    json_get_str(body, "prompt", prompt, sizeof prompt, "A cinematic 35mm photograph, natural light, ultra detailed");
     json_get_str(body, "tier", tier_s, sizeof tier_s, "fast");
+    json_get_str(body, "checkpoint", ckpt, sizeof ckpt, "");
+    int n_loras = json_get_loras(body, loras, EC_STUDIO_MAX_LORAS);
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 42);
-    int w = (int)json_get_num(body, "width", 256), h = (int)json_get_num(body, "height", 256);
-    int steps = (int)json_get_num(body, "steps", 8);
+    int w = (int)json_get_num(body, "width", 512), h = (int)json_get_num(body, "height", 512);
+    int photoreal = json_get_bool(body, "photoreal", (w >= 512 || h >= 512 || ckpt[0] || n_loras > 0) ? 1 : 0);
+    int steps = (int)json_get_num(body, "steps", photoreal ? 4 : 8);
     ec_tier_t tier = !strcmp(tier_s, "exact") ? EC_TIER_EXACT : EC_TIER_FAST;
     ec_studio_result_t r;
-    if (ec_studio_gen_image(st, prompt, seed, w, h, steps, tier, NULL, NULL, &r) == 0) {
-      snprintf(resp, 32768,
+    if (ec_studio_gen_image_ex(st, prompt, seed, w, h, steps, tier, photoreal,
+                               ckpt[0] ? ckpt : NULL, loras, n_loras, NULL, NULL, &r) == 0) {
+      snprintf(resp, RESP_CAP,
           "{\"ok\":true,\"artifact_url\":\"/artifacts/%s\",\"width\":%d,\"height\":%d,"
-          "\"tier\":\"%s\",\"steps_run\":%d,\"steps_skipped\":%d,\"gpu_ms\":%.2f}",
-          basename_safe(r.file_main), r.width, r.height, tier == EC_TIER_FAST ? "fast" : "exact",
-          r.steps_run, r.steps_skipped, r.gpu_ms);
+          "\"engine_mode\":\"%s\",\"checkpoint\":\"%s\",\"lora_tensors_fused\":%d,"
+          "\"tier\":\"%s\",\"steps_run\":%d,\"steps_skipped\":%d,"
+          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
+          basename_safe(r.file_main), r.width, r.height,
+          r.engine_mode[0] ? r.engine_mode : "dit_smoke",
+          basename_safe(r.checkpoint_used), r.lora_tensors_fused,
+          tier == EC_TIER_FAST ? "fast" : "exact",
+          r.steps_run, r.steps_skipped, r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"image generation failed\"}");
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/storage")) {
+    ec_studio_storage_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/creative/storage/roots")) {
+    char rpath[512], rlabel[64];
+    json_get_str(body, "path", rpath, sizeof rpath, "");
+    json_get_str(body, "label", rlabel, sizeof rlabel, "Network / Custom Drive");
+    if (rpath[0] && ec_studio_storage_add_root(st, rpath, rlabel) == 0) {
+      ec_studio_storage_json(st, resp, RESP_CAP);
+      send_json(cfd, 200, resp);
+    } else send_json(cfd, 400, "{\"error\":\"invalid storage root path\"}");
+  } else if (!strcmp(method, "DELETE") && !strcmp(path, "/v1/creative/storage/roots")) {
+    char rpath[512];
+    json_get_str(body, "path", rpath, sizeof rpath, "");
+    if (rpath[0] && ec_studio_storage_remove_root(st, rpath) == 0) {
+      ec_studio_storage_json(st, resp, RESP_CAP);
+      send_json(cfd, 200, resp);
+    } else send_json(cfd, 404, "{\"error\":\"storage root not found\"}");
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/creative/storage/rescan")) {
+    ec_studio_storage_rescan(st);
+    ec_studio_storage_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/loras")) {
+    ec_studio_loras_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/checkpoints")) {
+    ec_studio_checkpoints_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/recipes")) {
+    ec_studio_recipes_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/creative/recipes")) {
+    char id[64], name[96], cat[48], mod[24], prompt[768], cam[128], ckpt[128], lora[128];
+    json_get_str(body, "id", id, sizeof id, "");
+    json_get_str(body, "name", name, sizeof name, "");
+    json_get_str(body, "category", cat, sizeof cat, "Custom");
+    json_get_str(body, "modality", mod, sizeof mod, "image");
+    json_get_str(body, "prompt", prompt, sizeof prompt, "");
+    json_get_str(body, "camera", cam, sizeof cam, "");
+    json_get_str(body, "checkpoint", ckpt, sizeof ckpt, "flux2_klein_4b_bf16");
+    json_get_str(body, "lora", lora, sizeof lora, "");
+    float lstr = (float)json_get_num(body, "lora_strength", 0.8);
+    int w = (int)json_get_num(body, "width", 512), h = (int)json_get_num(body, "height", 512);
+    int steps = (int)json_get_num(body, "steps", 4);
+    uint32_t seed = (uint32_t)json_get_num(body, "seed", 42);
+    if (!id[0] && name[0]) snprintf(id, sizeof id, "user-%u", (unsigned)(time(NULL) & 0xFFFFFu));
+    if (ec_studio_recipe_save(st, id, name, cat, mod, prompt, cam, ckpt, lora, lstr, w, h, steps, seed) == 0) {
+      ec_studio_recipes_json(st, resp, RESP_CAP);
+      send_json(cfd, 200, resp);
+    } else send_json(cfd, 400, "{\"error\":\"invalid recipe or cannot overwrite builtin\"}");
+  } else if (!strcmp(method, "DELETE") && !strncmp(path, "/v1/creative/recipes/", 21)) {
+    const char *rid = path + 21;
+    if (ec_studio_recipe_delete(st, rid) == 0) send_json(cfd, 200, "{\"ok\":true}");
+    else send_json(cfd, 404, "{\"error\":\"user recipe not found\"}");
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/prompts")) {
+    ec_studio_prompts_json(resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/import")) {
+    int is_png = (body_len >= 8 && (uint8_t)body[0] == 137 && body[1] == 'P' && body[2] == 'N' && body[3] == 'G') ? 1 : 0;
+    int exec_now = (strstr(query, "execute=1") || strstr(query, "execute=true")) ? 1 : 0;
+    if (ec_studio_import_comfy(st, (const uint8_t *)body, body_len, is_png, exec_now, resp, RESP_CAP) == 0) {
+      send_json(cfd, 200, resp);
+    } else {
+      send_json(cfd, 400, resp);
+    }
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/3d/generations")) {
     char prompt[256]; json_get_str(body, "prompt", prompt, sizeof prompt, "sculptural torus");
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 77);

@@ -7,10 +7,14 @@
 #include "ec_studio.h"
 #include "ec_dit.h"
 #include "ec_flow.h"
+#include "ec_flux2.h"
 #include "ec_kernels_v2.cuh"
+#include "ec_lora.h"
 #include "ec_media.h"
 #include "ec_models.h"
 #include "ec_nvenc.h"
+#include "ec_recipes.h"
+#include "ec_storage.h"
 #include "ec_vram_pool.h"
 #include <cuda_fp16.h>
 #include <math.h>
@@ -41,10 +45,33 @@ struct ec_studio {
   float           *x_d;
   float           *v_d;
   cudaStream_t     compute_stream;
-  ec_flow_graph_t  flow_graph;
+  ec_flow_graph_t     flow_graph;
   ec_model_registry_t registry;
-  int              initialized;
+  ec_storage_vault_t  vault;
+  ec_recipe_lib_t     recipes;
+  ec_flux2_t         *flux2;
+  int                 initialized;
 };
+
+static void studio_try_init_flux2_locked(ec_studio_t *st) {
+  if (st->flux2 && ec_flux2_is_ready(st->flux2)) return;
+  const ec_storage_asset_t *ckpt = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "flux2_klein_4b");
+  const ec_storage_asset_t *vae  = ec_storage_find(&st->vault, EC_ASSET_VAE, "flux2_klein_vae");
+  if (!vae) vae = ec_storage_find(&st->vault, EC_ASSET_VAE, "flux2");
+  const ec_storage_asset_t *te   = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen_3_4b");
+  if (!te) te = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen3_4b");
+  const ec_storage_asset_t *tok  = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "qwen3_tokenizer");
+  if (!tok) tok = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "tokenizer");
+  if (!ckpt || !vae || !te || !tok) return;
+
+  ec_flux2_paths_t p = {};
+  snprintf(p.checkpoint_path,   sizeof p.checkpoint_path,   "%s", ckpt->path);
+  snprintf(p.vae_path,          sizeof p.vae_path,          "%s", vae->path);
+  snprintf(p.text_encoder_path, sizeof p.text_encoder_path, "%s", te->path);
+  snprintf(p.tokenizer_path,    sizeof p.tokenizer_path,    "%s", tok->path);
+  if (st->flux2) { ec_flux2_destroy(st->flux2); st->flux2 = NULL; }
+  st->flux2 = ec_flux2_create(&p);
+}
 
 static double st_now_ms(void) {
   struct timespec ts;
@@ -133,6 +160,14 @@ static int ec_studio_init_impl(ec_studio_t *st, const char *artifact_dir, const 
   ec_flow_init(&st->flow_graph);
   ec_registry_init(&st->registry, st->models_dir);
   if (st->models_dir[0]) ec_registry_scan(&st->registry);
+
+  char cfg_storage[512], cfg_recipes[512];
+  snprintf(cfg_storage, sizeof cfg_storage, "%s/storage_roots.json", st->artifact_dir);
+  snprintf(cfg_recipes, sizeof cfg_recipes, "%s/recipes_user.json", st->artifact_dir);
+  ec_storage_init(&st->vault, st->models_dir, cfg_storage);
+  ec_recipes_init(&st->recipes, cfg_recipes);
+  studio_try_init_flux2_locked(st);
+
   st->initialized = 1;
   return 0;
 }
@@ -148,6 +183,7 @@ extern "C" void ec_studio_destroy(ec_studio_t *st) {
   if (!st) return;
   if (st->initialized) {
     pthread_mutex_lock(&st->gpu_mu);
+    if (st->flux2) { ec_flux2_destroy(st->flux2); st->flux2 = NULL; }
     ec_registry_free(&st->registry);
     ec_flow_free(&st->flow_graph);
     ec_vram_pool_free(&st->vram_pool);
@@ -175,10 +211,93 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
   out->vram_pool_used_mb = (double)st->vram_pool.used_bytes / (1024.0 * 1024.0);
   out->vram_pool_budget_mb = (double)st->vram_pool.budget_bytes / (1024.0 * 1024.0);
   out->models_discovered = st->registry.n_models;
+  out->photoreal_ready = (st->flux2 && ec_flux2_is_ready(st->flux2)) ? 1 : 0;
+  out->storage_roots = st->vault.n_roots;
+  out->recipes_count = st->recipes.count;
+  for (int i = 0; i < st->vault.n_assets; i++) {
+    if (st->vault.assets[i].kind == EC_ASSET_LORA) out->loras_discovered++;
+    else if (st->vault.assets[i].kind == EC_ASSET_CHECKPOINT) out->checkpoints_discovered++;
+  }
+}
+
+typedef struct {
+  ec_progress_cb_t cb;
+  void            *cb_ctx;
+} fx_cb_bridge_t;
+
+static int fx_progress_bridge(int step, int total, const char *stage, void *ctx) {
+  fx_cb_bridge_t *b = (fx_cb_bridge_t *)ctx;
+  return (b && b->cb) ? b->cb(step, total, 0, stage, b->cb_ctx) : 0;
+}
+
+extern "C" int ec_studio_gen_image_ex(
+    ec_studio_t *st, const char *prompt, uint32_t seed, int width, int height,
+    int steps, ec_tier_t tier, int photoreal,
+    const char *checkpoint_query,
+    const ec_studio_lora_t *loras, int n_loras,
+    ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized) return -1;
+
+  if (photoreal && st->flux2 && ec_flux2_is_ready(st->flux2)) {
+    char ckpt_path[512] = {0};
+    if (checkpoint_query && checkpoint_query[0]) {
+      const ec_storage_asset_t *a = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, checkpoint_query);
+      if (a) snprintf(ckpt_path, sizeof ckpt_path, "%s", a->path);
+      else snprintf(ckpt_path, sizeof ckpt_path, "%s", checkpoint_query);
+    }
+
+    ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
+    int nl = 0;
+    for (int i = 0; i < n_loras && nl < EC_LORA_MAX_STACK; i++) {
+      if (!loras[i].path[0]) continue;
+      const ec_storage_asset_t *la = ec_storage_find(&st->vault, EC_ASSET_LORA, loras[i].path);
+      snprintf(lstack[nl].path, sizeof lstack[nl].path, "%s", la ? la->path : loras[i].path);
+      lstack[nl].strength = loras[i].strength;
+      nl++;
+    }
+
+    ec_flux2_req_t freq = {};
+    freq.prompt = prompt;
+    freq.seed = seed;
+    freq.width = (width >= 256) ? width : 512;
+    freq.height = (height >= 256) ? height : 512;
+    freq.steps = (steps >= 1 && steps <= 50) ? steps : 4;
+    freq.checkpoint_override = ckpt_path[0] ? ckpt_path : NULL;
+    freq.loras = nl > 0 ? lstack : NULL;
+    freq.n_loras = nl;
+
+    uint64_t tag = hash_prompt_seed(prompt, seed);
+    snprintf(res->file_main, sizeof res->file_main, "%s/flux2_%u_%04x.png",
+             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_flux2_res_t fres = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    int rc = ec_flux2_generate_png(st->flux2, &freq, res->file_main, cb ? fx_progress_bridge : NULL, &bridge, &fres);
+    pthread_mutex_unlock(&st->gpu_mu);
+    if (rc == 0 && fres.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "flux2_photoreal");
+      snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "%s", fres.checkpoint_used);
+      res->width = fres.width;
+      res->height = fres.height;
+      res->steps_run = fres.steps_run;
+      res->lora_tensors_fused = fres.lora_tensors_fused;
+      res->text_enc_ms = fres.text_enc_ms;
+      res->dit_ms = fres.dit_ms;
+      res->vae_ms = fres.vae_ms;
+      res->gpu_ms = fres.total_ms;
+      return 0;
+    }
+    return -1;
+  }
+
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  return ec_studio_gen_image(st, prompt, seed, width, height, steps, tier, cb, cb_ctx, res);
 }
 
 // ===========================================================================
-// 1. Image Generation: Shifted RF + 2D RoPE DiT + MagCache + TensorCore Conv2D VAE -> PNG
+// 1. Image Generation: Shifted RF + 2D RoPE DiT + MagCache + TensorCore Conv2D VAE -> PNG (Fast Smoke)
 // ===========================================================================
 extern "C" int ec_studio_gen_image(
     ec_studio_t *st, const char *prompt, uint32_t seed, int width, int height,
@@ -740,4 +859,230 @@ extern "C" int ec_studio_model_unload(ec_studio_t *st, const char *id) {
   int rc = ec_registry_unload(&st->registry, id);
   pthread_mutex_unlock(&st->gpu_mu);
   return rc;
+}
+
+// ===========================================================================
+// 8. Multi-Drive & Network-Drive Storage Vault, LoRAs & Finetune Checkpoints
+// ===========================================================================
+extern "C" int ec_studio_storage_json(ec_studio_t *st, char *buf, size_t cap) {
+  if (!st || !st->initialized) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int n = ec_storage_to_json(&st->vault, buf, cap);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return n;
+}
+
+extern "C" int ec_studio_storage_add_root(ec_studio_t *st, const char *path, const char *label) {
+  if (!st || !st->initialized || !path) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int rc = ec_storage_add_root(&st->vault, path, label, 1);
+  if (rc >= 0) {
+    ec_storage_scan(&st->vault);
+    studio_try_init_flux2_locked(st);
+  }
+  pthread_mutex_unlock(&st->gpu_mu);
+  return rc >= 0 ? 0 : -1;
+}
+
+extern "C" int ec_studio_storage_remove_root(ec_studio_t *st, const char *path) {
+  if (!st || !st->initialized || !path) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int rc = ec_storage_remove_root(&st->vault, path);
+  if (rc == 0) ec_storage_scan(&st->vault);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return rc;
+}
+
+extern "C" int ec_studio_storage_rescan(ec_studio_t *st) {
+  if (!st || !st->initialized) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int n = ec_storage_scan(&st->vault);
+  studio_try_init_flux2_locked(st);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return n;
+}
+
+extern "C" int ec_studio_loras_json(ec_studio_t *st, char *buf, size_t cap) {
+  if (!st || !st->initialized || !buf) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int n = snprintf(buf, cap, "{\"loras\":[");
+  int cnt = 0;
+  for (int i = 0; i < st->vault.n_assets && (size_t)n < cap - 320; i++) {
+    const ec_storage_asset_t *a = &st->vault.assets[i];
+    if (a->kind != EC_ASSET_LORA) continue;
+    int pairs = 0, rank = 0;
+    char arch[64] = "lora";
+    ec_lora_inspect(a->path, &pairs, &rank, arch, sizeof arch);
+    n += snprintf(buf + n, cap - (size_t)n,
+        "%s{\"id\":\"%s\",\"name\":\"%s\",\"path\":\"%s\",\"root\":\"%s\","
+        "\"bytes\":%llu,\"is_network\":%s,\"pairs\":%d,\"rank\":%d,\"arch\":\"%s\"}",
+        cnt ? "," : "", a->id, a->name, a->path, a->root_label,
+        (unsigned long long)a->bytes, a->is_network ? "true" : "false", pairs, rank, arch);
+    cnt++;
+  }
+  n += snprintf(buf + n, cap - (size_t)n, "],\"count\":%d}", cnt);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return n;
+}
+
+extern "C" int ec_studio_checkpoints_json(ec_studio_t *st, char *buf, size_t cap) {
+  if (!st || !st->initialized || !buf) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int n = snprintf(buf, cap, "{\"checkpoints\":[");
+  int cnt = 0;
+  for (int i = 0; i < st->vault.n_assets && (size_t)n < cap - 320; i++) {
+    const ec_storage_asset_t *a = &st->vault.assets[i];
+    if (a->kind != EC_ASSET_CHECKPOINT) continue;
+    n += snprintf(buf + n, cap - (size_t)n,
+        "%s{\"id\":\"%s\",\"name\":\"%s\",\"path\":\"%s\",\"root\":\"%s\","
+        "\"bytes\":%llu,\"is_network\":%s}",
+        cnt ? "," : "", a->id, a->name, a->path, a->root_label,
+        (unsigned long long)a->bytes, a->is_network ? "true" : "false");
+    cnt++;
+  }
+  n += snprintf(buf + n, cap - (size_t)n, "],\"count\":%d}", cnt);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return n;
+}
+
+// ===========================================================================
+// 9. Photoreal Prompt Library, User Recipes & Universal ComfyUI Importer
+// ===========================================================================
+extern "C" int ec_studio_recipes_json(ec_studio_t *st, char *buf, size_t cap) {
+  if (!st || !st->initialized) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int n = ec_recipes_to_json(&st->recipes, buf, cap);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return n;
+}
+
+extern "C" int ec_studio_prompts_json(char *buf, size_t cap) {
+  return ec_prompt_library_to_json(buf, cap);
+}
+
+extern "C" int ec_studio_recipe_save(
+    ec_studio_t *st, const char *id, const char *name, const char *category,
+    const char *modality, const char *prompt, const char *camera,
+    const char *checkpoint, const char *lora, float lora_strength,
+    int width, int height, int steps, uint32_t seed) {
+  if (!st || !st->initialized) return -1;
+  ec_recipe_t r = {};
+  snprintf(r.id, sizeof r.id, "%s", id ? id : "");
+  snprintf(r.name, sizeof r.name, "%s", name ? name : "");
+  snprintf(r.category, sizeof r.category, "%s", (category && category[0]) ? category : "Custom");
+  snprintf(r.modality, sizeof r.modality, "%s", (modality && modality[0]) ? modality : "image");
+  snprintf(r.prompt, sizeof r.prompt, "%s", prompt ? prompt : "");
+  snprintf(r.camera, sizeof r.camera, "%s", camera ? camera : "");
+  snprintf(r.checkpoint, sizeof r.checkpoint, "%s", checkpoint ? checkpoint : "");
+  snprintf(r.lora, sizeof r.lora, "%s", lora ? lora : "");
+  r.lora_strength = lora_strength;
+  r.width = width > 0 ? width : 512;
+  r.height = height > 0 ? height : 512;
+  r.steps = steps > 0 ? steps : 4;
+  r.seed = seed;
+  pthread_mutex_lock(&st->gpu_mu);
+  int rc = ec_recipes_save_user(&st->recipes, &r);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return rc;
+}
+
+extern "C" int ec_studio_recipe_delete(ec_studio_t *st, const char *id) {
+  if (!st || !st->initialized) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int rc = ec_recipes_delete_user(&st->recipes, id);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return rc;
+}
+
+extern "C" int ec_studio_import_comfy(
+    ec_studio_t *st, const uint8_t *payload, size_t payload_len, int is_png, int execute_now,
+    char *out_json, size_t out_cap) {
+  if (!st || !st->initialized || !payload || !payload_len || !out_json) return -1;
+  char *raw_json = (char *)malloc(262144);
+  char *api_json = (char *)malloc(262144);
+  if (!raw_json || !api_json) { free(raw_json); free(api_json); return -1; }
+
+  if (is_png) {
+    int n = ec_png_extract_comfy_json(payload, payload_len, raw_json, 262144);
+    if (n <= 0) {
+      snprintf(out_json, out_cap, "{\"ok\":false,\"error\":\"no embedded ComfyUI prompt/workflow chunk found in PNG\"}");
+      free(raw_json); free(api_json);
+      return -1;
+    }
+  } else {
+    size_t cp = payload_len < 262143 ? payload_len : 262143;
+    memcpy(raw_json, payload, cp);
+    raw_json[cp] = '\0';
+  }
+
+  ec_comfy_import_info_t info;
+  pthread_mutex_lock(&st->gpu_mu);
+  int nrc = ec_comfy_normalize_and_resolve(raw_json, &st->vault, api_json, 262144, &info);
+  pthread_mutex_unlock(&st->gpu_mu);
+  free(raw_json);
+
+  if (nrc != 0 || !info.ok) {
+    snprintf(out_json, out_cap, "{\"ok\":false,\"error\":\"%s\"}", info.error[0] ? info.error : "invalid ComfyUI workflow");
+    free(api_json);
+    return -1;
+  }
+
+  char artifact_url[256] = {0};
+  double exec_ms = 0.0;
+  char exec_mode[32] = "";
+  if (execute_now && info.extracted_prompt[0]) {
+    ec_studio_lora_t loras[4] = {};
+    int nl = 0;
+    for (int i = 0; i < info.n_loras && nl < 4; i++) {
+      if (info.resolved_loras[i][0]) {
+        snprintf(loras[nl].path, sizeof loras[nl].path, "%s", info.resolved_loras[i]);
+        loras[nl].strength = info.extracted_lora_strengths[i];
+        nl++;
+      }
+    }
+    ec_studio_result_t r = {};
+    int grc = ec_studio_gen_image_ex(
+        st, info.extracted_prompt, info.seed,
+        info.width >= 256 ? info.width : 512,
+        info.height >= 256 ? info.height : 512,
+        info.steps > 0 && info.steps <= 12 ? info.steps : 4,
+        EC_TIER_FAST, 1,
+        info.resolved_checkpoint[0] ? info.resolved_checkpoint : NULL,
+        nl > 0 ? loras : NULL, nl, NULL, NULL, &r);
+    if (grc == 0) {
+      const char *bn = strrchr(r.file_main, '/');
+      snprintf(artifact_url, sizeof artifact_url, "/artifacts/%s", bn ? bn + 1 : r.file_main);
+      exec_ms = r.gpu_ms;
+      snprintf(exec_mode, sizeof exec_mode, "%s", r.engine_mode);
+    }
+  }
+
+  // Escape extracted prompt for JSON response
+  char ep[1536] = {0};
+  size_t ej = 0;
+  for (size_t i = 0; info.extracted_prompt[i] && ej + 2 < sizeof ep; i++) {
+    char c = info.extracted_prompt[i];
+    if (c == '"' || c == '\\') { ep[ej++] = '\\'; ep[ej++] = c; }
+    else if (c == '\n') { ep[ej++] = '\\'; ep[ej++] = 'n'; }
+    else if ((unsigned char)c >= 0x20) ep[ej++] = c;
+  }
+
+  int pos = snprintf(out_json, out_cap,
+      "{\"ok\":true,\"source_format\":\"%s\",\"node_count\":%d,"
+      "\"extracted\":{\"prompt\":\"%s\",\"checkpoint\":\"%s\",\"resolved_checkpoint\":\"%s\","
+      "\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%u,\"loras\":[",
+      info.source_format, info.node_count, ep,
+      info.extracted_checkpoint, info.resolved_checkpoint,
+      info.width, info.height, info.steps, info.seed);
+  for (int i = 0; i < info.n_loras && (size_t)pos < out_cap - 512; i++) {
+    pos += snprintf(out_json + pos, out_cap - (size_t)pos,
+        "%s{\"name\":\"%s\",\"resolved\":\"%s\",\"strength\":%.2f}",
+        i ? "," : "", info.extracted_loras[i], info.resolved_loras[i], info.extracted_lora_strengths[i]);
+  }
+  pos += snprintf(out_json + pos, out_cap - (size_t)pos,
+      "]},\"executed\":%s,\"artifact_url\":\"%s\",\"engine_mode\":\"%s\",\"gpu_ms\":%.2f,\"api_workflow\":%s}",
+      artifact_url[0] ? "true" : "false", artifact_url, exec_mode, exec_ms,
+      strlen(api_json) < (out_cap - (size_t)pos - 32) ? api_json : "{}");
+  free(api_json);
+  return 0;
 }

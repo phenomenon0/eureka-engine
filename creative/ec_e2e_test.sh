@@ -125,7 +125,7 @@ check("E2E.4 Hardware NVENC H.264 + AAC MP4 (ffprobe)",
       f"enc={vd['encoder']} {vstreams[0]['width']}x{vstreams[0]['height']} h264+aac {len(mp4_b)}B")
 
 # 5. Async Job Queue + Real SSE text/event-stream Progress & Completion
-st_j, jb = req("POST", "/v1/jobs", {"kind": "image", "prompt": "sse live progress test", "seed": 888, "steps": 16, "tier": "fast"})
+st_j, jb = req("POST", "/v1/jobs", {"kind": "image", "prompt": "sse live progress test", "seed": 888, "width": 256, "height": 256, "steps": 16, "tier": "fast", "photoreal": False})
 job = json.loads(jb)
 sse_req = urllib.request.Request(base + job["events_url"], headers={"X-Api-Key": api_key})
 events = []
@@ -171,8 +171,142 @@ except urllib.error.HTTPError as e:
     trav = e.code in (400, 404)
 check("E2E.8 Path-Traversal Security Guard", trav, "rejected cleanly")
 
+# 9. Multi-Drive & Network Storage Vault + LoRA & Checkpoint Discovery
+_, sb = req("GET", "/v1/creative/storage")
+sv = json.loads(sb)
+net_test_dir = os.path.join(art_dir, "sim_network_vault")
+os.makedirs(net_test_dir, exist_ok=True)
+_, sb_add = req("POST", "/v1/creative/storage/roots", {"path": net_test_dir, "label": "Sim NAS Drive"})
+sv_add = json.loads(sb_add)
+_, sb_del = req("DELETE", "/v1/creative/storage/roots", {"path": net_test_dir})
+sv_del = json.loads(sb_del)
+_, lb = req("GET", "/v1/creative/loras")
+lreg = json.loads(lb)
+_, cb = req("GET", "/v1/creative/checkpoints")
+creg = json.loads(cb)
+check("E2E.9 Multi-Drive Vault + LoRA/Ckpt Discovery",
+      len(sv["roots"]) >= 2 and len(sv_add["roots"]) == len(sv["roots"]) + 1 and len(sv_del["roots"]) == len(sv["roots"]) and creg["count"] >= 1,
+      f"roots={len(sv['roots'])} ckpts={creg['count']} loras={lreg['count']} total_free={sum(r['free_gb'] for r in sv['roots']):.1f}GB")
+
+# 10. Curated Photoreal Prompt Library + User Recipes CRUD
+_, pb = req("GET", "/v1/creative/prompts")
+plib = json.loads(pb)
+_, rb0 = req("GET", "/v1/creative/recipes")
+rec0 = json.loads(rb0)
+_, rb1 = req("POST", "/v1/creative/recipes", {
+    "id": "e2e-custom-leica",
+    "name": "E2E Leica Rain Test",
+    "category": "Custom",
+    "modality": "image",
+    "prompt": "35mm street photograph in rain, Leica M11",
+    "camera": "Leica M11 35mm",
+    "checkpoint": "flux2_klein_4b_bf16",
+    "width": 512, "height": 512, "steps": 4, "seed": 1234
+})
+rec1 = json.loads(rb1)
+st_rd, _ = req("DELETE", "/v1/creative/recipes/e2e-custom-leica")
+_, rb2 = req("GET", "/v1/creative/recipes")
+rec2 = json.loads(rb2)
+check("E2E.10 Prompt Library + User Recipes CRUD",
+      len(plib.get("cameras", [])) >= 5 and rec0["count"] >= 12 and rec1["count"] == rec0["count"] + 1 and st_rd == 200 and rec2["count"] == rec0["count"],
+      f"builtins={rec0['count']} cameras={len(plib['cameras'])} user_crud=OK")
+
+# 11. Universal ComfyUI Importer: LiteGraph UI JSON + Embedded PNG Metadata
+litegraph_wf = {
+    "last_node_id": 5, "last_link_id": 4,
+    "nodes": [
+        {"id": 1, "type": "UNETLoader", "widgets_values": ["flux-2-klein-4b.safetensors", "default"]},
+        {"id": 2, "type": "LoraLoader", "widgets_values": ["Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", 0.75, 0.75]},
+        {"id": 3, "type": "CLIPTextEncode", "widgets_values": ["Candid editorial portrait in Kyoto workshop, 85mm f/1.4, Kodak Portra 400"]},
+        {"id": 4, "type": "EmptySD3LatentImage", "widgets_values": [768, 512, 1]},
+        {"id": 5, "type": "KSampler", "widgets_values": [2026, "fixed", 4, 1.0, "euler", "simple", 1.0]}
+    ],
+    "links": [[1, 1, 0, 2, 0, "MODEL"], [2, 2, 0, 5, 0, "MODEL"], [3, 3, 0, 5, 1, "CONDITIONING"], [4, 4, 0, 5, 3, "LATENT"]]
+}
+_, imp1_b = req("POST", "/v1/flows/import", litegraph_wf)
+imp1 = json.loads(imp1_b)
+
+# Build a valid PNG with an embedded ComfyUI tEXt "prompt" chunk and upload raw binary PNG!
+import zlib
+def make_comfy_png(prompt_dict):
+    def chunk(ctype, cdata):
+        return struct.pack(">I", len(cdata)) + ctype + cdata + struct.pack(">I", zlib.crc32(ctype + cdata) & 0xffffffff)
+    ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)
+    raw_px = b"".join(b"\x00" + b"\x80\x40\x20" * 4 for _ in range(4))
+    idat = zlib.compress(raw_px)
+    text = b"prompt\x00" + json.dumps(prompt_dict).encode("utf-8")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"tEXt", text) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+comfy_api_in_png = {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-4b.safetensors"}},
+    "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "Brutalist fjord concrete pavilion at blue hour, 24mm tilt-shift"}},
+    "3": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512}},
+    "4": {"class_type": "KSampler", "inputs": {"seed": 777, "steps": 4}}
+}
+png_payload = make_comfy_png(comfy_api_in_png)
+req_png = urllib.request.Request(base + "/v1/flows/import", data=png_payload, method="POST",
+                                 headers={"Content-Type": "image/png", "X-Api-Key": api_key})
+with urllib.request.urlopen(req_png, timeout=15) as resp_png:
+    imp2 = json.loads(resp_png.read())
+
+check("E2E.11 ComfyUI Import (LiteGraph UI + PNG tEXt)",
+      imp1["ok"] and imp1["source_format"] == "comfy_litegraph_ui" and "Kyoto" in imp1["extracted"]["prompt"]
+      and bool(imp1["extracted"]["resolved_checkpoint"]) and len(imp1["extracted"]["loras"]) == 1
+      and imp2["ok"] and imp2["source_format"] == "comfy_api" and "Brutalist" in imp2["extracted"]["prompt"],
+      f"lg_nodes={imp1['node_count']} ckpt_resolved=OK lora_resolved={bool(imp1['extracted']['loras'][0]['resolved'])} png_tEXt=OK")
+
+# 12. Real Native FLUX.2-klein-4B Photoreal Generation + Hot-Fused LoRA Delta Proof!
+if h.get("photoreal_ready"):
+    pr_prompt = "Candid editorial portrait of a ceramic artist in a sunlit Kyoto workshop, natural window sidelight, 85mm f/1.4, Kodak Portra 400, photorealistic"
+    _, ph1_b = req("POST", "/v1/images/generations", {
+        "prompt": pr_prompt, "seed": 1042, "width": 512, "height": 512, "steps": 4, "photoreal": True
+    }, timeout=180)
+    ph1 = json.loads(ph1_b)
+    _, ph1_png = req("GET", ph1["artifact_url"])
+    # Save proof PNG for visual audit
+    open(os.path.join(art_dir, "proof_photoreal_base.png"), "wb").write(ph1_png)
+
+    # Create a real synthetic FLUX.2 safetensors LoRA (BFL + Diffusers keys) & fuse onto GPU BF16 weights!
+    lora_path = os.path.join(art_dir, "e2e_test_flux2_lora.safetensors")
+    R, D, IN_L2 = 4, 3072, 12288
+    def mk_f32(n, val):
+        return struct.pack(f"<{n}f", *([val] * n))
+    t_specs = [
+        ("diffusion_model.double_blocks.0.img_attn.proj.lora_A.weight", [R, D], mk_f32(R * D, 0.08)),
+        ("diffusion_model.double_blocks.0.img_attn.proj.lora_B.weight", [D, R], mk_f32(D * R, 0.08)),
+        ("diffusion_model.single_blocks.0.linear2.lora_A.weight",       [R, IN_L2], mk_f32(R * IN_L2, 0.04)),
+        ("diffusion_model.single_blocks.0.linear2.lora_B.weight",       [D, R], mk_f32(D * R, 0.04)),
+        ("transformer.transformer_blocks.1.attn.to_q.lora_A.weight",    [R, D], mk_f32(R * D, 0.06)),
+        ("transformer.transformer_blocks.1.attn.to_q.lora_B.weight",    [D, R], mk_f32(D * R, 0.06)),
+    ]
+    hdr = {}
+    off = 0
+    blob = bytearray()
+    for name, sh, data in t_specs:
+        hdr[name] = {"dtype": "F32", "shape": sh, "data_offsets": [off, off + len(data)]}
+        blob.extend(data)
+        off += len(data)
+    hb = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
+    with open(lora_path, "wb") as lf:
+        lf.write(struct.pack("<Q", len(hb)) + hb + blob)
+
+    _, ph2_b = req("POST", "/v1/images/generations", {
+        "prompt": pr_prompt, "seed": 1042, "width": 512, "height": 512, "steps": 4, "photoreal": True,
+        "loras": [{"path": lora_path, "strength": 1.0}]
+    }, timeout=60)
+    ph2 = json.loads(ph2_b)
+    _, ph2_png = req("GET", ph2["artifact_url"])
+    open(os.path.join(art_dir, "proof_photoreal_lora.png"), "wb").write(ph2_png)
+
+    check("E2E.12 Photoreal FLUX.2-klein-4B + LoRA Fusion",
+          ph1["ok"] and ph1["engine_mode"] == "flux2_photoreal" and ph1["width"] == 512 and len(ph1_png) > 50000
+          and ph2["ok"] and ph2["lora_tensors_fused"] >= 3 and ph1_png != ph2_png,
+          f"base(dit={ph1['dit_ms']:.0f}ms,vae={ph1['vae_ms']:.0f}ms,png={len(ph1_png)}B) lora(fused={ph2['lora_tensors_fused']},warm_txt={ph2['text_enc_ms']:.1f}ms,delta=VERIFIED)")
+else:
+    check("E2E.12 Photoreal FLUX.2-klein-4B + LoRA Fusion", False, "photoreal_ready=false (models missing)")
+
 print("===========================================================================")
-print(f"E2E v2 VERDICT: {'ALL 8 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
+print(f"E2E v3 VERDICT: {'ALL 12 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
 print("===========================================================================")
 sys.exit(0 if fails == 0 else 1)
 PY
