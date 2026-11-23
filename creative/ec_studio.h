@@ -111,8 +111,25 @@ int ec_studio_realtime_burst(
     ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames,
     const char *shm_name, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
 
+// Live per-node ComfyUI DAG telemetry callback (status: "cached" | "start" | "progress" | "done")
+typedef int (*ec_flow_ui_event_cb_t)(
+    const char *node_id, const char *class_type, const char *status,
+    int step, int total_steps, int cache_hits, int executed,
+    double node_ms, const char *artifact_url, void *ctx);
+
 int ec_studio_run_flow_json(
     ec_studio_t *st, const char *comfy_json, ec_studio_result_t *res, char *err, size_t err_cap);
+int ec_studio_run_flow_ex(
+    ec_studio_t *st, const char *comfy_json,
+    ec_flow_ui_event_cb_t event_cb, void *cb_ctx,
+    ec_studio_result_t *res, char *node_outputs_json, size_t node_outputs_cap,
+    char *err, size_t err_cap);
+int ec_studio_flow_object_info_json(ec_studio_t *st, char *buf, size_t cap);
+int ec_studio_flow_templates_json(ec_studio_t *st, char *buf, size_t cap);
+void ec_studio_flow_clear_cache(ec_studio_t *st);
+int ec_studio_flow_upload_image(
+    ec_studio_t *st, const uint8_t *bytes, size_t len, const char *ext,
+    char *out_filename, size_t cap);
 
 // 7. Live Multi-Architecture Safetensors Model Registry API
 int ec_studio_models_scan(ec_studio_t *st);

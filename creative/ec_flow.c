@@ -1,11 +1,19 @@
 // ec_flow.c — Compiled Content-Addressed ComfyUI-Compatible DAG Engine ("Eureka Flow")
 // Zero Python, zero third-party JSON parsers.
 
+#define _POSIX_C_SOURCE 200809L
 #include "ec_flow.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double flow_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+}
 
 static void flow_err(char *err, size_t cap, const char *msg) {
   if (err && cap > 0) snprintf(err, cap, "%s", msg);
@@ -187,6 +195,9 @@ int ec_flow_parse_comfy_json(ec_flow_graph_t *g, const char *json, char *err, si
             if (fj_skip(&c, 0)) return -1;
             in->kind = EC_VAL_NUMBER;
             in->num_val = (double)bv;
+          } else if (*c.p == 'n') {
+            if (fj_skip(&c, 0)) return -1;
+            in->kind = EC_VAL_NONE;
           } else {
             if (fj_num(&c, &in->num_val)) { flow_err(err, err_cap, "flow: input num"); return -1; }
             in->kind = EC_VAL_NUMBER;
@@ -336,7 +347,18 @@ static ec_flow_cache_entry_t *cache_find(ec_flow_graph_t *g, uint64_t hash) {
   return NULL;
 }
 
-int ec_flow_execute(ec_flow_graph_t *g, ec_node_exec_fn exec_fn, void *user_ctx, char *err, size_t err_cap) {
+void ec_flow_clear_cache(ec_flow_graph_t *g) {
+  if (!g) return;
+  for (int32_t i = 0; i < g->n_cache; i++) {
+    free(g->cache[i].payload);
+    g->cache[i].payload = NULL;
+  }
+  g->n_cache = 0;
+}
+
+int ec_flow_execute_ex(
+    ec_flow_graph_t *g, ec_node_exec_fn exec_fn, ec_flow_node_event_fn event_fn,
+    void *user_ctx, char *err, size_t err_cap) {
   if (!g->compiled) {
     if (ec_flow_compile(g, err, err_cap)) return -1;
   }
@@ -354,6 +376,10 @@ int ec_flow_execute(ec_flow_graph_t *g, ec_node_exec_fn exec_fn, void *user_ctx,
     if (hit) {
       live[idx] = hit;
       g->last_cache_hits++;
+      if (event_fn && event_fn(g, step + 1, g->n_nodes, idx, "cached", hit, 0.0, user_ctx) != 0) {
+        flow_err(err, err_cap, "flow: cancelled");
+        return -2;
+      }
     } else {
       const ec_flow_cache_entry_t *ups[EC_FLOW_MAX_INPUTS];
       int32_t n_up = 0;
@@ -362,29 +388,57 @@ int ec_flow_execute(ec_flow_graph_t *g, ec_node_exec_fn exec_fn, void *user_ctx,
           ups[n_up++] = live[nd->inputs[k].link_node_idx];
         }
       }
-      if (g->n_cache >= EC_FLOW_MAX_CACHE) { flow_err(err, err_cap, "flow: cache full"); return -1; }
+      if (g->n_cache >= EC_FLOW_MAX_CACHE) {
+        // Evict oldest half of cache cleanly instead of hard failing long studio sessions
+        int32_t drop = EC_FLOW_MAX_CACHE / 2;
+        for (int32_t c = 0; c < drop; c++) free(g->cache[c].payload);
+        memmove(g->cache, g->cache + drop, (size_t)(g->n_cache - drop) * sizeof(ec_flow_cache_entry_t));
+        g->n_cache -= drop;
+      }
+      if (event_fn && event_fn(g, step, g->n_nodes, idx, "start", NULL, 0.0, user_ctx) != 0) {
+        flow_err(err, err_cap, "flow: cancelled");
+        return -2;
+      }
       ec_flow_cache_entry_t *slot = &g->cache[g->n_cache];
       memset(slot, 0, sizeof *slot);
       slot->hash = nd->merkle_hash;
-      if (exec_fn(g, idx, ups, n_up, slot, user_ctx) != 0) {
+      double t0 = flow_now_ms();
+      int rc = exec_fn(g, idx, ups, n_up, slot, user_ctx);
+      double dt = flow_now_ms() - t0;
+      if (rc == -2) {
+        free(slot->payload);
+        slot->payload = NULL;
+        flow_err(err, err_cap, "flow: cancelled");
+        return -2;
+      }
+      if (rc != 0) {
+        free(slot->payload);
+        slot->payload = NULL;
         flow_err(err, err_cap, "flow: node execution failed");
         return -1;
       }
       g->n_cache++;
       live[idx] = slot;
       g->last_executed++;
+      if (event_fn && event_fn(g, step + 1, g->n_nodes, idx, "done", slot, dt, user_ctx) != 0) {
+        flow_err(err, err_cap, "flow: cancelled");
+        return -2;
+      }
     }
 
     // Liveness VRAM eviction planning: mark any upstream whose last_consumer == step
     for (int32_t prev = 0; prev < step; prev++) {
       int32_t pidx = g->topo_order[prev];
       if (g->nodes[pidx].last_consumer == step && live[pidx] != NULL) {
-        // In GPU residency mode this releases transient activation VRAM immediately
         g->last_evictions++;
       }
     }
   }
   return 0;
+}
+
+int ec_flow_execute(ec_flow_graph_t *g, ec_node_exec_fn exec_fn, void *user_ctx, char *err, size_t err_cap) {
+  return ec_flow_execute_ex(g, exec_fn, NULL, user_ctx, err, err_cap);
 }
 
 const ec_flow_input_t *ec_flow_get_input(const ec_flow_node_t *n, const char *key) {

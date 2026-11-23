@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 #define EC_FLOW_MAX_NODES   128
-#define EC_FLOW_MAX_INPUTS  16
+#define EC_FLOW_MAX_INPUTS  24
 #define EC_FLOW_MAX_CACHE   256
 
 typedef enum {
@@ -26,7 +26,7 @@ typedef enum {
 typedef struct {
   char          key[48];
   ec_val_kind_t kind;
-  char          str_val[256]; // or link target node id
+  char          str_val[1024]; // or link target node id
   double        num_val;
   int32_t       link_slot;
   int32_t       link_node_idx; // resolved during compile (-1 if scalar)
@@ -82,8 +82,17 @@ int ec_flow_set_input_str(ec_flow_graph_t *g, const char *node_id, const char *k
 // Topological sort + cycle check + static VRAM liveness planner + Merkle hash computation
 int ec_flow_compile(ec_flow_graph_t *g, char *err, size_t err_cap);
 
+// Live per-node DAG execution hook ("cached", "start", "done"); return non-zero to cancel
+typedef int (*ec_flow_node_event_fn)(
+    const ec_flow_graph_t *g, int32_t step, int32_t total_steps, int32_t node_idx,
+    const char *status, const ec_flow_cache_entry_t *entry, double node_ms, void *user_ctx);
+
 // Executes only cache-missed (dirty) nodes in topological order; skips content-addressed hits
 int ec_flow_execute(ec_flow_graph_t *g, ec_node_exec_fn exec_fn, void *user_ctx, char *err, size_t err_cap);
+int ec_flow_execute_ex(
+    ec_flow_graph_t *g, ec_node_exec_fn exec_fn, ec_flow_node_event_fn event_fn,
+    void *user_ctx, char *err, size_t err_cap);
+void ec_flow_clear_cache(ec_flow_graph_t *g);
 
 // Helper lookups
 const ec_flow_input_t *ec_flow_get_input(const ec_flow_node_t *n, const char *key);

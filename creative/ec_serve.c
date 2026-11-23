@@ -193,7 +193,16 @@ typedef struct {
   job_state_t   state;
   _Atomic int   cancel_req;
   int           cur_step, total_steps, skipped;
-  char          result_json[2048];
+  int           event_seq;
+  char          node_id[32];
+  char          node_class[64];
+  char          node_status[24];
+  double        node_ms;
+  char          node_artifact[256];
+  int           flow_cache_hits;
+  int           flow_executed;
+  char         *flow_json;
+  char          result_json[32768];
   ec_studio_t  *st;
 } ec_job_t;
 
@@ -247,7 +256,30 @@ static int job_progress_cb(int step, int total, int skipped, const char *stage, 
   j->cur_step = step;
   j->total_steps = total;
   j->skipped = skipped;
+  j->event_seq++;
   if (stage) snprintf(j->stage, sizeof j->stage, "%s", stage);
+  pthread_cond_broadcast(&g_jobs_cv);
+  pthread_mutex_unlock(&g_jobs_mu);
+  return atomic_load(&j->cancel_req) ? 1 : 0;
+}
+
+static int job_flow_event_cb(
+    const char *node_id, const char *class_type, const char *status,
+    int step, int total_steps, int cache_hits, int executed,
+    double node_ms, const char *artifact_url, void *ctx) {
+  ec_job_t *j = (ec_job_t *)ctx;
+  pthread_mutex_lock(&g_jobs_mu);
+  j->cur_step = step;
+  j->total_steps = total_steps > 0 ? total_steps : 1;
+  j->flow_cache_hits = cache_hits;
+  j->flow_executed = executed;
+  j->node_ms = node_ms;
+  snprintf(j->node_id, sizeof j->node_id, "%s", node_id ? node_id : "");
+  snprintf(j->node_class, sizeof j->node_class, "%s", class_type ? class_type : "");
+  snprintf(j->node_status, sizeof j->node_status, "%s", status ? status : "");
+  snprintf(j->node_artifact, sizeof j->node_artifact, "%s", artifact_url ? artifact_url : "");
+  snprintf(j->stage, sizeof j->stage, "%.14s:%.15s", class_type ? class_type : "flow", status ? status : "run");
+  j->event_seq++;
   pthread_cond_broadcast(&g_jobs_cv);
   pthread_mutex_unlock(&g_jobs_mu);
   return atomic_load(&j->cancel_req) ? 1 : 0;
@@ -320,18 +352,50 @@ static void *job_runner_thread(void *arg) {
     if (rc == 0 && !r.cancelled)
       snprintf(out, sizeof out, "{\"shm_ring\":\"%s\",\"frames\":%d,\"fps\":%.1f,\"elapsed_ms\":%.2f}",
                r.file_main, r.frames, r.fps, r.gpu_ms);
+  } else if (!strcmp(j->kind, "flow") && j->flow_json) {
+    char *nouts = (char *)malloc(24576);
+    char ferr[256] = {0};
+    rc = ec_studio_run_flow_ex(j->st, j->flow_json, job_flow_event_cb, j, &r, nouts, 24576, ferr, sizeof ferr);
+    free(j->flow_json);
+    j->flow_json = NULL;
+    if (rc == 0 && !r.cancelled) {
+      pthread_mutex_lock(&g_jobs_mu);
+      j->state = JOB_DONE;
+      j->cur_step = j->total_steps > 0 ? j->total_steps : 1;
+      j->flow_cache_hits = r.dag_cache_hits;
+      j->flow_executed = r.dag_executed;
+      j->event_seq++;
+      snprintf(j->result_json, sizeof j->result_json,
+          "{\"ok\":true,\"executed\":%d,\"cache_hits\":%d,\"vram_evictions\":%d,\"gpu_ms\":%.2f,"
+          "\"image_url\":\"%s%s\",\"glb_url\":\"%s%s\",\"music_url\":\"%s%s\",\"mp4_url\":\"%s%s\","
+          "\"node_outputs\":%s}",
+          r.dag_executed, r.dag_cache_hits, r.dag_evictions, r.gpu_ms,
+          r.file_main[0] ? "/artifacts/" : "", r.file_main[0] ? basename_safe(r.file_main) : "",
+          r.file_aux[0]  ? "/artifacts/" : "", r.file_aux[0]  ? basename_safe(r.file_aux)  : "",
+          r.stem_files[0][0] ? "/artifacts/" : "", r.stem_files[0][0] ? basename_safe(r.stem_files[0]) : "",
+          r.file_mp4[0]  ? "/artifacts/" : "", r.file_mp4[0]  ? basename_safe(r.file_mp4)  : "",
+          (nouts && nouts[0] == '{') ? nouts : "{}");
+      pthread_cond_broadcast(&g_jobs_cv);
+      pthread_mutex_unlock(&g_jobs_mu);
+      free(nouts);
+      return NULL;
+    }
+    free(nouts);
   }
 
   pthread_mutex_lock(&g_jobs_mu);
   if (rc == 0 && r.cancelled) {
     j->state = JOB_CANCELLED;
+    j->event_seq++;
     snprintf(j->result_json, sizeof j->result_json, "{\"cancelled\":true}");
   } else if (rc == 0) {
     j->state = JOB_DONE;
     j->cur_step = j->total_steps > 0 ? j->total_steps : 1;
+    j->event_seq++;
     snprintf(j->result_json, sizeof j->result_json, "%s", out[0] ? out : "{}");
   } else {
     j->state = JOB_FAILED;
+    j->event_seq++;
     snprintf(j->result_json, sizeof j->result_json, "{\"error\":\"job failed\"}");
   }
   pthread_cond_broadcast(&g_jobs_cv);
@@ -348,9 +412,13 @@ static void format_job_json_locked(const ec_job_t *j, char *buf, size_t cap) {
   int pct = (j->state == JOB_DONE) ? 100 : (j->total_steps > 0 ? (j->cur_step * 100 / j->total_steps) : 0);
   snprintf(buf, cap,
       "{\"job_id\":%d,\"kind\":\"%s\",\"state\":\"%s\",\"stage\":\"%s\","
-      "\"step\":%d,\"total_steps\":%d,\"skipped\":%d,\"pct\":%d,\"result\":%s}",
+      "\"step\":%d,\"total_steps\":%d,\"skipped\":%d,\"pct\":%d,"
+      "\"node_id\":\"%s\",\"class_type\":\"%s\",\"node_status\":\"%s\",\"node_ms\":%.1f,"
+      "\"artifact_url\":\"%s\",\"cache_hits\":%d,\"executed\":%d,\"result\":%s}",
       j->id, j->kind, job_state_str(j->state), j->stage,
       j->cur_step, j->total_steps, j->skipped, pct,
+      j->node_id, j->node_class, j->node_status, j->node_ms,
+      j->node_artifact, j->flow_cache_hits, j->flow_executed,
       j->result_json[0] ? j->result_json : "null");
 }
 
@@ -363,9 +431,11 @@ static void stream_job_sse(int cfd, int job_id) {
       "Connection: close\r\n\r\n";
   send_all(cfd, hdr, strlen(hdr));
 
-  int last_step = -1;
+  int last_seq = -1;
   job_state_t last_state = (job_state_t)-1;
-  char payload[2560], frame[2700];
+  char *payload = (char *)malloc(36864);
+  char *frame   = (char *)malloc(37888);
+  if (!payload || !frame) { free(payload); free(frame); return; }
 
   while (!g_stop) {
     pthread_mutex_lock(&g_jobs_mu);
@@ -373,27 +443,30 @@ static void stream_job_sse(int cfd, int job_id) {
     if (!j) {
       pthread_mutex_unlock(&g_jobs_mu);
       send_all(cfd, "event: error\ndata: {\"error\":\"job not found\"}\n\n", 45);
+      free(payload); free(frame);
       return;
     }
-    while (j->cur_step == last_step && j->state == last_state &&
+    while (j->event_seq == last_seq && j->state == last_state &&
            (j->state == JOB_QUEUED || j->state == JOB_RUNNING) && !g_stop) {
       struct timespec ts;
       clock_gettime(CLOCK_REALTIME, &ts);
-      ts.tv_nsec += 200000000L;
+      ts.tv_nsec += 120000000L;
       if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
       pthread_cond_timedwait(&g_jobs_cv, &g_jobs_mu, &ts);
     }
-    last_step = j->cur_step;
+    last_seq = j->event_seq;
     last_state = j->state;
-    format_job_json_locked(j, payload, sizeof payload);
+    format_job_json_locked(j, payload, 36864);
     int done = (j->state == JOB_DONE || j->state == JOB_CANCELLED || j->state == JOB_FAILED);
     const char *ev = done ? (j->state == JOB_DONE ? "done" : job_state_str(j->state)) : "progress";
     pthread_mutex_unlock(&g_jobs_mu);
 
-    int fn = snprintf(frame, sizeof frame, "event: %s\ndata: %s\n\n", ev, payload);
+    int fn = snprintf(frame, 37888, "event: %s\ndata: %s\n\n", ev, payload);
     send_all(cfd, frame, (size_t)fn);
-    if (done) return;
+    if (done) break;
   }
+  free(payload);
+  free(frame);
 }
 
 // ===========================================================================
@@ -461,7 +534,7 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/health")) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v5\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v6\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
         "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
         "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,"
@@ -781,22 +854,70 @@ static void *client_thread(void *arg) {
           r.file_main, r.width, r.height, r.frames, r.gpu_ms, r.fps);
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"realtime burst failed\"}");
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/flows/object_info")) {
+    ec_studio_flow_object_info_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/flows/templates")) {
+    ec_studio_flow_templates_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/clear-cache")) {
+    ec_studio_flow_clear_cache(st);
+    send_json(cfd, 200, "{\"ok\":true,\"cache_cleared\":true}");
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/upload")) {
+    const char *ext = (body_len >= 3 && (uint8_t)body[0] == 0xFF && (uint8_t)body[1] == 0xD8) ? "jpg" : "png";
+    char fname[96] = {0};
+    if (ec_studio_flow_upload_image(st, (const uint8_t *)body, body_len, ext, fname, sizeof fname) == 0) {
+      snprintf(resp, 4096, "{\"ok\":true,\"name\":\"%s\",\"url\":\"/artifacts/%s\"}", fname, fname);
+      send_json(cfd, 200, resp);
+    } else {
+      send_json(cfd, 400, "{\"ok\":false,\"error\":\"invalid image upload\"}");
+    }
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/queue")) {
+    pthread_mutex_lock(&g_jobs_mu);
+    int slot = (g_next_job_id - 1) % EC_MAX_JOBS;
+    ec_job_t *j = &g_jobs[slot];
+    free(j->flow_json);
+    memset(j, 0, sizeof *j);
+    j->id = g_next_job_id++;
+    j->st = st;
+    j->state = JOB_QUEUED;
+    atomic_init(&j->cancel_req, 0);
+    snprintf(j->kind, sizeof j->kind, "flow");
+    snprintf(j->stage, sizeof j->stage, "queued");
+    j->flow_json = (char *)malloc(body_len + 1);
+    if (j->flow_json) { memcpy(j->flow_json, body, body_len); j->flow_json[body_len] = '\0'; }
+    int jid = j->id;
+    pthread_mutex_unlock(&g_jobs_mu);
+
+    pthread_t th;
+    pthread_create(&th, NULL, job_runner_thread, j);
+    pthread_detach(th);
+
+    snprintf(resp, 4096,
+        "{\"ok\":true,\"job_id\":%d,\"status_url\":\"/v1/jobs/%d\","
+        "\"events_url\":\"/v1/jobs/%d/events\",\"cancel_url\":\"/v1/jobs/%d/cancel\"}",
+        jid, jid, jid, jid);
+    send_json(cfd, 202, resp);
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/run")) {
     ec_studio_result_t r; char err[256] = {0};
-    if (ec_studio_run_flow_json(st, body, &r, err, sizeof err) == 0) {
-      snprintf(resp, 32768,
+    char *nouts = (char *)malloc(24576);
+    if (ec_studio_run_flow_ex(st, body, NULL, NULL, &r, nouts, 24576, err, sizeof err) == 0) {
+      snprintf(resp, RESP_CAP,
           "{\"ok\":true,\"executed\":%d,\"cache_hits\":%d,\"vram_evictions\":%d,"
-          "\"gpu_ms\":%.2f,\"image_url\":\"%s\",\"glb_url\":\"%s\",\"music_url\":\"%s\",\"mp4_url\":\"%s\"}",
+          "\"gpu_ms\":%.2f,\"image_url\":\"%s\",\"glb_url\":\"%s\",\"music_url\":\"%s\",\"mp4_url\":\"%s\","
+          "\"node_outputs\":%s}",
           r.dag_executed, r.dag_cache_hits, r.dag_evictions, r.gpu_ms,
           r.file_main[0] ? basename_safe(r.file_main) : "",
           r.file_aux[0]  ? basename_safe(r.file_aux)  : "",
           r.stem_files[0][0] ? basename_safe(r.stem_files[0]) : "",
-          r.file_mp4[0] ? basename_safe(r.file_mp4) : "");
+          r.file_mp4[0] ? basename_safe(r.file_mp4) : "",
+          (nouts && nouts[0] == '{') ? nouts : "{}");
       send_json(cfd, 200, resp);
     } else {
-      snprintf(resp, 32768, "{\"error\":\"%s\"}", err[0] ? err : "flow failed");
+      snprintf(resp, 4096, "{\"error\":\"%s\"}", err[0] ? err : "flow failed");
       send_json(cfd, 400, resp);
     }
+    free(nouts);
   } else {
     send_json(cfd, 404, "{\"error\":\"unknown route\"}");
   }

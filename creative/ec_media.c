@@ -333,6 +333,226 @@ int ec_export_png(const char *path, const uint8_t *rgb, uint32_t w, uint32_t h) 
   return rc;
 }
 
+static uint32_t rd_be32(const uint8_t *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+// Injects ComfyUI-compatible tEXt "prompt" (and optional "workflow") chunks right before IEND!
+// Works on ANY valid PNG (stored or compressed) with zero external libraries.
+int ec_png_inject_comfy_metadata(
+    const char *src_png, const char *dst_png, const char *prompt_json, const char *workflow_json) {
+  if (!src_png || !dst_png) return -1;
+  FILE *fi = fopen(src_png, "rb");
+  if (!fi) return -1;
+  fseek(fi, 0, SEEK_END);
+  long sz = ftell(fi);
+  if (sz < 24 || sz > 64 * 1024 * 1024) { fclose(fi); return -1; }
+  fseek(fi, 0, SEEK_SET);
+  uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+  if (!buf) { fclose(fi); return -1; }
+  if (fread(buf, 1, (size_t)sz, fi) != (size_t)sz) { free(buf); fclose(fi); return -1; }
+  fclose(fi);
+
+  static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+  if (memcmp(buf, sig, 8) != 0) { free(buf); return -1; }
+
+  // Find IEND chunk offset
+  size_t off = 8, iend_off = (size_t)sz;
+  while (off + 12 <= (size_t)sz) {
+    uint32_t clen = rd_be32(buf + off);
+    if (off + 12 + (size_t)clen > (size_t)sz) break;
+    if (memcmp(buf + off + 4, "IEND", 4) == 0) { iend_off = off; break; }
+    off += 12 + (size_t)clen;
+  }
+
+  FILE *fo = fopen(dst_png, "wb");
+  if (!fo) { free(buf); return -1; }
+  int rc = (fwrite(buf, 1, iend_off, fo) == iend_off) ? 0 : -1;
+
+  if (rc == 0 && prompt_json && prompt_json[0]) {
+    size_t plen = strlen(prompt_json);
+    size_t tlen = 7 + plen; // "prompt\0" + json
+    uint8_t *td = (uint8_t *)malloc(tlen);
+    if (td) {
+      memcpy(td, "prompt", 7);
+      memcpy(td + 7, prompt_json, plen);
+      rc = png_write_chunk(fo, "tEXt", td, (uint32_t)tlen);
+      free(td);
+    }
+  }
+  if (rc == 0 && workflow_json && workflow_json[0]) {
+    size_t wlen = strlen(workflow_json);
+    size_t tlen = 9 + wlen; // "workflow\0" + json
+    uint8_t *td = (uint8_t *)malloc(tlen);
+    if (td) {
+      memcpy(td, "workflow", 9);
+      memcpy(td + 9, workflow_json, wlen);
+      rc = png_write_chunk(fo, "tEXt", td, (uint32_t)tlen);
+      free(td);
+    }
+  }
+  if (rc == 0) rc = png_write_chunk(fo, "IEND", NULL, 0u);
+  fclose(fo);
+  free(buf);
+  return rc;
+}
+
+static uint8_t clamp_u8(float v) {
+  if (v <= 0.0f) return 0;
+  if (v >= 255.0f) return 255;
+  return (uint8_t)(v + 0.5f);
+}
+
+// Pure-C11 Native Photographic Post-Processing Node (decodes stored RGB PNGs from Eureka directly,
+// applies contrast, warmth, saturation, vignette, unsharp mask, grayscale, or invert, and writes PNG!)
+int ec_png_postprocess_grade(
+    const char *src_png, const char *dst_png,
+    float contrast, float warmth, float saturation, float vignette,
+    float sharpen, int grayscale, int invert) {
+  if (!src_png || !dst_png) return -1;
+  FILE *fi = fopen(src_png, "rb");
+  if (!fi) return -1;
+  fseek(fi, 0, SEEK_END);
+  long sz = ftell(fi);
+  if (sz < 32 || sz > 64 * 1024 * 1024) { fclose(fi); return -1; }
+  fseek(fi, 0, SEEK_SET);
+  uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+  if (!buf) { fclose(fi); return -1; }
+  if (fread(buf, 1, (size_t)sz, fi) != (size_t)sz) { free(buf); fclose(fi); return -1; }
+  fclose(fi);
+
+  static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+  if (memcmp(buf, sig, 8) != 0) { free(buf); return -1; }
+
+  uint32_t w = 0, h = 0;
+  uint8_t bit_depth = 0, color_type = 0;
+  uint8_t *idat = NULL;
+  size_t idat_len = 0, idat_cap = 0;
+
+  size_t off = 8;
+  while (off + 12 <= (size_t)sz) {
+    uint32_t clen = rd_be32(buf + off);
+    if (off + 12 + (size_t)clen > (size_t)sz) break;
+    const uint8_t *tag = buf + off + 4;
+    const uint8_t *cd  = buf + off + 8;
+    if (memcmp(tag, "IHDR", 4) == 0 && clen >= 13) {
+      w = rd_be32(cd);
+      h = rd_be32(cd + 4);
+      bit_depth = cd[8];
+      color_type = cd[9];
+    } else if (memcmp(tag, "IDAT", 4) == 0) {
+      if (idat_len + clen > idat_cap) {
+        idat_cap = (idat_len + clen) * 2 + 1024;
+        uint8_t *ni = (uint8_t *)realloc(idat, idat_cap);
+        if (!ni) { free(idat); free(buf); return -1; }
+        idat = ni;
+      }
+      memcpy(idat + idat_len, cd, clen);
+      idat_len += clen;
+    } else if (memcmp(tag, "IEND", 4) == 0) {
+      break;
+    }
+    off += 12 + (size_t)clen;
+  }
+  free(buf);
+
+  if (w == 0 || h == 0 || w > 4096 || h > 4096 || bit_depth != 8 || color_type != 2 || !idat || idat_len < 7) {
+    free(idat);
+    return -1;
+  }
+
+  // Unpack stored DEFLATE blocks (BTYPE=00) written by ec_export_png
+  const size_t row_bytes = (size_t)w * 3u + 1u;
+  const size_t expected = row_bytes * (size_t)h;
+  uint8_t *raw = (uint8_t *)malloc(expected);
+  if (!raw) { free(idat); return -1; }
+  size_t ip = 2, op = 0;
+  int stored_ok = 1;
+  while (ip + 5 <= idat_len && op < expected) {
+    uint8_t hdr_b = idat[ip++];
+    if ((hdr_b & 6u) != 0) { stored_ok = 0; break; } // compressed block not stored
+    uint16_t blen = (uint16_t)idat[ip] | ((uint16_t)idat[ip + 1] << 8);
+    ip += 4; // skip len + nlen
+    if (ip + blen > idat_len || op + blen > expected) { stored_ok = 0; break; }
+    memcpy(raw + op, idat + ip, blen);
+    ip += blen;
+    op += blen;
+    if (hdr_b & 1u) break;
+  }
+  free(idat);
+  if (!stored_ok || op != expected) { free(raw); return -1; }
+
+  uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3u);
+  uint8_t *out = (uint8_t *)malloc((size_t)w * h * 3u);
+  if (!rgb || !out) { free(raw); free(rgb); free(out); return -1; }
+  for (uint32_t y = 0; y < h; y++) {
+    memcpy(rgb + (size_t)y * w * 3u, raw + (size_t)y * row_bytes + 1u, (size_t)w * 3u);
+  }
+  free(raw);
+
+  // Optional 3x3 unsharp mask pass first
+  if (sharpen > 0.01f) {
+    for (uint32_t y = 0; y < h; y++) {
+      for (uint32_t x = 0; x < w; x++) {
+        uint32_t ym = y > 0 ? y - 1 : 0, yp = y + 1 < h ? y + 1 : h - 1;
+        uint32_t xm = x > 0 ? x - 1 : 0, xp = x + 1 < w ? x + 1 : w - 1;
+        for (int c = 0; c < 3; c++) {
+          float ctr = rgb[(y * w + x) * 3u + c];
+          float avg = 0.25f * (rgb[(ym * w + x) * 3u + c] + rgb[(yp * w + x) * 3u + c] +
+                               rgb[(y * w + xm) * 3u + c] + rgb[(y * w + xp) * 3u + c]);
+          out[(y * w + x) * 3u + c] = clamp_u8(ctr + sharpen * (ctr - avg));
+        }
+      }
+    }
+    memcpy(rgb, out, (size_t)w * h * 3u);
+  }
+
+  // Per-pixel color grade: contrast, warmth, saturation, vignette, grayscale, invert
+  const float inv_w = 1.0f / (float)w, inv_h = 1.0f / (float)h;
+  for (uint32_t y = 0; y < h; y++) {
+    float dy = ((float)y + 0.5f) * inv_h * 2.0f - 1.0f;
+    for (uint32_t x = 0; x < w; x++) {
+      float dx = ((float)x + 0.5f) * inv_w * 2.0f - 1.0f;
+      float r2 = dx * dx + dy * dy;
+      float vig = vignette > 0.001f ? fmaxf(0.15f, 1.0f - vignette * 0.45f * r2) : 1.0f;
+      size_t idx = ((size_t)y * w + x) * 3u;
+      float r = (float)rgb[idx + 0];
+      float g = (float)rgb[idx + 1];
+      float b = (float)rgb[idx + 2];
+
+      // Contrast around mid-gray 127.5
+      r = (r - 127.5f) * contrast + 127.5f;
+      g = (g - 127.5f) * contrast + 127.5f;
+      b = (b - 127.5f) * contrast + 127.5f;
+
+      // Warmth shift
+      r += warmth * 26.0f;
+      g += warmth * 6.0f;
+      b -= warmth * 24.0f;
+
+      // Saturation / Grayscale
+      float luma = 0.299f * r + 0.587f * g + 0.114f * b;
+      float sat = grayscale ? 0.0f : saturation;
+      r = luma + (r - luma) * sat;
+      g = luma + (g - luma) * sat;
+      b = luma + (b - luma) * sat;
+
+      // Vignette
+      r *= vig; g *= vig; b *= vig;
+
+      if (invert) { r = 255.0f - r; g = 255.0f - g; b = 255.0f - b; }
+      out[idx + 0] = clamp_u8(r);
+      out[idx + 1] = clamp_u8(g);
+      out[idx + 2] = clamp_u8(b);
+    }
+  }
+
+  int rc = ec_export_png(dst_png, out, w, h);
+  free(rgb);
+  free(out);
+  return rc;
+}
+
 // ===========================================================================
 // 4b. Native O-Voxel Surface Mesh & 3D Gaussian Splat Builders (TRELLIS.2)
 // ===========================================================================

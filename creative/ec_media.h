@@ -21,9 +21,14 @@ int ec_export_splat_ply(const char *path, const ec_splat3d_t *splat);
 // 3. Native 16-bit PCM Stereo/Mono WAV Music & Stems Exporter
 int ec_export_wav(const char *path, const ec_audio_t *audio);
 
-// 4. Native Image Exporters (PPM + Zero-Dependency Real PNG!)
+// 4. Native Image Exporters (PPM + Zero-Dependency Real PNG + ComfyUI tEXt Metadata & Post-FX!)
 int ec_export_ppm(const char *path, const uint8_t *rgb, uint32_t width, uint32_t height);
 int ec_export_png(const char *path, const uint8_t *rgb, uint32_t width, uint32_t height);
+int ec_png_inject_comfy_metadata(const char *src_png, const char *dst_png, const char *prompt_json, const char *workflow_json);
+int ec_png_postprocess_grade(
+    const char *src_png, const char *dst_png,
+    float contrast, float warmth, float saturation, float vignette,
+    float sharpen, int grayscale, int invert);
 
 // 4b. Native O-Voxel Iso-Surface Mesh & Gaussian Splat Builders (from GPU sparse coords/feats)
 int ec_ovoxel_build_mesh(

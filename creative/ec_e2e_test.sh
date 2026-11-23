@@ -447,8 +447,65 @@ check("E2E.16 ComfyUI Importer v2 (Subgraph+4-Modality)",
       imp_v2_ok,
       f"sg_flux2=OK wan_pos_vs_neg=OK(121f) ace_audio=OK(118bpm,90s,alias) trellis_3d=OK(alias)")
 
+# 17. Sprint 3 ComfyUI-Level Node Graph Studio: ObjectInfo + Templates + Upload + Queue SSE + Post-FX Merkle Cache + PNG tEXt Roundtrip!
+_, oi_b = req("GET", "/v1/flows/object_info")
+oi = json.loads(oi_b)
+_, tpl_b = req("GET", "/v1/flows/templates")
+tpls = json.loads(tpl_b)["templates"]
+
+# Test LoadImage binary upload endpoint
+req_up = urllib.request.Request(base + "/v1/flows/upload", data=png_payload, method="POST",
+                                headers={"Content-Type": "image/png", "X-Api-Key": api_key})
+with urllib.request.urlopen(req_up, timeout=15) as resp_up:
+    up_r = json.loads(resp_up.read())
+
+req("POST", "/v1/flows/clear-cache", {})
+
+# Run the real 8-node FLUX.2-klein-4B + Film Color Grade + SaveImage template via /v1/flows/queue + SSE!
+wf_flux = json.loads(json.dumps(tpls[0]["workflow"]))
+_, q1_b = req("POST", "/v1/flows/queue", wf_flux)
+q1 = json.loads(q1_b)
+_, sse1_b = req("GET", q1["events_url"], timeout=120)
+sse1_txt = sse1_b.decode("utf-8", "replace")
+ev1_lines = [json.loads(l[5:].strip()) for l in sse1_txt.splitlines() if l.startswith("data:")]
+fin1 = ev1_lines[-1]["result"]
+_, saved_png1 = req("GET", fin1["image_url"])
+open(os.path.join(art_dir, "proof_comfy_flow_grade1.png"), "wb").write(saved_png1)
+
+# Verify PNG tEXt ComfyUI metadata roundtrip! (Drop Eureka-generated PNG right back into /v1/flows/import!)
+req_rt = urllib.request.Request(base + "/v1/flows/import", data=saved_png1, method="POST",
+                                headers={"Content-Type": "image/png", "X-Api-Key": api_key})
+with urllib.request.urlopen(req_rt, timeout=15) as resp_rt:
+    rt_r = json.loads(resp_rt.read())
+
+# Now tweak ONLY downstream ImageColorGrade.contrast (1.08 -> 1.42) and re-queue!
+# Expect 6 upstream nodes (including FLUX.2 KSampler!) to hit compiled Merkle cache in 0 ms!
+wf_flux2 = json.loads(json.dumps(wf_flux))
+wf_flux2["7"]["inputs"]["contrast"] = 1.42
+wf_flux2["7"]["inputs"]["warmth"] = -0.25
+t_mk0 = time.time()
+_, q2_b = req("POST", "/v1/flows/queue", wf_flux2)
+q2 = json.loads(q2_b)
+_, sse2_b = req("GET", q2["events_url"], timeout=30)
+t_mk_ms = (time.time() - t_mk0) * 1000.0
+ev2_lines = [json.loads(l[5:].strip()) for l in sse2_b.decode("utf-8", "replace").splitlines() if l.startswith("data:")]
+fin2 = ev2_lines[-1]["result"]
+_, saved_png2 = req("GET", fin2["image_url"])
+open(os.path.join(art_dir, "proof_comfy_flow_grade2.png"), "wb").write(saved_png2)
+
+flow_v6_ok = (
+    len(oi) >= 24 and "KSampler" in oi and "ImageColorGrade" in oi and "TRELLIS2ImageTo3D" in oi
+    and len(tpls) >= 5 and up_r["ok"] and up_r["url"].startswith("/artifacts/upload_")
+    and fin1["ok"] and fin1["executed"] == 8 and fin1["cache_hits"] == 0 and len(saved_png1) > 50000
+    and rt_r["ok"] and rt_r["source_format"] == "comfy_api" and rt_r["node_count"] == 8
+    and fin2["ok"] and fin2["cache_hits"] == 6 and fin2["executed"] == 2 and saved_png1 != saved_png2
+)
+check("E2E.17 ComfyUI Node Graph (SSE+Merkle+PNG tEXt)",
+      flow_v6_ok,
+      f"nodes_schema={len(oi)} tpls={len(tpls)} cold={fin1['executed']}/8 warm_tweak=hits:{fin2['cache_hits']}+exec:{fin2['executed']}({t_mk_ms:.0f}ms!) png_roundtrip=OK(8n)")
+
 print("===========================================================================")
-print(f"E2E v5 VERDICT: {'ALL 16 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
+print(f"E2E v6 VERDICT: {'ALL 17 PRODUCTION E2E TESTS PASS' if fails == 0 else f'FAILED ({fails})'}")
 print("===========================================================================")
 sys.exit(0 if fails == 0 else 1)
 PY
