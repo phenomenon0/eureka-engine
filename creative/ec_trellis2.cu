@@ -1466,6 +1466,14 @@ extern "C" int ec_trellis2_is_ready(const ec_trellis2_t *tr) {
   return (tr && tr->dino_open && tr->flow_open && tr->dec_open) ? 1 : 0;
 }
 
+// Average BF16 DINOv3 patch features across multiple camera views in F32
+__global__ void k_tr_accum_bf16_f32(float *acc_f32, const uint16_t *src_bf16, long n, float weight) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float v = __uint_as_float(((uint32_t)src_bf16[i]) << 16);
+  acc_f32[i] += v * weight;
+}
+
 extern "C" int ec_trellis2_generate_3d(
     ec_trellis2_t *tr,
     const ec_trellis2_req_t *req,
@@ -1506,7 +1514,7 @@ extern "C" int ec_trellis2_generate_3d(
     }
   }
 
-  // Stage 1: DINOv3-ViT-L/16 Conditioning Features [1029, 1024]
+  // Stage 1: DINOv3-ViT-L/16 Conditioning Features [1029, 1024] (single OR multi-view average!)
   if (cb) cb(0, steps + 3, "trellis2_dinov3_encode", cb_ctx);
   uint16_t *cond_bf16_d = NULL;
   cudaMalloc(&cond_bf16_d, 1029L * 1024L * 2);
@@ -1514,6 +1522,33 @@ extern "C" int ec_trellis2_generate_3d(
     cudaFree(cond_bf16_d);
     snprintf(res->error, sizeof res->error, "dinov3 vision encoder failed");
     return -1;
+  }
+  int n_extra = req->n_extra_views;
+  if (n_extra > 3) n_extra = 3;
+  int valid_extra = 0;
+  for (int vi = 0; vi < n_extra; vi++) {
+    if (req->extra_rgbs[vi] && req->extra_w[vi] > 0 && req->extra_h[vi] > 0) valid_extra++;
+  }
+  if (valid_extra > 0) {
+    const long N_FEAT = 1029L * 1024L;
+    float *acc_d = NULL;
+    uint16_t *tmp_d = NULL;
+    cudaMalloc(&acc_d, N_FEAT * 4);
+    cudaMalloc(&tmp_d, N_FEAT * 2);
+    cudaMemsetAsync(acc_d, 0, N_FEAT * 4, tr->stream);
+    float w_view = 1.0f / (float)(1 + valid_extra);
+    k_tr_accum_bf16_f32<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, cond_bf16_d, N_FEAT, w_view);
+    for (int vi = 0; vi < n_extra; vi++) {
+      if (!req->extra_rgbs[vi] || req->extra_w[vi] <= 0 || req->extra_h[vi] <= 0) continue;
+      double vms = 0.0;
+      if (run_dinov3_vitl16(tr, req->extra_rgbs[vi], req->extra_w[vi], req->extra_h[vi], tmp_d, &vms) == 0) {
+        res->dino_ms += vms;
+        k_tr_accum_bf16_f32<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, tmp_d, N_FEAT, w_view);
+      }
+    }
+    k_tr_f32_to_bf16<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, cond_bf16_d, N_FEAT);
+    cudaStreamSynchronize(tr->stream);
+    cudaFree(acc_d); cudaFree(tmp_d);
   }
 
   // Stage 2: 30-Block SparseStructureFlowModel 1.3B BF16 (12-step Flow Euler CFG)

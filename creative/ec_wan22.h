@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "ec_lora.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -23,16 +24,27 @@ typedef struct {
 } ec_wan22_paths_t;
 
 typedef struct {
-  const char *prompt;
-  const char *neg_prompt;  // optional (NULL -> default clean negative prompt)
-  uint32_t    seed;
-  int         width;       // multiple of 32, min 640 (default 832 for native 480p)
-  int         height;      // multiple of 32, min 384 (default 480 for native 480p)
-  int         num_frames;  // 4*k + 1 (e.g. 5, 9, 17, 21, 25, 33; default 17)
-  int         fps;         // default 16
-  int         steps;       // default 24 (4..50)
-  float       cfg_scale;   // default 5.0
-  float       shift;       // 0 -> auto (3.0 for <=480p, 5.0 for 720p)
+  const char           *prompt;
+  const char           *neg_prompt;    // optional (NULL -> default clean negative prompt)
+  uint32_t              seed;
+  int                   width;         // multiple of 32, min 320 (default 832 for native 480p)
+  int                   height;        // multiple of 32, min 320 (default 480 for native 480p)
+  int                   num_frames;    // 4*k + 1 (e.g. 5, 9, 17, 21, 25, 33; default 17)
+  int                   fps;           // default 16
+  int                   steps;         // default 20 (4..50)
+  float                 cfg_scale;     // default 5.0
+  float                 shift;         // 0 -> auto (3.0 for <=480p, 5.0 for 720p)
+  // v8 Native Start-Frame I2V, Start+End FLF2V, Seamless Loop, Camera Motion & LoRA/QLoRA Stack
+  const uint8_t        *start_rgb;     // optional RGB24 start frame [start_h * start_w * 3]
+  int                   start_w;
+  int                   start_h;
+  const uint8_t        *end_rgb;       // optional RGB24 end frame [end_h * end_w * 3] (FLF2V!)
+  int                   end_w;
+  int                   end_h;
+  float                 denoise;       // 0.1..1.0 (default 1.0)
+  const char           *camera_motion; // optional: "orbit"|"dolly_in"|"pan_left"|"pan_right"|"crane_up"|"fpv"|"static"
+  const ec_lora_spec_t *loras;
+  int                   n_loras;
 } ec_wan22_req_t;
 
 typedef struct {
@@ -69,6 +81,11 @@ int ec_wan22_generate_mp4(
     const char *audio_wav_path,   // optional synced audio track to mux into MP4
     ec_wan22_progress_fn cb, void *cb_ctx,
     ec_wan22_res_t *res);
+
+// Native Wan2.2 Causal 3D VAE single-frame RGB -> normalized [H/16, W/16, 48] latent helper (for G-C7!)
+int ec_wan22_vae_encode_image(
+    ec_wan22_t *w, const uint8_t *rgb, int width, int height,
+    float **out_latent_h, int *out_h_lat, int *out_w_lat, double *out_ms);
 
 #ifdef __cplusplus
 }

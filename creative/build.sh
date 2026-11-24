@@ -16,7 +16,7 @@ GENC=(-gencode arch=compute_80,code=sm_80
       -gencode arch=compute_90,code=sm_90
       -gencode arch=compute_120,code=[sm_120,compute_120])
 
-echo "=== Building 100% Native Eureka Creative Engine v7 (Unified ec_ops + Cowrie v2 SHA-NI + FLUX.2 + ACE-Step 1.5 + TRELLIS.2 + Wan 2.2) in $OUT ==="
+echo "=== Building 100% Native Eureka Creative Engine v8 (Multimodal VAE Encoders + Universal QLoRA + 8-Stem + Cowrie v2 SHA-NI) in $OUT ==="
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_safetensors.c" -o "$OUT/obj/ec_safetensors.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_cowrie.c"      -o "$OUT/obj/ec_cowrie.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_flow.c"        -o "$OUT/obj/ec_flow.o"

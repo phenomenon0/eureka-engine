@@ -26,13 +26,22 @@ typedef struct {
 
 typedef struct {
   const char           *prompt;
+  const char           *neg_prompt;          // optional negative prompt (used when cfg_scale > 1.05)
   uint32_t              seed;
-  int                   width;         // multiple of 16 (e.g. 512, 768, 1024)
-  int                   height;        // multiple of 16 (e.g. 512, 768, 1024)
-  int                   steps;         // 4 default for FLUX.2-klein-4B distilled (1..50)
+  int                   width;               // multiple of 16 (e.g. 512, 768, 1024)
+  int                   height;              // multiple of 16 (e.g. 512, 768, 1024)
+  int                   steps;               // 4 default for FLUX.2-klein-4B distilled (1..50)
+  float                 cfg_scale;           // 1.0 default (distilled); >1.05 runs pos/neg CFG
   const char           *checkpoint_override; // optional finetune checkpoint path
   const ec_lora_spec_t *loras;
   int                   n_loras;
+  // v8 Native Multimodal Image Inputs (VAE Encode -> Img2Img / Inpaint / Outpaint / 2x Tile Upscale)
+  const uint8_t        *init_rgb;            // optional RGB24 input image [init_h * init_w * 3]
+  int                   init_w;
+  int                   init_h;
+  const float          *mask_gray;           // optional [init_h * init_w] float mask (1=repaint, 0=keep)
+  float                 denoise;             // 0.05..1.0 (default 1.0 for txt2img, 0.72 for img2img)
+  int                   tile_upscale;        // 1 -> run 2x overlapping tiled latent detail upscale
 } ec_flux2_req_t;
 
 typedef struct {
@@ -74,6 +83,11 @@ int ec_flux2_generate_rgb(
     const char *out_png_path,
     ec_flux2_progress_fn cb, void *cb_ctx,
     ec_flux2_res_t *res);
+
+// Native AutoencoderKLFlux2 2D VAE Encode -> Decode roundtrip helper (for G-C7 verification!)
+int ec_flux2_vae_roundtrip_rgb(
+    ec_flux2_t *fx, const uint8_t *in_rgb, int width, int height,
+    uint8_t *out_rgb, double *enc_ms, double *dec_ms);
 
 #ifdef __cplusplus
 }

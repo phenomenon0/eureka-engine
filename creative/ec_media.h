@@ -18,12 +18,27 @@ int ec_export_glb(const char *path, const ec_mesh_t *mesh);
 // 2. Native 3D Gaussian Splat (.ply) Exporter
 int ec_export_splat_ply(const char *path, const ec_splat3d_t *splat);
 
-// 3. Native 16-bit PCM Stereo/Mono WAV Music & Stems Exporter
+// 3. Native 16-bit PCM Stereo/Mono WAV Exporter, Loader & Multi-Stem Splitter (0/2/4/8 Stems)
 int ec_export_wav(const char *path, const ec_audio_t *audio);
+int ec_load_wav_stereo_f32(const char *path, int target_sr, float **out_pcm_lr, int *out_samples);
+// Splits stereo PCM into 0 (full mix), 2 (vocals/instrumental), 4 (drums/bass/harmony/lead),
+// or 8 (drums/bass/vocals/guitar/piano/synth/strings/fx) complementary stems summing to master!
+int ec_audio_split_stems(
+    const float *pcm_lr, int n_samples, int sr, int stem_mode,
+    const char *dir_prefix, char out_paths[8][256], char out_names[8][24], int *out_n_stems);
 
-// 4. Native Image Exporters (PPM + Zero-Dependency Real PNG + ComfyUI tEXt Metadata & Post-FX!)
+// 4. Native Image Exporters, Universal Loaders (PNG/JPG/PPM), Resizer, Mask & Outpaint Pad
 int ec_export_ppm(const char *path, const uint8_t *rgb, uint32_t width, uint32_t height);
 int ec_export_png(const char *path, const uint8_t *rgb, uint32_t width, uint32_t height);
+int ec_load_image_rgb(const char *path, uint8_t **out_rgb, int *out_w, int *out_h);
+uint8_t *ec_rgb_resize_bilinear(const uint8_t *src, int sw, int sh, int dw, int dh);
+int ec_load_mask_gray(const char *path, int target_w, int target_h, float **out_mask);
+int ec_rgb_pad_outpaint(
+    const uint8_t *src, int sw, int sh,
+    int pad_left, int pad_top, int pad_right, int pad_bottom,
+    int target_w, int target_h,
+    uint8_t **out_rgb, float **out_mask);
+void ec_rgb_isolate_foreground(uint8_t *rgb, int w, int h);
 int ec_png_inject_comfy_metadata(const char *src_png, const char *dst_png, const char *prompt_json, const char *workflow_json);
 int ec_png_postprocess_grade(
     const char *src_png, const char *dst_png,

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "ec_lora.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -24,13 +25,26 @@ typedef struct {
 } ec_acestep_paths_t;
 
 typedef struct {
-  const char *prompt;        // musical caption / style description
-  const char *lyrics;        // optional lyrics (NULL or "" -> "[Instrumental]")
-  uint32_t    seed;
-  int         bpm;           // 40..240 (default 120)
-  float       duration_sec;  // 4.0..60.0 (default 10.0)
-  int         steps;         // 1..8 (default 8 for Turbo Shift=3.0 ODE)
-  float       shift;         // 1.0, 2.0, or 3.0 (default 3.0)
+  const char           *prompt;           // musical caption / style description
+  const char           *lyrics;           // optional lyrics (NULL or "" -> "[Instrumental]")
+  uint32_t              seed;
+  int                   bpm;              // 40..240 (default 120)
+  float                 duration_sec;     // 4.0..120.0 (default 10.0)
+  int                   steps;            // 1..8 (default 8 for Turbo Shift=3.0 ODE)
+  float                 shift;            // 1.0, 2.0, or 3.0 (default 3.0)
+  // v8 Native Audio-to-Audio, Repaint [t0..t1], Extend (up to 120s), Musical Controls, Flexible Stems & LoRA/LoKr
+  const char           *key_scale;        // e.g. "D minor", "C major", "F# minor" (NULL -> "N/A")
+  const char           *time_sig;         // e.g. "4", "3", "6" (NULL -> "4")
+  const char           *vocal_mode;       // "auto"|"instrumental"|"female"|"male"|"duet"|"choir"|"rap"
+  const char           *audio_mode;       // "generate"|"cover"|"repaint"|"extend"
+  const float          *source_pcm_lr;    // optional 48kHz stereo interleaved F32 source audio
+  int                   source_samples;   // per channel sample count of source_pcm_lr
+  float                 denoise;          // 0.1..1.0 for Cover / Style Transfer (default 0.65)
+  float                 repaint_start_sec;// Repaint window start (sec)
+  float                 repaint_end_sec;  // Repaint window end (sec)
+  int                   stem_mode;        // 0=full_mix, 2=vocals/inst, 4=4stem, 8=8stem (default 4)
+  const ec_lora_spec_t *loras;
+  int                   n_loras;
 } ec_acestep_req_t;
 
 typedef struct {
@@ -40,6 +54,10 @@ typedef struct {
   int    num_samples;       // per channel
   int    latent_frames;     // T @ 25 Hz
   int    steps_run;
+  int    lora_tensors_fused;
+  int    n_stems;
+  char   stem_paths[8][256];
+  char   stem_names[8][24];
   float  peak_amp;
   float  rms_db;
   double text_enc_ms;
@@ -59,9 +77,8 @@ int           ec_acestep_is_ready(const ec_acestep_t *as);
 // Releases resident GPU weights (keeps lightweight mmap & tokenizer open) to share VRAM across engines.
 void ec_acestep_unload_vram(ec_acestep_t *as);
 
-// Generates 48 kHz Stereo WAV to out_wav_path, plus optional 4 mixer stems (drums/bass/harmony/lead)
-// if stem_paths != NULL (array of 4 path strings, any entry may be NULL/empty to skip).
-// Also optionally writes stereo interleaved float samples into out_pcm_lr (caller frees) if non-NULL.
+// Generates 48 kHz Stereo WAV to out_wav_path, plus flexible stems (0 / 2 / 4 / 8 based on req->stem_mode
+// or legacy stem_paths[4]). Optionally writes stereo interleaved float samples into out_pcm_lr.
 int ec_acestep_generate_wav(
     ec_acestep_t *as,
     const ec_acestep_req_t *req,
@@ -70,6 +87,11 @@ int ec_acestep_generate_wav(
     float **out_pcm_lr,
     ec_acestep_progress_fn cb, void *cb_ctx,
     ec_acestep_res_t *res);
+
+// Native Oobleck 1D Stereo Audio VAE Encoder (48 kHz stereo PCM -> [T, 64] GPU latent, exposed for G-C7 verification!)
+int ec_acestep_encode_pcm(
+    ec_acestep_t *as, const float *pcm_lr, int n_samples,
+    float **out_latent_h, int *out_T, double *out_ms);
 
 #ifdef __cplusplus
 }

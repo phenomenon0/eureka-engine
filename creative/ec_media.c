@@ -2,6 +2,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "ec_media.h"
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <float.h>
 #include <math.h>
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // Slice-by-8 IEEE 802.3 CRC32 (100% self-contained, ~15x faster than bit-loop -> 1+ GB/s!)
@@ -240,6 +242,276 @@ int ec_export_wav(const char *path, const ec_audio_t *a) {
 }
 
 // ===========================================================================
+// 3b. Native WAV Loader (PCM16 / PCM24 / IEEE F32 + Resampler + ffmpeg fallback)
+//     & Exact Complementary Multi-Stem Separator (0 / 2 / 4 / 8 Stems)
+// ===========================================================================
+static uint16_t rd_le16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static uint32_t rd_le32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int load_audio_via_ffmpeg(const char *path, int target_sr, float **out_pcm_lr, int *out_samples) {
+  int pipefd[2];
+  if (pipe(pipefd) != 0) return -1;
+  pid_t pid = fork();
+  if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
+  if (pid == 0) {
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+    close(pipefd[1]);
+    char sr_s[16];
+    snprintf(sr_s, sizeof sr_s, "%d", target_sr);
+    execlp("ffmpeg", "ffmpeg", "-v", "error", "-i", path,
+           "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "2", "-ar", sr_s, "-", (char *)NULL);
+    _exit(127);
+  }
+  close(pipefd[1]);
+  size_t cap = (size_t)target_sr * 2u * sizeof(float) * 8u;
+  uint8_t *buf = (uint8_t *)malloc(cap);
+  size_t got = 0;
+  if (buf) {
+    for (;;) {
+      if (got + 65536 > cap) {
+        if (cap >= 128u * 1024u * 1024u) break;
+        cap *= 2;
+        uint8_t *nb = (uint8_t *)realloc(buf, cap);
+        if (!nb) { free(buf); buf = NULL; break; }
+        buf = nb;
+      }
+      ssize_t r = read(pipefd[0], buf + got, cap - got);
+      if (r <= 0) break;
+      got += (size_t)r;
+    }
+  }
+  close(pipefd[0]);
+  int st = 0;
+  waitpid(pid, &st, 0);
+  size_t n_frames = got / (2u * sizeof(float));
+  if (!buf || n_frames == 0) { free(buf); return -1; }
+  *out_pcm_lr = (float *)buf;
+  *out_samples = (int)n_frames;
+  return 0;
+}
+
+int ec_load_wav_stereo_f32(const char *path, int target_sr, float **out_pcm_lr, int *out_samples) {
+  if (!path || !out_pcm_lr || !out_samples) return -1;
+  *out_pcm_lr = NULL;
+  *out_samples = 0;
+  if (target_sr <= 0) target_sr = 48000;
+
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz < 44 || sz > 256L * 1024L * 1024L) { fclose(f); return load_audio_via_ffmpeg(path, target_sr, out_pcm_lr, out_samples); }
+  uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+  if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return -1; }
+  fclose(f);
+
+  if (memcmp(buf, "RIFF", 4) != 0 || memcmp(buf + 8, "WAVE", 4) != 0) {
+    free(buf);
+    return load_audio_via_ffmpeg(path, target_sr, out_pcm_lr, out_samples);
+  }
+
+  uint16_t audio_fmt = 0, ch = 0, bits = 0;
+  uint32_t sr = 0;
+  const uint8_t *data_ptr = NULL;
+  uint32_t data_len = 0;
+  size_t off = 12;
+  while (off + 8 <= (size_t)sz) {
+    uint32_t clen = rd_le32(buf + off + 4);
+    if (off + 8 + (size_t)clen > (size_t)sz) break;
+    if (memcmp(buf + off, "fmt ", 4) == 0 && clen >= 16) {
+      audio_fmt = rd_le16(buf + off + 8);
+      ch        = rd_le16(buf + off + 10);
+      sr        = rd_le32(buf + off + 12);
+      bits      = rd_le16(buf + off + 22);
+    } else if (memcmp(buf + off, "data", 4) == 0) {
+      data_ptr = buf + off + 8;
+      data_len = clen;
+    }
+    off += 8 + (size_t)clen + (clen & 1u);
+  }
+  if (!data_ptr || !data_len || ch < 1 || ch > 2 || sr < 8000 || sr > 192000 ||
+      !((audio_fmt == 1 && (bits == 16 || bits == 24)) || (audio_fmt == 3 && bits == 32))) {
+    free(buf);
+    return load_audio_via_ffmpeg(path, target_sr, out_pcm_lr, out_samples);
+  }
+
+  uint32_t bps = bits / 8u;
+  uint32_t n_in = data_len / (ch * bps);
+  if (n_in == 0) { free(buf); return -1; }
+  float *src_lr = (float *)malloc((size_t)n_in * 2u * sizeof(float));
+  if (!src_lr) { free(buf); return -1; }
+  for (uint32_t i = 0; i < n_in; i++) {
+    float lr[2] = { 0.0f, 0.0f };
+    for (uint16_t c = 0; c < ch; c++) {
+      const uint8_t *p = data_ptr + ((size_t)i * ch + c) * bps;
+      if (audio_fmt == 1 && bits == 16) {
+        int16_t v = (int16_t)rd_le16(p);
+        lr[c] = (float)v / 32768.0f;
+      } else if (audio_fmt == 1 && bits == 24) {
+        int32_t v = ((int32_t)p[0]) | ((int32_t)p[1] << 8) | ((int32_t)(int8_t)p[2] << 16);
+        lr[c] = (float)v / 8388608.0f;
+      } else {
+        float v = 0.0f;
+        memcpy(&v, p, 4);
+        lr[c] = v;
+      }
+    }
+    if (ch == 1) lr[1] = lr[0];
+    src_lr[2 * i + 0] = lr[0];
+    src_lr[2 * i + 1] = lr[1];
+  }
+  free(buf);
+
+  if ((int)sr == target_sr) {
+    *out_pcm_lr = src_lr;
+    *out_samples = (int)n_in;
+    return 0;
+  }
+
+  int n_out = (int)llround((double)n_in * (double)target_sr / (double)sr);
+  if (n_out < 1) n_out = 1;
+  float *dst_lr = (float *)malloc((size_t)n_out * 2u * sizeof(float));
+  if (!dst_lr) { free(src_lr); return -1; }
+  double step = (double)sr / (double)target_sr;
+  for (int i = 0; i < n_out; i++) {
+    double pos = (double)i * step;
+    int i0 = (int)pos;
+    if (i0 >= (int)n_in - 1) i0 = (int)n_in - 1;
+    int i1 = (i0 + 1 < (int)n_in) ? (i0 + 1) : i0;
+    float frac = (float)(pos - (double)i0);
+    dst_lr[2 * i + 0] = src_lr[2 * i0 + 0] * (1.0f - frac) + src_lr[2 * i1 + 0] * frac;
+    dst_lr[2 * i + 1] = src_lr[2 * i0 + 1] * (1.0f - frac) + src_lr[2 * i1 + 1] * frac;
+  }
+  free(src_lr);
+  *out_pcm_lr = dst_lr;
+  *out_samples = n_out;
+  return 0;
+}
+
+int ec_audio_split_stems(
+    const float *pcm_lr, int n_samples, int sr, int stem_mode,
+    const char *dir_prefix, char out_paths[8][256], char out_names[8][24], int *out_n_stems) {
+  if (out_n_stems) *out_n_stems = 0;
+  if (!pcm_lr || n_samples <= 0 || sr <= 0) return -1;
+  if (stem_mode == 0) return 0;
+  if (stem_mode != 2 && stem_mode != 4 && stem_mode != 8) stem_mode = 4;
+
+  static const char *N2[2] = { "vocals", "instrumental" };
+  static const char *N4[4] = { "drums", "bass", "harmony", "lead" };
+  static const char *N8[8] = { "drums", "bass", "vocals", "guitar", "piano", "synth", "strings", "fx" };
+  const char *const *names = (stem_mode == 2) ? N2 : ((stem_mode == 8) ? N8 : N4);
+
+  float *stems[8] = {0};
+  for (int i = 0; i < stem_mode; i++) {
+    stems[i] = (float *)malloc((size_t)n_samples * 2u * sizeof(float));
+    if (!stems[i]) {
+      for (int j = 0; j < i; j++) free(stems[j]);
+      return -1;
+    }
+  }
+
+  const float two_pi = 6.283185307f;
+  const float a_sub  = 1.0f - expf(-two_pi * 160.0f  / (float)sr);
+  const float a_low  = 1.0f - expf(-two_pi * 320.0f  / (float)sr);
+  const float a_mid1 = 1.0f - expf(-two_pi * 900.0f  / (float)sr);
+  const float a_mid2 = 1.0f - expf(-two_pi * 2400.0f / (float)sr);
+  const float a_hi   = 1.0f - expf(-two_pi * 4800.0f / (float)sr);
+  const float a_air  = 1.0f - expf(-two_pi * 7500.0f / (float)sr);
+  const float a_fast = 1.0f - expf(-1.0f / ((float)sr * 0.004f));
+  const float a_slow = 1.0f - expf(-1.0f / ((float)sr * 0.055f));
+
+  float lp_sub[2] = {0}, lp_low[2] = {0}, lp_m1[2] = {0}, lp_m2[2] = {0}, lp_hi[2] = {0}, lp_air[2] = {0};
+  float env_fast = 1e-5f, env_slow = 1e-5f;
+
+  for (int n = 0; n < n_samples; n++) {
+    float xL = pcm_lr[(long)n * 2 + 0];
+    float xR = pcm_lr[(long)n * 2 + 1];
+    float abs_m = 0.5f * (fabsf(xL) + fabsf(xR));
+    env_fast += a_fast * (abs_m - env_fast);
+    env_slow += a_slow * (abs_m - env_slow);
+    float ratio = (env_fast > env_slow) ? ((env_fast - env_slow) / (env_fast + 1e-5f)) : 0.0f;
+    float t_w = ratio * 0.85f;
+    if (t_w > 0.85f) t_w = 0.85f;
+
+    float b_sub[2], b_low[2], b_m1[2], b_m2[2], b_hi[2], b_air[2], b_top[2];
+    for (int ch = 0; ch < 2; ch++) {
+      float x = (ch == 0) ? xL : xR;
+      lp_sub[ch] += a_sub  * (x - lp_sub[ch]);
+      lp_low[ch] += a_low  * (x - lp_low[ch]);
+      lp_m1[ch]  += a_mid1 * (x - lp_m1[ch]);
+      lp_m2[ch]  += a_mid2 * (x - lp_m2[ch]);
+      lp_hi[ch]  += a_hi   * (x - lp_hi[ch]);
+      lp_air[ch] += a_air  * (x - lp_air[ch]);
+      b_sub[ch] = lp_sub[ch];
+      b_low[ch] = lp_low[ch] - lp_sub[ch];
+      b_m1[ch]  = lp_m1[ch]  - lp_low[ch];
+      b_m2[ch]  = lp_m2[ch]  - lp_m1[ch];
+      b_hi[ch]  = lp_hi[ch]  - lp_m2[ch];
+      b_air[ch] = lp_air[ch] - lp_hi[ch];
+      b_top[ch] = x          - lp_air[ch];
+    }
+
+    if (stem_mode == 2) {
+      float vox_m = 0.5f * ((b_m1[0] + b_m2[0] + b_hi[0]) + (b_m1[1] + b_m2[1] + b_hi[1])) * (1.0f - 0.5f * t_w);
+      stems[0][(long)n * 2 + 0] = vox_m;
+      stems[0][(long)n * 2 + 1] = vox_m;
+      stems[1][(long)n * 2 + 0] = xL - vox_m;
+      stems[1][(long)n * 2 + 1] = xR - vox_m;
+    } else if (stem_mode == 4) {
+      for (int ch = 0; ch < 2; ch++) {
+        stems[0][(long)n * 2 + ch] = b_low[ch] + b_m1[ch];
+        stems[1][(long)n * 2 + ch] = b_sub[ch];
+        stems[2][(long)n * 2 + ch] = b_m2[ch] + b_hi[ch];
+        stems[3][(long)n * 2 + ch] = b_air[ch] + b_top[ch];
+      }
+    } else {
+      float m_m1 = 0.5f * (b_m1[0] + b_m1[1]), s_m1 = 0.5f * (b_m1[0] - b_m1[1]);
+      float m_m2 = 0.5f * (b_m2[0] + b_m2[1]), s_m2 = 0.5f * (b_m2[0] - b_m2[1]);
+      float m_hi = 0.5f * (b_hi[0] + b_hi[1]), s_hi = 0.5f * (b_hi[0] - b_hi[1]);
+      for (int ch = 0; ch < 2; ch++) {
+        float sgn = (ch == 0) ? 1.0f : -1.0f;
+        float x   = (ch == 0) ? xL : xR;
+        float s_drums   = t_w * (b_sub[ch] * 0.45f + b_low[ch] + b_m1[ch] + b_top[ch]);
+        float s_bass    = b_sub[ch] * (1.0f - 0.45f * t_w);
+        float s_vocals  = (1.0f - t_w) * (m_m1 * 0.55f + m_m2 + m_hi);
+        float s_guitar  = (1.0f - t_w) * (sgn * (s_m1 + s_m2));
+        float s_piano   = (1.0f - t_w) * (m_m1 * 0.45f + b_low[ch] * 0.50f) + t_w * (b_m2[ch] * 0.65f + b_hi[ch] * 0.50f);
+        float s_synth   = (1.0f - t_w) * (b_low[ch] * 0.50f + sgn * s_hi) + t_w * (b_m2[ch] * 0.35f + b_hi[ch] * 0.50f);
+        float s_strings = b_air[ch];
+        float s_fx      = x - (s_drums + s_bass + s_vocals + s_guitar + s_piano + s_synth + s_strings);
+        stems[0][(long)n * 2 + ch] = s_drums;
+        stems[1][(long)n * 2 + ch] = s_bass;
+        stems[2][(long)n * 2 + ch] = s_vocals;
+        stems[3][(long)n * 2 + ch] = s_guitar;
+        stems[4][(long)n * 2 + ch] = s_piano;
+        stems[5][(long)n * 2 + ch] = s_synth;
+        stems[6][(long)n * 2 + ch] = s_strings;
+        stems[7][(long)n * 2 + ch] = s_fx;
+      }
+    }
+  }
+
+  int rc = 0;
+  for (int i = 0; i < stem_mode; i++) {
+    if (out_names) snprintf(out_names[i], 24, "%s", names[i]);
+    if (dir_prefix && dir_prefix[0] && out_paths) {
+      snprintf(out_paths[i], 256, "%s_stem_%s.wav", dir_prefix, names[i]);
+      ec_audio_t au = { stems[i], (uint32_t)n_samples, (uint32_t)sr, 2 };
+      rc |= ec_export_wav(out_paths[i], &au);
+    }
+    free(stems[i]);
+  }
+  if (out_n_stems) *out_n_stems = stem_mode;
+  return rc;
+}
+
+// ===========================================================================
 // 4. Native Image Exporters: PPM + Zero-Dependency Real PNG (RFC 2083)
 // ===========================================================================
 int ec_export_ppm(const char *path, const uint8_t *rgb, uint32_t w, uint32_t h) {
@@ -403,43 +675,122 @@ static uint8_t clamp_u8(float v) {
   return (uint8_t)(v + 0.5f);
 }
 
-// Pure-C11 Native Photographic Post-Processing Node (decodes stored RGB PNGs from Eureka directly,
-// applies contrast, warmth, saturation, vignette, unsharp mask, grayscale, or invert, and writes PNG!)
-int ec_png_postprocess_grade(
-    const char *src_png, const char *dst_png,
-    float contrast, float warmth, float saturation, float vignette,
-    float sharpen, int grayscale, int invert) {
-  if (!src_png || !dst_png) return -1;
-  FILE *fi = fopen(src_png, "rb");
+static int paeth_pred(int a, int b, int c) {
+  int p = a + b - c;
+  int pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
+}
+
+typedef int (*zlib_uncompress_fn)(uint8_t *dst, unsigned long *dst_len, const uint8_t *src, unsigned long src_len);
+
+static int load_image_via_ffmpeg(const char *path, uint8_t **out_rgb, int *out_w, int *out_h) {
+  int pfd[2];
+  if (pipe(pfd) != 0) return -1;
+  pid_t pid = fork();
+  if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
+  if (pid == 0) {
+    close(pfd[0]);
+    dup2(pfd[1], STDOUT_FILENO);
+    int dn = open("/dev/null", O_WRONLY);
+    if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+    close(pfd[1]);
+    execlp("ffprobe", "ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path, (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[1]);
+  char dim_buf[64] = {0};
+  ssize_t dn = read(pfd[0], dim_buf, sizeof(dim_buf) - 1);
+  close(pfd[0]);
+  int st = 0;
+  waitpid(pid, &st, 0);
+  int w = 0, h = 0;
+  if (dn <= 0 || sscanf(dim_buf, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0 || w > 8192 || h > 8192) return -1;
+
+  size_t need = (size_t)w * (size_t)h * 3u;
+  uint8_t *rgb = (uint8_t *)malloc(need);
+  if (!rgb) return -1;
+
+  if (pipe(pfd) != 0) { free(rgb); return -1; }
+  pid = fork();
+  if (pid < 0) { close(pfd[0]); close(pfd[1]); free(rgb); return -1; }
+  if (pid == 0) {
+    close(pfd[0]);
+    dup2(pfd[1], STDOUT_FILENO);
+    int dn2 = open("/dev/null", O_WRONLY);
+    if (dn2 >= 0) { dup2(dn2, STDERR_FILENO); close(dn2); }
+    close(pfd[1]);
+    execlp("ffmpeg", "ffmpeg", "-v", "error", "-i", path,
+           "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-", (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[1]);
+  size_t got = 0;
+  while (got < need) {
+    ssize_t r = read(pfd[0], rgb + got, need - got);
+    if (r <= 0) break;
+    got += (size_t)r;
+  }
+  close(pfd[0]);
+  waitpid(pid, &st, 0);
+  if (got != need) { free(rgb); return -1; }
+  *out_rgb = rgb; *out_w = w; *out_h = h;
+  return 0;
+}
+
+int ec_load_image_rgb(const char *path, uint8_t **out_rgb, int *out_w, int *out_h) {
+  if (!path || !out_rgb || !out_w || !out_h) return -1;
+  *out_rgb = NULL; *out_w = 0; *out_h = 0;
+
+  FILE *fi = fopen(path, "rb");
   if (!fi) return -1;
   fseek(fi, 0, SEEK_END);
   long sz = ftell(fi);
-  if (sz < 32 || sz > 64 * 1024 * 1024) { fclose(fi); return -1; }
+  if (sz < 16 || sz > 64L * 1024L * 1024L) { fclose(fi); return -1; }
   fseek(fi, 0, SEEK_SET);
   uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-  if (!buf) { fclose(fi); return -1; }
-  if (fread(buf, 1, (size_t)sz, fi) != (size_t)sz) { free(buf); fclose(fi); return -1; }
+  if (!buf || fread(buf, 1, (size_t)sz, fi) != (size_t)sz) { free(buf); fclose(fi); return -1; }
   fclose(fi);
 
+  if (buf[0] == 'P' && buf[1] == '6' && (buf[2] == '\n' || buf[2] == ' ')) {
+    const char *p = (const char *)buf + 2, *end = (const char *)buf + sz;
+    int vals[3] = {0}, vi = 0;
+    while (p < end && vi < 3) {
+      while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+      if (p < end && *p == '#') { while (p < end && *p != '\n') p++; continue; }
+      vals[vi++] = (int)strtol(p, (char **)&p, 10);
+    }
+    if (vi == 3 && vals[0] > 0 && vals[1] > 0 && vals[2] == 255 && p < end) {
+      p++;
+      size_t need = (size_t)vals[0] * (size_t)vals[1] * 3u;
+      if ((size_t)(end - p) >= need) {
+        uint8_t *rgb = (uint8_t *)malloc(need);
+        if (rgb) { memcpy(rgb, p, need); free(buf); *out_rgb = rgb; *out_w = vals[0]; *out_h = vals[1]; return 0; }
+      }
+    }
+    free(buf);
+    return -1;
+  }
+
   static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
-  if (memcmp(buf, sig, 8) != 0) { free(buf); return -1; }
+  if (memcmp(buf, sig, 8) != 0) { free(buf); return load_image_via_ffmpeg(path, out_rgb, out_w, out_h); }
 
   uint32_t w = 0, h = 0;
-  uint8_t bit_depth = 0, color_type = 0;
-  uint8_t *idat = NULL;
-  size_t idat_len = 0, idat_cap = 0;
+  uint8_t bit_depth = 0, color_type = 0, interlace = 0;
+  uint8_t plte[256 * 3]; int has_plte = 0;
+  uint8_t *idat = NULL; size_t idat_len = 0, idat_cap = 0;
 
   size_t off = 8;
   while (off + 12 <= (size_t)sz) {
     uint32_t clen = rd_be32(buf + off);
     if (off + 12 + (size_t)clen > (size_t)sz) break;
-    const uint8_t *tag = buf + off + 4;
-    const uint8_t *cd  = buf + off + 8;
+    const uint8_t *tag = buf + off + 4, *cd = buf + off + 8;
     if (memcmp(tag, "IHDR", 4) == 0 && clen >= 13) {
-      w = rd_be32(cd);
-      h = rd_be32(cd + 4);
-      bit_depth = cd[8];
-      color_type = cd[9];
+      w = rd_be32(cd); h = rd_be32(cd + 4); bit_depth = cd[8]; color_type = cd[9]; interlace = cd[12];
+    } else if (memcmp(tag, "PLTE", 4) == 0 && clen >= 3 && clen <= sizeof(plte)) {
+      memcpy(plte, cd, clen); has_plte = 1;
     } else if (memcmp(tag, "IDAT", 4) == 0) {
       if (idat_len + clen > idat_cap) {
         idat_cap = (idat_len + clen) * 2 + 1024;
@@ -447,48 +798,225 @@ int ec_png_postprocess_grade(
         if (!ni) { free(idat); free(buf); return -1; }
         idat = ni;
       }
-      memcpy(idat + idat_len, cd, clen);
-      idat_len += clen;
-    } else if (memcmp(tag, "IEND", 4) == 0) {
-      break;
-    }
+      memcpy(idat + idat_len, cd, clen); idat_len += clen;
+    } else if (memcmp(tag, "IEND", 4) == 0) break;
     off += 12 + (size_t)clen;
   }
   free(buf);
 
-  if (w == 0 || h == 0 || w > 4096 || h > 4096 || bit_depth != 8 || color_type != 2 || !idat || idat_len < 7) {
+  int bpp = (color_type == 2) ? 3 : (color_type == 6) ? 4 : (color_type == 0 || color_type == 3) ? 1 : (color_type == 4) ? 2 : 0;
+  if (w == 0 || h == 0 || w > 8192 || h > 8192 || bit_depth != 8 || bpp == 0 || interlace != 0 || !idat || idat_len < 7 || (color_type == 3 && !has_plte)) {
     free(idat);
-    return -1;
+    return load_image_via_ffmpeg(path, out_rgb, out_w, out_h);
   }
 
-  // Unpack stored DEFLATE blocks (BTYPE=00) written by ec_export_png
-  const size_t row_bytes = (size_t)w * 3u + 1u;
-  const size_t expected = row_bytes * (size_t)h;
+  const size_t stride = (size_t)w * (size_t)bpp, row_bytes = stride + 1u, expected = row_bytes * (size_t)h;
   uint8_t *raw = (uint8_t *)malloc(expected);
   if (!raw) { free(idat); return -1; }
-  size_t ip = 2, op = 0;
-  int stored_ok = 1;
-  while (ip + 5 <= idat_len && op < expected) {
-    uint8_t hdr_b = idat[ip++];
-    if ((hdr_b & 6u) != 0) { stored_ok = 0; break; } // compressed block not stored
-    uint16_t blen = (uint16_t)idat[ip] | ((uint16_t)idat[ip + 1] << 8);
-    ip += 4; // skip len + nlen
-    if (ip + blen > idat_len || op + blen > expected) { stored_ok = 0; break; }
-    memcpy(raw + op, idat + ip, blen);
-    ip += blen;
-    op += blen;
-    if (hdr_b & 1u) break;
+
+  int inflated_ok = 0;
+  {
+    size_t ip = 2, op = 0; int stored_ok = 1;
+    while (ip + 5 <= idat_len && op < expected) {
+      uint8_t hdr_b = idat[ip++];
+      if ((hdr_b & 6u) != 0) { stored_ok = 0; break; }
+      uint16_t blen = (uint16_t)idat[ip] | ((uint16_t)idat[ip + 1] << 8);
+      ip += 4;
+      if (ip + blen > idat_len || op + blen > expected) { stored_ok = 0; break; }
+      memcpy(raw + op, idat + ip, blen); ip += blen; op += blen;
+      if (hdr_b & 1u) break;
+    }
+    if (stored_ok && op == expected) inflated_ok = 1;
+  }
+  if (!inflated_ok) {
+    static void *g_libz = NULL;
+    static zlib_uncompress_fn g_uncomp = NULL;
+    if (!g_libz) {
+      g_libz = dlopen("libz.so.1", RTLD_LAZY);
+      if (g_libz) g_uncomp = (zlib_uncompress_fn)dlsym(g_libz, "uncompress");
+    }
+    if (g_uncomp) {
+      unsigned long dlen = (unsigned long)expected;
+      if (g_uncomp(raw, &dlen, idat, (unsigned long)idat_len) == 0 && dlen == (unsigned long)expected) inflated_ok = 1;
+    }
   }
   free(idat);
-  if (!stored_ok || op != expected) { free(raw); return -1; }
+  if (!inflated_ok) { free(raw); return load_image_via_ffmpeg(path, out_rgb, out_w, out_h); }
 
-  uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3u);
-  uint8_t *out = (uint8_t *)malloc((size_t)w * h * 3u);
-  if (!rgb || !out) { free(raw); free(rgb); free(out); return -1; }
+  uint8_t *recon = (uint8_t *)malloc(stride * (size_t)h);
+  uint8_t *rgb = (uint8_t *)malloc((size_t)w * (size_t)h * 3u);
+  if (!recon || !rgb) { free(raw); free(recon); free(rgb); return -1; }
   for (uint32_t y = 0; y < h; y++) {
-    memcpy(rgb + (size_t)y * w * 3u, raw + (size_t)y * row_bytes + 1u, (size_t)w * 3u);
+    uint8_t filt = raw[(size_t)y * row_bytes];
+    const uint8_t *src = raw + (size_t)y * row_bytes + 1u;
+    uint8_t *cur = recon + (size_t)y * stride;
+    const uint8_t *prev = (y > 0) ? (recon + (size_t)(y - 1) * stride) : NULL;
+    for (size_t i = 0; i < stride; i++) {
+      int a = (i >= (size_t)bpp) ? cur[i - (size_t)bpp] : 0;
+      int b = prev ? prev[i] : 0;
+      int c = (prev && i >= (size_t)bpp) ? prev[i - (size_t)bpp] : 0;
+      int v = src[i];
+      if (filt == 1) v += a; else if (filt == 2) v += b;
+      else if (filt == 3) v += ((a + b) >> 1); else if (filt == 4) v += paeth_pred(a, b, c);
+      cur[i] = (uint8_t)(v & 0xFF);
+    }
   }
   free(raw);
+
+  for (uint32_t y = 0; y < h; y++) {
+    const uint8_t *row = recon + (size_t)y * stride;
+    uint8_t *dst = rgb + (size_t)y * (size_t)w * 3u;
+    for (uint32_t x = 0; x < w; x++) {
+      if (color_type == 2) { dst[x*3+0]=row[x*3+0]; dst[x*3+1]=row[x*3+1]; dst[x*3+2]=row[x*3+2]; }
+      else if (color_type == 6) { dst[x*3+0]=row[x*4+0]; dst[x*3+1]=row[x*4+1]; dst[x*3+2]=row[x*4+2]; }
+      else if (color_type == 0) { uint8_t g=row[x]; dst[x*3+0]=g; dst[x*3+1]=g; dst[x*3+2]=g; }
+      else if (color_type == 4) { uint8_t g=row[x*2]; dst[x*3+0]=g; dst[x*3+1]=g; dst[x*3+2]=g; }
+      else if (color_type == 3) { uint8_t pi=row[x]; dst[x*3+0]=plte[pi*3+0]; dst[x*3+1]=plte[pi*3+1]; dst[x*3+2]=plte[pi*3+2]; }
+    }
+  }
+  free(recon);
+  *out_rgb = rgb; *out_w = (int)w; *out_h = (int)h;
+  return 0;
+}
+
+uint8_t *ec_rgb_resize_bilinear(const uint8_t *src, int sw, int sh, int dw, int dh) {
+  if (!src || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return NULL;
+  uint8_t *dst = (uint8_t *)malloc((size_t)dw * (size_t)dh * 3u);
+  if (!dst) return NULL;
+  if (sw == dw && sh == dh) { memcpy(dst, src, (size_t)dw * dh * 3u); return dst; }
+  float sx_scale = (float)sw / (float)dw, sy_scale = (float)sh / (float)dh;
+  for (int y = 0; y < dh; y++) {
+    float fy = ((float)y + 0.5f) * sy_scale - 0.5f; if (fy < 0.0f) fy = 0.0f;
+    int y0 = (int)fy; if (y0 >= sh) y0 = sh - 1;
+    int y1 = (y0 + 1 < sh) ? (y0 + 1) : y0;
+    float wy = fy - (float)y0;
+    for (int x = 0; x < dw; x++) {
+      float fx = ((float)x + 0.5f) * sx_scale - 0.5f; if (fx < 0.0f) fx = 0.0f;
+      int x0 = (int)fx; if (x0 >= sw) x0 = sw - 1;
+      int x1 = (x0 + 1 < sw) ? (x0 + 1) : x0;
+      float wx = fx - (float)x0;
+      const uint8_t *p00 = src + ((size_t)y0 * sw + x0) * 3u, *p01 = src + ((size_t)y0 * sw + x1) * 3u;
+      const uint8_t *p10 = src + ((size_t)y1 * sw + x0) * 3u, *p11 = src + ((size_t)y1 * sw + x1) * 3u;
+      uint8_t *o = dst + ((size_t)y * dw + x) * 3u;
+      for (int c = 0; c < 3; c++) {
+        float v = (p00[c]*(1.0f-wx) + p01[c]*wx)*(1.0f-wy) + (p10[c]*(1.0f-wx) + p11[c]*wx)*wy;
+        o[c] = clamp_u8(v);
+      }
+    }
+  }
+  return dst;
+}
+
+int ec_load_mask_gray(const char *path, int target_w, int target_h, float **out_mask) {
+  if (!path || !out_mask || target_w <= 0 || target_h <= 0) return -1;
+  uint8_t *rgb = NULL; int sw = 0, sh = 0;
+  if (ec_load_image_rgb(path, &rgb, &sw, &sh) != 0) return -1;
+  uint8_t *res = ec_rgb_resize_bilinear(rgb, sw, sh, target_w, target_h);
+  free(rgb);
+  if (!res) return -1;
+  float *m = (float *)malloc((size_t)target_w * (size_t)target_h * sizeof(float));
+  if (!m) { free(res); return -1; }
+  for (int i = 0; i < target_w * target_h; i++) {
+    float lum = (0.299f * res[i*3+0] + 0.587f * res[i*3+1] + 0.114f * res[i*3+2]) / 255.0f;
+    m[i] = lum < 0.0f ? 0.0f : (lum > 1.0f ? 1.0f : lum);
+  }
+  free(res);
+  *out_mask = m;
+  return 0;
+}
+
+int ec_rgb_pad_outpaint(
+    const uint8_t *src, int sw, int sh,
+    int pad_left, int pad_top, int pad_right, int pad_bottom,
+    int target_w, int target_h, uint8_t **out_rgb, float **out_mask) {
+  if (!src || sw <= 0 || sh <= 0 || target_w <= 0 || target_h <= 0 || !out_rgb || !out_mask) return -1;
+  if (pad_left < 0) pad_left = 0;
+  if (pad_top < 0) pad_top = 0;
+  if (pad_right < 0) pad_right = 0;
+  if (pad_bottom < 0) pad_bottom = 0;
+  int cw = sw + pad_left + pad_right, ch = sh + pad_top + pad_bottom;
+  uint8_t *canvas = (uint8_t *)malloc((size_t)cw * (size_t)ch * 3u);
+  float *cmask = (float *)malloc((size_t)cw * (size_t)ch * sizeof(float));
+  if (!canvas || !cmask) { free(canvas); free(cmask); return -1; }
+  const float feather = 24.0f;
+  for (int y = 0; y < ch; y++) {
+    int sy = y - pad_top; int sy_c = sy < 0 ? 0 : (sy >= sh ? sh - 1 : sy);
+    for (int x = 0; x < cw; x++) {
+      int sx = x - pad_left; int sx_c = sx < 0 ? 0 : (sx >= sw ? sw - 1 : sx);
+      const uint8_t *sp = src + ((size_t)sy_c * sw + sx_c) * 3u;
+      uint8_t *dp = canvas + ((size_t)y * cw + x) * 3u;
+      dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2];
+      int d_in = 1000000;
+      if (pad_left > 0 && sx < d_in) d_in = sx;
+      if (pad_right > 0 && (sw - 1 - sx) < d_in) d_in = sw - 1 - sx;
+      if (pad_top > 0 && sy < d_in) d_in = sy;
+      if (pad_bottom > 0 && (sh - 1 - sy) < d_in) d_in = sh - 1 - sy;
+      float mv = (d_in <= 0) ? 1.0f : ((float)d_in < feather ? (1.0f - (float)d_in / feather) : 0.0f);
+      cmask[(size_t)y * cw + x] = mv;
+    }
+  }
+  uint8_t *res_rgb = ec_rgb_resize_bilinear(canvas, cw, ch, target_w, target_h);
+  float *res_mask = (float *)malloc((size_t)target_w * (size_t)target_h * sizeof(float));
+  free(canvas);
+  if (!res_rgb || !res_mask) { free(cmask); free(res_rgb); free(res_mask); return -1; }
+  for (int y = 0; y < target_h; y++) {
+    int sy = (int)((float)y * (float)ch / (float)target_h); if (sy >= ch) sy = ch - 1;
+    for (int x = 0; x < target_w; x++) {
+      int sx = (int)((float)x * (float)cw / (float)target_w); if (sx >= cw) sx = cw - 1;
+      res_mask[(size_t)y * target_w + x] = cmask[(size_t)sy * cw + sx];
+    }
+  }
+  free(cmask);
+  *out_rgb = res_rgb; *out_mask = res_mask;
+  return 0;
+}
+
+void ec_rgb_isolate_foreground(uint8_t *rgb, int w, int h) {
+  if (!rgb || w < 16 || h < 16) return;
+  float bg[3] = {0, 0, 0}; int cnt = 0;
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      if (x < 4 || x >= w - 4 || y < 4 || y >= h - 4) {
+        const uint8_t *p = rgb + ((size_t)y * w + x) * 3u;
+        bg[0] += p[0]; bg[1] += p[1]; bg[2] += p[2]; cnt++;
+      }
+  if (cnt == 0) return;
+  bg[0] /= (float)cnt; bg[1] /= (float)cnt; bg[2] /= (float)cnt;
+  float var = 0.0f;
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      if (x < 4 || x >= w - 4 || y < 4 || y >= h - 4) {
+        const uint8_t *p = rgb + ((size_t)y * w + x) * 3u;
+        float dr = p[0]-bg[0], dg = p[1]-bg[1], db = p[2]-bg[2];
+        var += dr*dr + dg*dg + db*db;
+      }
+  if (sqrtf(var / (float)cnt) > 42.0f) return;
+  for (int y = 0; y < h; y++) {
+    float ny = ((float)y / (float)h) * 2.0f - 1.0f;
+    for (int x = 0; x < w; x++) {
+      float nx = ((float)x / (float)w) * 2.0f - 1.0f;
+      float rad = sqrtf(nx*nx + ny*ny);
+      uint8_t *p = rgb + ((size_t)y * w + x) * 3u;
+      float dr = p[0]-bg[0], dg = p[1]-bg[1], db = p[2]-bg[2];
+      float dist = sqrtf(dr*dr + dg*dg + db*db);
+      if (dist < 28.0f && rad > 0.35f) {
+        float keep = fmaxf(0.0f, (dist - 14.0f) / 14.0f);
+        p[0] = (uint8_t)(p[0] * keep); p[1] = (uint8_t)(p[1] * keep); p[2] = (uint8_t)(p[2] * keep);
+      }
+    }
+  }
+}
+
+int ec_png_postprocess_grade(
+    const char *src_png, const char *dst_png,
+    float contrast, float warmth, float saturation, float vignette,
+    float sharpen, int grayscale, int invert) {
+  if (!src_png || !dst_png) return -1;
+  uint8_t *rgb = NULL; int iw = 0, ih = 0;
+  if (ec_load_image_rgb(src_png, &rgb, &iw, &ih) != 0 || !rgb) return -1;
+  uint32_t w = (uint32_t)iw, h = (uint32_t)ih;
+  uint8_t *out = (uint8_t *)malloc((size_t)w * h * 3u);
+  if (!out) { free(rgb); return -1; }
 
   // Optional 3x3 unsharp mask pass first
   if (sharpen > 0.01f) {

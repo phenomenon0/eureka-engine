@@ -42,6 +42,8 @@ int  ec_recipes_save_user(ec_recipe_lib_t *lib, const ec_recipe_t *r);
 int  ec_recipes_delete_user(ec_recipe_lib_t *lib, const char *id);
 int  ec_recipes_to_json(const ec_recipe_lib_t *lib, char *buf, size_t cap);
 int  ec_prompt_library_to_json(char *buf, size_t cap);
+// Curated 20-item Elite LoRA & QLoRA (NF4/FP8/DoRA/LoHa/LoKr) Catalog with live Vault installed status!
+int  ec_lora_catalog_to_json(const ec_storage_vault_t *vault, char *buf, size_t cap);
 
 // Extract embedded ComfyUI "prompt" or "workflow" JSON from a raw PNG byte buffer (tEXt / iTXt).
 // Returns bytes written to out_json, or <=0 if no ComfyUI chunk found.

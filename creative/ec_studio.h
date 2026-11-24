@@ -52,7 +52,9 @@ typedef struct {
   char   file_aux[256];       // .ply for 3D, keyframe0 .png for video
   char   file_mp4[256];       // hardware NVENC H.264 (+AAC) .mp4 for video / video_av
   char   encoder_used[32];    // "h264_nvenc" or "libx264"
-  char   stem_files[4][256];  // music: drums, bass, harmony, lead
+  char   stem_files[8][256];  // music: up to 8 flexible stems (0=full, 2=vocals/inst, 4=4stem, 8=8stem)
+  char   stem_names[8][24];   // stem labels corresponding to stem_files[0..n_stems-1]
+  int    n_stems;
   char   engine_mode[32];     // "flux2_photoreal", "acestep_1.5_turbo", "trellis2_1.3b", "wan2.2_ti2v_5b", or "dit_smoke"
   char   checkpoint_used[256];
   int    width, height, frames;
@@ -66,6 +68,66 @@ typedef struct {
   double fps;
   int    dag_executed, dag_cache_hits, dag_evictions;
 } ec_studio_result_t;
+
+// v8 Multimodal Request Structs (all optional media fields resolve either absolute paths or /artifacts/<name>!)
+typedef struct {
+  const char             *prompt;
+  const char             *neg_prompt;
+  uint32_t                seed;
+  int                     width, height, steps;
+  float                   cfg_scale;
+  ec_tier_t               tier;
+  int                     photoreal;
+  const char             *checkpoint_query;
+  const ec_studio_lora_t *loras;
+  int                     n_loras;
+  const char             *init_image_path;   // Img2Img / Inpaint / Outpaint input image
+  const char             *mask_image_path;   // Inpaint mask image (white=repaint, black=keep)
+  float                   denoise;           // 0.05..1.0
+  int                     outpaint_pad[4];   // left, top, right, bottom pixels
+  int                     tile_upscale;      // 1 -> 2x overlapping tiled latent detail upscale
+} ec_studio_image_v8_t;
+
+typedef struct {
+  const char             *prompt;
+  const char             *neg_prompt;
+  uint32_t                seed;
+  int                     n_frames, width, height, fps, steps, with_audio, full_model;
+  float                   cfg_scale, shift, denoise;
+  ec_tier_t               tier;
+  const char             *start_frame_path;  // I2V start frame
+  const char             *end_frame_path;    // FLF2V end frame (set == start_frame for Seamless Loop!)
+  const char             *camera_motion;     // auto|orbit|dolly_in|pan_left|pan_right|crane_up|fpv|static
+  const ec_studio_lora_t *loras;
+  int                     n_loras;
+} ec_studio_video_v8_t;
+
+typedef struct {
+  const char *prompt;
+  uint32_t    seed;
+  int         grid_res, steps, full_model, isolate_fg;
+  float       cfg_scale, rescale_t;
+  float       base_color[4];
+  ec_tier_t   tier;
+  const char *input_images[4]; // 1..4 direct photo uploads -> DINOv3 multi-view (skips FLUX.2!)
+  int         n_input_images;
+} ec_studio_3d_v8_t;
+
+typedef struct {
+  const char             *prompt;
+  const char             *lyrics;
+  uint32_t                seed;
+  int                     bpm, steps, stem_mode, full_model; // stem_mode: 0=full, 2, 4, 8
+  float                   duration_sec, shift, denoise, repaint_start_sec, repaint_end_sec;
+  ec_tier_t               tier;
+  const char             *key_scale;
+  const char             *time_sig;
+  const char             *vocal_mode;
+  const char             *audio_mode;        // generate|cover|repaint|extend
+  const char             *source_audio_path; // WAV/MP3/FLAC upload for Cover/Repaint/Extend
+  const ec_studio_lora_t *loras;
+  int                     n_loras;
+} ec_studio_music_v8_t;
 
 // Live progress callback for SSE streaming & cooperative cancellation (return non-zero to cancel)
 typedef int (*ec_progress_cb_t)(int step, int total_steps, int skipped, const char *stage, void *ctx);
@@ -112,6 +174,14 @@ int ec_studio_gen_video_ex(
     ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames, int width, int height,
     int fps, int steps, int with_audio, ec_tier_t tier, int full_model,
     ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+
+// v8 Native Multimodal Entrypoints (Img2Img/Inpaint/Outpaint/Upscale, I2V/FLF2V/Loop, Photo-to-3D, 8-Stem/Repaint/Cover/Extend)
+int ec_studio_gen_image_v8(ec_studio_t *st, const ec_studio_image_v8_t *req, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+int ec_studio_gen_video_v8(ec_studio_t *st, const ec_studio_video_v8_t *req, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+int ec_studio_gen_3d_v8(ec_studio_t *st, const ec_studio_3d_v8_t *req, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+int ec_studio_gen_music_v8(ec_studio_t *st, const ec_studio_music_v8_t *req, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res);
+int ec_studio_lora_catalog_json(ec_studio_t *st, char *buf, size_t cap);
+int ec_studio_upload_media(ec_studio_t *st, const uint8_t *bytes, size_t len, const char *ext, char *out_filename, size_t cap);
 
 int ec_studio_realtime_burst(
     ec_studio_t *st, const char *prompt, uint32_t seed, int n_frames,

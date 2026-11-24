@@ -1,12 +1,12 @@
-// ec_cowrie.h — Optional Zero-Build-Dep Tessera / Cowrie v2 Bridge for Eureka Creative Engine
+// ec_cowrie.h — Zero-Build-Dep Cowrie (v1.1 Hardened) Bridge for Eureka Creative Engine
 // Dynamically loads libcowrie_core.so via dlopen (-ldl only; graceful fallback when absent).
 // Provides:
-//   Phase A: 16 KB-aligned SHA-NI Merkle StatePages (.state.cowrie) with (model_sha, doc_cid, kv_quant)
-//            Coordinate Contracts for Wan 2.2 UMT5-XXL, FLUX.2 Qwen3-4B, TRELLIS.2 DINOv3, and
-//            persistent cross-restart ComfyUI DAG node caches.
+//   Phase A: 16 KB-aligned SHA-NI Merkle StatePages (.state.cowrie) with (model_sha, runtime_id,
+//            doc_cid, kv_quant) Coordinate Contracts + unified strided model fingerprinting for
+//            Wan 2.2 UMT5-XXL, FLUX.2 Qwen3-4B, TRELLIS.2 DINOv3, and persistent ComfyUI DAG caches.
 //   Phase B: Canonical COWR framing, out-of-band Trust Membrane (UNTRUSTED_EXT = 0x04 + sticky
-//            BIT_TAINTED = 0x80 causal propagation), Creative Trust Gate (403 on tainted exec),
-//            and deterministic R0 / R1 / R2 Director LLM lenses.
+//            BIT_TAINTED = 0x80 causal propagation), fail-closed Creative Trust Gate (403 on
+//            tainted/unknown/ambiguous/empty privileged exec), and R0 / R1 / R2 Director lenses.
 
 #pragma once
 
@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-// Authority & epistemic constants matching Cowrie v2 SPEC.md §5
+// Authority & epistemic constants matching Cowrie SPEC.md §5
 #define EC_COWRIE_AUTH_SYS_POLICY    0x01u
 #define EC_COWRIE_AUTH_VERIFIED_TOOL 0x02u
 #define EC_COWRIE_AUTH_UNTRUSTED_EXT 0x04u
@@ -34,6 +34,9 @@ extern "C" {
 #define EC_COWRIE_ERR_STATEPAGE_HASH_MISMATCH 24
 #define EC_COWRIE_ERR_TAINTED_EXEC_BLOCKED    25
 #define EC_COWRIE_ERR_KV_QUANT_MISMATCH       29
+#define EC_COWRIE_ERR_SSM_DTYPE_MISMATCH      30
+#define EC_COWRIE_ERR_RUNTIME_MISMATCH        31
+#define EC_COWRIE_ERR_AUTH_MAC_MISMATCH       32
 
 typedef struct {
   int      enabled;
@@ -49,7 +52,7 @@ typedef struct {
 typedef struct {
   int     ok;
   char    cid_hex[69];   // 34-byte multihash hex (68 hex chars + NUL)
-  char    handle[24];    // Alpha32 R0 short handle (e.g. "@a7f2bc")
+  char    handle[24];    // Alpha32 R0 10-letter handle (e.g. "@abcdefghij")
   uint8_t authority;
   uint8_t epistemic;
   int     tainted;
@@ -70,14 +73,13 @@ void ec_cowrie_get_stats(ec_cowrie_stats_t *out);
 // SHA-NI accelerated SHA-256 hex digest (64 hex chars + NUL). Returns 0 on success.
 int ec_cowrie_sha256_hex(const void *data, size_t len, char out_hex_65[65]);
 
-// Fast sub-millisecond deterministic 64-hex model fingerprint (hashes file size + head 64KB + tail 64KB).
+// Unified sub-millisecond deterministic 64-hex model fingerprint (file_size + 32 x 64 KB strided windows).
 int ec_cowrie_file_fingerprint(const char *path, char out_hex_65[65]);
 
 // Combine multiple strings/digests into a deterministic 64-hex composite model contract SHA.
 int ec_cowrie_composite_sha(const char *const *parts, int n_parts, char out_hex_65[65]);
 
 // Phase A: Persistent 16 KB-aligned SHA-NI StatePage cache API
-// Returns 0 on verified hit/save, negative CowrieError code (e.g. -23 ERR_MODEL_MISMATCH) on contract mismatch, -1 on miss.
 int ec_cowrie_sp_save(
     const char *ns,
     const char *model_sha_64,
@@ -121,7 +123,7 @@ int ec_cowrie_trust_register_json(
     const char *const *parent_ids, int n_parents,
     ec_cowrie_trust_meta_t *out_meta);
 
-// Evaluates Trust Gate for privileged vs read-only action.
+// Evaluates fail-closed Trust Gate for privileged vs read-only action.
 // Returns HTTP status code: 200 (allowed) or 403 (ERR_TAINTED_EXECUTION_BLOCKED).
 int ec_cowrie_trust_gate_json(
     const char *action,

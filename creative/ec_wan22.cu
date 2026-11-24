@@ -11,6 +11,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ec_wan22.h"
 #include "ec_cowrie.h"
+#include "ec_lora.h"
 #include "ec_media.h"
 #include "ec_nvenc.h"
 #include "ec_ops.h"
@@ -622,6 +623,84 @@ __global__ void k_wn_unpatchify_rgb24(
   rgb_out[idx] = (uint8_t)lrintf((v * 0.5f + 0.5f) * 255.0f);
 }
 
+// Inverse Patchify(patch_size=2): RGB24 [T, 2H, 2W, 3] -> [-1, 1] F32 [T, H, W, 12]
+__global__ void k_wn_patchify_rgb24(
+    const uint8_t *__restrict__ rgb_in, float *__restrict__ out12, int T, int H, int W) {
+  int H2 = 2 * H, W2 = 2 * W;
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)T * H * W * 12;
+  if (idx >= tot) return;
+  int ch12 = (int)(idx % 12);
+  long p = idx / 12;
+  int t  = (int)(p / ((long)H * W));
+  int ih = (int)((p / W) % H);
+  int iw = (int)(p % W);
+  int c = ch12 >> 2;
+  int r = (ch12 >> 1) & 1;
+  int q = ch12 & 1;
+  int oh = ih * 2 + q;
+  int ow = iw * 2 + r;
+  uint8_t pix = rgb_in[(((long)t * H2 + oh) * W2 + ow) * 3 + c];
+  out12[idx] = (float)pix * (2.0f / 255.0f) - 1.0f;
+}
+
+// Stride-2 3x3 Spatial Downsample im2col (asymmetric pad [0,1,0,1] matching Wan2.2 VAE!)
+__global__ void k_wn_im2col_2d_s2(
+    const float *__restrict__ x, uint16_t *__restrict__ col_bf16,
+    int T, int H_in, int W_in, int H_out, int W_out, int C, long p0, int chunk) {
+  long K = 9L * C;
+  long tot = (long)chunk * K;
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= tot) return;
+  int row = (int)(idx / K);
+  int rem = (int)(idx % K);
+  int k = rem / C, ic = rem % C;
+  int kh = k / 3, kw = k % 3;
+  long p = p0 + row;
+  int t  = (int)(p / ((long)H_out * W_out));
+  int oh = (int)((p / W_out) % H_out);
+  int ow = (int)(p % W_out);
+  int ih = oh * 2 + kh;
+  int iw = ow * 2 + kw;
+  float v = (ih >= 0 && ih < H_in && iw >= 0 && iw < W_in)
+            ? x[(((long)t * H_in + ih) * W_in + iw) * C + ic] : 0.0f;
+  col_bf16[idx] = wn_f32_to_bf16(v);
+}
+
+// AvgDown3D shortcut for T=1 single-frame encode: 2x2 spatial unshuffle + channel-group mean
+__global__ void k_wn_avgdown2d(
+    const float *__restrict__ in, float *__restrict__ out,
+    int H_in, int W_in, int C_in, int C_out) {
+  int H_out = H_in / 2, W_out = W_in / 2;
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)H_out * W_out * C_out;
+  if (idx >= tot) return;
+  int oc = (int)(idx % C_out);
+  long p = idx / C_out;
+  int oh = (int)(p / W_out);
+  int ow = (int)(p % W_out);
+  int grp = (4 * C_in) / C_out;
+  float sum = 0.0f;
+  for (int g = 0; g < grp; g++) {
+    int flat = oc * grp + g;
+    int ic = flat >> 2;
+    int sh = (flat >> 1) & 1;
+    int sw = flat & 1;
+    sum += in[(((long)(oh * 2 + sh)) * W_in + (ow * 2 + sw)) * C_in + ic];
+  }
+  out[idx] = sum / (float)grp;
+}
+
+// Normalize encoded Wan2.2 latent: z = (mu[0..47] - mean) / std
+__global__ void k_wn_norm_latent_mu(const float *z96, float *z48, const float *mean, const float *std, long n_pix) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = n_pix * 48;
+  if (idx >= tot) return;
+  long p = idx / 48;
+  int c = (int)(idx % 48);
+  z48[idx] = (z96[p * 96 + c] - mean[c]) / std[c];
+}
+
 // ===========================================================================
 // 6. Safetensors Weight Helpers (F16 / BF16 / F32 / FP8_E4M3-scaled)
 // ===========================================================================
@@ -742,6 +821,8 @@ typedef struct {
 
 typedef struct {
   int loaded;
+  char lora_sig[1024];
+  int  lora_hits;
   uint16_t *patch_w, *txt0_w, *txt2_w, *t0_w, *t2_w, *tproj_w, *head_w;
   float    *patch_b, *txt0_b, *txt2_b, *t0_b, *t2_b, *tproj_b, *head_b, *head_mod;
   wn_dit_blk_t blocks[30];
@@ -830,10 +911,23 @@ static void free_vae_res(wn_vae_res_t *v) {
   memset(v, 0, sizeof *v);
 }
 
-static int ensure_dit_loaded(ec_wan22_t *w) {
-  if (w->dit.loaded) return 0;
+static void build_wan_lora_sig(const ec_lora_spec_t *loras, int n_loras, char *out, size_t cap) {
+  out[0] = '\0';
+  size_t pos = 0;
+  for (int i = 0; i < n_loras && pos + 8 < cap; i++) {
+    if (!loras[i].path[0]) continue;
+    pos += (size_t)snprintf(out + pos, cap - pos, "%s%.3f|", loras[i].path, loras[i].strength);
+  }
+}
+
+static int ensure_dit_loaded(ec_wan22_t *w, const ec_lora_spec_t *loras, int n_loras) {
+  char lsig[1024];
+  build_wan_lora_sig(loras, n_loras, lsig, sizeof lsig);
+  if (w->dit.loaded && strcmp(w->dit.lora_sig, lsig) == 0) return 0;
+  if (w->dit.loaded) free_dit_res(&w->dit);
   const ec_safetensors_t *st = &w->dit_st;
   wn_dit_res_t *d = &w->dit;
+  ec_lora_apply_stats_t lstats = {};
 
   d->patch_w  = wn_upload_bf16(st, "patch_embedding.weight", w->stream);
   d->patch_b  = wn_upload_f32(st,  "patch_embedding.bias");
@@ -856,10 +950,12 @@ static int ensure_dit_loaded(ec_wan22_t *w) {
   for (int i = 0; i < 30; i++) {
     wn_dit_blk_t *B = &d->blocks[i];
     snprintf(k, sizeof k, "blocks.%d.modulation", i);             B->mod     = wn_upload_f32(st, k);
-    // Fuse self-attn Q, K, V weights & biases into contiguous [3*3072, 3072] BF16 + [3*3072] F32!
     snprintf(k, sizeof k, "blocks.%d.self_attn.q.weight", i);     uint16_t *qw = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && qw) ec_lora_fuse_onto_bf16(qw, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.self_attn.k.weight", i);     uint16_t *kw = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && kw) ec_lora_fuse_onto_bf16(kw, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.self_attn.v.weight", i);     uint16_t *vw = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && vw) ec_lora_fuse_onto_bf16(vw, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.self_attn.q.bias", i);       float *qb = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.k.bias", i);       float *kb = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.v.bias", i);       float *vb = wn_upload_f32(st, k);
@@ -879,27 +975,36 @@ static int ensure_dit_loaded(ec_wan22_t *w) {
     }
     cudaFree(qw); cudaFree(kw); cudaFree(vw); cudaFree(qb); cudaFree(kb); cudaFree(vb);
     snprintf(k, sizeof k, "blocks.%d.self_attn.o.weight", i);     B->sa_o_w  = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && B->sa_o_w) ec_lora_fuse_onto_bf16(B->sa_o_w, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.self_attn.o.bias", i);       B->sa_o_b  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.norm_q.weight", i); B->sa_nq  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.norm_k.weight", i); B->sa_nk  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.norm3.weight", i);           B->norm3_w = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.norm3.bias", i);             B->norm3_b = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.q.weight", i);    B->ca_q_w  = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && B->ca_q_w) ec_lora_fuse_onto_bf16(B->ca_q_w, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.q.bias", i);      B->ca_q_b  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.k.weight", i);    B->ca_k_w  = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && B->ca_k_w) ec_lora_fuse_onto_bf16(B->ca_k_w, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.k.bias", i);      B->ca_k_b  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.v.weight", i);    B->ca_v_w  = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && B->ca_v_w) ec_lora_fuse_onto_bf16(B->ca_v_w, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.v.bias", i);      B->ca_v_b  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.o.weight", i);    B->ca_o_w  = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && B->ca_o_w) ec_lora_fuse_onto_bf16(B->ca_o_w, 3072, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.o.bias", i);      B->ca_o_b  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.norm_q.weight", i); B->ca_nq = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.norm_k.weight", i); B->ca_nk = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.ffn.0.weight", i);           B->ffn0_w  = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && B->ffn0_w) ec_lora_fuse_onto_bf16(B->ffn0_w, 14336, 3072, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.ffn.0.bias", i);             B->ffn0_b  = wn_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.ffn.2.weight", i);           B->ffn2_w  = wn_upload_bf16(st, k, w->stream);
+    if (n_loras > 0 && B->ffn2_w) ec_lora_fuse_onto_bf16(B->ffn2_w, 3072, 14336, k, loras, n_loras, &lstats, w->stream);
     snprintf(k, sizeof k, "blocks.%d.ffn.2.bias", i);             B->ffn2_b  = wn_upload_f32(st, k);
     if (!B->sa_qkv_w || !B->sa_qkv_b || !B->ca_q_w || !B->ffn2_w) { free_dit_res(d); return -1; }
   }
+  snprintf(d->lora_sig, sizeof d->lora_sig, "%s", lsig);
+  d->lora_hits = lstats.n_tensors_matched;
   d->loaded = 1;
   return 0;
 }
@@ -1227,11 +1332,13 @@ static void wan_dit_forward(
 static int run_wan_dit(
     ec_wan22_t *w, const uint16_t *t5_pos_bf16, const uint16_t *t5_neg_bf16,
     int F, int Hp, int Wp, int steps, float cfg_scale, float shift, uint32_t seed,
+    const float *start_z_d, const float *end_z_d, // optional [2*Hp * 2*Wp * 48] I2V / FLF2V anchors!
     float *out_z_d, // [F, 2*Hp, 2*Wp, 48] F32 on GPU
     ec_wan22_progress_fn cb, void *cb_ctx, double *out_ms) {
   double t0 = wn_now_ms();
   const wn_dit_res_t *d = &w->dit;
   const int N = F * Hp * Wp, DIM = 3072, H = 24, FFN = 14336, Lctx = 512;
+  const long FRAME_ELEMS = (long)(2 * Hp) * (2 * Wp) * 48;
   const long Z_ELEMS = (long)N * 192;
 
   // Project text embeddings ONCE: 4096 -> 3072 -> GELU -> 3072
@@ -1312,6 +1419,14 @@ static int run_wan_dit(
   cudaMemcpyAsync(xt_d, xt_h, (size_t)Z_ELEMS * 4, cudaMemcpyHostToDevice, w->stream);
   free(xt_h);
 
+  // Pin Start Frame (TI2V I2V) and optional End Frame (FLF2V) latent anchors!
+  if (start_z_d) {
+    cudaMemcpyAsync(xt_d, start_z_d, (size_t)FRAME_ELEMS * 4, cudaMemcpyDeviceToDevice, w->stream);
+  }
+  if (end_z_d && F >= 2) {
+    cudaMemcpyAsync(xt_d + (long)(F - 1) * FRAME_ELEMS, end_z_d, (size_t)FRAME_ELEMS * 4, cudaMemcpyDeviceToDevice, w->stream);
+  }
+
   // Shifted Flow Matching Euler Schedule
   float sig[65];
   for (int i = 0; i <= steps; i++) {
@@ -1333,7 +1448,6 @@ static int run_wan_dit(
     wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, ck_pos, cv_pos, &W, vp_d);
 
     if (cfg_scale > 1.01f) {
-      // FasterCache (ICLR 2025): full CFG on warmup 0..3 & final 2 steps, alternating uncond delta reuse on mid steps
       int reuse_delta = (!exact_mode && steps >= 10 && s >= 4 && s < steps - 2 && (s & 1) == 1);
       if (!reuse_delta) {
         wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, ck_neg, cv_neg, &W, vn_d);
@@ -1343,6 +1457,14 @@ static int run_wan_dit(
       }
     } else {
       ec_ops_wan_cfg_euler(xt_d, vp_d, NULL, NULL, Z_ELEMS, dt, 1.0f, 0, w->stream);
+    }
+
+    // Re-pin TI2V Start Frame (frame 0) and FLF2V End Frame (frame F-1) cleanly after every Euler step!
+    if (start_z_d) {
+      cudaMemcpyAsync(xt_d, start_z_d, (size_t)FRAME_ELEMS * 4, cudaMemcpyDeviceToDevice, w->stream);
+    }
+    if (end_z_d && F >= 2) {
+      cudaMemcpyAsync(xt_d + (long)(F - 1) * FRAME_ELEMS, end_z_d, (size_t)FRAME_ELEMS * 4, cudaMemcpyDeviceToDevice, w->stream);
     }
   }
 
@@ -1697,6 +1819,200 @@ static int run_wan_vae_decode(
 }
 
 // ===========================================================================
+// 10b. Stage 3b: Native CUDA Wan2_2_VAE Single-Frame Image Encoder (T=1 -> [H/16, W/16, 48]!)
+//      Streams encoder.* weights layer-by-layer (zero persistent VRAM cost!) for I2V & FLF2V!
+// ===========================================================================
+static float *vae_enc_run_resblk_streamed(
+    ec_wan22_t *w, float *x_d, int H, int W, int Cin, int Cout,
+    const char *pfx, uint16_t *col, size_t col_cap) {
+  const ec_safetensors_t *st = &w->vae_st;
+  long total_p = (long)H * W;
+  char k[192];
+  wn_cache_slot_t c0 = {0, 0}, c1 = {0, 0};
+
+  float *h_d = x_d;
+  if (Cin != Cout) {
+    snprintf(k, sizeof k, "%s.shortcut.weight", pfx); uint16_t *sc_w = wn_upload_conv_k_bf16(st, k, Cout, Cin, 1);
+    snprintf(k, sizeof k, "%s.shortcut.bias", pfx);   float    *sc_b = wn_upload_f32(st, k);
+    cudaMalloc(&h_d, (size_t)total_p * Cout * 4);
+    vae_conv1x1(w, x_d, h_d, sc_w, sc_b, total_p, Cin, Cout, col, col_cap);
+    cudaStreamSynchronize(w->stream);
+    cudaFree(sc_w); cudaFree(sc_b);
+  }
+
+  snprintf(k, sizeof k, "%s.residual.0.gamma", pfx);  float    *g0 = wn_upload_f32(st, k);
+  snprintf(k, sizeof k, "%s.residual.2.weight", pfx); uint16_t *w2 = wn_upload_conv_k_bf16(st, k, Cout, Cin, 27);
+  snprintf(k, sizeof k, "%s.residual.2.bias", pfx);   float    *b2 = wn_upload_f32(st, k);
+  float *a_d = NULL, *b_d = NULL;
+  cudaMalloc(&a_d, (size_t)total_p * Cin * 4);
+  cudaMalloc(&b_d, (size_t)total_p * Cout * 4);
+  k_wn_rmsnorm<<<total_p, 256, 0, w->stream>>>(x_d, g0, a_d, NULL, (int)total_p, Cin, 1e-12f, 1);
+  vae_causal_conv3d(w, a_d, b_d, w2, b2, 1, H, W, Cin, Cout, &c0, col, col_cap);
+  cudaStreamSynchronize(w->stream);
+  cudaFree(g0); cudaFree(w2); cudaFree(b2); cudaFree(a_d); cudaFree(c0.frames_d);
+  if (Cin != Cout) cudaFree(x_d);
+
+  snprintf(k, sizeof k, "%s.residual.3.gamma", pfx);  float    *g3 = wn_upload_f32(st, k);
+  snprintf(k, sizeof k, "%s.residual.6.weight", pfx); uint16_t *w6 = wn_upload_conv_k_bf16(st, k, Cout, Cout, 27);
+  snprintf(k, sizeof k, "%s.residual.6.bias", pfx);   float    *b6 = wn_upload_f32(st, k);
+  cudaMalloc(&a_d, (size_t)total_p * Cout * 4);
+  k_wn_rmsnorm<<<total_p, 256, 0, w->stream>>>(b_d, g3, a_d, NULL, (int)total_p, Cout, 1e-12f, 1);
+  vae_causal_conv3d(w, a_d, b_d, w6, b6, 1, H, W, Cout, Cout, &c1, col, col_cap);
+  k_wn_add_inplace<<<(total_p * Cout + 255) / 256, 256, 0, w->stream>>>(h_d, b_d, total_p * Cout);
+  cudaStreamSynchronize(w->stream);
+  cudaFree(g3); cudaFree(w6); cudaFree(b6); cudaFree(a_d); cudaFree(b_d); cudaFree(c1.frames_d);
+  return h_d;
+}
+
+static int run_wan_vae_encode_frame(
+    ec_wan22_t *w, const uint8_t *rgb_hwc, int img_W, int img_H,
+    float *out_z_d, // GPU [H/16 * W/16 * 48] normalized F32
+    double *out_ms) {
+  double t0 = wn_now_ms();
+  const ec_safetensors_t *st = &w->vae_st;
+  const size_t COL_CAP = 32L * 1024 * 1024;
+  uint16_t *col = NULL;
+  if (cudaMalloc(&col, COL_CAP * 2) != cudaSuccess) return -1;
+
+  int H = img_H / 2, W = img_W / 2;
+  uint8_t *rgb_d = NULL;
+  float *in12_d = NULL, *cur = NULL;
+  cudaMalloc(&rgb_d, (size_t)img_H * img_W * 3);
+  cudaMemcpyAsync(rgb_d, rgb_hwc, (size_t)img_H * img_W * 3, cudaMemcpyHostToDevice, w->stream);
+  cudaMalloc(&in12_d, (size_t)H * W * 12 * 4);
+  k_wn_patchify_rgb24<<<((long)H * W * 12 + 255) / 256, 256, 0, w->stream>>>(rgb_d, in12_d, 1, H, W);
+  cudaFree(rgb_d);
+
+  // encoder.conv1: 12 -> 160 (CausalConv3d T=1)
+  {
+    uint16_t *c1w = wn_upload_conv_k_bf16(st, "encoder.conv1.weight", 160, 12, 27);
+    float    *c1b = wn_upload_f32(st, "encoder.conv1.bias");
+    wn_cache_slot_t cslot = {0, 0};
+    cudaMalloc(&cur, (size_t)H * W * 160 * 4);
+    vae_causal_conv3d(w, in12_d, cur, c1w, c1b, 1, H, W, 12, 160, &cslot, col, COL_CAP);
+    cudaStreamSynchronize(w->stream);
+    cudaFree(c1w); cudaFree(c1b); cudaFree(cslot.frames_d); cudaFree(in12_d);
+  }
+
+  // encoder.downsamples.0..3: (160->160 dn), (160->320 dn), (320->640 dn), (640->640)
+  const int in_cs[4]  = { 160, 160, 320, 640 };
+  const int out_cs[4] = { 160, 320, 640, 640 };
+  char pfx[192], kw[192], kb[192];
+  for (int b = 0; b < 4; b++) {
+    int Cin = in_cs[b], Cout = out_cs[b];
+    float *x_in_copy = NULL;
+    int H_in = H, W_in = W;
+    if (b < 3) {
+      cudaMalloc(&x_in_copy, (size_t)H * W * Cin * 4);
+      cudaMemcpyAsync(x_in_copy, cur, (size_t)H * W * Cin * 4, cudaMemcpyDeviceToDevice, w->stream);
+    }
+    snprintf(pfx, sizeof pfx, "encoder.downsamples.%d.downsamples.0", b);
+    cur = vae_enc_run_resblk_streamed(w, cur, H, W, Cin, Cout, pfx, col, COL_CAP);
+    snprintf(pfx, sizeof pfx, "encoder.downsamples.%d.downsamples.1", b);
+    cur = vae_enc_run_resblk_streamed(w, cur, H, W, Cout, Cout, pfx, col, COL_CAP);
+
+    if (b < 3) {
+      int nH = H / 2, nW = W / 2;
+      snprintf(kw, sizeof kw, "encoder.downsamples.%d.downsamples.2.resample.1.weight", b);
+      snprintf(kb, sizeof kb, "encoder.downsamples.%d.downsamples.2.resample.1.bias", b);
+      uint16_t *dw = wn_upload_conv_k_bf16(st, kw, Cout, Cout, 9);
+      float    *db = wn_upload_f32(st, kb);
+      float *dn_out = NULL, *sc_dn = NULL;
+      cudaMalloc(&dn_out, (size_t)nH * nW * Cout * 4);
+      long total_p = (long)nH * nW;
+      int max_ch = (int)(COL_CAP / (size_t)(9 * Cout)); if (max_ch < 64) max_ch = 64;
+      for (long p0 = 0; p0 < total_p; p0 += max_ch) {
+        int ch = (total_p - p0 < max_ch) ? (int)(total_p - p0) : max_ch;
+        k_wn_im2col_2d_s2<<<((long)ch * 9 * Cout + 255) / 256, 256, 0, w->stream>>>(cur, col, 1, H, W, nH, nW, Cout, p0, ch);
+        wn_gemm(col, dw, db, dn_out + p0 * Cout, NULL, ch, Cout, 9 * Cout, w->stream);
+      }
+      cudaFree(cur); cudaFree(dw); cudaFree(db);
+      // Add AvgDown3D shortcut (T=1 spatial 2x2 average + channel fold)
+      cudaMalloc(&sc_dn, (size_t)nH * nW * Cout * 4);
+      k_wn_avgdown2d<<<((long)nH * nW * Cout + 255) / 256, 256, 0, w->stream>>>(x_in_copy, sc_dn, H_in, W_in, Cin, Cout);
+      cudaFree(x_in_copy);
+      k_wn_add_inplace<<<((long)nH * nW * Cout + 255) / 256, 256, 0, w->stream>>>(dn_out, sc_dn, (long)nH * nW * Cout);
+      cudaStreamSynchronize(w->stream);
+      cudaFree(sc_dn);
+      cur = dn_out; H = nH; W = nW;
+    }
+  }
+
+  // encoder.middle.{0,1,2} (640 channels, H_lat x W_lat)
+  cur = vae_enc_run_resblk_streamed(w, cur, H, W, 640, 640, "encoder.middle.0", col, COL_CAP);
+  {
+    int HW = H * W;
+    float *ag = wn_upload_f32(st, "encoder.middle.1.norm.gamma");
+    uint16_t *aqw = wn_upload_conv_k_bf16(st, "encoder.middle.1.to_qkv.weight", 1920, 640, 1);
+    float    *aqb = wn_upload_f32(st, "encoder.middle.1.to_qkv.bias");
+    uint16_t *apw = wn_upload_conv_k_bf16(st, "encoder.middle.1.proj.weight", 640, 640, 1);
+    float    *apb = wn_upload_f32(st, "encoder.middle.1.proj.bias");
+    float *norm_d = NULL, *qkv_d = NULL, *pr_d = NULL; uint16_t *ao_b = NULL;
+    cudaMalloc(&norm_d, (size_t)HW * 640 * 4); cudaMalloc(&qkv_d, (size_t)HW * 1920 * 4);
+    cudaMalloc(&ao_b, (size_t)HW * 640 * 2);   cudaMalloc(&pr_d, (size_t)HW * 640 * 4);
+    k_wn_rmsnorm<<<HW, 256, 0, w->stream>>>(cur, ag, norm_d, NULL, HW, 640, 1e-12f, 0);
+    vae_conv1x1(w, norm_d, qkv_d, aqw, aqb, HW, 640, 1920, col, COL_CAP);
+    k_wn_vae_attn_1h<<<HW, 256, (size_t)(HW + 32) * 4, w->stream>>>(qkv_d, ao_b, HW, 640);
+    wn_gemm(ao_b, apw, apb, pr_d, NULL, HW, 640, 640, w->stream);
+    k_wn_add_inplace<<<((long)HW * 640 + 255) / 256, 256, 0, w->stream>>>(cur, pr_d, (long)HW * 640);
+    cudaStreamSynchronize(w->stream);
+    cudaFree(ag); cudaFree(aqw); cudaFree(aqb); cudaFree(apw); cudaFree(apb);
+    cudaFree(norm_d); cudaFree(qkv_d); cudaFree(ao_b); cudaFree(pr_d);
+  }
+  cur = vae_enc_run_resblk_streamed(w, cur, H, W, 640, 640, "encoder.middle.2", col, COL_CAP);
+
+  // encoder.head (RMSNorm 640 + SiLU + CausalConv3d 640->96) -> conv1 (96->96) -> slice mu[0..47] + normalize!
+  {
+    long HW = (long)H * W;
+    float *hg = wn_upload_f32(st, "encoder.head.0.gamma");
+    uint16_t *hw = wn_upload_conv_k_bf16(st, "encoder.head.2.weight", 96, 640, 27);
+    float    *hb = wn_upload_f32(st, "encoder.head.2.bias");
+    uint16_t *c1w = wn_upload_conv_k_bf16(st, "conv1.weight", 96, 96, 1);
+    float    *c1b = wn_upload_f32(st, "conv1.bias");
+    float *hnorm = NULL, *z96 = NULL, *q96 = NULL, *mean_d = NULL, *std_d = NULL;
+    wn_cache_slot_t cslot = {0, 0};
+    cudaMalloc(&hnorm, (size_t)HW * 640 * 4);
+    cudaMalloc(&z96,   (size_t)HW * 96 * 4);
+    cudaMalloc(&q96,   (size_t)HW * 96 * 4);
+    k_wn_rmsnorm<<<HW, 256, 0, w->stream>>>(cur, hg, hnorm, NULL, (int)HW, 640, 1e-12f, 1);
+    cudaFree(cur);
+    vae_causal_conv3d(w, hnorm, z96, hw, hb, 1, H, W, 640, 96, &cslot, col, COL_CAP);
+    vae_conv1x1(w, z96, q96, c1w, c1b, HW, 96, 96, col, COL_CAP);
+    cudaMalloc(&mean_d, 48 * 4); cudaMalloc(&std_d, 48 * 4);
+    cudaMemcpyAsync(mean_d, WAN22_LATENT_MEAN, 48 * 4, cudaMemcpyHostToDevice, w->stream);
+    cudaMemcpyAsync(std_d,  WAN22_LATENT_STD,  48 * 4, cudaMemcpyHostToDevice, w->stream);
+    k_wn_norm_latent_mu<<<(HW * 48 + 255) / 256, 256, 0, w->stream>>>(q96, out_z_d, mean_d, std_d, HW);
+    cudaStreamSynchronize(w->stream);
+    cudaFree(hg); cudaFree(hw); cudaFree(hb); cudaFree(c1w); cudaFree(c1b);
+    cudaFree(cslot.frames_d); cudaFree(hnorm); cudaFree(z96); cudaFree(q96);
+    cudaFree(mean_d); cudaFree(std_d);
+  }
+  cudaFree(col);
+  if (out_ms) *out_ms = wn_now_ms() - t0;
+  return 0;
+}
+
+extern "C" int ec_wan22_vae_encode_image(
+    ec_wan22_t *w, const uint8_t *rgb, int width, int height,
+    float **out_latent_h, int *out_h_lat, int *out_w_lat, double *out_ms) {
+  if (!ec_wan22_is_ready(w) || !rgb || !out_latent_h || width < 64 || height < 64 || (width & 15) || (height & 15))
+    return -1;
+  int hl = height / 16, wl = width / 16;
+  float *z_d = NULL;
+  if (cudaMalloc(&z_d, (size_t)hl * wl * 48 * 4) != cudaSuccess) return -1;
+  int rc = run_wan_vae_encode_frame(w, rgb, width, height, z_d, out_ms);
+  if (rc == 0) {
+    float *zh = (float *)malloc((size_t)hl * wl * 48 * 4);
+    cudaMemcpy(zh, z_d, (size_t)hl * wl * 48 * 4, cudaMemcpyDeviceToHost);
+    *out_latent_h = zh;
+    if (out_h_lat) *out_h_lat = hl;
+    if (out_w_lat) *out_w_lat = wl;
+  }
+  cudaFree(z_d);
+  return rc;
+}
+
+// ===========================================================================
 // 11. Public Lifecycle & End-to-End Video Generator
 // ===========================================================================
 extern "C" ec_wan22_t *ec_wan22_create(const ec_wan22_paths_t *paths) {
@@ -1758,25 +2074,65 @@ extern "C" int ec_wan22_generate_mp4(
 
   int W = req->width  > 0 ? ((req->width  + 31) & ~31) : 832;
   int H = req->height > 0 ? ((req->height + 31) & ~31) : 480;
-  if (W < 640) W = 640; if (W > 1280) W = 1280;
-  if (H < 384) H = 384; if (H > 768)  H = 768;
+  if (W < 320) W = 320; if (W > 1280) W = 1280;
+  if (H < 320) H = 320; if (H > 1024) H = 1024;
   int req_f = req->num_frames > 0 ? req->num_frames : 17;
   int F_lat = (req_f - 1) / 4 + 1;
   if (F_lat < 2) F_lat = 2;
   if (F_lat > 21) F_lat = 21;
   int n_frames = 1 + 4 * (F_lat - 1);
   int fps   = (req->fps >= 8 && req->fps <= 60) ? req->fps : 16;
-  int steps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 24;
+  int steps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 20;
   float cfg = (req->cfg_scale > 0.0f) ? req->cfg_scale : 5.0f;
   float shf = (req->shift > 0.0f) ? req->shift : ((W * H <= 832 * 480) ? 3.0f : 5.0f);
 
   int H_lat = H / 16, W_lat = W / 16;
   int Hp = H_lat / 2, Wp = W_lat / 2;
 
-  const char *pos_p = (req->prompt && req->prompt[0]) ? req->prompt : "A cinematic drone shot over snow-capped mountains at sunrise";
+  char prompt_buf[1536];
+  const char *base_p = (req->prompt && req->prompt[0]) ? req->prompt : "A cinematic drone shot over snow-capped mountains at sunrise";
+  if (req->camera_motion && req->camera_motion[0] && strcmp(req->camera_motion, "auto") != 0) {
+    const char *cm = req->camera_motion;
+    const char *c_desc = !strcmp(cm, "orbit")     ? ", smooth 360 orbital camera arc around subject"
+                       : !strcmp(cm, "dolly_in")  ? ", slow cinematic dolly-in camera push forward"
+                       : !strcmp(cm, "pan_left")  ? ", steady smooth camera pan left"
+                       : !strcmp(cm, "pan_right") ? ", steady smooth camera pan right"
+                       : !strcmp(cm, "crane_up")  ? ", sweeping crane camera rise upward"
+                       : !strcmp(cm, "fpv")       ? ", dynamic forward FPV drone glide"
+                       : !strcmp(cm, "static")    ? ", locked-off tripod static camera frame"
+                       : "";
+    snprintf(prompt_buf, sizeof prompt_buf, "%s%s", base_p, c_desc);
+  } else {
+    snprintf(prompt_buf, sizeof prompt_buf, "%s", base_p);
+  }
+  const char *pos_p = prompt_buf;
   const char *neg_p = (req->neg_prompt && req->neg_prompt[0])
       ? req->neg_prompt
       : "blurry, low quality, distorted, static, overexposed, watermark, text, ugly, jitter";
+
+  // Stage 0 (v8): Optional Native Causal 3D VAE Encode of Start Frame (I2V) and End Frame (FLF2V)!
+  float *start_z_d = NULL, *end_z_d = NULL;
+  double enc_frame_ms = 0.0;
+  if (req->start_rgb && req->start_w > 0 && req->start_h > 0) {
+    uint8_t *sr = ec_rgb_resize_bilinear(req->start_rgb, req->start_w, req->start_h, W, H);
+    if (sr) {
+      cudaMalloc(&start_z_d, (size_t)H_lat * W_lat * 48 * 4);
+      double em = 0;
+      if (run_wan_vae_encode_frame(w, sr, W, H, start_z_d, &em) == 0) enc_frame_ms += em;
+      else { cudaFree(start_z_d); start_z_d = NULL; }
+      free(sr);
+    }
+  }
+  if (req->end_rgb && req->end_w > 0 && req->end_h > 0) {
+    uint8_t *er = ec_rgb_resize_bilinear(req->end_rgb, req->end_w, req->end_h, W, H);
+    if (er) {
+      cudaMalloc(&end_z_d, (size_t)H_lat * W_lat * 48 * 4);
+      double em = 0;
+      if (run_wan_vae_encode_frame(w, er, W, H, end_z_d, &em) == 0) enc_frame_ms += em;
+      else { cudaFree(end_z_d); end_z_d = NULL; }
+      free(er);
+    }
+  }
 
   // Stage 1: UMT5-XXL FP8-Scaled Text Encoding (before loading 9.4 GB DiT -> minimal peak VRAM!)
   if (cb) cb(0, steps + 3, "wan22_umt5_encode", cb_ctx);
@@ -1786,30 +2142,30 @@ extern "C" int ec_wan22_generate_mp4(
   double ms_p = 0, ms_n = 0;
   if (run_umt5_xxl(w, pos_p, t5_pos_d, &ms_p) != 0 ||
       run_umt5_xxl(w, neg_p, t5_neg_d, &ms_n) != 0) {
-    cudaFree(t5_pos_d); cudaFree(t5_neg_d);
+    cudaFree(t5_pos_d); cudaFree(t5_neg_d); cudaFree(start_z_d); cudaFree(end_z_d);
     snprintf(res->error, sizeof res->error, "umt5-xxl text encoder failed");
     return -1;
   }
   res->text_enc_ms = ms_p + ms_n;
 
-  // Stage 2: Load & Run 30-Block WanModel TI2V-5B DiT
-  if (ensure_dit_loaded(w) != 0) {
-    cudaFree(t5_pos_d); cudaFree(t5_neg_d);
+  // Stage 2: Load & Run 30-Block WanModel TI2V-5B DiT (+ optional hot-fused LoRA/QLoRA + I2V/FLF2V anchors!)
+  if (ensure_dit_loaded(w, req->loras, req->n_loras) != 0) {
+    cudaFree(t5_pos_d); cudaFree(t5_neg_d); cudaFree(start_z_d); cudaFree(end_z_d);
     snprintf(res->error, sizeof res->error, "wan22 dit load failed");
     return -1;
   }
   float *z_d = NULL;
   cudaMalloc(&z_d, (size_t)F_lat * H_lat * W_lat * 48 * 4);
-  int rc = run_wan_dit(w, t5_pos_d, t5_neg_d, F_lat, Hp, Wp, steps, cfg, shf, req->seed, z_d, cb, cb_ctx, &res->dit_ms);
-  cudaFree(t5_pos_d); cudaFree(t5_neg_d);
+  int rc = run_wan_dit(w, t5_pos_d, t5_neg_d, F_lat, Hp, Wp, steps, cfg, shf, req->seed,
+                       start_z_d, end_z_d, z_d, cb, cb_ctx, &res->dit_ms);
+  cudaFree(t5_pos_d); cudaFree(t5_neg_d); cudaFree(start_z_d); cudaFree(end_z_d);
   if (rc != 0) {
     cudaFree(z_d);
     snprintf(res->error, sizeof res->error, rc == -2 ? "cancelled" : "wan22 dit denoising failed");
     return rc;
   }
 
-  // Stage 3: Unload 9.4 GB DiT if VRAM is tight? Wait: VAE is only 1.4 GB + 300 MB scratch -> fits alongside DiT!
-  // Let's keep DiT resident unless VAE load fails, in which case auto-evict DiT and retry!
+  // Stage 3: Causal 3D VAE Streaming Decode
   if (cb) cb(steps + 1, steps + 3, "wan22_causal_vae_decode", cb_ctx);
   if (ensure_vae_loaded(w) != 0) {
     free_dit_res(&w->dit);
@@ -1825,6 +2181,7 @@ extern "C" int ec_wan22_generate_mp4(
     snprintf(res->error, sizeof res->error, "wan22 vae decode failed");
     return -1;
   }
+  res->vae_ms += enc_frame_ms;
   cudaFree(z_d);
 
   // Stage 4: Export Keyframe PNG + Hardware NVENC H.264 (+ optional AAC) MP4!

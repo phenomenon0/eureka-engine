@@ -11,6 +11,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ec_acestep.h"
 #include "ec_bpe.h"
+#include "ec_lora.h"
 #include "ec_media.h"
 #include "ec_ops.h"
 #include "ec_safetensors.h"
@@ -365,6 +366,31 @@ __global__ void k_as_im2col_1d_k7(
   col_bf16[idx] = as_f32_to_bf16(v);
 }
 
+// General strided 1D im2col for Oobleck Encoder (arbitrary K, stride, pad) on chunk [q0 .. q0+chunk-1]
+__global__ void k_as_im2col_1d_strided(
+    const float *__restrict__ x, uint16_t *__restrict__ col_bf16,
+    int L_in, int Cin, int K, int stride, int pad, int q0, int chunk) {
+  long KK = (long)K * Cin;
+  long tot = (long)chunk * KK;
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= tot) return;
+  int row = (int)(idx / KK);
+  int rem = (int)(idx % KK);
+  int k = rem / Cin;
+  int ic = rem % Cin;
+  int t = (q0 + row) * stride - pad + k;
+  float v = (t >= 0 && t < L_in) ? x[(long)t * Cin + ic] : 0.0f;
+  col_bf16[idx] = as_f32_to_bf16(v);
+}
+
+// Slice first 64 mean channels (mu) from [T, 128] encoder output -> [T, 64]
+__global__ void k_as_slice_mu64(const float *in128, float *out64, int T) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)T * 64) return;
+  int t = (int)(idx / 64), c = (int)(idx % 64);
+  out64[idx] = in128[(long)t * 128 + c];
+}
+
 // Build input pairs for ConvTranspose1d (k=2*s, stride=s, pad=s/2) on chunk [q0 .. q0+q_chunk-1]
 // Row r = cat(x[q], x[q-1]) of width 2*Cin, zero outside [0, L_in-1].
 __global__ void k_as_convt_pairs(
@@ -583,10 +609,25 @@ static int load_time_emb(const ec_safetensors_t *st, const char *pfx, as_time_em
   return (te->l1_w && te->l1_b && te->l2_w && te->l2_b && te->proj_w && te->proj_b) ? 0 : -1;
 }
 
-static int ensure_dit_loaded(ec_acestep_t *as) {
-  if (as->dit.loaded) return 0;
+static void build_as_lora_sig(const ec_lora_spec_t *loras, int n_loras, char *out, size_t cap) {
+  out[0] = '\0';
+  size_t pos = 0;
+  for (int i = 0; i < n_loras && pos + 8 < cap; i++) {
+    if (!loras[i].path[0]) continue;
+    pos += (size_t)snprintf(out + pos, cap - pos, "%s%.3f|", loras[i].path, loras[i].strength);
+  }
+}
+
+static int ensure_dit_loaded(ec_acestep_t *as, const ec_lora_spec_t *loras, int n_loras) {
+  static char s_loaded_sig[1024] = {0};
+  static int  s_loaded_hits = 0;
+  char lsig[1024];
+  build_as_lora_sig(loras, n_loras, lsig, sizeof lsig);
+  if (as->dit.loaded && strcmp(s_loaded_sig, lsig) == 0) return s_loaded_hits;
+  if (as->dit.loaded) free_dit_resident(&as->dit);
   const ec_safetensors_t *st = &as->dit_st;
   as_dit_resident_t *d = &as->dit;
+  ec_lora_apply_stats_t lstats = {};
 
   // proj_in.1.weight [2048, 192, 2] -> transpose to [2048, 384] where [oc, k*192 + ic] = W[oc, ic, k]
   float *w_in_h = NULL;
@@ -620,16 +661,27 @@ static int ensure_dit_loaded(ec_acestep_t *as) {
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.q_norm.weight", i); L->cross_q_norm = st_upload_f32(st, k);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.k_norm.weight", i); L->cross_k_norm = st_upload_f32(st, k);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.q_proj.weight", i);  L->self_q  = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->self_q) ec_lora_fuse_onto_bf16(L->self_q, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.k_proj.weight", i);  L->self_k  = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->self_k) ec_lora_fuse_onto_bf16(L->self_k, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.v_proj.weight", i);  L->self_v  = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->self_v) ec_lora_fuse_onto_bf16(L->self_v, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.o_proj.weight", i);  L->self_o  = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->self_o) ec_lora_fuse_onto_bf16(L->self_o, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.q_proj.weight", i); L->cross_q = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->cross_q) ec_lora_fuse_onto_bf16(L->cross_q, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.k_proj.weight", i); L->cross_k = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->cross_k) ec_lora_fuse_onto_bf16(L->cross_k, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.v_proj.weight", i); L->cross_v = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->cross_v) ec_lora_fuse_onto_bf16(L->cross_v, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.o_proj.weight", i); L->cross_o = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->cross_o) ec_lora_fuse_onto_bf16(L->cross_o, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.mlp.gate_proj.weight", i);     L->mlp_gate = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->mlp_gate) ec_lora_fuse_onto_bf16(L->mlp_gate, 6144, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.mlp.up_proj.weight", i);       L->mlp_up   = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->mlp_up) ec_lora_fuse_onto_bf16(L->mlp_up, 6144, 2048, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.mlp.down_proj.weight", i);     L->mlp_down = st_upload_bf16(st, k);
+    if (n_loras > 0 && L->mlp_down) ec_lora_fuse_onto_bf16(L->mlp_down, 2048, 6144, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.scale_shift_table", i);        L->scale_shift = st_upload_f32(st, k);
     if (!L->self_q || !L->cross_q || !L->mlp_down || !L->scale_shift) {
       free_dit_resident(d);
@@ -661,8 +713,10 @@ static int ensure_dit_loaded(ec_acestep_t *as) {
   cudaMalloc(&d->proj_out_b2, 128 * sizeof(float));
   cudaMemcpy(d->proj_out_b2, b_out2, 128 * sizeof(float), cudaMemcpyHostToDevice);
 
+  snprintf(s_loaded_sig, sizeof s_loaded_sig, "%s", lsig);
+  s_loaded_hits = lstats.n_tensors_matched;
   d->loaded = 1;
-  return 0;
+  return s_loaded_hits;
 }
 
 static int load_snake(const ec_safetensors_t *st, const char *pfx, int C, as_snake_t *s) {
@@ -924,6 +978,7 @@ static int run_qwen3_06b(
   return 0;
 }
 
+
 // ===========================================================================
 // 9. Stage 2: Native CUDA AceStepConditionEncoder (Text Proj + 8L Lyric + 4L Timbre)
 // ===========================================================================
@@ -1065,6 +1120,7 @@ static int run_condition_encoder(
   return 0;
 }
 
+
 // ===========================================================================
 // 10. Stage 3: Native CUDA 24-Layer AceStepDiTModel (8-Step Shift=3.0 Turbo ODE)
 // ===========================================================================
@@ -1113,6 +1169,8 @@ static int run_acestep_dit(
     ec_acestep_t *as,
     const uint16_t *enc_packed_bf16_d, int L_enc,
     int T, int steps, float shift, uint32_t seed,
+    const float *src_lat_h, int T_src, const char *audio_mode,
+    float denoise, float repaint_start_sec, float repaint_end_sec,
     float *out_x0_d, // [T, 64] F32 on GPU
     ec_acestep_progress_fn cb, void *cb_ctx,
     double *out_ms) {
@@ -1122,7 +1180,6 @@ static int run_acestep_dit(
   int T_pad = (T + 1) & ~1;
   int T_p = T_pad / 2;
 
-  // Build valid Turbo schedule
   static const float S1[8] = {1.0f, 0.875f, 0.75f, 0.625f, 0.5f, 0.375f, 0.25f, 0.125f};
   static const float S2[8] = {1.0f, 0.93333333f, 0.85714286f, 0.76923077f, 0.66666667f, 0.54545454f, 0.4f, 0.22222222f};
   static const float S3[8] = {1.0f, 0.95454545f, 0.9f, 0.83333333f, 0.75f, 0.64285714f, 0.5f, 0.3f};
@@ -1132,18 +1189,29 @@ static int run_acestep_dit(
   if (n_steps == 8) {
     memcpy(sched, base_sched, sizeof sched);
   } else {
-    for (int i = 0; i < n_steps; i++) {
-      int idx = (i * 8) / n_steps;
-      sched[i] = base_sched[idx];
-    }
+    for (int i = 0; i < n_steps; i++) sched[i] = base_sched[(i * 8) / n_steps];
   }
+
+  int is_cover   = (src_lat_h && T_src > 0 && audio_mode && !strcmp(audio_mode, "cover"));
+  int is_repaint = (src_lat_h && T_src > 0 && audio_mode && !strcmp(audio_mode, "repaint"));
+  int is_extend  = (src_lat_h && T_src > 0 && audio_mode && !strcmp(audio_mode, "extend"));
+
+  int s0 = 0;
+  if (is_cover && denoise > 0.05f && denoise < 0.99f) {
+    s0 = (int)roundf((1.0f - denoise) * (float)n_steps);
+    if (s0 < 0) s0 = 0; if (s0 >= n_steps) s0 = n_steps - 1;
+  }
+  int rp_t0 = (int)roundf(repaint_start_sec * 25.0f);
+  int rp_t1 = (int)roundf(repaint_end_sec   * 25.0f);
+  if (rp_t0 < 0) rp_t0 = 0;
+  if (rp_t1 <= rp_t0) rp_t1 = T;
+  if (rp_t1 > T) rp_t1 = T;
 
   // Project encoder_hidden_states ONCE through decoder.condition_embedder
   uint16_t *cond_bf16_d = NULL;
   cudaMalloc(&cond_bf16_d, (size_t)L_enc * DIM * 2);
   as_gemm(enc_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, cond_bf16_d, L_enc, DIM, DIM, as->stream);
 
-  // Precompute & cache cross-attention K/V in BF16 for all 24 layers (direct TensorCore FA2!)
   uint16_t *ck_cache[24] = {0}, *cv_cache[24] = {0};
   float *ck_tmp = NULL, *cv_tmp = NULL;
   cudaMalloc(&ck_tmp, (size_t)L_enc * HKV * D * 4);
@@ -1160,33 +1228,45 @@ static int run_acestep_dit(
   }
   cudaFree(ck_tmp); cudaFree(cv_tmp); cudaFree(cond_bf16_d);
 
-  // Precompute constant time_embed_r(0.0) using pre-allocated zero-sync scratch
   float *temb_r_d = NULL, *tproj_r_d = NULL;
   float *temb_t_d = NULL, *tproj_t_d = NULL;
   float *temb_d = NULL, *tproj_d = NULL, *mod_d = NULL, *out_mod_d = NULL;
   uint16_t *te_f_d = NULL, *te_hb_d = NULL; float *te_hf_d = NULL;
-  cudaMalloc(&temb_r_d,  DIM * 4);
-  cudaMalloc(&tproj_r_d, 6 * DIM * 4);
-  cudaMalloc(&temb_t_d,  DIM * 4);
-  cudaMalloc(&tproj_t_d, 6 * DIM * 4);
-  cudaMalloc(&temb_d,    DIM * 4);
-  cudaMalloc(&tproj_d,   6 * DIM * 4);
-  cudaMalloc(&mod_d,     6 * DIM * 4);
-  cudaMalloc(&out_mod_d, 2 * DIM * 4);
-  cudaMalloc(&te_f_d,    256 * 2);
-  cudaMalloc(&te_hf_d,   2048 * 4);
-  cudaMalloc(&te_hb_d,   2048 * 2);
+  cudaMalloc(&temb_r_d,  DIM * 4); cudaMalloc(&tproj_r_d, 6 * DIM * 4);
+  cudaMalloc(&temb_t_d,  DIM * 4); cudaMalloc(&tproj_t_d, 6 * DIM * 4);
+  cudaMalloc(&temb_d,    DIM * 4); cudaMalloc(&tproj_d,   6 * DIM * 4);
+  cudaMalloc(&mod_d,     6 * DIM * 4); cudaMalloc(&out_mod_d, 2 * DIM * 4);
+  cudaMalloc(&te_f_d,    256 * 2); cudaMalloc(&te_hf_d, 2048 * 4); cudaMalloc(&te_hb_d, 2048 * 2);
   compute_time_embed_gpu(as, &d->time_embed_r, 0.0f, te_f_d, te_hf_d, te_hb_d, temb_r_d, tproj_r_d);
 
-  // Prepare context_latents [T, 128] = cat(silence_latent[0..T-1], ones) and initial noise xt [T, 64]
+  // Prepare native ACE-Step 1.5 context_latents [T, 128] = cat(ctx_64, gen_mask_64) and initial xt [T, 64]
   float *ctx_h = (float *)malloc((size_t)T * 128 * 4);
   float *xt_h  = (float *)malloc((size_t)T * 64 * 4);
   uint64_t rng = (uint64_t)seed * 6364136223846793005ULL + 1442695040888963407ULL;
+  float t_start = sched[s0];
   for (int t = 0; t < T; t++) {
     int st_idx = t % as->silence_frames;
-    memcpy(ctx_h + (long)t * 128, as->silence_T64_h + (long)st_idx * 64, 64 * 4);
-    for (int c = 0; c < 64; c++) ctx_h[(long)t * 128 + 64 + c] = 1.0f;
-    for (int c = 0; c < 64; c++) xt_h[(long)t * 64 + c] = as_randn(&rng);
+    int has_src = (src_lat_h && t < T_src);
+    float gen_m = 1.0f;
+    if (is_repaint && has_src) {
+      gen_m = (t >= rp_t0 && t < rp_t1) ? 1.0f : 0.0f;
+    } else if (is_extend && has_src) {
+      gen_m = 0.0f;
+    }
+    if ((is_repaint || is_extend) && has_src && gen_m < 0.5f) {
+      memcpy(ctx_h + (long)t * 128, src_lat_h + (long)t * 64, 64 * 4);
+    } else {
+      memcpy(ctx_h + (long)t * 128, as->silence_T64_h + (long)st_idx * 64, 64 * 4);
+    }
+    for (int c = 0; c < 64; c++) ctx_h[(long)t * 128 + 64 + c] = gen_m;
+    for (int c = 0; c < 64; c++) {
+      float eps = as_randn(&rng);
+      if (is_cover && has_src) {
+        xt_h[(long)t * 64 + c] = (1.0f - t_start) * src_lat_h[(long)t * 64 + c] + t_start * eps;
+      } else {
+        xt_h[(long)t * 64 + c] = eps;
+      }
+    }
   }
   float *ctx_d = NULL, *xt_d = NULL, *vt_d = NULL;
   cudaMalloc(&ctx_d, (size_t)T * 128 * 4);
@@ -1196,7 +1276,6 @@ static int run_acestep_dit(
   cudaMemcpyAsync(xt_d,  xt_h,  (size_t)T * 64 * 4,  cudaMemcpyHostToDevice, as->stream);
   free(ctx_h); free(xt_h);
 
-  // Working buffers for DiT forward [T_p, DIM] (BF16 Q/K/V for TensorCore FA2!)
   uint16_t *patch_in_bf16 = NULL, *xn_bf16 = NULL, *ao_bf16 = NULL, *mlp_bf16 = NULL;
   uint16_t *qr_b = NULL, *kr_b = NULL, *vr_b = NULL;
   float *x_d = NULL, *q_d = NULL, *k_d = NULL, *v_d = NULL;
@@ -1218,7 +1297,7 @@ static int run_acestep_dit(
 
   const float attn_scale = 1.0f / sqrtf((float)D);
   int cancelled = 0;
-  for (int step = 0; step < n_steps; step++) {
+  for (int step = s0; step < n_steps; step++) {
     if (cb && cb(step + 2, n_steps + 3, "acestep_dit_step", cb_ctx) != 0) {
       cancelled = 1;
       break;
@@ -1446,6 +1525,137 @@ static int run_oobleck_vae_decode(
 }
 
 // ===========================================================================
+// 11b. Native CUDA AutoencoderOobleck 1D Stereo Audio VAE Encoder (48kHz -> 25Hz [T, 64]!)
+//      Streams encoder.* weights per block (zero persistent VRAM overhead!).
+// ===========================================================================
+static void run_conv1d_strided_chunked(
+    ec_acestep_t *as, const float *x_d, float *y_d,
+    const uint16_t *w_bf16, const float *b_f32,
+    int L_in, int L_out, int Cin, int Cout, int K, int stride, int pad,
+    uint16_t *col_scratch, size_t col_cap_elems) {
+  int max_ch = (int)(col_cap_elems / (size_t)(K * Cin));
+  if (max_ch < 64) max_ch = 64;
+  for (int q0 = 0; q0 < L_out; q0 += max_ch) {
+    int ch = (L_out - q0 < max_ch) ? (L_out - q0) : max_ch;
+    long n_col = (long)ch * K * Cin;
+    k_as_im2col_1d_strided<<<(n_col + 255) / 256, 256, 0, as->stream>>>(
+        x_d, col_scratch, L_in, Cin, K, stride, pad, q0, ch);
+    as_gemm(col_scratch, w_bf16, b_f32, y_d + (long)q0 * Cout, NULL, ch, Cout, K * Cin, as->stream);
+  }
+}
+
+static int run_oobleck_vae_encode(
+    ec_acestep_t *as, const float *pcm_lr_h, int n_samples,
+    float *out_z64_h, int *out_T, double *out_ms) {
+  double t0 = as_now_ms();
+  const ec_safetensors_t *st = &as->vae_st;
+  int T = n_samples / 1920;
+  if (T < 1) return -1;
+  int L = T * 1920;
+
+  const size_t COL_CAP = 32L * 1024 * 1024;
+  uint16_t *col = NULL;
+  if (cudaMalloc(&col, COL_CAP * 2) != cudaSuccess) return -1;
+
+  float *pcm_d = NULL, *cur_d = NULL;
+  cudaMalloc(&pcm_d, (size_t)L * 2 * 4);
+  cudaMemcpyAsync(pcm_d, pcm_lr_h, (size_t)L * 2 * 4, cudaMemcpyHostToDevice, as->stream);
+
+  // encoder.conv1: 2 -> 128, k=7, stride=1, pad=3
+  {
+    uint16_t *c1w = load_wn_conv1d_bf16(st, "encoder.conv1", 128, 2, 7);
+    float    *c1b = st_upload_f32(st, "encoder.conv1.bias");
+    cudaMalloc(&cur_d, (size_t)L * 128 * 4);
+    run_conv1d_strided_chunked(as, pcm_d, cur_d, c1w, c1b, L, L, 2, 128, 7, 1, 3, col, COL_CAP);
+    cudaStreamSynchronize(as->stream);
+    cudaFree(c1w); cudaFree(c1b); cudaFree(pcm_d);
+  }
+
+  // encoder.block.0..4 (strides 2, 4, 4, 6, 10 -> 1920x downsample!)
+  const int in_cs[5]  = { 128, 128, 256,  512, 1024 };
+  const int out_cs[5] = { 128, 256, 512, 1024, 2048 };
+  const int strds[5]  = {   2,   4,   4,    6,   10 };
+  const int dils[3]   = {   1,   3,   9 };
+  char pfx[192], kb[192];
+
+  for (int b = 0; b < 5; b++) {
+    int Cin = in_cs[b], Cout = out_cs[b], s = strds[b];
+    // 3 dilated ResUnits at Cin
+    float *buf_a = NULL, *buf_b = NULL;
+    cudaMalloc(&buf_a, (size_t)L * Cin * 4);
+    cudaMalloc(&buf_b, (size_t)L * Cin * 4);
+    int r_ch = (int)(COL_CAP / (size_t)(7 * Cin)); if (r_ch < 256) r_ch = 256;
+    for (int u = 0; u < 3; u++) {
+      as_oobleck_res_t R = {};
+      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.snake1", b, u + 1); load_snake(st, pfx, Cin, &R.s1);
+      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.conv1",  b, u + 1); R.c1_w = load_wn_conv1d_bf16(st, pfx, Cin, Cin, 7);
+      snprintf(kb,  sizeof kb,  "%s.bias", pfx);                                R.c1_b = st_upload_f32(st, kb);
+      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.snake2", b, u + 1); load_snake(st, pfx, Cin, &R.s2);
+      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.conv2",  b, u + 1); R.c2_w = load_wn_conv1d_bf16(st, pfx, Cin, Cin, 1);
+      snprintf(kb,  sizeof kb,  "%s.bias", pfx);                                R.c2_b = st_upload_f32(st, kb);
+      run_oobleck_resunit(as, cur_d, buf_a, buf_b, &R, L, Cin, dils[u], col, r_ch);
+      cudaStreamSynchronize(as->stream);
+      free_snake(&R.s1); free_snake(&R.s2);
+      cudaFree(R.c1_w); cudaFree(R.c1_b); cudaFree(R.c2_w); cudaFree(R.c2_b);
+    }
+    cudaFree(buf_b);
+
+    // snake1 -> strided conv1 (k=2*s, stride=s, pad=s/2)
+    as_snake_t sn = {};
+    snprintf(pfx, sizeof pfx, "encoder.block.%d.snake1", b); load_snake(st, pfx, Cin, &sn);
+    k_as_snake1d<<<((long)L * Cin + 255) / 256, 256, 0, as->stream>>>(cur_d, sn.exp_alpha, sn.inv_beta, buf_a, L, Cin);
+    cudaFree(cur_d); free_snake(&sn);
+
+    int L_out = L / s;
+    snprintf(pfx, sizeof pfx, "encoder.block.%d.conv1", b);
+    uint16_t *dw = load_wn_conv1d_bf16(st, pfx, Cout, Cin, 2 * s);
+    snprintf(kb, sizeof kb, "%s.bias", pfx);
+    float *db = st_upload_f32(st, kb);
+    float *next_d = NULL;
+    cudaMalloc(&next_d, (size_t)L_out * Cout * 4);
+    run_conv1d_strided_chunked(as, buf_a, next_d, dw, db, L, L_out, Cin, Cout, 2 * s, s, s / 2, col, COL_CAP);
+    cudaStreamSynchronize(as->stream);
+    cudaFree(buf_a); cudaFree(dw); cudaFree(db);
+    cur_d = next_d; L = L_out;
+  }
+
+  // Final encoder.snake1(2048) -> encoder.conv2(2048 -> 128, k=3, pad=1) -> slice mean mu [T, 64]
+  as_snake_t fsn = {};
+  load_snake(st, "encoder.snake1", 2048, &fsn);
+  float *sn_d = NULL, *z128_d = NULL, *z64_d = NULL;
+  cudaMalloc(&sn_d,   (size_t)L * 2048 * 4);
+  cudaMalloc(&z128_d, (size_t)L * 128 * 4);
+  cudaMalloc(&z64_d,  (size_t)L * 64 * 4);
+  k_as_snake1d<<<((long)L * 2048 + 255) / 256, 256, 0, as->stream>>>(cur_d, fsn.exp_alpha, fsn.inv_beta, sn_d, L, 2048);
+  cudaFree(cur_d); free_snake(&fsn);
+  uint16_t *c2w = load_wn_conv1d_bf16(st, "encoder.conv2", 128, 2048, 3);
+  float    *c2b = st_upload_f32(st, "encoder.conv2.bias");
+  run_conv1d_strided_chunked(as, sn_d, z128_d, c2w, c2b, L, L, 2048, 128, 3, 1, 1, col, COL_CAP);
+  k_as_slice_mu64<<<((long)L * 64 + 255) / 256, 256, 0, as->stream>>>(z128_d, z64_d, L);
+  cudaMemcpyAsync(out_z64_h, z64_d, (size_t)L * 64 * 4, cudaMemcpyDeviceToHost, as->stream);
+  cudaStreamSynchronize(as->stream);
+  cudaFree(sn_d); cudaFree(z128_d); cudaFree(z64_d); cudaFree(c2w); cudaFree(c2b); cudaFree(col);
+  if (out_T) *out_T = L;
+  if (out_ms) *out_ms = as_now_ms() - t0;
+  return 0;
+}
+
+extern "C" int ec_acestep_encode_pcm(
+    ec_acestep_t *as, const float *pcm_lr, int n_samples,
+    float **out_latent_h, int *out_T, double *out_ms) {
+  if (!ec_acestep_is_ready(as) || !pcm_lr || n_samples < 1920 || !out_latent_h) return -1;
+  int T = n_samples / 1920;
+  float *zh = (float *)malloc((size_t)T * 64 * 4);
+  if (!zh) return -1;
+  int got_T = 0;
+  int rc = run_oobleck_vae_encode(as, pcm_lr, n_samples, zh, &got_T, out_ms);
+  if (rc != 0) { free(zh); return -1; }
+  *out_latent_h = zh;
+  if (out_T) *out_T = got_T;
+  return 0;
+}
+
+// ===========================================================================
 // 12. Complementary 4-Band Stem Separator for Studio Live Mixer
 //     (Clean 1-pole crossover cascade: stems sum identically to the AI mix!)
 // ===========================================================================
@@ -1578,29 +1788,57 @@ extern "C" int ec_acestep_generate_wav(
   double t_all = as_now_ms();
 
   int bpm = (req->bpm >= 40 && req->bpm <= 240) ? req->bpm : 120;
-  float dur = (req->duration_sec >= 2.0f && req->duration_sec <= 60.0f) ? req->duration_sec : 10.0f;
+  float dur = (req->duration_sec >= 2.0f && req->duration_sec <= 120.0f) ? req->duration_sec : 10.0f;
   int steps = (req->steps >= 1 && req->steps <= 8) ? req->steps : 8;
   float shift = (req->shift >= 0.5f && req->shift <= 4.0f) ? req->shift : 3.0f;
   int T = (int)roundf(dur * 25.0f);
   if (T < 25) T = 25;
   int n_samples = T * 1920;
 
-  // Format exact SFT_GEN_PROMPT caption & lyrics strings
+  // Format exact SFT_GEN_PROMPT caption & lyrics strings (now including Key/Scale, Time Sig & Vocal Mode!)
   const char *caption = (req->prompt && req->prompt[0]) ? req->prompt : "Warm cinematic instrumental synthwave";
   const char *lyrics  = (req->lyrics && req->lyrics[0]) ? req->lyrics : "[Instrumental]";
-  const char *lang    = (req->lyrics && req->lyrics[0]) ? "en" : "unknown";
+  const char *vmode   = (req->vocal_mode && req->vocal_mode[0]) ? req->vocal_mode : "auto";
+  if (!strcmp(vmode, "instrumental")) lyrics = "[Instrumental]";
+  const char *lang    = (lyrics && strcmp(lyrics, "[Instrumental]") != 0) ? "en" : "unknown";
+  const char *ks      = (req->key_scale && req->key_scale[0]) ? req->key_scale : "N/A";
+  const char *tsig    = (req->time_sig && req->time_sig[0]) ? req->time_sig : "4";
+  char cap_full[1536];
+  if (strcmp(vmode, "auto") != 0 && strcmp(vmode, "instrumental") != 0) {
+    snprintf(cap_full, sizeof cap_full, "%s, %s vocals", caption, vmode);
+  } else if (!strcmp(vmode, "instrumental")) {
+    snprintf(cap_full, sizeof cap_full, "%s, instrumental only, no vocals", caption);
+  } else {
+    snprintf(cap_full, sizeof cap_full, "%s", caption);
+  }
   char cap_buf[2048], lyr_buf[2048];
   snprintf(cap_buf, sizeof cap_buf,
            "# Instruction\nFill the audio semantic mask based on the given conditions:\n\n"
            "# Caption\n%s\n\n"
-           "# Metas\n- bpm: %d\n- timesignature: 4\n- keyscale: N/A\n- duration: %d seconds\n<|endoftext|>\n",
-           caption, bpm, (int)roundf(dur));
+           "# Metas\n- bpm: %d\n- timesignature: %s\n- keyscale: %s\n- duration: %d seconds\n<|endoftext|>\n",
+           cap_full, bpm, tsig, ks, (int)roundf(dur));
   snprintf(lyr_buf, sizeof lyr_buf, "# Languages\n%s\n\n# Lyric\n%s<|endoftext|>", lang, lyrics);
+
+  // Optional Stage 0 (v8): Native Oobleck 1D Stereo VAE Encode for Cover / Repaint / Extend!
+  float *src_lat_h = NULL;
+  int T_src = 0;
+  double enc_ms = 0.0;
+  if (req->source_pcm_lr && req->source_samples >= 1920) {
+    int max_src_T = req->source_samples / 1920;
+    if (max_src_T > T) max_src_T = T;
+    src_lat_h = (float *)malloc((size_t)max_src_T * 64 * 4);
+    if (src_lat_h) {
+      if (run_oobleck_vae_encode(as, req->source_pcm_lr, max_src_T * 1920, src_lat_h, &T_src, &enc_ms) != 0) {
+        free(src_lat_h); src_lat_h = NULL; T_src = 0;
+      }
+    }
+  }
 
   int32_t text_ids[256], lyric_ids[1024];
   int L_txt = ec_bpe_encode(as->bpe, cap_buf, text_ids, 256);
   int L_lyr = ec_bpe_encode(as->bpe, lyr_buf, lyric_ids, 1024);
   if (L_txt <= 0 || L_lyr <= 0) {
+    free(src_lat_h);
     snprintf(res->error, sizeof res->error, "bpe tokenization failed");
     return -1;
   }
@@ -1611,7 +1849,7 @@ extern "C" int ec_acestep_generate_wav(
   cudaMalloc(&text_bf16_d,  (size_t)L_txt * 1024 * 2);
   cudaMalloc(&lyric_bf16_d, (size_t)L_lyr * 1024 * 2);
   if (run_qwen3_06b(as, text_ids, L_txt, lyric_ids, L_lyr, text_bf16_d, lyric_bf16_d, &res->text_enc_ms) != 0) {
-    cudaFree(text_bf16_d); cudaFree(lyric_bf16_d);
+    free(src_lat_h); cudaFree(text_bf16_d); cudaFree(lyric_bf16_d);
     snprintf(res->error, sizeof res->error, "qwen3-0.6b text encoder failed");
     return -1;
   }
@@ -1622,22 +1860,29 @@ extern "C" int ec_acestep_generate_wav(
   uint16_t *enc_packed_d = NULL;
   cudaMalloc(&enc_packed_d, (size_t)L_enc * 2048 * 2);
   if (run_condition_encoder(as, text_bf16_d, L_txt, lyric_bf16_d, L_lyr, enc_packed_d, &res->cond_enc_ms) != 0) {
-    cudaFree(text_bf16_d); cudaFree(lyric_bf16_d); cudaFree(enc_packed_d);
+    free(src_lat_h); cudaFree(text_bf16_d); cudaFree(lyric_bf16_d); cudaFree(enc_packed_d);
     snprintf(res->error, sizeof res->error, "condition encoder failed");
     return -1;
   }
   cudaFree(text_bf16_d);
   cudaFree(lyric_bf16_d);
 
-  // Stage 3: Load & Run 24-Layer AceStepDiTModel (8-step Shift=3.0 Turbo ODE)
-  if (ensure_dit_loaded(as) != 0) {
-    cudaFree(enc_packed_d);
+  // Stage 3: Load & Run 24-Layer AceStepDiTModel (+ hot-fused LoRA/QLoRA/LoKr + Cover/Repaint/Extend!)
+  int lora_hits = ensure_dit_loaded(as, req->loras, req->n_loras);
+  if (lora_hits < 0) {
+    free(src_lat_h); cudaFree(enc_packed_d);
     snprintf(res->error, sizeof res->error, "acestep dit weight load failed");
     return -1;
   }
+  res->lora_tensors_fused = lora_hits;
   float *x0_d = NULL;
   cudaMalloc(&x0_d, (size_t)T * 64 * 4);
-  int rc = run_acestep_dit(as, enc_packed_d, L_enc, T, steps, shift, req->seed, x0_d, cb, cb_ctx, &res->dit_ms);
+  const char *amode = (req->audio_mode && req->audio_mode[0]) ? req->audio_mode : (src_lat_h ? "cover" : "generate");
+  float denoise = (req->denoise > 0.05f && req->denoise <= 1.0f) ? req->denoise : 0.65f;
+  int rc = run_acestep_dit(as, enc_packed_d, L_enc, T, steps, shift, req->seed,
+                           src_lat_h, T_src, amode, denoise, req->repaint_start_sec, req->repaint_end_sec,
+                           x0_d, cb, cb_ctx, &res->dit_ms);
+  free(src_lat_h);
   cudaFree(enc_packed_d);
   if (rc != 0) {
     cudaFree(x0_d);
@@ -1658,6 +1903,7 @@ extern "C" int ec_acestep_generate_wav(
     snprintf(res->error, sizeof res->error, "oobleck vae decode failed");
     return -1;
   }
+  res->vae_ms += enc_ms;
   cudaFree(x0_d);
 
   // Peak normalize softly only if peak > 0.99 (preserve genuine studio dynamics!), compute RMS/peak
@@ -1689,7 +1935,25 @@ extern "C" int ec_acestep_generate_wav(
       return -1;
     }
   }
-  export_mixer_stems(pcm_lr, n_samples, 48000, stem_paths);
+  // Flexible Stem Mode: 0=full_mix, 2=vocals/instrumental, 4=4stem, 8=8stem full band!
+  int smode = req->stem_mode;
+  if (smode == 0 && stem_paths && stem_paths[0] && stem_paths[0][0]) smode = 4; // legacy caller passed 4 paths
+  if (smode == 4 && stem_paths && stem_paths[0] && stem_paths[0][0]) {
+    export_mixer_stems(pcm_lr, n_samples, 48000, stem_paths);
+    static const char *N4[4] = { "drums", "bass", "harmony", "lead" };
+    res->n_stems = 4;
+    for (int i = 0; i < 4; i++) {
+      snprintf(res->stem_paths[i], sizeof res->stem_paths[i], "%s", stem_paths[i] ? stem_paths[i] : "");
+      snprintf(res->stem_names[i], sizeof res->stem_names[i], "%s", N4[i]);
+    }
+  } else if (smode == 2 || smode == 4 || smode == 8) {
+    char pfx[240];
+    snprintf(pfx, sizeof pfx, "%s", (out_wav_path && out_wav_path[0]) ? out_wav_path : "/tmp/acestep_mix");
+    char *dot = strstr(pfx, "_master.wav");
+    if (!dot) dot = strrchr(pfx, '.');
+    if (dot) *dot = '\0';
+    ec_audio_split_stems(pcm_lr, n_samples, 48000, smode, pfx, res->stem_paths, res->stem_names, &res->n_stems);
+  }
 
   if (out_pcm_lr) *out_pcm_lr = pcm_lr;
   else free(pcm_lr);

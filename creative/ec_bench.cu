@@ -4,16 +4,20 @@
 //   G-C0.2: Paired Performance Fly-Stack (Exact FP16 FA2 vs Fast SageAttention INT8 + CUDA Graph + MagCache)
 //   G-C0.3: Safetensors hardening + ComfyUI JSON Compiled DAG + GLB/PLY/WAV/PPM + Zero-Copy SHM 60+ FPS Ring
 
+#include "ec_acestep.h"
 #include "ec_cowrie.h"
 #include "ec_dit.h"
 #include "ec_flow.h"
+#include "ec_flux2.h"
 #include "ec_kernels.cuh"
 #include "ec_kernels_v2.cuh"
+#include "ec_lora.h"
 #include "ec_media.h"
 #include "ec_models.h"
 #include "ec_ops.h"
 #include "ec_safetensors.h"
 #include "ec_vram_pool.h"
+#include "ec_wan22.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -22,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static double now_ms(void) {
   struct timespec ts;
@@ -1525,6 +1530,445 @@ static void test_v2_kernels_and_models(const char *art_dir) {
   }
 }
 
+// ===========================================================================
+// Section 5: G-C7 v8 Universal QLoRA (NF4/FP8/DoRA/LoHa/LoKr), 8-Stem / PNG / WAV
+//            Media Roundtrip, and Live NVMe Multimodal VAE Encoders (FLUX.2 / Wan 2.2 / ACE-Step)
+// ===========================================================================
+static void test_v8_multimodal_and_qlora(const char *art_dir) {
+  char buf[224], path[320];
+  auto f32_to_bf16_u = [](float f) -> uint16_t {
+    uint32_t u; memcpy(&u, &f, 4);
+    u += 0x7FFFU + ((u >> 16) & 1U);
+    return (uint16_t)(u >> 16);
+  };
+  auto bf16_to_f32_u = [](uint16_t b) -> float {
+    uint32_t u = ((uint32_t)b) << 16; float f; memcpy(&f, &u, 4); return f;
+  };
+  static const float NF4_REF[16] = {
+    -1.00000000f, -0.69619280f, -0.52507305f, -0.39491749f,
+    -0.28444138f, -0.18477343f, -0.09105004f,  0.00000000f,
+     0.07958030f,  0.16093020f,  0.24611230f,  0.33791524f,
+     0.44070983f,  0.56261700f,  0.72295684f,  1.00000000f
+  };
+
+  // G-C7.1: Universal Adapter GPU Fusion vs CPU F64 Oracle (QLoRA NF4, QLoRA FP8, DoRA, LoHa, LoKr)
+  {
+    const int OUT = 32, IN = 64, R = 4;
+    uint16_t *W0_h = (uint16_t *)malloc((size_t)OUT * IN * 2);
+    uint16_t *Wg_h = (uint16_t *)malloc((size_t)OUT * IN * 2);
+    float    *Wf_g = (float *)malloc((size_t)OUT * IN * 4);
+    double   *Wref = (double *)malloc((size_t)OUT * IN * 8);
+    for (int i = 0; i < OUT * IN; i++) W0_h[i] = f32_to_bf16_u(randf_sym(0.8f));
+    uint16_t *Wd = NULL;
+    cudaMalloc(&Wd, (size_t)OUT * IN * 2);
+
+    // (a) QLoRA NF4 (packed U8 high/low nibble + blockwise absmax)
+    double nf4_rel = 1.0; int nf4_fmt_ok = 0;
+    {
+      const int NA = R * IN, NB = OUT * R;
+      uint8_t A_pk[R * IN / 2], B_pk[OUT * R / 2];
+      float A_abs[4] = { 0.35f, 0.28f, 0.42f, 0.31f };
+      float B_abs[2] = { 0.40f, 0.25f };
+      double A_ref[R * IN], B_ref[OUT * R];
+      for (int i = 0; i < NA / 2; i++) {
+        uint8_t hi = (uint8_t)((i * 5 + 3) & 15), lo = (uint8_t)((i * 7 + 9) & 15);
+        A_pk[i] = (uint8_t)((hi << 4) | lo);
+        A_ref[2 * i]     = (double)NF4_REF[hi] * A_abs[(2 * i) / 64];
+        A_ref[2 * i + 1] = (double)NF4_REF[lo] * A_abs[(2 * i + 1) / 64];
+      }
+      for (int i = 0; i < NB / 2; i++) {
+        uint8_t hi = (uint8_t)((i * 3 + 11) & 15), lo = (uint8_t)((i * 11 + 2) & 15);
+        B_pk[i] = (uint8_t)((hi << 4) | lo);
+        B_ref[2 * i]     = (double)NF4_REF[hi] * B_abs[(2 * i) / 64];
+        B_ref[2 * i + 1] = (double)NF4_REF[lo] * B_abs[(2 * i + 1) / 64];
+      }
+      snprintf(path, sizeof path, "%s/gc7_qlora_nf4.safetensors", art_dir);
+      const char *nms[4] = {
+        "blocks.0.self_attn.q.lora_A.weight", "blocks.0.self_attn.q.lora_A.weight.absmax",
+        "blocks.0.self_attn.q.lora_B.weight", "blocks.0.self_attn.q.lora_B.weight.absmax"
+      };
+      ec_dtype_t dts[4] = { EC_DTYPE_U8, EC_DTYPE_F32, EC_DTYPE_U8, EC_DTYPE_F32 };
+      int32_t rks[4] = { 2, 1, 2, 1 };
+      int64_t sh[4][5] = { {NA / 2, 1, 0,0,0}, {4, 0,0,0,0}, {NB / 2, 1, 0,0,0}, {2, 0,0,0,0} };
+      const void *ds[4] = { A_pk, A_abs, B_pk, B_abs };
+      uint64_t nbs[4] = { sizeof A_pk, sizeof A_abs, sizeof B_pk, sizeof B_abs };
+      ec_st_write_simple(path, nms, dts, rks, sh, ds, nbs, 4);
+
+      cudaMemcpy(Wd, W0_h, (size_t)OUT * IN * 2, cudaMemcpyHostToDevice);
+      ec_lora_spec_t sp = {}; snprintf(sp.path, sizeof sp.path, "%s", path); sp.strength = 0.75f;
+      ec_lora_apply_stats_t stats = {};
+      ec_lora_fuse_onto_bf16(Wd, OUT, IN, "blocks.0.self_attn.q.weight", &sp, 1, &stats, 0);
+      cudaMemcpy(Wg_h, Wd, (size_t)OUT * IN * 2, cudaMemcpyDeviceToHost);
+      for (int r = 0; r < OUT; r++)
+        for (int c = 0; c < IN; c++) {
+          double acc = 0.0;
+          for (int k = 0; k < R; k++) acc += B_ref[r * R + k] * A_ref[k * IN + c];
+          Wref[r * IN + c] = (double)bf16_to_f32_u(W0_h[r * IN + c]) + 0.75 * acc;
+          Wf_g[r * IN + c] = bf16_to_f32_u(Wg_h[r * IN + c]);
+        }
+      err_metrics_t m = compare_arrays(Wf_g, Wref, (size_t)OUT * IN);
+      nf4_rel = m.rel_l2;
+      char arch[32] = {0}, fmt[32] = {0}; int np = 0, rk = 0;
+      ec_lora_inspect_ex(path, &np, &rk, arch, sizeof arch, fmt, sizeof fmt);
+      nf4_fmt_ok = (!strcmp(stats.format_detected, "qlora_nf4") && !strcmp(fmt, "qlora_nf4") && stats.n_tensors_matched == 1);
+    }
+
+    // (b) QLoRA FP8 E4M3FN + scale
+    double fp8_rel = 1.0; int fp8_fmt_ok = 0;
+    {
+      uint8_t A_fp8[R * IN], B_fp8[OUT * R];
+      float sc_a = 0.25f, sc_b = 0.50f;
+      double A_ref[R * IN], B_ref[OUT * R];
+      auto dec_fp8 = [](uint8_t b) -> double {
+        int s = (b >> 7) & 1, e = (b >> 3) & 15, m = b & 7;
+        if (e == 15 && m == 7) return 0.0;
+        double v = (e == 0) ? ldexp((double)m, -9) : ldexp(1.0 + m * 0.125, e - 7);
+        return s ? -v : v;
+      };
+      for (int i = 0; i < R * IN; i++) {
+        uint8_t b = (uint8_t)(0x28 + (i % 24)); if (i & 1) b |= 0x80;
+        A_fp8[i] = b; A_ref[i] = dec_fp8(b) * sc_a;
+      }
+      for (int i = 0; i < OUT * R; i++) {
+        uint8_t b = (uint8_t)(0x28 + ((i * 3) % 24)); if (i & 2) b |= 0x80;
+        B_fp8[i] = b; B_ref[i] = dec_fp8(b) * sc_b;
+      }
+      snprintf(path, sizeof path, "%s/gc7_qlora_fp8.safetensors", art_dir);
+      const char *nms[4] = {
+        "layers.0.self_attn.q_proj.lora_A.weight", "layers.0.self_attn.q_proj.lora_A.scale",
+        "layers.0.self_attn.q_proj.lora_B.weight", "layers.0.self_attn.q_proj.lora_B.scale"
+      };
+      ec_dtype_t dts[4] = { EC_DTYPE_FP8_E4M3, EC_DTYPE_F32, EC_DTYPE_FP8_E4M3, EC_DTYPE_F32 };
+      int32_t rks[4] = { 2, 1, 2, 1 };
+      int64_t sh[4][5] = { {R, IN, 0,0,0}, {1, 0,0,0,0}, {OUT, R, 0,0,0}, {1, 0,0,0,0} };
+      const void *ds[4] = { A_fp8, &sc_a, B_fp8, &sc_b };
+      uint64_t nbs[4] = { sizeof A_fp8, 4, sizeof B_fp8, 4 };
+      ec_st_write_simple(path, nms, dts, rks, sh, ds, nbs, 4);
+
+      cudaMemcpy(Wd, W0_h, (size_t)OUT * IN * 2, cudaMemcpyHostToDevice);
+      ec_lora_spec_t sp = {}; snprintf(sp.path, sizeof sp.path, "%s", path); sp.strength = 1.0f;
+      ec_lora_apply_stats_t stats = {};
+      ec_lora_fuse_onto_bf16(Wd, OUT, IN, "layers.0.self_attn.q_proj.weight", &sp, 1, &stats, 0);
+      cudaMemcpy(Wg_h, Wd, (size_t)OUT * IN * 2, cudaMemcpyDeviceToHost);
+      for (int r = 0; r < OUT; r++)
+        for (int c = 0; c < IN; c++) {
+          double acc = 0.0;
+          for (int k = 0; k < R; k++) acc += B_ref[r * R + k] * A_ref[k * IN + c];
+          Wref[r * IN + c] = (double)bf16_to_f32_u(W0_h[r * IN + c]) + acc;
+          Wf_g[r * IN + c] = bf16_to_f32_u(Wg_h[r * IN + c]);
+        }
+      err_metrics_t m = compare_arrays(Wf_g, Wref, (size_t)OUT * IN);
+      fp8_rel = m.rel_l2;
+      fp8_fmt_ok = (!strcmp(stats.format_detected, "qlora_fp8") && stats.n_tensors_matched == 1);
+    }
+
+    // (c) DoRA (LoRA + row L2 magnitude rescaling)
+    double dora_rel = 1.0; int dora_fmt_ok = 0;
+    {
+      float A[R * IN], B[OUT * R], M[OUT];
+      for (int i = 0; i < R * IN; i++) A[i] = randf_sym(0.3f);
+      for (int i = 0; i < OUT * R; i++) B[i] = randf_sym(0.3f);
+      for (int i = 0; i < OUT; i++) M[i] = 2.0f + 0.05f * (float)i;
+      snprintf(path, sizeof path, "%s/gc7_dora.safetensors", art_dir);
+      const char *nms[3] = {
+        "single_blocks.0.linear1.lora_A.weight",
+        "single_blocks.0.linear1.lora_B.weight",
+        "single_blocks.0.linear1.lora_magnitude_vector"
+      };
+      ec_dtype_t dts[3] = { EC_DTYPE_F32, EC_DTYPE_F32, EC_DTYPE_F32 };
+      int32_t rks[3] = { 2, 2, 1 };
+      int64_t sh[3][5] = { {R, IN, 0,0,0}, {OUT, R, 0,0,0}, {OUT, 0,0,0,0} };
+      const void *ds[3] = { A, B, M };
+      uint64_t nbs[3] = { sizeof A, sizeof B, sizeof M };
+      ec_st_write_simple(path, nms, dts, rks, sh, ds, nbs, 3);
+
+      cudaMemcpy(Wd, W0_h, (size_t)OUT * IN * 2, cudaMemcpyHostToDevice);
+      ec_lora_spec_t sp = {}; snprintf(sp.path, sizeof sp.path, "%s", path); sp.strength = 0.8f;
+      ec_lora_apply_stats_t stats = {};
+      ec_lora_fuse_onto_bf16(Wd, OUT, IN, "single_blocks.0.linear1.weight", &sp, 1, &stats, 0);
+      cudaMemcpy(Wg_h, Wd, (size_t)OUT * IN * 2, cudaMemcpyDeviceToHost);
+      for (int r = 0; r < OUT; r++) {
+        double ss = 0.0, row[IN];
+        for (int c = 0; c < IN; c++) {
+          double acc = 0.0;
+          for (int k = 0; k < R; k++) acc += (double)B[r * R + k] * (double)A[k * IN + c];
+          row[c] = (double)bf16_to_f32_u(W0_h[r * IN + c]) + 0.8 * acc;
+          ss += row[c] * row[c];
+        }
+        double sc = (double)M[r] / sqrt(ss + 1e-12);
+        for (int c = 0; c < IN; c++) {
+          Wref[r * IN + c] = row[c] * sc;
+          Wf_g[r * IN + c] = bf16_to_f32_u(Wg_h[r * IN + c]);
+        }
+      }
+      err_metrics_t m = compare_arrays(Wf_g, Wref, (size_t)OUT * IN);
+      dora_rel = m.rel_l2;
+      dora_fmt_ok = (!strcmp(stats.format_detected, "dora") && stats.n_tensors_matched == 1);
+    }
+
+    // (d) LoHa (Hadamard) + (e) LoKr (Kronecker)
+    double loha_rel = 1.0, lokr_rel = 1.0; int loha_ok = 0, lokr_ok = 0;
+    {
+      float w1a[OUT * R], w1b[R * IN], w2a[OUT * R], w2b[R * IN];
+      for (int i = 0; i < OUT * R; i++) { w1a[i] = randf_sym(0.3f); w2a[i] = randf_sym(0.3f); }
+      for (int i = 0; i < R * IN; i++)  { w1b[i] = randf_sym(0.3f); w2b[i] = randf_sym(0.3f); }
+      snprintf(path, sizeof path, "%s/gc7_loha.safetensors", art_dir);
+      const char *nms[4] = {
+        "double_blocks.0.img_mlp.0.hada_w1_a", "double_blocks.0.img_mlp.0.hada_w1_b",
+        "double_blocks.0.img_mlp.0.hada_w2_a", "double_blocks.0.img_mlp.0.hada_w2_b"
+      };
+      ec_dtype_t dts[4] = { EC_DTYPE_F32, EC_DTYPE_F32, EC_DTYPE_F32, EC_DTYPE_F32 };
+      int32_t rks[4] = { 2, 2, 2, 2 };
+      int64_t sh[4][5] = { {OUT, R, 0,0,0}, {R, IN, 0,0,0}, {OUT, R, 0,0,0}, {R, IN, 0,0,0} };
+      const void *ds[4] = { w1a, w1b, w2a, w2b };
+      uint64_t nbs[4] = { sizeof w1a, sizeof w1b, sizeof w2a, sizeof w2b };
+      ec_st_write_simple(path, nms, dts, rks, sh, ds, nbs, 4);
+
+      cudaMemcpy(Wd, W0_h, (size_t)OUT * IN * 2, cudaMemcpyHostToDevice);
+      ec_lora_spec_t sp = {}; snprintf(sp.path, sizeof sp.path, "%s", path); sp.strength = 0.9f;
+      ec_lora_apply_stats_t stats = {};
+      ec_lora_fuse_onto_bf16(Wd, OUT, IN, "double_blocks.0.img_mlp.0.weight", &sp, 1, &stats, 0);
+      cudaMemcpy(Wg_h, Wd, (size_t)OUT * IN * 2, cudaMemcpyDeviceToHost);
+      for (int r = 0; r < OUT; r++)
+        for (int c = 0; c < IN; c++) {
+          double a1 = 0.0, a2 = 0.0;
+          for (int k = 0; k < R; k++) { a1 += w1a[r * R + k] * w1b[k * IN + c]; a2 += w2a[r * R + k] * w2b[k * IN + c]; }
+          Wref[r * IN + c] = (double)bf16_to_f32_u(W0_h[r * IN + c]) + 0.9 * (a1 * a2);
+          Wf_g[r * IN + c] = bf16_to_f32_u(Wg_h[r * IN + c]);
+        }
+      loha_rel = compare_arrays(Wf_g, Wref, (size_t)OUT * IN).rel_l2;
+      loha_ok = (!strcmp(stats.format_detected, "loha") && stats.n_tensors_matched == 1);
+    }
+    {
+      // LoKr: m1=4, n1=8, m2=8, n2=8 -> OUT=32, IN=64
+      float k1[4 * 8], k2[8 * 8];
+      for (int i = 0; i < 32; i++) k1[i] = randf_sym(0.5f);
+      for (int i = 0; i < 64; i++) k2[i] = randf_sym(0.5f);
+      snprintf(path, sizeof path, "%s/gc7_lokr.safetensors", art_dir);
+      const char *nms[2] = { "layers.0.self_attn.v_proj.lokr_w1", "layers.0.self_attn.v_proj.lokr_w2" };
+      ec_dtype_t dts[2] = { EC_DTYPE_F32, EC_DTYPE_F32 };
+      int32_t rks[2] = { 2, 2 };
+      int64_t sh[2][5] = { {4, 8, 0,0,0}, {8, 8, 0,0,0} };
+      const void *ds[2] = { k1, k2 };
+      uint64_t nbs[2] = { sizeof k1, sizeof k2 };
+      ec_st_write_simple(path, nms, dts, rks, sh, ds, nbs, 2);
+
+      cudaMemcpy(Wd, W0_h, (size_t)OUT * IN * 2, cudaMemcpyHostToDevice);
+      ec_lora_spec_t sp = {}; snprintf(sp.path, sizeof sp.path, "%s", path); sp.strength = 0.85f;
+      ec_lora_apply_stats_t stats = {};
+      ec_lora_fuse_onto_bf16(Wd, OUT, IN, "layers.0.self_attn.v_proj.weight", &sp, 1, &stats, 0);
+      cudaMemcpy(Wg_h, Wd, (size_t)OUT * IN * 2, cudaMemcpyDeviceToHost);
+      for (int r = 0; r < OUT; r++)
+        for (int c = 0; c < IN; c++) {
+          double delta = (double)k1[(r / 8) * 8 + (c / 8)] * (double)k2[(r % 8) * 8 + (c % 8)];
+          Wref[r * IN + c] = (double)bf16_to_f32_u(W0_h[r * IN + c]) + 0.85 * delta;
+          Wf_g[r * IN + c] = bf16_to_f32_u(Wg_h[r * IN + c]);
+        }
+      lokr_rel = compare_arrays(Wf_g, Wref, (size_t)OUT * IN).rel_l2;
+      lokr_ok = (!strcmp(stats.format_detected, "lokr") && stats.n_tensors_matched == 1);
+    }
+
+    int pass_qlora = (nf4_fmt_ok && fp8_fmt_ok && dora_fmt_ok && loha_ok && lokr_ok &&
+                      nf4_rel < 0.01 && fp8_rel < 0.01 && dora_rel < 0.01 && loha_rel < 0.01 && lokr_rel < 0.01);
+    snprintf(buf, sizeof buf, "NF4=%.4f FP8=%.4f DoRA=%.4f LoHa=%.4f LoKr=%.4f (all <0.01)",
+             nf4_rel, fp8_rel, dora_rel, loha_rel, lokr_rel);
+    check_gate("G-C7.1 Universal QLoRA/DoRA/LoHa/LoKr GPU Fuse", pass_qlora, buf);
+    cudaFree(Wd); free(W0_h); free(Wg_h); free(Wf_g); free(Wref);
+  }
+
+  // G-C7.2: 8-Stem & 2-Stem Exact Master Reconstruction + WAV/PNG Roundtrip + Outpaint Pad
+  {
+    const int SR = 48000, NS = 48000;
+    float *pcm = (float *)malloc((size_t)NS * 2 * sizeof(float));
+    for (int i = 0; i < NS; i++) {
+      double t = (double)i / SR;
+      double L = 0.25 * sin(2 * 3.14159265 * 80.0 * t) + 0.20 * sin(2 * 3.14159265 * 440.0 * t) + 0.15 * sin(2 * 3.14159265 * 3200.0 * t);
+      double R = 0.25 * sin(2 * 3.14159265 * 80.0 * t) + 0.18 * sin(2 * 3.14159265 * 660.0 * t) - 0.12 * sin(2 * 3.14159265 * 4800.0 * t);
+      pcm[2 * i] = (float)L; pcm[2 * i + 1] = (float)R;
+    }
+    char pfx[280], spaths[8][256], snames[8][24];
+    int n_stems = 0;
+    snprintf(pfx, sizeof pfx, "%s/gc7_mix8", art_dir);
+    int rc8 = ec_audio_split_stems(pcm, NS, SR, 8, pfx, spaths, snames, &n_stems);
+    float *sum8 = (float *)calloc((size_t)NS * 2, sizeof(float));
+    int loaded_ok = (rc8 == 0 && n_stems == 8);
+    for (int s = 0; s < n_stems && loaded_ok; s++) {
+      float *sb = NULL; int ns_got = 0;
+      if (ec_load_wav_stereo_f32(spaths[s], SR, &sb, &ns_got) == 0 && ns_got == NS) {
+        for (int i = 0; i < NS * 2; i++) sum8[i] += sb[i];
+      } else loaded_ok = 0;
+      free(sb);
+    }
+    err_metrics_t m8 = compare_f32(sum8, pcm, (size_t)NS * 2);
+    free(sum8);
+
+    // 2-stem check
+    snprintf(pfx, sizeof pfx, "%s/gc7_mix2", art_dir);
+    int n2 = 0;
+    int rc2 = ec_audio_split_stems(pcm, NS, SR, 2, pfx, spaths, snames, &n2);
+    float *sum2 = (float *)calloc((size_t)NS * 2, sizeof(float));
+    int ok2 = (rc2 == 0 && n2 == 2 && !strcmp(snames[0], "vocals") && !strcmp(snames[1], "instrumental"));
+    for (int s = 0; s < n2 && ok2; s++) {
+      float *sb = NULL; int ns_got = 0;
+      if (ec_load_wav_stereo_f32(spaths[s], SR, &sb, &ns_got) == 0 && ns_got == NS) {
+        for (int i = 0; i < NS * 2; i++) sum2[i] += sb[i];
+      } else ok2 = 0;
+      free(sb);
+    }
+    err_metrics_t m2 = compare_f32(sum2, pcm, (size_t)NS * 2);
+    free(sum2); free(pcm);
+
+    // PNG Export + Load + Outpaint Pad check
+    const int IW = 64, IH = 48;
+    uint8_t *img = (uint8_t *)malloc((size_t)IW * IH * 3);
+    for (int y = 0; y < IH; y++)
+      for (int x = 0; x < IW; x++) {
+        img[(y * IW + x) * 3 + 0] = (uint8_t)(x * 4);
+        img[(y * IW + x) * 3 + 1] = (uint8_t)(y * 5);
+        img[(y * IW + x) * 3 + 2] = (uint8_t)((x + y) * 2);
+      }
+    snprintf(path, sizeof path, "%s/gc7_rt.png", art_dir);
+    int png_ok = (ec_export_png(path, img, IW, IH) == 0);
+    uint8_t *img_in = NULL; int rw = 0, rh = 0;
+    if (png_ok && ec_load_image_rgb(path, &img_in, &rw, &rh) == 0) {
+      png_ok = (rw == IW && rh == IH && memcmp(img, img_in, (size_t)IW * IH * 3) == 0);
+    } else png_ok = 0;
+    uint8_t *op_rgb = NULL; float *op_mask = NULL;
+    int op_ok = (ec_rgb_pad_outpaint(img, IW, IH, 32, 0, 32, 0, 128, 64, &op_rgb, &op_mask) == 0 &&
+                 op_mask[32 * 128 + 64] < 0.05f && op_mask[32 * 128 + 2] > 0.95f);
+    free(img); free(img_in); free(op_rgb); free(op_mask);
+
+    int pass_med = (loaded_ok && ok2 && m8.rel_l2 < 1e-3 && m2.rel_l2 < 1e-3 && png_ok && op_ok);
+    snprintf(buf, sizeof buf, "8stem_rel=%.2e 2stem_rel=%.2e png_exact=%d outpaint_mask=%d",
+             m8.rel_l2, m2.rel_l2, png_ok, op_ok);
+    check_gate("G-C7.2 8-Stem/2-Stem WAV + PNG + Outpaint Media", pass_med, buf);
+  }
+
+  // G-C7.3: Live RTX 3090 Multimodal VAE Encoders (FLUX.2 / Wan 2.2 / ACE-Step 1.5)
+  const char *mdir = "/home/omen/.local/share/models/creative";
+  {
+    // FLUX.2 2D VAE Encode -> Decode Roundtrip
+    char fv_path[320], fd_path[320], ft_path[320], fk_path[320];
+    snprintf(fv_path, sizeof fv_path, "%s/flux2_klein_vae.safetensors", mdir);
+    snprintf(fd_path, sizeof fd_path, "%s/flux2_klein_4b_bf16.safetensors", mdir);
+    snprintf(ft_path, sizeof ft_path, "%s/qwen_3_4b.safetensors", mdir);
+    if (access(ft_path, R_OK) != 0)
+      snprintf(ft_path, sizeof ft_path, "/mnt/storage/ai-models/comfyui/models/text_encoders/qwen_3_4b.safetensors");
+    snprintf(fk_path, sizeof fk_path, "%s/qwen3_tokenizer.json", mdir);
+    if (access(fv_path, R_OK) == 0 && access(fd_path, R_OK) == 0 && access(ft_path, R_OK) == 0) {
+      ec_flux2_paths_t fp = {};
+      snprintf(fp.checkpoint_path, sizeof fp.checkpoint_path, "%s", fd_path);
+      snprintf(fp.vae_path, sizeof fp.vae_path, "%s", fv_path);
+      snprintf(fp.text_encoder_path, sizeof fp.text_encoder_path, "%s", ft_path);
+      snprintf(fp.tokenizer_path, sizeof fp.tokenizer_path, "%s", fk_path);
+      ec_flux2_t *fx = ec_flux2_create(&fp);
+      const int W = 256, H = 256;
+      uint8_t *in_rgb = (uint8_t *)malloc((size_t)W * H * 3);
+      uint8_t *out_rgb = (uint8_t *)calloc((size_t)W * H * 3, 1);
+      for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+          float u = (float)x / (float)W, v = (float)y / (float)H;
+          float r = 0.5f + 0.42f * sinf(u * 6.28318f) * cosf(v * 3.14159f);
+          float g = 0.5f + 0.40f * cosf((u + v) * 4.5f);
+          float b = 0.5f + 0.38f * sinf(v * 6.28318f + 0.8f);
+          in_rgb[(y * W + x) * 3 + 0] = (uint8_t)(r * 255.0f);
+          in_rgb[(y * W + x) * 3 + 1] = (uint8_t)(g * 255.0f);
+          in_rgb[(y * W + x) * 3 + 2] = (uint8_t)(b * 255.0f);
+        }
+      double ems = 0.0, dms = 0.0;
+      int rc = (fx && ec_flux2_is_ready(fx)) ? ec_flux2_vae_roundtrip_rgb(fx, in_rgb, W, H, out_rgb, &ems, &dms) : -1;
+      double mse = 0.0, dot = 0.0, n1 = 0.0, n2 = 0.0;
+      for (size_t i = 0; i < (size_t)W * H * 3; i++) {
+        double a = (double)in_rgb[i], b = (double)out_rgb[i], d = a - b;
+        mse += d * d; dot += a * b; n1 += a * a; n2 += b * b;
+      }
+      mse /= (double)(W * H * 3);
+      double psnr = (mse > 1e-6) ? (10.0 * log10(255.0 * 255.0 / mse)) : 99.0;
+      double cos_sim = (n1 > 0 && n2 > 0) ? (dot / (sqrt(n1) * sqrt(n2))) : 0.0;
+      snprintf(buf, sizeof buf, "256x256 enc=%.1fms dec=%.1fms PSNR=%.2fdB cos=%.5f", ems, dms, psnr, cos_sim);
+      check_gate("G-C7.3 FLUX.2 Native 2D VAE Encode->Decode", rc == 0 && psnr >= 24.0 && cos_sim >= 0.99, buf);
+      ec_flux2_destroy(fx);
+      free(in_rgb); free(out_rgb);
+    }
+
+    // Wan 2.2 Causal 3D VAE Single-Frame I2V/FLF2V Encoder
+    char wv_path[320], wd_path[320], wt_path[320], wk_path[320];
+    snprintf(wv_path, sizeof wv_path, "%s/wan2.2_vae.safetensors", mdir);
+    snprintf(wd_path, sizeof wd_path, "%s/wan2.2_ti2v_5b_fp16.safetensors", mdir);
+    snprintf(wt_path, sizeof wt_path, "%s/umt5_xxl_fp8_e4m3fn_scaled.safetensors", mdir);
+    snprintf(wk_path, sizeof wk_path, "%s/umt5_tokenizer.json", mdir);
+    if (access(wv_path, R_OK) == 0 && access(wd_path, R_OK) == 0 && access(wt_path, R_OK) == 0) {
+      ec_wan22_paths_t wp = {};
+      snprintf(wp.dit_path, sizeof wp.dit_path, "%s", wd_path);
+      snprintf(wp.vae_path, sizeof wp.vae_path, "%s", wv_path);
+      snprintf(wp.text_encoder_path, sizeof wp.text_encoder_path, "%s", wt_path);
+      snprintf(wp.tokenizer_path, sizeof wp.tokenizer_path, "%s", wk_path);
+      ec_wan22_t *wn = ec_wan22_create(&wp);
+      const int W = 256, H = 256;
+      uint8_t *in_rgb = (uint8_t *)malloc((size_t)W * H * 3);
+      for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+          in_rgb[(y * W + x) * 3 + 0] = (uint8_t)((x + y) & 255);
+          in_rgb[(y * W + x) * 3 + 1] = (uint8_t)((x * 2) & 255);
+          in_rgb[(y * W + x) * 3 + 2] = (uint8_t)((y * 2) & 255);
+        }
+      float *lat = NULL; int hl = 0, wl = 0; double ems = 0.0;
+      int rc = (wn && ec_wan22_is_ready(wn)) ? ec_wan22_vae_encode_image(wn, in_rgb, W, H, &lat, &hl, &wl, &ems) : -1;
+      int finite = 1; double rms = 0.0;
+      if (rc == 0 && lat && hl == 16 && wl == 16) {
+        size_t nl = (size_t)hl * wl * 48;
+        for (size_t i = 0; i < nl; i++) {
+          if (!isfinite(lat[i])) { finite = 0; break; }
+          rms += (double)lat[i] * (double)lat[i];
+        }
+        rms = sqrt(rms / (double)nl);
+      } else finite = 0;
+      snprintf(buf, sizeof buf, "256x256 -> [%dx%dx48] enc=%.1fms rms=%.3f finite=%d", hl, wl, ems, rms, finite);
+      check_gate("G-C7.3 Wan 2.2 Causal 3D VAE I2V/FLF2V Encode", rc == 0 && finite && rms > 0.05 && rms < 10.0, buf);
+      free(lat); free(in_rgb);
+      ec_wan22_destroy(wn);
+    }
+
+    // ACE-Step 1.5 Oobleck 1D Stereo Audio VAE Encoder (48 kHz -> 25 Hz [T, 64])
+    char av_path[320], ad_path[320], at_path[320], as_path[320];
+    snprintf(av_path, sizeof av_path, "%s/acestep_v15_vae.safetensors", mdir);
+    snprintf(ad_path, sizeof ad_path, "%s/acestep_v15_turbo_bf16.safetensors", mdir);
+    snprintf(at_path, sizeof at_path, "%s/acestep_qwen3_0.6b.safetensors", mdir);
+    snprintf(as_path, sizeof as_path, "%s/acestep_silence_latent.safetensors", mdir);
+    if (access(av_path, R_OK) == 0 && access(ad_path, R_OK) == 0 && access(at_path, R_OK) == 0) {
+      ec_acestep_paths_t ap = {};
+      snprintf(ap.dit_path, sizeof ap.dit_path, "%s", ad_path);
+      snprintf(ap.vae_path, sizeof ap.vae_path, "%s", av_path);
+      snprintf(ap.text_encoder_path, sizeof ap.text_encoder_path, "%s", at_path);
+      snprintf(ap.silence_latent_path, sizeof ap.silence_latent_path, "%s", as_path);
+      snprintf(ap.tokenizer_path, sizeof ap.tokenizer_path, "%s", fk_path);
+      ec_acestep_t *as = ec_acestep_create(&ap);
+      const int NS = 48000 * 2; // 2.0 sec @ 48 kHz -> T = 50 @ 25 Hz
+      float *pcm = (float *)malloc((size_t)NS * 2 * sizeof(float));
+      for (int i = 0; i < NS; i++) {
+        double t = (double)i / 48000.0;
+        pcm[2 * i]     = (float)(0.35 * sin(2 * 3.14159265 * 220.0 * t) + 0.25 * sin(2 * 3.14159265 * 329.63 * t));
+        pcm[2 * i + 1] = (float)(0.35 * sin(2 * 3.14159265 * 220.0 * t) + 0.25 * sin(2 * 3.14159265 * 440.00 * t));
+      }
+      float *lat = NULL; int T = 0; double ems = 0.0;
+      int rc = (as && ec_acestep_is_ready(as)) ? ec_acestep_encode_pcm(as, pcm, NS, &lat, &T, &ems) : -1;
+      int finite = 1; double rms = 0.0;
+      if (rc == 0 && lat && T == 50) {
+        size_t nl = (size_t)T * 64;
+        for (size_t i = 0; i < nl; i++) {
+          if (!isfinite(lat[i])) { finite = 0; break; }
+          rms += (double)lat[i] * (double)lat[i];
+        }
+        rms = sqrt(rms / (double)nl);
+      } else finite = 0;
+      snprintf(buf, sizeof buf, "2.0s 48kHz -> [%dx64] enc=%.1fms rms=%.3f finite=%d", T, ems, rms, finite);
+      check_gate("G-C7.3 ACE-Step Oobleck 1D Audio VAE Encode", rc == 0 && finite && rms > 0.05 && rms < 15.0, buf);
+      free(lat); free(pcm);
+      ec_acestep_destroy(as);
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   const char *art_dir = (argc > 1) ? argv[1] : "/tmp/eureka-creative-build/artifacts";
   cudaDeviceProp prop;
@@ -1555,6 +1999,9 @@ int main(int argc, char **argv) {
 
   printf("\n[Section 4] G-C1..C4 — BF16/FP8, TensorCore Conv2D, Cross-Attn & All 5 HF Model Loaders\n");
   test_v2_kernels_and_models(art_dir);
+
+  printf("\n[Section 5] G-C7 — v8 Universal QLoRA/DoRA/LoHa/LoKr, 8-Stem Media & Live VAE Encoders\n");
+  test_v8_multimodal_and_qlora(art_dir);
 
   printf("\n===========================================================================\n");
   printf("VERDICT: %s (%d failures)\n", g_fails == 0 ? "ALL GATES PASS" : "FAILED", g_fails);

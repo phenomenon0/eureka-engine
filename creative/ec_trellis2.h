@@ -23,9 +23,14 @@ typedef struct {
 } ec_trellis2_paths_t;
 
 typedef struct {
-  const uint8_t *rgb;        // conditioning RGB image (H * W * 3), required!
+  const uint8_t *rgb;        // primary conditioning RGB image (H * W * 3), required!
   int            img_w;
   int            img_h;
+  // v8 Multi-View Conditioning (up to 3 extra RGB views fused cleanly in DINOv3 patch feature space!)
+  const uint8_t *extra_rgbs[3];
+  int            extra_w[3];
+  int            extra_h[3];
+  int            n_extra_views;
   uint32_t       seed;
   int            steps;      // default 12
   float          cfg_scale;  // default 7.5

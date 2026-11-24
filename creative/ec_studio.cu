@@ -330,6 +330,406 @@ static int fx_progress_bridge(int step, int total, const char *stage, void *ctx)
   fx_cb_bridge_t *b = (fx_cb_bridge_t *)ctx;
   return (b && b->cb) ? b->cb(step, total, 0, stage, b->cb_ctx) : 0;
 }
+static int tr_ref_progress_bridge(int step, int total, const char *stage, void *ctx);
+static int tr_flow_progress_bridge(int step, int total, const char *stage, void *ctx);
+
+static int resolve_studio_media_path(const ec_studio_t *st, const char *raw, char *out, size_t cap) {
+  out[0] = '\0';
+  if (!raw || !raw[0]) return -1;
+  if (!strncmp(raw, "/artifacts/", 11)) {
+    const char *bn = raw + 11;
+    if (strstr(bn, "..") || strchr(bn, '/')) return -1;
+    snprintf(out, cap, "%s/%s", st->artifact_dir, bn);
+    return access(out, R_OK) == 0 ? 0 : -1;
+  }
+  if (raw[0] == '/') {
+    snprintf(out, cap, "%s", raw);
+    return access(out, R_OK) == 0 ? 0 : -1;
+  }
+  if (!strstr(raw, "..") && !strchr(raw, '/')) {
+    snprintf(out, cap, "%s/%s", st->artifact_dir, raw);
+    return access(out, R_OK) == 0 ? 0 : -1;
+  }
+  return -1;
+}
+
+static int resolve_lora_stack(
+    const ec_studio_t *st, const ec_studio_lora_t *in, int n_in, ec_lora_spec_t out[EC_LORA_MAX_STACK]) {
+  int nl = 0;
+  for (int i = 0; i < n_in && nl < EC_LORA_MAX_STACK; i++) {
+    if (!in[i].path[0]) continue;
+    const ec_storage_asset_t *la = ec_storage_find(&st->vault, EC_ASSET_LORA, in[i].path);
+    snprintf(out[nl].path, sizeof out[nl].path, "%s", la ? la->path : in[i].path);
+    out[nl].strength = in[i].strength;
+    nl++;
+  }
+  return nl;
+}
+
+extern "C" int ec_studio_gen_image_v8(
+    ec_studio_t *st, const ec_studio_image_v8_t *req,
+    ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized || !req) return -1;
+
+  if (req->photoreal && st->flux2 && ec_flux2_is_ready(st->flux2)) {
+    char ckpt_path[512] = {0};
+    if (req->checkpoint_query && req->checkpoint_query[0]) {
+      const ec_storage_asset_t *a = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, req->checkpoint_query);
+      snprintf(ckpt_path, sizeof ckpt_path, "%s", a ? a->path : req->checkpoint_query);
+    }
+    ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
+    int nl = resolve_lora_stack(st, req->loras, req->n_loras, lstack);
+
+    int W = (req->width  >= 256) ? req->width  : 512;
+    int H = (req->height >= 256) ? req->height : 512;
+    uint8_t *init_rgb = NULL;
+    int init_w = 0, init_h = 0;
+    float *mask_gray = NULL;
+
+    char ipath[512] = {0}, mpath[512] = {0};
+    if (req->init_image_path && resolve_studio_media_path(st, req->init_image_path, ipath, sizeof ipath) == 0) {
+      ec_load_image_rgb(ipath, &init_rgb, &init_w, &init_h);
+    }
+    int has_outpaint = (init_rgb && (req->outpaint_pad[0] > 0 || req->outpaint_pad[1] > 0 ||
+                                     req->outpaint_pad[2] > 0 || req->outpaint_pad[3] > 0));
+    if (has_outpaint) {
+      uint8_t *pad_rgb = NULL; float *pad_mask = NULL;
+      if (ec_rgb_pad_outpaint(init_rgb, init_w, init_h,
+                              req->outpaint_pad[0], req->outpaint_pad[1], req->outpaint_pad[2], req->outpaint_pad[3],
+                              W, H, &pad_rgb, &pad_mask) == 0) {
+        free(init_rgb); init_rgb = pad_rgb; init_w = W; init_h = H; mask_gray = pad_mask;
+      }
+    } else if (init_rgb && req->mask_image_path && resolve_studio_media_path(st, req->mask_image_path, mpath, sizeof mpath) == 0) {
+      ec_load_mask_gray(mpath, init_w, init_h, &mask_gray);
+    }
+
+    ec_flux2_req_t freq = {};
+    freq.prompt = req->prompt;
+    freq.neg_prompt = req->neg_prompt;
+    freq.seed = req->seed;
+    freq.width = W;
+    freq.height = H;
+    freq.steps = (req->steps >= 1 && req->steps <= 50) ? req->steps : 4;
+    freq.cfg_scale = req->cfg_scale;
+    freq.checkpoint_override = ckpt_path[0] ? ckpt_path : NULL;
+    freq.loras = nl > 0 ? lstack : NULL;
+    freq.n_loras = nl;
+    freq.init_rgb = init_rgb;
+    freq.init_w = init_w;
+    freq.init_h = init_h;
+    freq.mask_gray = mask_gray;
+    freq.denoise = req->denoise;
+    freq.tile_upscale = req->tile_upscale;
+
+    uint64_t tag = hash_prompt_seed(req->prompt, req->seed);
+    if (init_rgb) tag ^= 0x12101210ULL;
+    if (mask_gray) tag ^= 0xA1B2C3D4ULL;
+    if (req->tile_upscale) tag ^= 0x20002000ULL;
+    snprintf(res->file_main, sizeof res->file_main, "%s/flux2_%u_%04x.png",
+             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_flux2_res_t fres = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 1);
+    int rc = ec_flux2_generate_png(st->flux2, &freq, res->file_main, cb ? fx_progress_bridge : NULL, &bridge, &fres);
+    pthread_mutex_unlock(&st->gpu_mu);
+    free(init_rgb); free(mask_gray);
+    if (rc == 0 && fres.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "%s",
+               has_outpaint ? "flux2_outpaint" : (mask_gray ? "flux2_inpaint" : (init_rgb ? "flux2_img2img" : "flux2_photoreal")));
+      snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "%s", fres.checkpoint_used);
+      res->width = fres.width; res->height = fres.height;
+      res->steps_run = fres.steps_run; res->lora_tensors_fused = fres.lora_tensors_fused;
+      res->text_enc_ms = fres.text_enc_ms; res->dit_ms = fres.dit_ms;
+      res->vae_ms = fres.vae_ms; res->gpu_ms = fres.total_ms;
+      return 0;
+    }
+    return -1;
+  }
+
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  return ec_studio_gen_image(st, req->prompt, req->seed, req->width, req->height, req->steps, req->tier, cb, cb_ctx, res);
+}
+
+extern "C" int ec_studio_gen_3d_v8(
+    ec_studio_t *st, const ec_studio_3d_v8_t *req,
+    ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized || !req) return -1;
+
+  if (req->full_model && st->trellis2 && ec_trellis2_is_ready(st->trellis2)) {
+    uint8_t *views[4] = {0};
+    int vw[4] = {0}, vh[4] = {0}, n_loaded = 0;
+    for (int i = 0; i < req->n_input_images && i < 4; i++) {
+      char pbuf[512];
+      if (req->input_images[i] && resolve_studio_media_path(st, req->input_images[i], pbuf, sizeof pbuf) == 0) {
+        if (ec_load_image_rgb(pbuf, &views[n_loaded], &vw[n_loaded], &vh[n_loaded]) == 0) {
+          if (req->isolate_fg) ec_rgb_isolate_foreground(views[n_loaded], vw[n_loaded], vh[n_loaded]);
+          n_loaded++;
+        }
+      }
+    }
+
+    uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ ((uint64_t)n_loaded * 0x9E3779B9ULL);
+    snprintf(res->file_main, sizeof res->file_main, "%s/trellis2_%u_%04x.glb",
+             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+    snprintf(res->file_aux, sizeof res->file_aux, "%s/trellis2_%u_%04x.ply",
+             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    double ref_ms = 0.0;
+    if (n_loaded == 0 && st->flux2 && ec_flux2_is_ready(st->flux2)) {
+      char hero_prompt[1536], ref_png[256];
+      snprintf(hero_prompt, sizeof hero_prompt,
+          "Isolated centered 3D studio product render of %s, single object floating centered on pure solid matte black background, even neutral softbox studio lighting, full object visible in frame, no room, no table, no background clutter",
+          (req->prompt && req->prompt[0]) ? req->prompt : "sculptural matte-white porcelain teapot with bamboo handle");
+      snprintf(ref_png, sizeof ref_png, "%s/trellis2_%u_%04x_ref.png",
+               st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+      ec_flux2_req_t freq = {};
+      freq.prompt = hero_prompt; freq.seed = req->seed; freq.width = 512; freq.height = 512; freq.steps = 4;
+      ec_flux2_res_t fres = {};
+      pthread_mutex_lock(&st->gpu_mu);
+      studio_evict_other_engines_locked(st, 1);
+      int rc_ref = ec_flux2_generate_rgb(st->flux2, &freq, &views[0], ref_png,
+                                         cb ? tr_ref_progress_bridge : NULL, &bridge, &fres);
+      ec_flux2_unload_vram(st->flux2);
+      pthread_mutex_unlock(&st->gpu_mu);
+      if (rc_ref != 0 || !views[0]) {
+        free(views[0]);
+        if (rc_ref == -2) { res->cancelled = 1; return 0; }
+        return -1;
+      }
+      vw[0] = fres.width; vh[0] = fres.height; n_loaded = 1; ref_ms = fres.total_ms;
+    }
+
+    if (n_loaded > 0) {
+      ec_trellis2_req_t treq = {};
+      treq.rgb = views[0]; treq.img_w = vw[0]; treq.img_h = vh[0];
+      for (int i = 1; i < n_loaded; i++) {
+        treq.extra_rgbs[i - 1] = views[i]; treq.extra_w[i - 1] = vw[i]; treq.extra_h[i - 1] = vh[i];
+      }
+      treq.n_extra_views = n_loaded - 1;
+      treq.seed = req->seed;
+      treq.steps = (req->steps >= 2 && req->steps <= 50) ? req->steps : 12;
+      treq.cfg_scale = (req->cfg_scale > 0.0f) ? req->cfg_scale : 7.5f;
+      treq.rescale_t = (req->rescale_t > 0.0f) ? req->rescale_t : 5.0f;
+      memcpy(treq.base_color, req->base_color, sizeof treq.base_color);
+
+      ec_trellis2_res_t tres = {};
+      pthread_mutex_lock(&st->gpu_mu);
+      studio_evict_other_engines_locked(st, 3);
+      int rc_3d = ec_trellis2_generate_3d(st->trellis2, &treq, res->file_main, res->file_aux,
+                                          cb ? tr_flow_progress_bridge : NULL, &bridge, &tres);
+      pthread_mutex_unlock(&st->gpu_mu);
+      for (int i = 0; i < n_loaded; i++) free(views[i]);
+      if (rc_3d == -2) { res->cancelled = 1; return 0; }
+      if (rc_3d == 0 && tres.ok) {
+        snprintf(res->engine_mode, sizeof res->engine_mode, "%s",
+                 req->n_input_images > 1 ? "trellis2_multiview" : (req->n_input_images == 1 ? "trellis2_photo" : "trellis2_1.3b"));
+        res->n_verts = tres.n_verts; res->n_tris = tres.n_tris; res->n_splats = tres.n_splats;
+        res->steps_run = tres.steps_run;
+        res->text_enc_ms = ref_ms; res->dit_ms = tres.dino_ms + tres.flow_ms;
+        res->vae_ms = tres.dec_ms + tres.mesh_ms; res->gpu_ms = ref_ms + tres.total_ms;
+        return 0;
+      }
+      return -1;
+    }
+  }
+  int rc = ec_studio_gen_3d(st, req->prompt, req->seed, req->grid_res, req->tier, cb, cb_ctx, res);
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  return rc;
+}
+
+extern "C" int ec_studio_gen_music_v8(
+    ec_studio_t *st, const ec_studio_music_v8_t *req,
+    ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized || !req) return -1;
+
+  if (req->full_model && st->acestep && ec_acestep_is_ready(st->acestep)) {
+    uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ ((uint64_t)req->stem_mode << 12);
+    snprintf(res->file_main, sizeof res->file_main, "%s/acestep_%u_%04x_master.wav",
+             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+
+    float *src_pcm = NULL; int src_samples = 0;
+    char apath[512] = {0};
+    if (req->source_audio_path && resolve_studio_media_path(st, req->source_audio_path, apath, sizeof apath) == 0) {
+      ec_load_wav_stereo_f32(apath, 48000, &src_pcm, &src_samples);
+    }
+    ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
+    int nl = resolve_lora_stack(st, req->loras, req->n_loras, lstack);
+
+    ec_acestep_req_t areq = {};
+    areq.prompt = (req->prompt && req->prompt[0]) ? req->prompt : "warm jazz house groove, electric rhodes piano, crisp percussion, analog bassline";
+    areq.lyrics = (req->lyrics && req->lyrics[0]) ? req->lyrics : "";
+    areq.seed = req->seed;
+    areq.bpm = (req->bpm >= 40 && req->bpm <= 240) ? req->bpm : 120;
+    areq.duration_sec = (req->duration_sec >= 4.0f && req->duration_sec <= 120.0f) ? req->duration_sec : 10.0f;
+    areq.steps = (req->steps >= 1 && req->steps <= 8) ? req->steps : 8;
+    areq.shift = (req->shift >= 0.5f && req->shift <= 4.0f) ? req->shift : 3.0f;
+    areq.key_scale = req->key_scale;
+    areq.time_sig = req->time_sig;
+    areq.vocal_mode = req->vocal_mode;
+    areq.audio_mode = req->audio_mode;
+    areq.source_pcm_lr = src_pcm;
+    areq.source_samples = src_samples;
+    areq.denoise = req->denoise;
+    areq.repaint_start_sec = req->repaint_start_sec;
+    areq.repaint_end_sec = req->repaint_end_sec;
+    areq.stem_mode = req->stem_mode;
+    areq.loras = nl > 0 ? lstack : NULL;
+    areq.n_loras = nl;
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_acestep_res_t ares = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 2);
+    int rc = ec_acestep_generate_wav(st->acestep, &areq, res->file_main, NULL, NULL,
+                                     cb ? fx_progress_bridge : NULL, &bridge, &ares);
+    pthread_mutex_unlock(&st->gpu_mu);
+    free(src_pcm);
+
+    if (rc == -2) { res->cancelled = 1; return 0; }
+    if (rc == 0 && ares.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "acestep_1.5_turbo");
+      res->sample_rate = ares.sample_rate;
+      res->frames = ares.num_samples;
+      res->steps_run = ares.steps_run;
+      res->lora_tensors_fused = ares.lora_tensors_fused;
+      res->n_stems = ares.n_stems;
+      for (int i = 0; i < ares.n_stems && i < 8; i++) {
+        snprintf(res->stem_files[i], sizeof res->stem_files[i], "%s", ares.stem_paths[i]);
+        snprintf(res->stem_names[i], sizeof res->stem_names[i], "%s", ares.stem_names[i]);
+      }
+      res->text_enc_ms = ares.text_enc_ms + ares.cond_enc_ms;
+      res->dit_ms = ares.dit_ms;
+      res->vae_ms = ares.vae_ms;
+      res->gpu_ms = ares.total_ms;
+      return 0;
+    }
+    return -1;
+  }
+  int rc = ec_studio_gen_music(st, req->prompt, req->seed, req->bpm, req->duration_sec, req->tier, cb, cb_ctx, res);
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  res->sample_rate = 44100;
+  if (rc == 0 && !res->cancelled) {
+    if (req->stem_mode == 0) {
+      res->n_stems = 0;
+      for (int i = 0; i < 8; i++) { res->stem_files[i][0] = '\0'; res->stem_names[i][0] = '\0'; }
+    } else if (req->stem_mode == 2 || req->stem_mode == 8) {
+      float *pcm = NULL; int ns = 0;
+      if (ec_load_wav_stereo_f32(res->file_main, 44100, &pcm, &ns) == 0 && pcm && ns > 0) {
+        char pfx[240];
+        snprintf(pfx, sizeof pfx, "%s/music_%u_v8", st->artifact_dir, req->seed);
+        for (int i = 0; i < 8; i++) { res->stem_files[i][0] = '\0'; res->stem_names[i][0] = '\0'; }
+        ec_audio_split_stems(pcm, ns, 44100, req->stem_mode, pfx, res->stem_files, res->stem_names, &res->n_stems);
+        free(pcm);
+      }
+    } else {
+      static const char *L4[4] = { "drums", "bass", "harmony", "lead" };
+      res->n_stems = 4;
+      for (int i = 0; i < 4; i++) snprintf(res->stem_names[i], sizeof res->stem_names[i], "%s", L4[i]);
+    }
+  }
+  return rc;
+}
+
+extern "C" int ec_studio_gen_video_v8(
+    ec_studio_t *st, const ec_studio_video_v8_t *req,
+    ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
+  memset(res, 0, sizeof *res);
+  if (!st || !st->initialized || !req) return -1;
+
+  if (req->full_model && st->wan22 && ec_wan22_is_ready(st->wan22)) {
+    int W = (req->width  >= 320) ? ((req->width  + 31) & ~31) : 832;
+    if (W > 1280) W = 1280;
+    int H = (req->height >= 320) ? ((req->height + 31) & ~31) : 480;
+    if (H > 1024) H = 1024;
+    int req_f = (req->n_frames >= 5) ? req->n_frames : 17;
+    int F_lat = (req_f - 1) / 4 + 1;
+    if (F_lat < 2) F_lat = 2; if (F_lat > 21) F_lat = 21;
+    int actual_f = 1 + 4 * (F_lat - 1);
+    int afps = (req->fps >= 8 && req->fps <= 60) ? req->fps : 16;
+    int asteps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 20;
+
+    char wav_path[256] = {0};
+    double audio_ms = 0.0;
+    if (req->with_audio) {
+      if (cb && cb(0, asteps + 4, 0, "acestep_synced_audio", cb_ctx) != 0) { res->cancelled = 1; return 0; }
+      ec_studio_result_t ares = {};
+      float dur = (float)actual_f / (float)afps;
+      if (dur < 4.0f) dur = 4.0f;
+      int use_acestep = (st->acestep && ec_acestep_is_ready(st->acestep)) ? 1 : 0;
+      if (ec_studio_gen_music_ex(st, req->prompt, "", req->seed + 17, 116, dur, req->tier, use_acestep, NULL, NULL, &ares) == 0 && !ares.cancelled) {
+        snprintf(wav_path, sizeof wav_path, "%s", ares.file_main);
+        audio_ms = ares.gpu_ms;
+      }
+    }
+
+    uint8_t *start_rgb = NULL, *end_rgb = NULL;
+    int sw = 0, sh = 0, ew = 0, eh = 0;
+    char spath[512] = {0}, epath[512] = {0};
+    if (req->start_frame_path && resolve_studio_media_path(st, req->start_frame_path, spath, sizeof spath) == 0) {
+      ec_load_image_rgb(spath, &start_rgb, &sw, &sh);
+    }
+    if (req->end_frame_path && resolve_studio_media_path(st, req->end_frame_path, epath, sizeof epath) == 0) {
+      ec_load_image_rgb(epath, &end_rgb, &ew, &eh);
+    }
+    ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
+    int nl = resolve_lora_stack(st, req->loras, req->n_loras, lstack);
+
+    uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ (start_rgb ? 0x1111ULL : 0ULL) ^ (end_rgb ? 0x2222ULL : 0ULL);
+    snprintf(res->file_mp4, sizeof res->file_mp4, "%s/wan22_%u_%04x%s.mp4",
+             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu), req->with_audio ? "_av" : "");
+    snprintf(res->file_aux, sizeof res->file_aux, "%s/wan22_%u_%04x_kf0.png",
+             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+    snprintf(res->file_main, sizeof res->file_main, "%s", res->file_mp4);
+
+    ec_wan22_req_t wreq = {};
+    wreq.prompt = (req->prompt && req->prompt[0]) ? req->prompt : "Aerial drone footage flying slowly along black basalt sea cliffs in Iceland at sunset, 35mm cinema";
+    wreq.neg_prompt = req->neg_prompt;
+    wreq.seed = req->seed;
+    wreq.width = W; wreq.height = H; wreq.num_frames = actual_f;
+    wreq.fps = afps; wreq.steps = asteps;
+    wreq.cfg_scale = (req->cfg_scale > 0.0f) ? req->cfg_scale : 5.0f;
+    wreq.shift = (req->shift > 0.0f) ? req->shift : ((W * H <= 832 * 480) ? 3.0f : 5.0f);
+    wreq.start_rgb = start_rgb; wreq.start_w = sw; wreq.start_h = sh;
+    wreq.end_rgb = end_rgb; wreq.end_w = ew; wreq.end_h = eh;
+    wreq.denoise = req->denoise;
+    wreq.camera_motion = req->camera_motion;
+    wreq.loras = nl > 0 ? lstack : NULL;
+    wreq.n_loras = nl;
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_wan22_res_t wres = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 4);
+    int rc = ec_wan22_generate_mp4(st->wan22, &wreq, res->file_mp4, res->file_aux,
+                                   wav_path[0] ? wav_path : NULL,
+                                   cb ? fx_progress_bridge : NULL, &bridge, &wres);
+    pthread_mutex_unlock(&st->gpu_mu);
+    free(start_rgb); free(end_rgb);
+
+    if (rc == -2) { res->cancelled = 1; return 0; }
+    if (rc == 0 && wres.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "%s",
+               (start_rgb && end_rgb) ? "wan2.2_flf2v" : (start_rgb ? "wan2.2_i2v" : "wan2.2_ti2v_5b"));
+      snprintf(res->encoder_used, sizeof res->encoder_used, "%s", wres.encoder_used);
+      res->width = wres.width; res->height = wres.height; res->frames = wres.num_frames;
+      res->steps_run = wres.steps_run;
+      res->text_enc_ms = wres.text_enc_ms; res->dit_ms = wres.dit_ms;
+      res->vae_ms = wres.vae_ms; res->gpu_ms = wres.total_ms + audio_ms;
+      res->fps = (double)wres.num_frames / ((wres.total_ms > 1.0 ? wres.total_ms : 1.0) * 1e-3);
+      return 0;
+    }
+    return -1;
+  }
+  int rc = ec_studio_gen_video(st, req->prompt, req->seed, req->n_frames, req->width, req->height, req->fps, req->with_audio, req->tier, cb, cb_ctx, res);
+  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
+  return rc;
+}
 
 extern "C" int ec_studio_gen_image_ex(
     ec_studio_t *st, const char *prompt, uint32_t seed, int width, int height,
@@ -1116,11 +1516,19 @@ typedef struct {
   uint32_t seed;
   float cfg, duration_sec;
   char image_path[256];
+  char end_image_path[256];
+  char mask_path[256];
   char audio_path[256];
   char video_path[256];
   char glb_path[256];
   char ply_path[256];
-  char stem_paths[4][256];
+  char stem_paths[8][256];
+  char camera_motion[32];
+  char key_scale[32];
+  char vocal_mode[24];
+  char audio_mode[24];
+  float denoise, repaint_start, repaint_end;
+  int  stem_mode, tile_upscale, isolate_fg;
   char engine_mode[32];
   double gpu_ms;
 } ec_node_val_t;
@@ -1185,11 +1593,23 @@ static void flow_merge_val(ec_node_val_t *dst, const ec_node_val_t *src) {
   if (src->cfg > 0.0f && dst->cfg <= 0.0f) dst->cfg = src->cfg;
   if (src->full_model && !dst->full_model) dst->full_model = src->full_model;
   if (src->image_path[0] && !dst->image_path[0]) snprintf(dst->image_path, sizeof dst->image_path, "%s", src->image_path);
+  if (src->end_image_path[0] && !dst->end_image_path[0]) snprintf(dst->end_image_path, sizeof dst->end_image_path, "%s", src->end_image_path);
+  if (src->mask_path[0] && !dst->mask_path[0]) snprintf(dst->mask_path, sizeof dst->mask_path, "%s", src->mask_path);
   if (src->audio_path[0] && !dst->audio_path[0]) snprintf(dst->audio_path, sizeof dst->audio_path, "%s", src->audio_path);
   if (src->video_path[0] && !dst->video_path[0]) snprintf(dst->video_path, sizeof dst->video_path, "%s", src->video_path);
   if (src->glb_path[0] && !dst->glb_path[0]) snprintf(dst->glb_path, sizeof dst->glb_path, "%s", src->glb_path);
   if (src->ply_path[0] && !dst->ply_path[0]) snprintf(dst->ply_path, sizeof dst->ply_path, "%s", src->ply_path);
-  for (int i = 0; i < 4; i++) {
+  if (src->camera_motion[0] && !dst->camera_motion[0]) snprintf(dst->camera_motion, sizeof dst->camera_motion, "%s", src->camera_motion);
+  if (src->key_scale[0] && !dst->key_scale[0]) snprintf(dst->key_scale, sizeof dst->key_scale, "%s", src->key_scale);
+  if (src->vocal_mode[0] && !dst->vocal_mode[0]) snprintf(dst->vocal_mode, sizeof dst->vocal_mode, "%s", src->vocal_mode);
+  if (src->audio_mode[0] && !dst->audio_mode[0]) snprintf(dst->audio_mode, sizeof dst->audio_mode, "%s", src->audio_mode);
+  if (src->denoise > 0.0f && dst->denoise <= 0.0f) dst->denoise = src->denoise;
+  if (src->repaint_start > 0.0f && dst->repaint_start <= 0.0f) dst->repaint_start = src->repaint_start;
+  if (src->repaint_end > 0.0f && dst->repaint_end <= 0.0f) dst->repaint_end = src->repaint_end;
+  if (src->stem_mode > 0 && dst->stem_mode <= 0) dst->stem_mode = src->stem_mode;
+  if (src->tile_upscale && !dst->tile_upscale) dst->tile_upscale = src->tile_upscale;
+  if (src->isolate_fg && !dst->isolate_fg) dst->isolate_fg = src->isolate_fg;
+  for (int i = 0; i < 8; i++) {
     if (src->stem_paths[i][0] && !dst->stem_paths[i][0]) snprintf(dst->stem_paths[i], sizeof dst->stem_paths[i], "%s", src->stem_paths[i]);
   }
   if (src->engine_mode[0] && !dst->engine_mode[0]) snprintf(dst->engine_mode, sizeof dst->engine_mode, "%s", src->engine_mode);
@@ -1298,7 +1718,7 @@ static int studio_dag_cb(
     }
     return 0;
   }
-  if (!strcmp(ct, "LoraLoader") || !strcmp(ct, "LoraLoaderModelOnly")) {
+  if (!strcmp(ct, "LoraLoader") || !strcmp(ct, "LoraLoaderModelOnly") || !strcmp(ct, "QLoRALoader")) {
     const ec_flow_input_t *in_ln = ec_flow_get_input(nd, "lora_name");
     const ec_flow_input_t *in_ls = ec_flow_get_input(nd, "strength_model");
     if (!in_ls) in_ls = ec_flow_get_input(nd, "strength");
@@ -1325,6 +1745,54 @@ static int studio_dag_cb(
     }
     return 0;
   }
+  if (!strcmp(ct, "LoadAudio")) {
+    const ec_flow_input_t *in_au = ec_flow_get_input(nd, "audio");
+    if (in_au && in_au->kind == EC_VAL_STRING && in_au->str_val[0]) {
+      if (in_au->str_val[0] == '/') snprintf(val->audio_path, sizeof val->audio_path, "%s", in_au->str_val);
+      else snprintf(val->audio_path, sizeof val->audio_path, "%s/%s", fc->st->artifact_dir, flow_bname(in_au->str_val));
+    }
+    return 0;
+  }
+  if (!strcmp(ct, "VAEEncode") || !strcmp(ct, "ImageInpaintMask")) {
+    if (!val->modality[0]) snprintf(val->modality, sizeof val->modality, "image");
+    const ec_flow_input_t *dn = ec_flow_get_input(nd, "denoise");
+    if (dn && dn->kind == EC_VAL_NUMBER) val->denoise = (float)dn->num_val;
+    const ec_flow_input_t *mk = ec_flow_get_input(nd, "mask");
+    if (mk && mk->kind == EC_VAL_STRING && mk->str_val[0]) {
+      if (mk->str_val[0] == '/') snprintf(val->mask_path, sizeof val->mask_path, "%s", mk->str_val);
+      else snprintf(val->mask_path, sizeof val->mask_path, "%s/%s", fc->st->artifact_dir, flow_bname(mk->str_val));
+    }
+    return 0;
+  }
+  if (!strcmp(ct, "AceStepAudioEncode") || !strcmp(ct, "AceStepRepaint") || !strcmp(ct, "AceStepExtend")) {
+    snprintf(val->modality, sizeof val->modality, "music");
+    if (!strcmp(ct, "AceStepRepaint")) snprintf(val->audio_mode, sizeof val->audio_mode, "repaint");
+    else if (!strcmp(ct, "AceStepExtend")) snprintf(val->audio_mode, sizeof val->audio_mode, "extend");
+    else {
+      const ec_flow_input_t *am = ec_flow_get_input(nd, "audio_mode");
+      snprintf(val->audio_mode, sizeof val->audio_mode, "%s", (am && am->kind == EC_VAL_STRING && am->str_val[0]) ? am->str_val : "cover");
+    }
+    const ec_flow_input_t *dn = ec_flow_get_input(nd, "denoise");
+    if (dn && dn->kind == EC_VAL_NUMBER) val->denoise = (float)dn->num_val;
+    const ec_flow_input_t *rs = ec_flow_get_input(nd, "start_sec");
+    if (rs && rs->kind == EC_VAL_NUMBER) val->repaint_start = (float)rs->num_val;
+    const ec_flow_input_t *re = ec_flow_get_input(nd, "end_sec");
+    if (re && re->kind == EC_VAL_NUMBER) val->repaint_end = (float)re->num_val;
+    const ec_flow_input_t *ts = ec_flow_get_input(nd, "target_seconds");
+    if (ts && ts->kind == EC_VAL_NUMBER && ts->num_val > 0) val->duration_sec = (float)ts->num_val;
+    return 0;
+  }
+  if (!strcmp(ct, "WanFirstLastFrameToVideo")) {
+    snprintf(val->modality, sizeof val->modality, "video");
+    const ec_node_val_t *sv = flow_get_up_val(g, nd, ups, n_up, "start_image");
+    const ec_node_val_t *ev = flow_get_up_val(g, nd, ups, n_up, "end_image");
+    if (sv && sv->image_path[0]) snprintf(val->image_path, sizeof val->image_path, "%s", sv->image_path);
+    if (ev && ev->image_path[0]) snprintf(val->end_image_path, sizeof val->end_image_path, "%s", ev->image_path);
+    const ec_flow_input_t *cm = ec_flow_get_input(nd, "camera_motion");
+    if (cm && cm->kind == EC_VAL_STRING && cm->str_val[0]) snprintf(val->camera_motion, sizeof val->camera_motion, "%s", cm->str_val);
+    if (val->width <= 0) val->width = 832; if (val->height <= 0) val->height = 480; if (val->frames <= 0) val->frames = 17;
+    return 0;
+  }
 
   // --- 2. CONDITIONING & LATENT SPEC NODES ---
   if (!strcmp(ct, "CLIPTextEncode") || !strcmp(ct, "TextEncodeQwenImage") ||
@@ -1339,6 +1807,18 @@ static int studio_dag_cb(
   }
   if (!strcmp(ct, "TextEncodeAceStepAudio") || !strcmp(ct, "TextEncodeAceStepAudio1.5")) {
     snprintf(val->modality, sizeof val->modality, "music");
+    const ec_flow_input_t *in_ks = ec_flow_get_input(nd, "key_scale");
+    if (in_ks && in_ks->kind == EC_VAL_STRING && in_ks->str_val[0]) snprintf(val->key_scale, sizeof val->key_scale, "%s", in_ks->str_val);
+    const ec_flow_input_t *in_vm = ec_flow_get_input(nd, "vocal_mode");
+    if (in_vm && in_vm->kind == EC_VAL_STRING && in_vm->str_val[0]) snprintf(val->vocal_mode, sizeof val->vocal_mode, "%s", in_vm->str_val);
+    const ec_flow_input_t *in_sm = ec_flow_get_input(nd, "stem_mode");
+    if (in_sm && in_sm->kind == EC_VAL_NUMBER) val->stem_mode = (int)in_sm->num_val;
+    else if (in_sm && in_sm->kind == EC_VAL_STRING) {
+      if (!strcmp(in_sm->str_val, "8stem") || !strcmp(in_sm->str_val, "8")) val->stem_mode = 8;
+      else if (!strcmp(in_sm->str_val, "4stem") || !strcmp(in_sm->str_val, "4")) val->stem_mode = 4;
+      else if (!strcmp(in_sm->str_val, "2stem") || !strcmp(in_sm->str_val, "2")) val->stem_mode = 2;
+      else if (!strcmp(in_sm->str_val, "full_mix") || !strcmp(in_sm->str_val, "0")) val->stem_mode = 0;
+    }
     return 0;
   }
   if (!strcmp(ct, "EmptyLatentImage") || !strcmp(ct, "EmptySD3LatentImage") || !strcmp(ct, "EmptyFlux2LatentImage")) {
@@ -1367,29 +1847,52 @@ static int studio_dag_cb(
 
   if (!strcmp(ct, "KSampler") || !strcmp(ct, "KSamplerAdvanced") || !strcmp(ct, "SamplerCustomAdvanced")) {
     const char *mod = val->modality[0] ? val->modality : "image";
+    const ec_flow_input_t *in_dn = ec_flow_get_input(nd, "denoise");
+    if (in_dn && in_dn->kind == EC_VAL_NUMBER) val->denoise = (float)in_dn->num_val;
+    const ec_flow_input_t *in_tu = ec_flow_get_input(nd, "tile_upscale");
+    if (in_tu && in_tu->kind == EC_VAL_NUMBER) val->tile_upscale = (int)in_tu->num_val;
     if (!strcmp(mod, "music")) {
-      int bpm = (val->bpm >= 40 && val->bpm <= 240) ? val->bpm : 124;
-      float dur = (val->duration_sec >= 2.0f && val->duration_sec <= 30.0f) ? val->duration_sec : 10.0f;
-      int fm = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : (fc->st->acestep ? 1 : 0);
-      int rc = ec_studio_gen_music_ex(fc->st, prompt, val->lyrics, seed, bpm, dur, EC_TIER_FAST, fm, flow_sub_progress_cb, fc, &sub);
+      ec_studio_music_v8_t mq = {};
+      mq.prompt = prompt; mq.lyrics = val->lyrics; mq.seed = seed;
+      mq.bpm = (val->bpm >= 40 && val->bpm <= 240) ? val->bpm : 124;
+      mq.duration_sec = (val->duration_sec >= 2.0f && val->duration_sec <= 120.0f) ? val->duration_sec : 10.0f;
+      mq.steps = (val->steps >= 1 && val->steps <= 8) ? val->steps : 8;
+      mq.stem_mode = val->stem_mode > 0 ? val->stem_mode : 4;
+      mq.key_scale = val->key_scale[0] ? val->key_scale : NULL;
+      mq.vocal_mode = val->vocal_mode[0] ? val->vocal_mode : NULL;
+      mq.audio_mode = val->audio_mode[0] ? val->audio_mode : NULL;
+      mq.source_audio_path = val->audio_path[0] ? val->audio_path : NULL;
+      mq.denoise = val->denoise; mq.repaint_start_sec = val->repaint_start; mq.repaint_end_sec = val->repaint_end;
+      mq.loras = val->n_loras > 0 ? val->loras : NULL; mq.n_loras = val->n_loras;
+      mq.tier = EC_TIER_FAST;
+      mq.full_model = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : (fc->st->acestep ? 1 : 0);
+      int rc = ec_studio_gen_music_v8(fc->st, &mq, flow_sub_progress_cb, fc, &sub);
       if (sub.cancelled) return -2;
       if (rc != 0) return -1;
       snprintf(val->audio_path, sizeof val->audio_path, "%s", sub.file_main);
-      for (int i = 0; i < 4; i++) snprintf(val->stem_paths[i], sizeof val->stem_paths[i], "%s", sub.stem_files[i]);
+      for (int i = 0; i < sub.n_stems && i < 8; i++) snprintf(val->stem_paths[i], sizeof val->stem_paths[i], "%s", sub.stem_files[i]);
       snprintf(val->engine_mode, sizeof val->engine_mode, "%s", sub.engine_mode);
       val->gpu_ms = sub.gpu_ms;
       snprintf(fc->res->stem_files[0], sizeof fc->res->stem_files[0], "%s", sub.file_main);
       fc->res->gpu_ms += sub.gpu_ms;
       return 0;
     } else if (!strcmp(mod, "video")) {
-      int vw = val->width >= 320 ? val->width : 832;
-      int vh = val->height >= 180 ? val->height : 480;
-      if (vw > 832) { vw = 832; vh = 480; }
-      int vf = (val->frames >= 5 && val->frames <= 33) ? val->frames : 17;
-      int vs = (val->steps >= 4 && val->steps <= 28) ? val->steps : 20;
-      int fm = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((vw >= 640 && fc->st->wan22) ? 1 : 0);
-      int wa = ec_flow_get_input(nd, "with_audio") ? (int)ec_flow_get_input(nd, "with_audio")->num_val : 1;
-      int rc = ec_studio_gen_video_ex(fc->st, prompt, seed, vf, vw, vh, fm ? 16 : 24, vs, wa, EC_TIER_FAST, fm, flow_sub_progress_cb, fc, &sub);
+      ec_studio_video_v8_t vq = {};
+      vq.prompt = prompt; vq.neg_prompt = val->neg_prompt[0] ? val->neg_prompt : NULL; vq.seed = seed;
+      vq.width = val->width >= 320 ? val->width : 832;
+      vq.height = val->height >= 180 ? val->height : 480;
+      vq.n_frames = (val->frames >= 5 && val->frames <= 81) ? val->frames : 17;
+      vq.steps = (val->steps >= 4 && val->steps <= 40) ? val->steps : 20;
+      vq.cfg_scale = val->cfg > 0.0f ? val->cfg : 5.0f;
+      vq.full_model = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((vq.width >= 320 && fc->st->wan22) ? 1 : 0);
+      vq.fps = vq.full_model ? 16 : 24;
+      vq.with_audio = ec_flow_get_input(nd, "with_audio") ? (int)ec_flow_get_input(nd, "with_audio")->num_val : 1;
+      vq.start_frame_path = val->image_path[0] ? val->image_path : NULL;
+      vq.end_frame_path = val->end_image_path[0] ? val->end_image_path : NULL;
+      vq.camera_motion = val->camera_motion[0] ? val->camera_motion : NULL;
+      vq.loras = val->n_loras > 0 ? val->loras : NULL; vq.n_loras = val->n_loras;
+      vq.tier = EC_TIER_FAST;
+      int rc = ec_studio_gen_video_v8(fc->st, &vq, flow_sub_progress_cb, fc, &sub);
       if (sub.cancelled) return -2;
       if (rc != 0) return -1;
       snprintf(val->video_path, sizeof val->video_path, "%s", sub.file_mp4);
@@ -1400,8 +1903,12 @@ static int studio_dag_cb(
       fc->res->gpu_ms += sub.gpu_ms;
       return 0;
     } else if (!strcmp(mod, "3d")) {
-      int fm = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : (fc->st->trellis2 ? 1 : 0);
-      int rc = ec_studio_gen_3d_ex(fc->st, prompt, seed, fm ? 64 : 18, EC_TIER_FAST, fm, flow_sub_progress_cb, fc, &sub);
+      ec_studio_3d_v8_t tq = {};
+      tq.prompt = prompt; tq.seed = seed; tq.tier = EC_TIER_FAST;
+      tq.full_model = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : (fc->st->trellis2 ? 1 : 0);
+      tq.grid_res = tq.full_model ? 64 : 18;
+      if (val->image_path[0]) { tq.input_images[0] = val->image_path; tq.n_input_images = 1; }
+      int rc = ec_studio_gen_3d_v8(fc->st, &tq, flow_sub_progress_cb, fc, &sub);
       if (sub.cancelled) return -2;
       if (rc != 0) return -1;
       snprintf(val->glb_path, sizeof val->glb_path, "%s", sub.file_main);
@@ -1413,16 +1920,20 @@ static int studio_dag_cb(
       fc->res->gpu_ms += sub.gpu_ms;
       return 0;
     } else {
-      // Photoreal Image (FLUX.2-klein-4B + hot-fused LoRA stack) or fast smoke if width < 512 and photoreal==0
-      int iw = val->width >= 256 ? val->width : 512;
-      int ih = val->height >= 256 ? val->height : 512;
-      int is = (val->steps >= 1 && val->steps <= 28) ? val->steps : 4;
-      int pr = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((iw >= 512 && fc->st->flux2) ? 1 : 0);
-      int rc = ec_studio_gen_image_ex(
-          fc->st, prompt, seed, iw, ih, is, EC_TIER_FAST, pr,
-          val->checkpoint[0] ? val->checkpoint : NULL,
-          val->n_loras > 0 ? val->loras : NULL, val->n_loras,
-          flow_sub_progress_cb, fc, &sub);
+      ec_studio_image_v8_t iq = {};
+      iq.prompt = prompt; iq.neg_prompt = val->neg_prompt[0] ? val->neg_prompt : NULL; iq.seed = seed;
+      iq.width = val->width >= 256 ? val->width : 512;
+      iq.height = val->height >= 256 ? val->height : 512;
+      iq.steps = (val->steps >= 1 && val->steps <= 28) ? val->steps : 4;
+      iq.cfg_scale = val->cfg;
+      iq.tier = EC_TIER_FAST;
+      iq.photoreal = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((iq.width >= 512 && fc->st->flux2) ? 1 : 0);
+      iq.checkpoint_query = val->checkpoint[0] ? val->checkpoint : NULL;
+      iq.loras = val->n_loras > 0 ? val->loras : NULL; iq.n_loras = val->n_loras;
+      iq.init_image_path = val->image_path[0] ? val->image_path : NULL;
+      iq.mask_image_path = val->mask_path[0] ? val->mask_path : NULL;
+      iq.denoise = val->denoise; iq.tile_upscale = val->tile_upscale;
+      int rc = ec_studio_gen_image_v8(fc->st, &iq, flow_sub_progress_cb, fc, &sub);
       if (sub.cancelled) return -2;
       if (rc != 0) return -1;
       snprintf(val->image_path, sizeof val->image_path, "%s", sub.file_main);
@@ -1465,24 +1976,55 @@ static int studio_dag_cb(
       snprintf(fc->res->stem_files[0], sizeof fc->res->stem_files[0], "%s", val->audio_path);
       return 0;
     }
-    int bpm = (val->bpm >= 40 && val->bpm <= 240) ? val->bpm : 120;
-    float dur = (val->duration_sec >= 1.0f && val->duration_sec <= 30.0f) ? val->duration_sec : 2.0f;
-    int fm = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((dur >= 5.0f && fc->st->acestep) ? 1 : 0);
-    int rc = ec_studio_gen_music_ex(fc->st, prompt, val->lyrics, seed, bpm, dur, EC_TIER_FAST, fm, flow_sub_progress_cb, fc, &sub);
+    ec_studio_music_v8_t mq = {};
+    mq.prompt = prompt;
+    mq.lyrics = val->lyrics;
+    mq.seed = seed;
+    mq.bpm = (val->bpm >= 40 && val->bpm <= 240) ? val->bpm : 120;
+    mq.duration_sec = (val->duration_sec >= 1.0f && val->duration_sec <= 120.0f) ? val->duration_sec : 10.0f;
+    mq.steps = (val->steps >= 1 && val->steps <= 8) ? val->steps : 8;
+    const ec_flow_input_t *in_sm = ec_flow_get_input(nd, "stem_mode");
+    int sm = val->stem_mode > 0 ? val->stem_mode : 4;
+    if (in_sm && in_sm->kind == EC_VAL_NUMBER) sm = (int)in_sm->num_val;
+    else if (in_sm && in_sm->kind == EC_VAL_STRING) {
+      if (!strcmp(in_sm->str_val, "8stem") || !strcmp(in_sm->str_val, "8")) sm = 8;
+      else if (!strcmp(in_sm->str_val, "4stem") || !strcmp(in_sm->str_val, "4")) sm = 4;
+      else if (!strcmp(in_sm->str_val, "2stem") || !strcmp(in_sm->str_val, "2")) sm = 2;
+      else if (!strcmp(in_sm->str_val, "full_mix") || !strcmp(in_sm->str_val, "0")) sm = 0;
+    }
+    mq.stem_mode = sm;
+    mq.key_scale = val->key_scale[0] ? val->key_scale : NULL;
+    mq.vocal_mode = val->vocal_mode[0] ? val->vocal_mode : NULL;
+    mq.audio_mode = val->audio_mode[0] ? val->audio_mode : NULL;
+    mq.source_audio_path = val->audio_path[0] ? val->audio_path : NULL;
+    mq.denoise = val->denoise;
+    mq.repaint_start_sec = val->repaint_start;
+    mq.repaint_end_sec = val->repaint_end;
+    mq.loras = val->n_loras > 0 ? val->loras : NULL;
+    mq.n_loras = val->n_loras;
+    mq.tier = EC_TIER_FAST;
+    mq.full_model = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((mq.duration_sec >= 4.0f && fc->st->acestep) ? 1 : 0);
+    int rc = ec_studio_gen_music_v8(fc->st, &mq, flow_sub_progress_cb, fc, &sub);
     if (sub.cancelled) return -2;
     if (rc != 0) return -1;
     snprintf(val->audio_path, sizeof val->audio_path, "%s", sub.file_main);
-    for (int i = 0; i < 4; i++) snprintf(val->stem_paths[i], sizeof val->stem_paths[i], "%s", sub.stem_files[i]);
+    for (int i = 0; i < sub.n_stems && i < 8; i++) snprintf(val->stem_paths[i], sizeof val->stem_paths[i], "%s", sub.stem_files[i]);
     snprintf(val->engine_mode, sizeof val->engine_mode, "%s", sub.engine_mode);
     val->gpu_ms = sub.gpu_ms;
     snprintf(fc->res->stem_files[0], sizeof fc->res->stem_files[0], "%s", sub.file_main);
     fc->res->gpu_ms += sub.gpu_ms;
     return 0;
   }
-  if (!strcmp(ct, "Eureka3DGen") || !strcmp(ct, "TRELLIS3D") || !strcmp(ct, "TRELLIS2ImageTo3D")) {
-    int fm = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((!strcmp(ct, "TRELLIS2ImageTo3D") && fc->st->trellis2) ? 1 : 0);
-    int gr = fm ? 64 : 18;
-    int rc = ec_studio_gen_3d_ex(fc->st, prompt, seed, gr, EC_TIER_FAST, fm, flow_sub_progress_cb, fc, &sub);
+  if (!strcmp(ct, "Eureka3DGen") || !strcmp(ct, "TRELLIS3D") || !strcmp(ct, "TRELLIS2ImageTo3D") || !strcmp(ct, "TrellisImageTo3D")) {
+    int fm = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : (((!strcmp(ct, "TRELLIS2ImageTo3D") || !strcmp(ct, "TrellisImageTo3D")) && fc->st->trellis2) ? 1 : 0);
+    ec_studio_3d_v8_t tq = {};
+    tq.prompt = prompt; tq.seed = seed; tq.grid_res = fm ? 64 : 18;
+    tq.steps = val->steps > 0 ? val->steps : 12;
+    tq.cfg_scale = val->cfg > 0.0f ? val->cfg : 7.5f;
+    tq.tier = EC_TIER_FAST; tq.full_model = fm;
+    tq.isolate_fg = ec_flow_get_input(nd, "isolate_fg") ? (int)ec_flow_get_input(nd, "isolate_fg")->num_val : 1;
+    if (val->image_path[0]) { tq.input_images[0] = val->image_path; tq.n_input_images = 1; }
+    int rc = ec_studio_gen_3d_v8(fc->st, &tq, flow_sub_progress_cb, fc, &sub);
     if (sub.cancelled) return -2;
     if (rc != 0) return -1;
     snprintf(val->glb_path, sizeof val->glb_path, "%s", sub.file_main);
@@ -1496,12 +2038,19 @@ static int studio_dag_cb(
   }
   if (!strcmp(ct, "EurekaVideoGen") || !strcmp(ct, "LTXVideoAV") || !strcmp(ct, "Wan22VideoGen")) {
     int fm = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((!strcmp(ct, "Wan22VideoGen") && fc->st->wan22) ? 1 : 0);
-    int vw = val->width >= 320 ? val->width : (fm ? 832 : 320);
-    int vh = val->height >= 180 ? val->height : (fm ? 480 : 180);
-    int vf = val->frames >= 5 ? val->frames : (fm ? 17 : 16);
-    int vs = val->steps >= 4 ? val->steps : (fm ? 20 : 4);
-    int wa = ec_flow_get_input(nd, "with_audio") ? (int)ec_flow_get_input(nd, "with_audio")->num_val : 1;
-    int rc = ec_studio_gen_video_ex(fc->st, prompt, seed, vf, vw, vh, fm ? 16 : 24, vs, wa, EC_TIER_FAST, fm, flow_sub_progress_cb, fc, &sub);
+    ec_studio_video_v8_t vq = {};
+    vq.prompt = prompt; vq.neg_prompt = val->neg_prompt[0] ? val->neg_prompt : NULL; vq.seed = seed;
+    vq.width = val->width >= 320 ? val->width : (fm ? 832 : 320);
+    vq.height = val->height >= 180 ? val->height : (fm ? 480 : 180);
+    vq.n_frames = val->frames >= 5 ? val->frames : (fm ? 17 : 16);
+    vq.steps = val->steps >= 4 ? val->steps : (fm ? 20 : 4);
+    vq.fps = fm ? 16 : 24; vq.full_model = fm; vq.tier = EC_TIER_FAST;
+    vq.with_audio = ec_flow_get_input(nd, "with_audio") ? (int)ec_flow_get_input(nd, "with_audio")->num_val : 1;
+    vq.start_frame_path = val->image_path[0] ? val->image_path : NULL;
+    vq.end_frame_path = val->end_image_path[0] ? val->end_image_path : NULL;
+    vq.camera_motion = val->camera_motion[0] ? val->camera_motion : NULL;
+    vq.loras = val->n_loras > 0 ? val->loras : NULL; vq.n_loras = val->n_loras;
+    int rc = ec_studio_gen_video_v8(fc->st, &vq, flow_sub_progress_cb, fc, &sub);
     if (sub.cancelled) return -2;
     if (rc != 0) return -1;
     snprintf(val->video_path, sizeof val->video_path, "%s", sub.file_mp4);
@@ -1713,12 +2262,20 @@ extern "C" void ec_studio_flow_clear_cache(ec_studio_t *st) {
   pthread_mutex_unlock(&st->gpu_mu);
 }
 
-extern "C" int ec_studio_flow_upload_image(
+extern "C" int ec_studio_upload_media(
     ec_studio_t *st, const uint8_t *bytes, size_t len, const char *ext,
     char *out_filename, size_t cap) {
-  if (!st || !st->initialized || !bytes || len < 8 || len > 16 * 1024 * 1024) return -1;
+  if (!st || !st->initialized || !bytes || len < 8 || len > 32 * 1024 * 1024) return -1;
   uint32_t crc = ec_crc32_fast(bytes, len);
-  const char *e = (ext && !strcmp(ext, "jpg")) ? "jpg" : "png";
+  const char *e = "png";
+  if (ext) {
+    if (!strcmp(ext, "jpg") || !strcmp(ext, "jpeg")) e = "jpg";
+    else if (!strcmp(ext, "webp")) e = "webp";
+    else if (!strcmp(ext, "wav"))  e = "wav";
+    else if (!strcmp(ext, "mp3"))  e = "mp3";
+    else if (!strcmp(ext, "flac")) e = "flac";
+    else if (!strcmp(ext, "ogg"))  e = "ogg";
+  }
   char fname[96], fpath[384];
   snprintf(fname, sizeof fname, "upload_%08x.%s", crc, e);
   snprintf(fpath, sizeof fpath, "%s/%s", st->artifact_dir, fname);
@@ -1729,6 +2286,20 @@ extern "C" int ec_studio_flow_upload_image(
   if (wr != len) return -1;
   if (out_filename && cap > 0) snprintf(out_filename, cap, "%s", fname);
   return 0;
+}
+
+extern "C" int ec_studio_flow_upload_image(
+    ec_studio_t *st, const uint8_t *bytes, size_t len, const char *ext,
+    char *out_filename, size_t cap) {
+  return ec_studio_upload_media(st, bytes, len, ext, out_filename, cap);
+}
+
+extern "C" int ec_studio_lora_catalog_json(ec_studio_t *st, char *buf, size_t cap) {
+  if (!st || !st->initialized || !buf) return -1;
+  pthread_mutex_lock(&st->gpu_mu);
+  int n = ec_lora_catalog_to_json(&st->vault, buf, cap);
+  pthread_mutex_unlock(&st->gpu_mu);
+  return n;
 }
 
 // Emits ComfyUI-compatible typed node schema catalog (/v1/flows/object_info) hydrated with live Vault models!
@@ -1758,8 +2329,17 @@ extern "C" int ec_studio_flow_object_info_json(ec_studio_t *st, char *buf, size_
       "{"
       "\"UNETLoader\":{\"category\":\"loaders\",\"title\":\"Load Diffusion Model\",\"outputs\":[\"MODEL\"],\"inputs\":{\"unet_name\":{\"type\":\"COMBO\",\"options\":%s,\"default\":\"flux2_klein_4b_bf16.safetensors\"}}},"
       "\"CheckpointLoaderSimple\":{\"category\":\"loaders\",\"title\":\"Load Checkpoint\",\"outputs\":[\"MODEL\",\"CLIP\",\"VAE\"],\"inputs\":{\"ckpt_name\":{\"type\":\"COMBO\",\"options\":%s,\"default\":\"flux2_klein_4b_bf16.safetensors\"}}},"
-      "\"LoraLoader\":{\"category\":\"loaders\",\"title\":\"Load LoRA (Hot-Fused BF16)\",\"outputs\":[\"MODEL\",\"CLIP\"],\"inputs\":{\"model\":{\"type\":\"MODEL\"},\"lora_name\":{\"type\":\"COMBO\",\"options\":%s,\"default\":\"None\"},\"strength_model\":{\"type\":\"FLOAT\",\"default\":0.85,\"min\":0,\"max\":2,\"step\":0.05}}},"
+      "\"LoraLoader\":{\"category\":\"loaders\",\"title\":\"Load LoRA / QLoRA (BF16/NF4/FP8/DoRA/LoKr)\",\"outputs\":[\"MODEL\",\"CLIP\"],\"inputs\":{\"model\":{\"type\":\"MODEL\"},\"lora_name\":{\"type\":\"COMBO\",\"options\":%s,\"default\":\"None\"},\"strength_model\":{\"type\":\"FLOAT\",\"default\":0.85,\"min\":-2,\"max\":2,\"step\":0.05}}},"
+      "\"QLoRALoader\":{\"category\":\"loaders\",\"title\":\"Load QLoRA / DoRA / LoHa / LoKr\",\"outputs\":[\"MODEL\"],\"inputs\":{\"model\":{\"type\":\"MODEL\"},\"lora_name\":{\"type\":\"COMBO\",\"options\":%s,\"default\":\"None\"},\"strength_model\":{\"type\":\"FLOAT\",\"default\":0.85,\"min\":-2,\"max\":2,\"step\":0.05}}},"
       "\"LoadImage\":{\"category\":\"loaders\",\"title\":\"Load Image\",\"outputs\":[\"IMAGE\"],\"inputs\":{\"image\":{\"type\":\"IMAGE_UPLOAD\",\"default\":\"\"}}},"
+      "\"LoadAudio\":{\"category\":\"audio\",\"title\":\"Load Audio (WAV/MP3/FLAC)\",\"outputs\":[\"AUDIO\"],\"inputs\":{\"audio\":{\"type\":\"AUDIO_UPLOAD\",\"default\":\"\"}}},"
+      "\"VAEEncode\":{\"category\":\"latent\",\"title\":\"VAE Encode (FLUX.2 Img2Img)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"pixels\":{\"type\":\"IMAGE\"},\"denoise\":{\"type\":\"FLOAT\",\"default\":0.65,\"min\":0.05,\"max\":1.0,\"step\":0.05}}},"
+      "\"ImageInpaintMask\":{\"category\":\"latent\",\"title\":\"Image + Inpaint Mask\",\"outputs\":[\"LATENT\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"mask\":{\"type\":\"IMAGE_UPLOAD\",\"default\":\"\"}}},"
+      "\"WanFirstLastFrameToVideo\":{\"category\":\"video\",\"title\":\"Wan 2.2 First + Last Frame (FLF2V)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"start_image\":{\"type\":\"IMAGE\"},\"end_image\":{\"type\":\"IMAGE\"},\"width\":{\"type\":\"INT\",\"default\":832,\"min\":320,\"max\":1280,\"step\":32},\"height\":{\"type\":\"INT\",\"default\":480,\"min\":320,\"max\":1024,\"step\":32},\"length\":{\"type\":\"INT\",\"default\":17,\"min\":5,\"max\":81,\"step\":4},\"camera_motion\":{\"type\":\"COMBO\",\"options\":[\"auto\",\"orbit\",\"dolly_in\",\"pan_left\",\"pan_right\",\"crane_up\",\"fpv\",\"static\"],\"default\":\"auto\"}}},"
+      "\"TrellisImageTo3D\":{\"category\":\"3d\",\"title\":\"TRELLIS.2 Direct Photo -> 3D\",\"outputs\":[\"MESH3D\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"steps\":{\"type\":\"INT\",\"default\":12,\"min\":4,\"max\":30},\"cfg\":{\"type\":\"FLOAT\",\"default\":7.5,\"min\":1,\"max\":12,\"step\":0.5},\"isolate_fg\":{\"type\":\"BOOL\",\"default\":true},\"seed\":{\"type\":\"INT\",\"default\":101},\"full_model\":{\"type\":\"BOOL\",\"default\":true}}},"
+      "\"AceStepAudioEncode\":{\"category\":\"audio\",\"title\":\"ACE-Step Oobleck VAE Encode (Cover)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"audio\":{\"type\":\"AUDIO\"},\"audio_mode\":{\"type\":\"COMBO\",\"options\":[\"cover\",\"repaint\",\"extend\"],\"default\":\"cover\"},\"denoise\":{\"type\":\"FLOAT\",\"default\":0.65,\"min\":0.1,\"max\":1.0,\"step\":0.05}}},"
+      "\"AceStepRepaint\":{\"category\":\"audio\",\"title\":\"ACE-Step Audio Repaint [t0..t1]\",\"outputs\":[\"LATENT\"],\"inputs\":{\"audio\":{\"type\":\"AUDIO\"},\"start_sec\":{\"type\":\"FLOAT\",\"default\":4.0,\"min\":0,\"max\":115,\"step\":0.5},\"end_sec\":{\"type\":\"FLOAT\",\"default\":8.0,\"min\":0.5,\"max\":120,\"step\":0.5}}},"
+      "\"AceStepExtend\":{\"category\":\"audio\",\"title\":\"ACE-Step Song Extender (up to 120s)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"audio\":{\"type\":\"AUDIO\"},\"target_seconds\":{\"type\":\"FLOAT\",\"default\":45.0,\"min\":8,\"max\":120,\"step\":1}}},"
       "\"CLIPTextEncode\":{\"category\":\"conditioning\",\"title\":\"CLIP Text Encode (Prompt)\",\"outputs\":[\"CONDITIONING\"],\"inputs\":{\"clip\":{\"type\":\"CLIP\"},\"text\":{\"type\":\"STRING\",\"multiline\":true,\"default\":\"Candid editorial portrait in a sunlit Kyoto ceramic workshop, 85mm f/1.4, Kodak Portra 400, photorealistic\"}}},"
       "\"ConditioningZeroOut\":{\"category\":\"conditioning\",\"title\":\"Conditioning Zero Out\",\"outputs\":[\"CONDITIONING\"],\"inputs\":{\"conditioning\":{\"type\":\"CONDITIONING\"}}},"
       "\"FluxGuidance\":{\"category\":\"conditioning\",\"title\":\"FLUX Guidance\",\"outputs\":[\"CONDITIONING\"],\"inputs\":{\"conditioning\":{\"type\":\"CONDITIONING\"},\"guidance\":{\"type\":\"FLOAT\",\"default\":3.5,\"min\":1,\"max\":12,\"step\":0.5}}},"
@@ -1786,50 +2366,86 @@ extern "C" int ec_studio_flow_object_info_json(ec_studio_t *st, char *buf, size_
       "\"EurekaMusicGen\":{\"category\":\"audio\",\"title\":\"Eureka 4-Stem Music\",\"outputs\":[\"AUDIO\"],\"inputs\":{\"prompt\":{\"type\":\"STRING\",\"multiline\":true,\"default\":\"Nordic ambient analog synth soundtrack\"},\"seed\":{\"type\":\"INT\",\"default\":2026},\"bpm\":{\"type\":\"INT\",\"default\":118},\"duration_sec\":{\"type\":\"FLOAT\",\"default\":2},\"full_model\":{\"type\":\"BOOL\",\"default\":false}}},"
       "\"EurekaVideoGen\":{\"category\":\"video\",\"title\":\"Eureka NVENC Cinema Video\",\"outputs\":[\"VIDEO\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"audio\":{\"type\":\"AUDIO\"},\"prompt\":{\"type\":\"STRING\",\"multiline\":true,\"default\":\"Architectural dawn timelapse\"},\"seed\":{\"type\":\"INT\",\"default\":2026},\"width\":{\"type\":\"INT\",\"default\":320},\"height\":{\"type\":\"INT\",\"default\":180},\"frames\":{\"type\":\"INT\",\"default\":16},\"full_model\":{\"type\":\"BOOL\",\"default\":false}}}"
       "}",
-      ckpt_opts, ckpt_opts, lora_opts);
+      ckpt_opts, ckpt_opts, lora_opts, lora_opts);
 }
 
-// 5 Ready-to-Run Multi-Node ComfyUI Templates with clean visual coordinates
+// 24 Pre-Seeded Ready-to-Run Multi-Modal ComfyUI Workflow Templates (6 per modality!)
 extern "C" int ec_studio_flow_templates_json(ec_studio_t *st, char *buf, size_t cap) {
   (void)st;
-  return snprintf(buf, cap,
+  return snprintf(buf, cap, "%s",
       "{\"templates\":["
+      // ==================== PHOTOREAL IMAGE (6) ====================
       "{\"id\":\"flux2-photoreal-grade\",\"name\":\"FLUX.2-klein-4B + LoRA + Film Color Grade\",\"modality\":\"image\","
-      "\"desc\":\"Full native ComfyUI photoreal pipeline with hot-fused LoRA, pure-C11 Film Color Grade (proving instant Merkle cache hits when tweaking grade!), and PNG tEXt workflow embedding.\","
+      "\"desc\":\"Full native ComfyUI photoreal pipeline with hot-fused LoRA/QLoRA, pure-C11 Film Color Grade (instant Merkle cache hits!), and PNG tEXt workflow embedding.\","
       "\"positions\":{\"1\":[40,40],\"2\":[310,40],\"3\":[40,210],\"4\":[310,270],\"5\":[610,110],\"6\":[900,110],\"7\":[1150,90],\"8\":[1440,110]},"
       "\"workflow\":{"
       "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
       "\"2\":{\"class_type\":\"LoraLoader\",\"inputs\":{\"model\":[\"1\",0],\"lora_name\":\"None\",\"strength_model\":0.85}},"
       "\"3\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Candid editorial portrait of a ceramic artist in a sunlit Kyoto workshop, natural window sidelight, 85mm f/1.4, Kodak Portra 400, photorealistic\"}},"
-      "\"4\":{\"class_type\":\"EmptyFlux2LatentImage\",\"inputs\":{\"width\":512,\"height\":512}},"
+      "\"4\":{\"class_type\":\"EmptyFlux2LatentImage\",\"inputs\":{\"width\":768,\"height\":1024}},"
       "\"5\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"2\",0],\"positive\":[\"3\",0],\"latent_image\":[\"4\",0],\"seed\":1042,\"steps\":4,\"cfg\":1.0,\"full_model\":true}},"
       "\"6\":{\"class_type\":\"VAEDecode\",\"inputs\":{\"samples\":[\"5\",0]}},"
       "\"7\":{\"class_type\":\"ImageColorGrade\",\"inputs\":{\"image\":[\"6\",0],\"contrast\":1.08,\"warmth\":0.12,\"saturation\":1.10,\"vignette\":0.20,\"sharpen\":0.25}},"
       "\"8\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"7\",0],\"filename_prefix\":\"Flux2Studio\"}}"
       "}},"
-      "{\"id\":\"acestep-15-song\",\"name\":\"ACE-Step 1.5 Turbo — 48 kHz Song + 4 Stems\",\"modality\":\"music\","
-      "\"desc\":\"24L GQA Sliding-Window DiT + Oobleck 48 kHz stereo decoder wired as a live ComfyUI audio graph (197 ms warm DiT!).\","
-      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[360,310],\"4\":[660,120],\"5\":[950,120],\"6\":[1210,120]},"
-      "\"workflow\":{"
-      "\"1\":{\"class_type\":\"CheckpointLoaderSimple\",\"inputs\":{\"ckpt_name\":\"acestep_v15_turbo_bf16.safetensors\"}},"
-      "\"2\":{\"class_type\":\"TextEncodeAceStepAudio\",\"inputs\":{\"tags\":\"warm upbeat jazz house groove, electric rhodes chords, funky bassline, crisp acoustic percussion, studio mix\",\"lyrics\":\"\",\"bpm\":124}},"
-      "\"3\":{\"class_type\":\"EmptyAceStepLatentAudio\",\"inputs\":{\"seconds\":10}},"
-      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":4242,\"steps\":8,\"cfg\":1.0,\"full_model\":true}},"
-      "\"5\":{\"class_type\":\"VAEDecodeAudio\",\"inputs\":{\"samples\":[\"4\",0]}},"
-      "\"6\":{\"class_type\":\"SaveAudio\",\"inputs\":{\"audio\":[\"5\",0]}}"
-      "}},"
-      "{\"id\":\"trellis2-hero-3d\",\"name\":\"FLUX.2 Hero -> TRELLIS.2 1.3B 3D GLB + PLY\",\"modality\":\"3d\","
-      "\"desc\":\"Two-stage multimodal graph: FLUX.2 generates a studio concept image, then TRELLIS.2 lifts it to a watertight 33k-triangle GLB 2.0 + 3DGS PLY (8.66 s Flow!).\","
-      "\"positions\":{\"1\":[40,60],\"2\":[40,230],\"3\":[360,120],\"4\":[660,120],\"5\":[960,100],\"6\":[1280,120]},"
+      "{\"id\":\"flux2-img2img-restyle\",\"name\":\"FLUX.2 Photo-to-Photo Img2Img Restyle\",\"modality\":\"image\","
+      "\"desc\":\"Load any photograph, encode through native AutoencoderKLFlux2 VAE Encoder, and re-render style & lighting with adjustable denoise strength.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[340,210],\"4\":[340,40],\"5\":[660,110],\"6\":[950,110],\"7\":[1210,110]},"
       "\"workflow\":{"
       "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
-      "\"2\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"sculptural matte-white porcelain teapot with curved spout and warm bamboo handle\"}},"
-      "\"3\":{\"class_type\":\"EmptyFlux2LatentImage\",\"inputs\":{\"width\":512,\"height\":512}},"
-      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":777,\"steps\":4,\"full_model\":true}},"
-      "\"5\":{\"class_type\":\"TRELLIS2ImageTo3D\",\"inputs\":{\"image\":[\"4\",0],\"prompt\":\"sculptural matte-white porcelain teapot with curved spout and warm bamboo handle\",\"seed\":777,\"full_model\":true}},"
-      "\"6\":{\"class_type\":\"Save3D\",\"inputs\":{\"mesh\":[\"5\",0]}}"
+      "\"2\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":\"\"}},"
+      "\"3\":{\"class_type\":\"VAEEncode\",\"inputs\":{\"pixels\":[\"2\",0],\"denoise\":0.65}},"
+      "\"4\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Transformed into golden-hour 35mm Leica cinema still with warm sun flare and Kodak Portra 400 grain, photorealistic\"}},"
+      "\"5\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"4\",0],\"latent_image\":[\"3\",0],\"seed\":2042,\"steps\":6,\"cfg\":1.0,\"denoise\":0.65,\"full_model\":true}},"
+      "\"6\":{\"class_type\":\"VAEDecode\",\"inputs\":{\"samples\":[\"5\",0]}},"
+      "\"7\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"6\",0],\"filename_prefix\":\"Flux2Img2Img\"}}"
       "}},"
-      "{\"id\":\"wan22-cinema-av\",\"name\":\"Wan 2.2 TI2V-5B Cinema Video + Pos/Neg CFG\",\"modality\":\"video\","
+      "{\"id\":\"flux2-masked-inpaint\",\"name\":\"FLUX.2 Precision Masked Inpainting\",\"modality\":\"image\","
+      "\"desc\":\"Paint a mask region over any photo and selectively repaint only the masked area via exact flow-matching latent projection.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[340,210],\"4\":[340,40],\"5\":[660,110],\"6\":[960,110]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":\"\"}},"
+      "\"3\":{\"class_type\":\"ImageInpaintMask\",\"inputs\":{\"image\":[\"2\",0],\"mask\":\"\"}},"
+      "\"4\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Replace masked region seamlessly with weathered handmade stoneware vase holding wild eucalyptus branches, matching ambient lighting\"}},"
+      "\"5\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"4\",0],\"latent_image\":[\"3\",0],\"seed\":3033,\"steps\":6,\"cfg\":1.0,\"denoise\":0.92,\"full_model\":true}},"
+      "\"6\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"5\",0],\"filename_prefix\":\"Flux2Inpaint\"}}"
+      "}},"
+      "{\"id\":\"flux2-2x-tile-upscale\",\"name\":\"FLUX.2 2x Latent Detail Tile Upscaler\",\"modality\":\"image\","
+      "\"desc\":\"Generates or loads a base frame and runs overlapping 2x tiled VAE-encode + flow-detail refinement for razor-sharp 1536px+ editorial prints.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[340,120],\"4\":[650,120],\"5\":[960,120],\"6\":[1240,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Commercial macro photograph of a brushed titanium mechanical chronograph on dark wet slate, strip softbox lighting, Canon R5 100mm macro\"}},"
+      "\"3\":{\"class_type\":\"EmptyFlux2LatentImage\",\"inputs\":{\"width\":512,\"height\":512}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":777,\"steps\":4,\"tile_upscale\":true,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"ImageColorGrade\",\"inputs\":{\"image\":[\"4\",0],\"contrast\":1.05,\"sharpen\":0.30}},"
+      "\"6\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"5\",0],\"filename_prefix\":\"Flux2Upscale2x\"}}"
+      "}},"
+      "{\"id\":\"flux2-monochrome-darkroom\",\"name\":\"Leica Monochrom Silver Gelatin Darkroom\",\"modality\":\"image\","
+      "\"desc\":\"High-contrast documentary street photography pipeline with native C11 monochrome silver-gelatin darkroom finishing.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[340,240],\"4\":[640,120],\"5\":[940,120],\"6\":[1220,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Street documentary photograph of a jazz saxophonist under a rainy Paris cafe awning at twilight, Leica M11 50mm Summilux f/1.4, Ilford HP5 film grain\"}},"
+      "\"3\":{\"class_type\":\"EmptyFlux2LatentImage\",\"inputs\":{\"width\":1024,\"height\":768}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":314,\"steps\":4,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"ImageGrayscale\",\"inputs\":{\"image\":[\"4\",0],\"contrast\":1.22}},"
+      "\"6\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"5\",0],\"filename_prefix\":\"LeicaMono\"}}"
+      "}},"
+      "{\"id\":\"flux2-qlora-style-stack\",\"name\":\"FLUX.2 Multi-LoRA / QLoRA NF4 Style Stack\",\"modality\":\"image\","
+      "\"desc\":\"Hot-fuses chained LoRA / QLoRA NF4 / DoRA / LoKr adapters on GPU into BF16 DiT weights with zero Python or PEFT overhead.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[310,40],\"3\":[40,210],\"4\":[310,270],\"5\":[610,110],\"6\":[910,110]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"QLoRALoader\",\"inputs\":{\"model\":[\"1\",0],\"lora_name\":\"None\",\"strength_model\":0.85}},"
+      "\"3\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Anamorphic 65mm film still of a lone astronaut walking across an obsidian volcanic plain under two crescent moons, ARRI Alexa 65\"}},"
+      "\"4\":{\"class_type\":\"EmptyFlux2LatentImage\",\"inputs\":{\"width\":1024,\"height\":576}},"
+      "\"5\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"2\",0],\"positive\":[\"3\",0],\"latent_image\":[\"4\",0],\"seed\":2049,\"steps\":4,\"full_model\":true}},"
+      "\"6\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"5\",0],\"filename_prefix\":\"Flux2QLoRA\"}}"
+      "}},"
+      // ==================== CINEMA VIDEO (6) ====================
+      "{\"id\":\"wan22-cinema-av\",\"name\":\"Wan 2.2 TI2V-5B Cinema Video + Synced Audio\",\"modality\":\"video\","
       "\"desc\":\"30-block 3D RoPE Wan 2.2 TI2V-5B with isolated positive/negative prompts, 832x480x17f latent, and hardware NVENC H.264 + 48 kHz AAC mux.\","
       "\"positions\":{\"1\":[40,40],\"2\":[40,190],\"3\":[40,390],\"4\":[370,320],\"5\":[680,140],\"6\":[990,140]},"
       "\"workflow\":{"
@@ -1840,8 +2456,101 @@ extern "C" int ec_studio_flow_templates_json(ec_studio_t *st, char *buf, size_t 
       "\"5\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"negative\":[\"3\",0],\"latent_image\":[\"4\",0],\"seed\":42,\"steps\":20,\"cfg\":5.0,\"full_model\":true}},"
       "\"6\":{\"class_type\":\"SaveVideo\",\"inputs\":{\"video\":[\"5\",0]}}"
       "}},"
-      "{\"id\":\"director-4-modality\",\"name\":\"4-Modality Director Master Graph (Fast Smoke / Full)\",\"modality\":\"image\","
-      "\"desc\":\"All 4 creative modalities (Image + 3D GLB + Music WAV + NVENC MP4) linked in one compiled Merkle-cached DAG — tweak any downstream node and upstream nodes hit cache in 0 ms!\","
+      "{\"id\":\"wan22-start-frame-i2v\",\"name\":\"Wan 2.2 Start-Frame Image-to-Video (I2V)\",\"modality\":\"video\","
+      "\"desc\":\"Animate any uploaded photo or FLUX.2 hero still by encoding Frame 0 via native Causal 3D VAE and anchoring the opening frame cleanly.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[340,210],\"4\":[340,40],\"5\":[680,120],\"6\":[990,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"wan2.2_ti2v_5b_fp16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":\"\"}},"
+      "\"3\":{\"class_type\":\"Wan22ImageToVideoLatent\",\"inputs\":{\"image\":[\"2\",0],\"width\":832,\"height\":480,\"length\":17,\"camera_motion\":\"dolly_in\"}},"
+      "\"4\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Gentle atmospheric motion, soft breeze and shifting natural cinema light, smooth camera dolly-in, 35mm film\"}},"
+      "\"5\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"4\",0],\"latent_image\":[\"3\",0],\"seed\":808,\"steps\":20,\"cfg\":5.0,\"full_model\":true}},"
+      "\"6\":{\"class_type\":\"SaveVideo\",\"inputs\":{\"video\":[\"5\",0]}}"
+      "}},"
+      "{\"id\":\"wan22-first-last-frame\",\"name\":\"Wan 2.2 First + Last Frame Keyframe Bridge (FLF2V)\",\"modality\":\"video\","
+      "\"desc\":\"Pin BOTH Start Frame and End Frame in Wan 2.2 Causal 3D latent space to synthesize seamless transitions, camera orbits, or morph shots.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,190],\"3\":[40,360],\"4\":[360,240],\"5\":[690,140],\"6\":[1000,140]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"wan2.2_ti2v_5b_fp16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":\"\"}},"
+      "\"3\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":\"\"}},"
+      "\"4\":{\"class_type\":\"WanFirstLastFrameToVideo\",\"inputs\":{\"start_image\":[\"2\",0],\"end_image\":[\"3\",0],\"width\":832,\"height\":480,\"length\":17,\"camera_motion\":\"orbit\"}},"
+      "\"5\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"latent_image\":[\"4\",0],\"prompt\":\"Seamless continuous camera glide transitioning fluidly from start frame to closing frame, 35mm cinema\",\"seed\":515,\"steps\":20,\"cfg\":5.0,\"full_model\":true}},"
+      "\"6\":{\"class_type\":\"SaveVideo\",\"inputs\":{\"video\":[\"5\",0]}}"
+      "}},"
+      "{\"id\":\"wan22-seamless-loop\",\"name\":\"Wan 2.2 Seamless Infinite Loop (Cinemagraph)\",\"modality\":\"video\","
+      "\"desc\":\"Locks Start Frame == End Frame on a 1:1 canvas for hypnotic infinitely-looping ambient backdrops and product cinemagraphs.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[350,150],\"4\":[670,120],\"5\":[980,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"wan2.2_ti2v_5b_fp16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":\"\"}},"
+      "\"3\":{\"class_type\":\"WanFirstLastFrameToVideo\",\"inputs\":{\"start_image\":[\"2\",0],\"end_image\":[\"2\",0],\"width\":640,\"height\":640,\"length\":17,\"camera_motion\":\"static\"}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"latent_image\":[\"3\",0],\"prompt\":\"Hypnotic seamless loop, gentle ambient light shimmer and curling steam, locked tripod camera\",\"seed\":108,\"steps\":18,\"cfg\":5.0,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveVideo\",\"inputs\":{\"video\":[\"4\",0]}}"
+      "}},"
+      "{\"id\":\"wan22-vertical-9x16\",\"name\":\"Wan 2.2 Vertical 9:16 Social Reel (480x832)\",\"modality\":\"video\","
+      "\"desc\":\"Native vertical 480x832 portrait cinema pipeline with synced ACE-Step 1.5 soundtrack for Reels, Shorts, and fashion stories.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[350,240],\"4\":[670,120],\"5\":[980,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"wan2.2_ti2v_5b_fp16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Vertical 9:16 editorial fashion film of silk trench coat billowing on a sunlit Milan rooftop, slow tracking shot, 35mm cinema\"}},"
+      "\"3\":{\"class_type\":\"Wan22ImageToVideoLatent\",\"inputs\":{\"width\":480,\"height\":832,\"length\":17,\"camera_motion\":\"orbit\"}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":916,\"steps\":20,\"cfg\":5.0,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveVideo\",\"inputs\":{\"video\":[\"4\",0]}}"
+      "}},"
+      "{\"id\":\"flux2-to-wan22-hero\",\"name\":\"FLUX.2 Concept Still -> Wan 2.2 I2V Cinema Shot\",\"modality\":\"video\","
+      "\"desc\":\"Two-model director chain: synthesize a crisp FLUX.2 hero still first, then animate it live through Wan 2.2 Causal 3D VAE I2V.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[350,120],\"4\":[660,120],\"5\":[980,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"Rain-beaded vintage bronze astrolabe glowing softly by warm candlelight inside a wood-paneled observatory, 35mm cinema\"}},"
+      "\"3\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"width\":832,\"height\":480,\"seed\":303,\"steps\":4,\"full_model\":true}},"
+      "\"4\":{\"class_type\":\"Wan22VideoGen\",\"inputs\":{\"image\":[\"3\",0],\"prompt\":\"Slow orbital camera dolly around glowing bronze astrolabe, flickering candlelight reflections\",\"width\":832,\"height\":480,\"frames\":17,\"steps\":18,\"seed\":303,\"with_audio\":true,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveVideo\",\"inputs\":{\"video\":[\"4\",0]}}"
+      "}},"
+      // ==================== 3D ASSETS (6) ====================
+      "{\"id\":\"trellis2-hero-3d\",\"name\":\"FLUX.2 Hero -> TRELLIS.2 1.3B 3D GLB + PLY\",\"modality\":\"3d\","
+      "\"desc\":\"Two-stage multimodal graph: FLUX.2 generates a studio concept image, then TRELLIS.2 lifts it to a watertight GLB 2.0 + 3DGS PLY.\","
+      "\"positions\":{\"1\":[40,60],\"2\":[40,230],\"3\":[360,120],\"4\":[660,120],\"5\":[960,100],\"6\":[1280,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"flux2_klein_4b_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"CLIPTextEncode\",\"inputs\":{\"text\":\"sculptural matte-white porcelain teapot with curved spout and warm bamboo handle\"}},"
+      "\"3\":{\"class_type\":\"EmptyFlux2LatentImage\",\"inputs\":{\"width\":512,\"height\":512}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":777,\"steps\":4,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"TRELLIS2ImageTo3D\",\"inputs\":{\"image\":[\"4\",0],\"prompt\":\"sculptural matte-white porcelain teapot with curved spout and warm bamboo handle\",\"seed\":777,\"full_model\":true}},"
+      "\"6\":{\"class_type\":\"Save3D\",\"inputs\":{\"mesh\":[\"5\",0]}}"
+      "}},"
+      "{\"id\":\"trellis2-direct-photo\",\"name\":\"Direct Photo-to-3D Upload (Skip FLUX.2!)\",\"modality\":\"3d\","
+      "\"desc\":\"Upload any product photo directly into DINOv3-ViT-L/16 + TRELLIS.2 1.3B with automatic studio backdrop isolation -> watertight GLB 2.0 + 3DGS PLY.\","
+      "\"positions\":{\"1\":[40,120],\"2\":[380,120],\"3\":[740,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":\"\"}},"
+      "\"2\":{\"class_type\":\"TrellisImageTo3D\",\"inputs\":{\"image\":[\"1\",0],\"steps\":12,\"cfg\":7.5,\"isolate_fg\":true,\"seed\":101,\"full_model\":true}},"
+      "\"3\":{\"class_type\":\"Save3D\",\"inputs\":{\"mesh\":[\"2\",0]}}"
+      "}},"
+      "{\"id\":\"trellis2-game-prop-cad\",\"name\":\"Hard-Surface Sci-Fi Game Prop (GLB + PLY)\",\"modality\":\"3d\","
+      "\"desc\":\"Clean symmetric hard-surface prop generation tuned for Unity, Unreal Engine 5, and Blender PBR asset pipelines.\","
+      "\"positions\":{\"1\":[40,120],\"2\":[420,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"TRELLIS2ImageTo3D\",\"inputs\":{\"prompt\":\"hard-surface orbital pilot helmet in weathered titanium and dark amber visor glass, studio product render\",\"seed\":2099,\"steps\":14,\"full_model\":true}},"
+      "\"2\":{\"class_type\":\"Save3D\",\"inputs\":{\"mesh\":[\"1\",0]}}"
+      "}},"
+      "{\"id\":\"trellis2-archviz-furniture\",\"name\":\"ArchViz Mid-Century Furniture 3D Asset\",\"modality\":\"3d\","
+      "\"desc\":\"Architectural visualization furniture generator exporting clean glTF 2.0 meshes with auto-sampled PBR base albedo.\","
+      "\"positions\":{\"1\":[40,120],\"2\":[420,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"TRELLIS2ImageTo3D\",\"inputs\":{\"prompt\":\"Danish mid-century sculpted walnut lounge chair with saddle tan leather cushion, neutral studio turntable\",\"seed\":1958,\"steps\":12,\"full_model\":true}},"
+      "\"2\":{\"class_type\":\"Save3D\",\"inputs\":{\"mesh\":[\"1\",0]}}"
+      "}},"
+      "{\"id\":\"trellis2-fast-ovoxel-draft\",\"name\":\"Fast O-Voxel 3D Concept Draft (< 150ms)\",\"modality\":\"3d\","
+      "\"desc\":\"Ultra-fast GPU sparse O-Voxel hash-grid + Surface Nets draft for instant silhouette ideation before committing to full 1.3B flow.\","
+      "\"positions\":{\"1\":[40,120],\"2\":[420,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"Eureka3DGen\",\"inputs\":{\"prompt\":\"Brutalist concrete architectural sculpture\",\"seed\":2026,\"full_model\":false}},"
+      "\"2\":{\"class_type\":\"Save3D\",\"inputs\":{\"mesh\":[\"1\",0]}}"
+      "}},"
+      "{\"id\":\"director-4-modality\",\"name\":\"4-Modality Director Master Graph (Image+3D+Music+MP4)\",\"modality\":\"3d\","
+      "\"desc\":\"All 4 creative modalities linked in one compiled Merkle-cached DAG — tweak any downstream node and upstream nodes hit cache in 0 ms.\","
       "\"positions\":{\"1\":[40,150],\"2\":[360,30],\"3\":[360,270],\"4\":[690,150],\"5\":[980,30],\"6\":[980,270]},"
       "\"workflow\":{"
       "\"1\":{\"class_type\":\"EurekaImageGen\",\"inputs\":{\"prompt\":\"Brutalist concrete architectural pavilion over misty Norwegian fjord at dawn\",\"seed\":2026,\"width\":256,\"height\":256,\"full_model\":false}},"
@@ -1850,6 +2559,68 @@ extern "C" int ec_studio_flow_templates_json(ec_studio_t *st, char *buf, size_t 
       "\"4\":{\"class_type\":\"EurekaVideoGen\",\"inputs\":{\"image\":[\"1\",0],\"audio\":[\"3\",0],\"prompt\":\"Brutalist fjord pavilion dawn timelapse\",\"seed\":2026,\"width\":320,\"height\":180,\"frames\":16,\"full_model\":false}},"
       "\"5\":{\"class_type\":\"Save3D\",\"inputs\":{\"mesh\":[\"2\",0]}},"
       "\"6\":{\"class_type\":\"SaveVideo\",\"inputs\":{\"video\":[\"4\",0]}}"
+      "}},"
+      // ==================== MUSIC & AUDIO (6) ====================
+      "{\"id\":\"acestep-15-8stem-band\",\"name\":\"ACE-Step 1.5 Turbo — 8-Stem Full Band Master\",\"modality\":\"music\","
+      "\"desc\":\"24L GQA Sliding-Window DiT + Oobleck 48 kHz stereo decoder exporting 8 complementary stems (Drums, Bass, Vocals, Guitar, Piano, Synth, Strings, FX).\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[360,310],\"4\":[660,120],\"5\":[950,120],\"6\":[1210,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"CheckpointLoaderSimple\",\"inputs\":{\"ckpt_name\":\"acestep_v15_turbo_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"TextEncodeAceStepAudio\",\"inputs\":{\"tags\":\"warm upbeat jazz house groove, electric rhodes chords, funky bassline, crisp acoustic percussion, studio mix\",\"lyrics\":\"\",\"bpm\":124,\"key_scale\":\"D minor\",\"stem_mode\":8}},"
+      "\"3\":{\"class_type\":\"EmptyAceStepLatentAudio\",\"inputs\":{\"seconds\":15}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":4242,\"steps\":8,\"cfg\":1.0,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"VAEDecodeAudio\",\"inputs\":{\"samples\":[\"4\",0]}},"
+      "\"6\":{\"class_type\":\"SaveAudio\",\"inputs\":{\"audio\":[\"5\",0]}}"
+      "}},"
+      "{\"id\":\"acestep-15-vocal-2stem\",\"name\":\"ACE-Step 1.5 Vocal Song — 2-Stem (Vocals + Inst)\",\"modality\":\"music\","
+      "\"desc\":\"Structured lyric-to-song pipeline with [Verse]/[Chorus] tags and clean 2-stem Vocals + Instrumental separation.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[360,310],\"4\":[660,120],\"5\":[950,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"CheckpointLoaderSimple\",\"inputs\":{\"ckpt_name\":\"acestep_v15_turbo_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"TextEncodeAceStepAudio\",\"inputs\":{\"tags\":\"shimmering indie dream-pop anthem, airy female vocals, jangly electric guitar, warm analog synths\",\"lyrics\":\"[Verse 1]\\nNeon rain on window glass tonight\\nChasing echoes in the city light\\n[Chorus]\\nHold the skyline till the morning comes\",\"bpm\":118,\"key_scale\":\"A major\",\"vocal_mode\":\"female\",\"stem_mode\":2}},"
+      "\"3\":{\"class_type\":\"EmptyAceStepLatentAudio\",\"inputs\":{\"seconds\":20}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"seed\":404,\"steps\":8,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveAudio\",\"inputs\":{\"audio\":[\"4\",0]}}"
+      "}},"
+      "{\"id\":\"acestep-15-audio-cover\",\"name\":\"ACE-Step 1.5 Audio-to-Audio Cover / Remix\",\"modality\":\"music\","
+      "\"desc\":\"Upload a reference WAV/MP3 loop, encode via native Oobleck 1D Audio VAE, and transform genre & instrumentation while keeping melody & groove.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[350,210],\"4\":[680,120],\"5\":[980,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"LoadAudio\",\"inputs\":{\"audio\":\"\"}},"
+      "\"2\":{\"class_type\":\"TextEncodeAceStepAudio\",\"inputs\":{\"tags\":\"lush orchestral jazz arrangement with warm Fender Rhodes, brushed snare, upright bass, vinyl warmth\",\"bpm\":112,\"stem_mode\":8}},"
+      "\"3\":{\"class_type\":\"AceStepAudioEncode\",\"inputs\":{\"audio\":[\"1\",0],\"audio_mode\":\"cover\",\"denoise\":0.65}},"
+      "\"4\":{\"class_type\":\"ACEStepMusic\",\"inputs\":{\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"duration_sec\":15,\"seed\":505,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveAudio\",\"inputs\":{\"audio\":[\"4\",0]}}"
+      "}},"
+      "{\"id\":\"acestep-15-repaint-section\",\"name\":\"ACE-Step 1.5 Precision Audio Repaint [t0..t1]\",\"modality\":\"music\","
+      "\"desc\":\"Keep intro and outro 100% locked while repainting a target time window (e.g. 4s–8s) using native ACE-Step ctx_d mask conditioning.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[360,140],\"4\":[690,140],\"5\":[980,140]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"LoadAudio\",\"inputs\":{\"audio\":\"\"}},"
+      "\"2\":{\"class_type\":\"TextEncodeAceStepAudio\",\"inputs\":{\"tags\":\"explosive synth lead solo with crisp drum fill transition\",\"bpm\":124,\"stem_mode\":4}},"
+      "\"3\":{\"class_type\":\"AceStepRepaint\",\"inputs\":{\"audio\":[\"1\",0],\"start_sec\":4.0,\"end_sec\":8.0}},"
+      "\"4\":{\"class_type\":\"ACEStepMusic\",\"inputs\":{\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"duration_sec\":12,\"seed\":606,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveAudio\",\"inputs\":{\"audio\":[\"4\",0]}}"
+      "}},"
+      "{\"id\":\"acestep-15-extend-track\",\"name\":\"ACE-Step 1.5 Long-Form Song Extender (up to 120s)\",\"modality\":\"music\","
+      "\"desc\":\"Lock an existing 10s–30s clip in context latents and seamlessly compose a continuous chorus, bridge, and outro up to 2 minutes.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[40,210],\"3\":[360,140],\"4\":[690,140],\"5\":[980,140]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"LoadAudio\",\"inputs\":{\"audio\":\"\"}},"
+      "\"2\":{\"class_type\":\"TextEncodeAceStepAudio\",\"inputs\":{\"tags\":\"evolving build into soaring euphoric chorus and warm fadeout outro\",\"bpm\":124,\"stem_mode\":8}},"
+      "\"3\":{\"class_type\":\"AceStepExtend\",\"inputs\":{\"audio\":[\"1\",0],\"target_seconds\":45.0}},"
+      "\"4\":{\"class_type\":\"ACEStepMusic\",\"inputs\":{\"positive\":[\"2\",0],\"latent_image\":[\"3\",0],\"duration_sec\":45,\"seed\":707,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveAudio\",\"inputs\":{\"audio\":[\"4\",0]}}"
+      "}},"
+      "{\"id\":\"acestep-15-lokr-master\",\"name\":\"ACE-Step 1.5 + LoKr Mastering Adapter (Full Mix)\",\"modality\":\"music\","
+      "\"desc\":\"Clean full-mix 48 kHz studio track with hot-fused Kronecker LoKr / QLoRA adapter support and zero stem split overhead.\","
+      "\"positions\":{\"1\":[40,40],\"2\":[310,40],\"3\":[40,210],\"4\":[620,120],\"5\":[940,120]},"
+      "\"workflow\":{"
+      "\"1\":{\"class_type\":\"CheckpointLoaderSimple\",\"inputs\":{\"ckpt_name\":\"acestep_v15_turbo_bf16.safetensors\"}},"
+      "\"2\":{\"class_type\":\"QLoRALoader\",\"inputs\":{\"model\":[\"1\",0],\"lora_name\":\"None\",\"strength_model\":0.85}},"
+      "\"3\":{\"class_type\":\"TextEncodeAceStepAudio\",\"inputs\":{\"tags\":\"cinematic Hans Zimmer orchestral trailer, deep resonant cellos, French horns, taiko drums, soaring piano\",\"bpm\":96,\"key_scale\":\"G minor\",\"stem_mode\":0}},"
+      "\"4\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"2\",0],\"positive\":[\"3\",0],\"duration_sec\":20,\"seed\":609,\"steps\":8,\"full_model\":true}},"
+      "\"5\":{\"class_type\":\"SaveAudio\",\"inputs\":{\"audio\":[\"4\",0]}}"
       "}}"
       "]}");
 }
@@ -1947,13 +2718,13 @@ extern "C" int ec_studio_loras_json(ec_studio_t *st, char *buf, size_t cap) {
     const ec_storage_asset_t *a = &st->vault.assets[i];
     if (a->kind != EC_ASSET_LORA) continue;
     int pairs = 0, rank = 0;
-    char arch[64] = "lora";
-    ec_lora_inspect(a->path, &pairs, &rank, arch, sizeof arch);
+    char arch[64] = "lora", fmt[32] = "lora";
+    ec_lora_inspect_ex(a->path, &pairs, &rank, arch, sizeof arch, fmt, sizeof fmt);
     n += snprintf(buf + n, cap - (size_t)n,
         "%s{\"id\":\"%s\",\"name\":\"%s\",\"path\":\"%s\",\"root\":\"%s\","
-        "\"bytes\":%llu,\"is_network\":%s,\"pairs\":%d,\"rank\":%d,\"arch\":\"%s\"}",
+        "\"bytes\":%llu,\"is_network\":%s,\"pairs\":%d,\"rank\":%d,\"arch\":\"%s\",\"format\":\"%s\"}",
         cnt ? "," : "", a->id, a->name, a->path, a->root_label,
-        (unsigned long long)a->bytes, a->is_network ? "true" : "false", pairs, rank, arch);
+        (unsigned long long)a->bytes, a->is_network ? "true" : "false", pairs, rank, arch, fmt);
     cnt++;
   }
   n += snprintf(buf + n, cap - (size_t)n, "],\"count\":%d}", cnt);

@@ -21,6 +21,7 @@ static void json_esc(const char *src, char *dst, size_t cap) {
 }
 
 static const ec_recipe_t BUILTIN_RECIPES[] = {
+  // --- Photoreal Image & Editing (8) ---
   {
     "editorial-portrait-85mm", "Editorial Portrait — 85mm f/1.4", "Portrait", "image",
     "Candid editorial portrait of a weathered ceramic artist in a sunlit Kyoto workshop, natural window sidelight catching dust motes and fine skin texture, shot on Hasselblad X2D 100C, 85mm f/1.4, shallow depth of field, Kodak Portra 400 color science, authentic candid expression, photorealistic",
@@ -42,11 +43,6 @@ static const ec_recipe_t BUILTIN_RECIPES[] = {
     "Canon R5 · 100mm Macro f/5.6 · Strip Softbox", "flux2_klein_4b_bf16", "", 0.8f, 768, 768, 4, 777, 1
   },
   {
-    "golden-hour-wildlife", "Golden Hour Wildlife — 400mm Telephoto", "Nature", "image",
-    "National Geographic photograph of a golden retriever sitting calmly on a weathered wooden lake pier at golden hour, backlit fur glowing in warm low sun, glassy alpine mountain reflections in soft bokeh background, shot on Sony A1 400mm f/2.8, crisp eye catchlight, natural photography",
-    "Sony A1 · 400mm f/2.8 · Natural Backlight", "flux2_klein_4b_bf16", "", 0.8f, 1024, 768, 4, 888, 1
-  },
-  {
     "leica-street-doc", "Street Documentary — Rainy Paris 50mm", "Street", "image",
     "Timeless street documentary photograph of a jazz saxophonist under a warm glowing Paris cafe awning during a light evening rain, wet cobblestones, subtle motion blur of passing umbrellas, Leica M11 50mm Summilux f/1.4, authentic film grain, candid human moment",
     "Leica M11 · 50mm Summilux f/1.4", "flux2_klein_4b_bf16", "", 0.8f, 1024, 768, 4, 314, 1
@@ -57,29 +53,97 @@ static const ec_recipe_t BUILTIN_RECIPES[] = {
     "Fuji GFX 100 II · 32mm f/5.6 · Daylight", "flux2_klein_4b_bf16", "", 0.8f, 1024, 768, 4, 512, 1
   },
   {
-    "culinary-editorial", "Culinary Editorial — Overhead Artisanal", "Food", "image",
-    "Overhead editorial food photograph of freshly baked sourdough boule sliced on an aged walnut board beside cultured butter, flaky sea salt, and wild figs, raking natural daylight from side window, subtle flour dust suspended in air, shot on Nikon Z8 50mm f/2.8, Bon Appetit style",
-    "Nikon Z8 · 50mm f/2.8 · Raking Daylight", "flux2_klein_4b_bf16", "", 0.8f, 768, 1024, 4, 909, 1
-  },
-  {
     "scifi-cinema-still", "Cinema Sci-Fi Film Still — 65mm IMAX", "Cinema", "image",
     "Anamorphic 65mm film still of a lone astronaut walking across an obsidian volcanic plain under two pale crescent moons, subtle dust storm catching amber helmet visor lights, Denis Villeneuve cinematography, atmospheric scale, muted naturalistic palette, shot on ARRI Alexa 65",
     "ARRI Alexa 65 · Prime DNA 40mm · Naturalistic", "flux2_klein_4b_bf16", "", 0.8f, 1024, 576, 4, 2049, 1
   },
   {
-    "hero-3d-prop", "3D Hero PBR Prop — Studio Turntable", "3D Asset", "3d",
-    "Isometric studio turntable asset of a hand-crafted brass and matte ceramic espresso machine with clean watertight silhouette, neutral softbox lighting, subtle bevel wear, ready for TRELLIS.2 O-Voxel GLB 2.0 and 3DGS splat export",
-    "Neutral 3-Point Turntable · PBR Clean", "trellis2_ss_flow_1.3b_bf16", "", 0.0f, 512, 512, 12, 77, 1
+    "typography-poster-swiss", "Swiss Editorial Poster — Bold Typography", "Design", "image",
+    "Minimalist International Typographic Style architectural exhibition poster on textured heavyweight cotton paper, bold black Helvetica headline 'EUREKA 2026' aligned to crisp Swiss grid, burnt vermilion geometric accent circle, raking gallery spotlight, studio photograph",
+    "Swiss Grid · Cotton Stock · Editorial Print", "flux2_klein_4b_bf16", "", 0.8f, 768, 1024, 4, 1968, 1
   },
+  // --- Cinema Video (T2V / I2V / FLF2V / Loop / Vertical) (6) ---
   {
     "cinema-video-dolly", "Cinema Video — 35mm Orbital Dolly", "Video", "video",
     "Slow cinematic 35mm orbital camera dolly around a rain-beaded vintage bronze astrolabe glowing softly by candlelight inside an observatory, smooth temporal continuity, shallow focus pull, 24fps NVENC H.264 + stereo score",
-    "24fps Orbital Dolly · Wan 2.2 TI2V-5B", "wan2.2_ti2v_5b_fp16", "", 0.0f, 512, 288, 12, 303, 1
+    "Wan 2.2 TI2V-5B · Orbital Dolly · 16:9", "wan2.2_ti2v_5b_fp16", "", 0.0f, 832, 480, 20, 303, 1
   },
   {
-    "cinema-synth-stems", "Full-Song 4-Stem Score — Analog Cinema", "Music", "music",
-    "Warm analog Moog bassline, crisp acoustic brushed drums, lush Juno-106 pad harmonies, and expressive Rhodes electric piano lead arpeggio at 124 BPM in D minor, studio mastered 44.1kHz stereo with isolated stems",
-    "124 BPM · D Minor · 4 Stems (ACE-Step 1.5)", "acestep_v15_turbo_bf16", "", 0.0f, 0, 0, 8, 101, 1
+    "iceland-basalt-drone", "Iceland Basalt Cliffs — Aerial FPV", "Video", "video",
+    "Sweeping low-altitude aerial drone shot gliding along wet black volcanic basalt sea cliffs in Iceland at golden sunset, turquoise North Atlantic surf crashing in slow motion, sea mist catching warm amber light, 35mm cinema lens",
+    "Wan 2.2 TI2V-5B · Aerial Glide · 832x480", "wan2.2_ti2v_5b_fp16", "", 0.0f, 832, 480, 20, 42, 1
+  },
+  {
+    "tokyo-neon-i2v-rain", "Neon Alley Rain — Start-Frame I2V", "Video I2V", "video",
+    "Subtle living motion from start frame: shimmering rain streaks falling across glowing Tokyo alley neon signs, steam drifting softly from street grate, wet pavement reflections rippling gently, slow cinematic push-in",
+    "Wan 2.2 TI2V-5B · I2V Anchor · Slow Push", "wan2.2_ti2v_5b_fp16", "", 0.0f, 832, 480, 20, 808, 1
+  },
+  {
+    "morph-flf2v-bridge", "Start -> End Morph Transition (FLF2V)", "Video FLF2V", "video",
+    "Fluid continuous camera glide seamlessly transitioning from opening frame composition into closing frame geometry, physically coherent lighting evolution, smooth optical flow, zero jump cuts, cinema 35mm",
+    "Wan 2.2 TI2V-5B · First+Last Frame FLF2V", "wan2.2_ti2v_5b_fp16", "", 0.0f, 832, 480, 20, 515, 1
+  },
+  {
+    "seamless-ambient-loop", "Seamless Cinemagraph Loop — Tea Steam", "Video Loop", "video",
+    "Hypnotic seamless loop of delicate white steam curling upward from a handcrafted black stoneware matcha bowl on a rain-misted cypress windowsill, locked-off tripod framing, calm Zen light",
+    "Wan 2.2 TI2V-5B · Seamless Loop · Tripod", "wan2.2_ti2v_5b_fp16", "", 0.0f, 640, 640, 20, 108, 1
+  },
+  {
+    "vertical-reel-fashion", "Vertical 9:16 Editorial Fashion Reel", "Video Vertical", "video",
+    "Vertical 9:16 fashion film of silk trench coat billowing in golden hour wind on a brutalist Milan rooftop, medium telephoto 85mm tracking shot, natural film grain, editorial cinema",
+    "Wan 2.2 TI2V-5B · 480x832 Vertical Reel", "wan2.2_ti2v_5b_fp16", "", 0.0f, 480, 832, 20, 916, 1
+  },
+  // --- 3D Assets (TRELLIS.2 1.3B Text->3D & Photo->3D) (4) ---
+  {
+    "hero-3d-prop", "3D Hero PBR Prop — Espresso Machine", "3D Asset", "3d",
+    "Hand-crafted brushed brass and matte charcoal ceramic lever espresso machine with clean watertight silhouette, neutral studio turntable lighting, subtle chamfered edges",
+    "TRELLIS.2 1.3B · PBR GLB + 3DGS PLY", "trellis2_ss_flow_1.3b_bf16", "", 0.0f, 512, 512, 12, 77, 1
+  },
+  {
+    "ceramic-teapot-3d", "Sculptural Porcelain Teapot — 3D Asset", "3D Asset", "3d",
+    "Sculptural matte-white porcelain teapot with graceful curved spout and bent smoked bamboo handle, clean silhouette, neutral studio turntable",
+    "TRELLIS.2 1.3B · Matte Ceramic PBR", "trellis2_ss_flow_1.3b_bf16", "", 0.0f, 512, 512, 12, 777, 1
+  },
+  {
+    "scifi-mecha-helmet-3d", "Hard-Surface Sci-Fi Pilot Helmet — 3D", "3D Game", "3d",
+    "Hard-surface sci-fi orbital pilot helmet in weathered titanium and dark amber visor glass, recessed mechanical vents, symmetric industrial design",
+    "TRELLIS.2 1.3B · Hard-Surface Game Prop", "trellis2_ss_flow_1.3b_bf16", "", 0.0f, 512, 512, 12, 2099, 1
+  },
+  {
+    "midcentury-chair-3d", "Mid-Century Oak Lounge Chair — ArchViz", "3D Furniture", "3d",
+    "Danish mid-century sculpted walnut lounge chair with saddle tan leather cushion, clean tapered legs, gallery product render",
+    "TRELLIS.2 1.3B · ArchViz Furniture GLB", "trellis2_ss_flow_1.3b_bf16", "", 0.0f, 512, 512, 12, 1958, 1
+  },
+  // --- Music & Audio (ACE-Step 1.5 Turbo: 2/4/8 Stems, Vocals, Scores, Beats) (6) ---
+  {
+    "cinema-synth-stems", "Analog Cinema Score — 8-Stem Master", "Music", "music",
+    "Warm analog Moog bassline, crisp acoustic brushed drums, lush Juno-106 pad harmonies, expressive Rhodes electric piano, subtle cello strings, 124 BPM in D minor, studio mastered 48kHz stereo",
+    "124 BPM · D minor · 8-Stem (ACE-Step 1.5)", "acestep_v15_turbo_bf16", "", 0.0f, 0, 0, 8, 101, 1
+  },
+  {
+    "kyoto-lofi-jazzhop", "Kyoto Rain Lo-Fi Jazzhop — Rhodes & Vinyl", "Music", "music",
+    "Warm dusty lo-fi hip-hop instrumental, mellow Fender Rhodes seventh chords, upright walking bass, swung boom-bap acoustic snare with gentle rain ambience, intimate analog tape saturation, 88 BPM in F major",
+    "88 BPM · F major · 4-Stem Tape Mix", "acestep_v15_turbo_bf16", "", 0.0f, 0, 0, 8, 880, 1
+  },
+  {
+    "indie-vocal-anthem", "Indie Dream-Pop Song — Female Vocals", "Music Vocals", "music",
+    "Shimmering indie dream-pop anthem with airy female lead vocals, jangly chorus electric guitar arpeggios, punchy live acoustic drums, warm analog synth pads, driving bassline, 118 BPM in A major, radio master",
+    "118 BPM · A major · Vocal + Instrumental", "acestep_v15_turbo_bf16", "", 0.0f, 0, 0, 8, 404, 1
+  },
+  {
+    "berlin-melodic-techno", "Berlin Melodic Techno — Warehouse 132 BPM", "Music Club", "music",
+    "Hypnotic Berlin melodic techno track, deep rolling sub-bass, punchy 909 kick and crisp offbeat hi-hats, evolving Prophet-6 arpeggiator with cavernous reverb tail, tension build and drop, 132 BPM in C minor",
+    "132 BPM · C minor · 8-Stem Club Mix", "acestep_v15_turbo_bf16", "", 0.0f, 0, 0, 8, 132, 1
+  },
+  {
+    "orchestral-trailer-epic", "Orchestral Film Trailer — Brass & Taiko", "Music Score", "music",
+    "Sweeping cinematic orchestral film score, resonant cellos and soaring violins, heroic French horns, thunderous taiko percussion, emotional piano motif building to soaring climax, 96 BPM in G minor, Hans Zimmer soundstage",
+    "96 BPM · G minor · Full Orchestral", "acestep_v15_turbo_bf16", "", 0.0f, 0, 0, 8, 609, 1
+  },
+  {
+    "afrobeats-amapiano-groove", "Afrobeats & Amapiano — Log Drum Groove", "Music Groove", "music",
+    "Infectious modern Afrobeats Amapiano fusion, bouncy deep log drum bassline, silky electric guitar riffs, shakers and crisp rimshots, lush Rhodes chords, sunlit Lagos rooftop summer energy, 112 BPM in E minor",
+    "112 BPM · E minor · 8-Stem Groove", "acestep_v15_turbo_bf16", "", 0.0f, 0, 0, 8, 112, 1
   }
 };
 
@@ -239,14 +303,127 @@ int ec_recipes_to_json(const ec_recipe_lib_t *lib, char *buf, size_t cap) {
 int ec_prompt_library_to_json(char *buf, size_t cap) {
   return snprintf(buf, cap,
     "{"
-    "\"cameras\":[\"Hasselblad X2D 100C\",\"Leica M11 Summilux\",\"ARRI Alexa 65\",\"Phase One IQ4\",\"Sony A1\",\"Fujifilm GFX 100 II\",\"Canon EOS R5\"],"
-    "\"lenses\":[\"24mm tilt-shift f/8\",\"35mm anamorphic f/1.4\",\"50mm Summilux f/1.4\",\"85mm portrait f/1.4\",\"100mm macro f/5.6\",\"400mm telephoto f/2.8\"],"
-    "\"lighting\":[\"natural window sidelight\",\"golden hour backlight\",\"rain-slicked neon night reflections\",\"overhead studio strip softbox\",\"overcast diffused Nordic daylight\",\"chiaroscuro tungsten rim light\"],"
-    "\"film_stocks\":[\"Kodak Portra 400 color science\",\"Cinestill 800T halation\",\"Ilford HP5 monochrome grain\",\"Fujifilm Velvia 50 vivid landscape\",\"ARRI LogC naturalistic film grade\"],"
-    "\"compositions\":[\"shallow depth of field bokeh\",\"rule of thirds editorial framing\",\"rectilinear architectural verticals\",\"overhead flat-lay tabletop\",\"sweeping anamorphic wide shot\",\"intimate macro focus stack\"],"
-    "\"music_palettes\":[\"warm analog Moog bass + brushed drums 124 BPM\",\"lush strings + solo cello cinematic 84 BPM\",\"lo-fi Rhodes chords + dusty vinyl breaks 92 BPM\",\"driving Berlin techno arpeggio + sub 132 BPM\"],"
-    "\"materials_3d\":[\"brushed titanium + sapphire glass PBR\",\"hand-thrown matte stoneware ceramic\",\"weathered patinated bronze + walnut wood\",\"translucent frosted acrylic + anodized aluminum\"]"
+    "\"cameras\":[\"Hasselblad X2D 100C\",\"Leica M11 Summilux\",\"ARRI Alexa 65 IMAX\",\"Phase One IQ4 150MP\",\"Sony A1 Mirrorless\",\"Fujifilm GFX 100 II\",\"Canon EOS R5\",\"Mamiya RZ67 Medium Format\",\"RED V-Raptor 8K VV\",\"Contax T2 35mm Point-and-Shoot\"],"
+    "\"lenses\":[\"14mm ultra-wide rectilinear f/2.8\",\"24mm tilt-shift architectural f/8\",\"35mm anamorphic cinema f/1.4\",\"50mm Summilux f/1.4\",\"85mm editorial portrait f/1.4\",\"100mm macro focus-stack f/5.6\",\"135mm compressed bokeh f/1.8\",\"400mm wildlife telephoto f/2.8\",\"vintage Cooke Panchro 40mm\",\"Helios 44-2 swirly bokeh 58mm\"],"
+    "\"lighting\":[\"natural window sidelight with dust motes\",\"golden hour rim backlight\",\"rain-slicked neon midnight reflections\",\"overhead studio strip softbox\",\"overcast diffused Nordic skylight\",\"chiaroscuro tungsten rim light\",\"practical warm candlelight\",\"volumetric god-rays through mist\",\"bioluminescent ambient glow\",\"high-key editorial cyclorama\"],"
+    "\"film_stocks\":[\"Kodak Portra 400 color science\",\"Cinestill 800T tungsten halation\",\"Ilford HP5 Plus 400 monochrome grain\",\"Fujifilm Velvia 50 vivid landscape\",\"Kodak Ektachrome E100 slide transparency\",\"Kodak Vision3 500T cinema stock\",\"ARRI LogC4 naturalistic film grade\",\"Fuji Classic Chrome muted editorial\"],"
+    "\"compositions\":[\"shallow depth of field creamy bokeh\",\"rule of thirds editorial framing\",\"rectilinear architectural verticals\",\"overhead flat-lay tabletop\",\"sweeping 2.39:1 anamorphic wide shot\",\"intimate macro focus stack\",\"low-angle monumental perspective\",\"symmetrical Kubrick one-point corridor\",\"over-the-shoulder candid documentary\"],"
+    "\"color_grades\":[\"muted teal and burnt ochre cinema grade\",\"warm Kodak amber highlights & deep charcoal shadows\",\"crisp high-contrast monochrome silver gelatin\",\"pastel Nordic daylight minimal palette\",\"cyberpunk magenta & sodium-vapor night grade\",\"bleached bypass gritty film look\",\"velvet emerald & antique gold editorial\"],"
+    "\"negative_prompts\":[\"blurry, low quality, distorted anatomy, watermark, text overlay, plastic skin\",\"static frozen frame, flicker, temporal jitter, morphing artifacts, overexposed\",\"extra limbs, deformed hands, bad proportions, oversaturated HDR, CGI sheen\",\"noisy audio, clipping distortion, muddiness, harsh sibilance, off-key pitch\"],"
+    "\"video_camera_moves\":[\"slow 360 orbital dolly around subject\",\"smooth steady dolly-in push forward\",\"sweeping crane camera rise upward\",\"aerial FPV drone low-altitude glide\",\"handheld documentary tracking shot\",\"locked-off tripod cinemagraph frame\",\"subtle rack focus foreground to background\",\"panoramic whip-pan transition\",\"slow-motion 120fps tracking orbit\"],"
+    "\"video_physics\":[\"crisp water droplets & wet surface specular ripples\",\"billowing silk fabric in golden hour wind\",\"delicate curling steam & volumetric smoke drift\",\"realistic ember sparks & drifting ash\",\"soft dappled leaf shadows swaying gently\",\"ocean surf foam breaking in slow motion\",\"warm breath vapor in crisp winter air\"],"
+    "\"materials_3d\":[\"brushed titanium + anti-reflective sapphire glass PBR\",\"hand-thrown matte stoneware ceramic glaze\",\"weathered patinated bronze + oiled walnut\",\"translucent frosted acrylic + anodized aluminum\",\"forged carbon fiber weave + knurled steel\",\"sculpted travertine marble with natural veins\",\"hand-stitched saddle leather + solid brass\",\"iridescent dichroic optical glass\"],"
+    "\"3d_styles\":[\"clean watertight studio turntable asset\",\"hard-surface industrial design prototype\",\"stylized hand-painted game hero prop\",\"architectural scale maquette model\",\"museum-grade sculptural porcelain artifact\",\"organic botanical macro specimen\",\"mid-century Scandinavian furniture render\"],"
+    "\"music_genres\":[\"warm jazz house groove with Rhodes chords\",\"Kyoto rain lo-fi boom-bap beats\",\"Berlin warehouse melodic techno 132 BPM\",\"shimmering indie dream-pop vocal anthem\",\"sweeping Hans Zimmer orchestral trailer score\",\"Afrobeats Amapiano log drum summer groove\",\"Nordic ambient modular analog soundscape\",\"neo-soul funk pocket with live horns\",\"UK garage 2-step chopped vocal club\",\"acoustic folk fingerpicked intimate ballad\"],"
+    "\"music_instruments\":[\"Fender Rhodes electric piano\",\"Moog Sub 37 analog bass\",\"Roland Juno-106 lush chorus pad\",\"acoustic brushed jazz kit\",\"upright double bass\",\"solo expressive cello + chamber strings\",\"vintage TR-909 punchy percussion\",\"chorus-drenched Fender Jazzmaster guitar\",\"deep Amapiano log drum\",\"felt grand piano with intimate hammer noise\"],"
+    "\"music_structures\":[\"[Intro]\\n\",\"[Verse 1]\\n\",\"[Pre-Chorus]\\n\",\"[Chorus]\\n\",\"[Verse 2]\\n\",\"[Bridge]\\n\",\"[Drop]\\n\",\"[Instrumental Solo]\\n\",\"[Breakdown]\\n\",\"[Outro]\\n\"],"
+    "\"music_palettes\":[\"warm analog Moog bass + brushed drums 124 BPM\",\"lush strings + solo cello cinematic 84 BPM\",\"lo-fi Rhodes chords + dusty vinyl breaks 92 BPM\",\"driving Berlin techno arpeggio + sub 132 BPM\"]"
     "}");
+}
+
+// ===========================================================================
+// Pre-Seeded 20-Item Elite LoRA & QLoRA (NF4 / FP8 / DoRA / LoHa / LoKr) Catalog
+// ===========================================================================
+typedef struct {
+  const char *id;
+  const char *name;
+  const char *arch;       // "flux2" | "wan22" | "acestep" | "trellis2"
+  const char *format;     // "lora" | "qlora_nf4" | "qlora_fp8" | "dora" | "loha" | "lokr"
+  int         rank;
+  float       strength;
+  const char *trigger;
+  const char *repo;
+  const char *filename;
+  const char *desc;
+} ec_lora_catalog_item_t;
+
+static const ec_lora_catalog_item_t ELITE_LORA_CATALOG[] = {
+  // --- FLUX.2 Photoreal Image LoRAs & QLoRAs (8) ---
+  {"flux2-kodak-portra-dora", "Kodak Portra 400 Film Science", "flux2", "dora", 32, 0.85f,
+   "portra400, natural skin grain", "eureka-labs/flux2-kodak-portra-dora", "flux2_kodak_portra400_dora.safetensors",
+   "Authentic medium-format Kodak Portra 400 highlight rolloff, skin tones, and organic film grain via weight-decomposed DoRA."},
+  {"flux2-hyperreal-skin-nf4", "Editorial Skin & Micro-Texture (QLoRA NF4)", "flux2", "qlora_nf4", 64, 0.75f,
+   "editorial candid, natural pores", "eureka-labs/flux2-editorial-skin-nf4", "flux2_editorial_skin_nf4.safetensors",
+   "4-bit NormalFloat QLoRA adapter tuned on medium-format editorial portraits — eliminates AI plastic sheen at 4x smaller size."},
+  {"flux2-cinestill-800t-fp8", "CineStill 800T Night Halation (QLoRA FP8)", "flux2", "qlora_fp8", 32, 0.90f,
+   "cinestill800t, tungsten halation", "eureka-labs/flux2-cinestill-800t-fp8", "flux2_cinestill800t_fp8.safetensors",
+   "OCP FP8 E4M3FN quantized tungsten night cinema adapter adding genuine red halation around practical neon & streetlamps."},
+  {"flux2-arch-monograph-lora", "Architectural Monograph & Tilt-Shift", "flux2", "lora", 32, 0.80f,
+   "archmonograph, crisp verticals", "eureka-labs/flux2-arch-monograph", "flux2_arch_monograph_r32.safetensors",
+   "Enforces razor-sharp rectilinear architectural lines, natural daylight falloff, and editorial concrete/timber materiality."},
+  {"flux2-product-studio-loha", "Luxury Commercial Product Studio (LoHa)", "flux2", "loha", 32, 0.85f,
+   "commercial macro, strip softbox", "eureka-labs/flux2-product-studio-loha", "flux2_product_studio_loha.safetensors",
+   "Hadamard-product LoHa adapter for immaculate reflections on brushed titanium, glass, watches, ceramics, and studio packaging."},
+  {"flux2-swiss-typography-lokr", "Swiss Editorial & Typography (LoKr)", "flux2", "lokr", 16, 0.90f,
+   "swissgrid, crisp typography", "eureka-labs/flux2-swiss-type-lokr", "flux2_swiss_typography_lokr.safetensors",
+   "Kronecker-product LoKr adapter dramatically improving crisp poster lettering, editorial grids, and book cover design."},
+  {"flux2-leica-monochrome-lora", "Leica Monochrom Silver Gelatin B&W", "flux2", "lora", 16, 0.95f,
+   "silvergelatin, leicamonochrom", "eureka-labs/flux2-leica-monochrom", "flux2_leica_monochrom_r16.safetensors",
+   "Rich tonal zone-system black-and-white documentary photography inspired by Ilford HP5 & Tri-X darkroom prints."},
+  {"flux2-anime-cel-nf4", "Makoto Cel Cinema & Painterly (QLoRA NF4)", "flux2", "qlora_nf4", 64, 0.80f,
+   "celcinema, handpainted sky", "eureka-labs/flux2-cel-cinema-nf4", "flux2_cel_cinema_nf4.safetensors",
+   "High-rank NF4 QLoRA for theatrical Japanese cel animation lighting, painterly clouds, and crisp linework."},
+  // --- Wan 2.2 TI2V-5B Cinema Video LoRAs & QLoRAs (6) ---
+  {"wan22-lightning-4step-fp8", "Wan 2.2 CausVid 6-Step Turbo (QLoRA FP8)", "wan22", "qlora_fp8", 32, 1.00f,
+   "", "lightx2v/Wan2.2-Lightning", "wan22_lightning_fp8_lora.safetensors",
+   "Step-distillation FP8 QLoRA enabling crisp 6–8 step cinema video generation at 2.5x faster DiT latency on RTX 3090."},
+  {"wan22-orbital-dolly-lora", "Cinema 360 Orbital & Dolly Camera Control", "wan22", "lora", 32, 0.85f,
+   "orbital dolly, steady arc", "eureka-labs/wan22-camera-orbit", "wan22_camera_orbit_r32.safetensors",
+   "Trained on real cinema crane & Steadicam arcs for physically accurate parallax during 360-degree orbits and push-ins."},
+  {"wan22-35mm-anamorphic-dora", "35mm Anamorphic Film Motion (DoRA)", "wan22", "dora", 32, 0.80f,
+   "anamorphic35mm, natural motion blur", "eureka-labs/wan22-anamorphic-dora", "wan22_anamorphic_35mm_dora.safetensors",
+   "DoRA cinema motion adapter delivering authentic 180-degree shutter motion blur, subtle lens breathing, and filmic contrast."},
+  {"wan22-fluid-physics-nf4", "Fluid, Cloth & Smoke Physics (QLoRA NF4)", "wan22", "qlora_nf4", 64, 0.85f,
+   "realistic fluid motion", "eureka-labs/wan22-physics-nf4", "wan22_fluid_physics_nf4.safetensors",
+   "NF4 QLoRA sharpening liquid splashes, billowing fabrics, curling steam, and natural wind dynamics without temporal smear."},
+  {"wan22-fpv-drone-lora", "Aerial FPV Drone & Hyperlapse Glide", "wan22", "lora", 24, 0.80f,
+   "fpv drone glide, sweeping aerial", "eureka-labs/wan22-fpv-drone", "wan22_fpv_drone_r24.safetensors",
+   "High-speed smooth forward FPV camera trajectory control for landscapes, coastal cliffs, and architectural flythroughs."},
+  {"wan22-product-turntable-loha", "Studio 360 Product Commercial (LoHa)", "wan22", "loha", 32, 0.90f,
+   "studio turntable, smooth rotation", "eureka-labs/wan22-product-turntable", "wan22_product_turntable_loha.safetensors",
+   "Ultra-clean commercial product rotation & lighting sweep with zero background drift — ideal with Start-Frame I2V."},
+  // --- ACE-Step 1.5 Music & Audio LoKr / QLoRA Adapters (4) ---
+  {"acestep-analog-master-lokr", "Analog Tape & Neve Mastering (LoKr)", "acestep", "lokr", 16, 0.85f,
+   "analog tape warmth, wide stereo master", "ACE-Step/acestep15-analog-master-lokr", "acestep_analog_master_lokr.safetensors",
+   "Native Kronecker LoKr adapter trained on Studer A800 & Neve console stems for punchy low-end clarity and silk treble."},
+  {"acestep-orchestral-score-lokr", "Symphonic Cinema Soundstage (LoKr)", "acestep", "lokr", 32, 0.90f,
+   "abbey road soundstage, live orchestra", "ACE-Step/acestep15-orchestral-lokr", "acestep_orchestral_lokr.safetensors",
+   "Elevates brass realism, string bowing dynamics, and concert-hall room acoustics for film trailers & game soundtracks."},
+  {"acestep-afro-amapiano-nf4", "Afrobeats & Amapiano Percussion (QLoRA NF4)", "acestep", "qlora_nf4", 64, 0.85f,
+   "amapiano log drum, lagos groove", "eureka-labs/acestep15-amapiano-nf4", "acestep_afro_amapiano_nf4.safetensors",
+   "4-bit NF4 QLoRA specializing in authentic log-drum syncopation, warm shakers, and modern Afro-fusion pocket grooves."},
+  {"acestep-vocal-clarity-dora", "Studio Lead Vocal Presence (DoRA)", "acestep", "dora", 32, 0.80f,
+   "intimate studio vocal, crisp diction", "eureka-labs/acestep15-vocal-dora", "acestep_vocal_clarity_dora.safetensors",
+   "Weight-decomposed DoRA improving sung lyric articulation, breath realism, and center-channel vocal separation."},
+  // --- TRELLIS.2 1.3B 3D Asset LoRAs (2) ---
+  {"trellis2-hardsurface-cad-lora", "Hard-Surface CAD & Mecha Bevels", "trellis2", "lora", 32, 0.85f,
+   "clean hard-surface geometry", "eureka-labs/trellis2-hardsurface", "trellis2_hardsurface_r32.safetensors",
+   "Sharpens planar panels, crisp mechanical bevels, and symmetric silhouettes for game props & industrial design."},
+  {"trellis2-stylized-sculpt-nf4", "Stylized Character & Maquette Sculpt (QLoRA NF4)", "trellis2", "qlora_nf4", 64, 0.80f,
+   "stylized sculptural silhouette", "eureka-labs/trellis2-stylized-nf4", "trellis2_stylized_sculpt_nf4.safetensors",
+   "NF4 QLoRA tuned for expressive figurines, ceramic sculptures, and clean watertight collectibles."}
+};
+
+int ec_lora_catalog_to_json(const ec_storage_vault_t *vault, char *buf, size_t cap) {
+  size_t n_items = sizeof(ELITE_LORA_CATALOG) / sizeof(ELITE_LORA_CATALOG[0]);
+  int n = snprintf(buf, cap, "{\"count\":%zu,\"catalog\":[", n_items);
+  for (size_t i = 0; i < n_items && (size_t)n < cap - 640; i++) {
+    const ec_lora_catalog_item_t *c = &ELITE_LORA_CATALOG[i];
+    const ec_storage_asset_t *found = vault ? ec_storage_find(vault, EC_ASSET_LORA, c->filename) : NULL;
+    if (!found && vault) found = ec_storage_find(vault, EC_ASSET_LORA, c->id);
+    char ed[512], et[256], ep[512];
+    json_esc(c->desc, ed, sizeof ed);
+    json_esc(c->trigger, et, sizeof et);
+    json_esc(found ? found->path : "", ep, sizeof ep);
+    n += snprintf(buf + n, cap - (size_t)n,
+        "%s{\"id\":\"%s\",\"name\":\"%s\",\"arch\":\"%s\",\"format\":\"%s\","
+        "\"rank\":%d,\"strength\":%.2f,\"trigger\":\"%s\",\"repo\":\"%s\","
+        "\"filename\":\"%s\",\"desc\":\"%s\",\"installed\":%s,\"local_path\":\"%s\"}",
+        i ? "," : "", c->id, c->name, c->arch, c->format, c->rank, c->strength,
+        et, c->repo, c->filename, ed, found ? "true" : "false", ep);
+  }
+  n += snprintf(buf + n, cap - (size_t)n, "]}");
+  return n;
 }
 
 // ===========================================================================

@@ -75,8 +75,11 @@ static void send_file(int fd, const char *path) {
 
   const char *mime = "application/octet-stream";
   if (strstr(path, ".png"))      mime = "image/png";
+  else if (strstr(path, ".jpg") || strstr(path, ".jpeg")) mime = "image/jpeg";
+  else if (strstr(path, ".webp")) mime = "image/webp";
   else if (strstr(path, ".glb")) mime = "model/gltf-binary";
   else if (strstr(path, ".wav")) mime = "audio/wav";
+  else if (strstr(path, ".mp3")) mime = "audio/mpeg";
   else if (strstr(path, ".mp4")) mime = "video/mp4";
 
   char hdr[512];
@@ -221,7 +224,8 @@ typedef struct {
   int           id;
   char          kind[24];
   char          prompt[1024];
-  char          lyrics[1024];
+  char          neg_prompt[1024];
+  char          lyrics[1536];
   char          tier[16];
   char          stage[32];
   char          checkpoint[256];
@@ -231,7 +235,25 @@ typedef struct {
   int           full_model;
   uint32_t      seed;
   int           width, height, steps, frames, bpm, with_audio, grid_res, fps;
-  float         duration_sec;
+  float         duration_sec, cfg_scale, shift, denoise, repaint_start, repaint_end, rescale_t;
+  // v8 Multimodal Inputs
+  char          init_image[256];
+  char          mask_image[256];
+  int           outpaint_pad[4];
+  int           tile_upscale;
+  char          start_frame[256];
+  char          end_frame[256];
+  char          camera_motion[32];
+  char          input_images[4][256];
+  int           n_input_images;
+  int           isolate_fg;
+  float         base_color[4];
+  char          source_audio[256];
+  char          audio_mode[24];
+  char          key_scale[32];
+  char          time_sig[16];
+  char          vocal_mode[24];
+  int           stem_mode;
   job_state_t   state;
   _Atomic int   cancel_req;
   int           cur_step, total_steps, skipped;
@@ -247,6 +269,65 @@ typedef struct {
   char          result_json[32768];
   ec_studio_t  *st;
 } ec_job_t;
+
+static void format_stems_json(const ec_studio_result_t *r, char *out, size_t cap) {
+  int n = r->n_stems;
+  if (n <= 0 && r->stem_files[0][0]) {
+    // Legacy 4-stem smoke fallback
+    static const char *L4[4] = { "drums", "bass", "harmony", "lead" };
+    snprintf(out, cap,
+        "{\"%s\":\"/artifacts/%s\",\"%s\":\"/artifacts/%s\",\"%s\":\"/artifacts/%s\",\"%s\":\"/artifacts/%s\"}",
+        L4[0], basename_safe(r->stem_files[0]), L4[1], basename_safe(r->stem_files[1]),
+        L4[2], basename_safe(r->stem_files[2]), L4[3], basename_safe(r->stem_files[3]));
+    return;
+  }
+  int p = snprintf(out, cap, "{");
+  int emitted = 0;
+  for (int i = 0; i < n && i < 8 && (size_t)p + 300 < cap; i++) {
+    if (!r->stem_files[i][0]) continue;
+    const char *nm = r->stem_names[i][0] ? r->stem_names[i] : "stem";
+    p += snprintf(out + p, cap - (size_t)p, "%s\"%s\":\"/artifacts/%s\"",
+                  emitted ? "," : "", nm, basename_safe(r->stem_files[i]));
+    emitted++;
+  }
+  snprintf(out + p, cap - (size_t)p, "}");
+}
+
+static int json_get_path_array(const char *j, const char *key, char vals[][256], int max_n) {
+  char pat[64];
+  snprintf(pat, sizeof pat, "\"%s\"", key);
+  const char *p = strstr(j, pat);
+  if (!p) return 0;
+  p = strchr(p + strlen(pat), '[');
+  if (!p) return 0;
+  p++;
+  int cnt = 0;
+  while (*p && *p != ']' && cnt < max_n) {
+    while (*p && *p != '"' && *p != ']') p++;
+    if (*p != '"') break;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < 256) vals[cnt][n++] = *p++;
+    vals[cnt][n] = '\0';
+    if (*p == '"') p++;
+    if (n > 0) cnt++;
+  }
+  return cnt;
+}
+
+static int parse_stem_mode(const char *j, int def) {
+  char s[32] = {0};
+  json_get_str(j, "stem_mode", s, sizeof s, "");
+  if (s[0]) {
+    if (!strcmp(s, "full") || !strcmp(s, "full_mix") || !strcmp(s, "0")) return 0;
+    if (!strcmp(s, "2") || !strcmp(s, "2stem")) return 2;
+    if (!strcmp(s, "4") || !strcmp(s, "4stem")) return 4;
+    if (!strcmp(s, "8") || !strcmp(s, "8stem")) return 8;
+  }
+  double n = json_get_num(j, "stem_mode", (double)def);
+  int iv = (int)n;
+  return (iv == 0 || iv == 2 || iv == 4 || iv == 8) ? iv : def;
+}
 
 // Parse JSON array "loras": [ { "path": "...", "strength": 0.8 }, ... ]
 static int json_get_loras(const char *j, ec_studio_lora_t *out, int max_n) {
@@ -337,12 +418,20 @@ static void *job_runner_thread(void *arg) {
   ec_tier_t tier = !strcmp(j->tier, "exact") ? EC_TIER_EXACT : EC_TIER_FAST;
   ec_studio_result_t r;
   int rc = -1;
-  char out[2048] = {0};
+  char out[4096] = {0};
 
   if (!strcmp(j->kind, "image")) {
-    rc = ec_studio_gen_image_ex(
-        j->st, j->prompt, j->seed, j->width, j->height, j->steps, tier, j->photoreal,
-        j->checkpoint[0] ? j->checkpoint : NULL, j->loras, j->n_loras, job_progress_cb, j, &r);
+    ec_studio_image_v8_t iq = {};
+    iq.prompt = j->prompt; iq.neg_prompt = j->neg_prompt[0] ? j->neg_prompt : NULL;
+    iq.seed = j->seed; iq.width = j->width; iq.height = j->height; iq.steps = j->steps;
+    iq.cfg_scale = j->cfg_scale; iq.tier = tier; iq.photoreal = j->photoreal;
+    iq.checkpoint_query = j->checkpoint[0] ? j->checkpoint : NULL;
+    iq.loras = j->n_loras > 0 ? j->loras : NULL; iq.n_loras = j->n_loras;
+    iq.init_image_path = j->init_image[0] ? j->init_image : NULL;
+    iq.mask_image_path = j->mask_image[0] ? j->mask_image : NULL;
+    iq.denoise = j->denoise; iq.tile_upscale = j->tile_upscale;
+    memcpy(iq.outpaint_pad, j->outpaint_pad, sizeof iq.outpaint_pad);
+    rc = ec_studio_gen_image_v8(j->st, &iq, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
       snprintf(out, sizeof out,
           "{\"artifact_url\":\"/artifacts/%s\",\"width\":%d,\"height\":%d,"
@@ -353,7 +442,14 @@ static void *job_runner_thread(void *arg) {
           r.steps_run, r.steps_skipped, r.lora_tensors_fused,
           r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
   } else if (!strcmp(j->kind, "3d")) {
-    rc = ec_studio_gen_3d_ex(j->st, j->prompt, j->seed, j->grid_res, tier, j->full_model, job_progress_cb, j, &r);
+    ec_studio_3d_v8_t tq = {};
+    tq.prompt = j->prompt; tq.seed = j->seed; tq.grid_res = j->grid_res;
+    tq.steps = j->steps > 0 ? j->steps : 12; tq.cfg_scale = j->cfg_scale; tq.rescale_t = j->rescale_t;
+    tq.tier = tier; tq.full_model = j->full_model; tq.isolate_fg = j->isolate_fg;
+    memcpy(tq.base_color, j->base_color, sizeof tq.base_color);
+    for (int i = 0; i < j->n_input_images && i < 4; i++) tq.input_images[i] = j->input_images[i];
+    tq.n_input_images = j->n_input_images;
+    rc = ec_studio_gen_3d_v8(j->st, &tq, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
       snprintf(out, sizeof out,
           "{\"ok\":true,\"glb_url\":\"/artifacts/%s\",\"splat_ply_url\":\"/artifacts/%s\","
@@ -363,23 +459,42 @@ static void *job_runner_thread(void *arg) {
           r.engine_mode[0] ? r.engine_mode : "dit_smoke",
           r.n_verts, r.n_tris, r.n_splats, r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
   } else if (!strcmp(j->kind, "music")) {
-    rc = ec_studio_gen_music_ex(j->st, j->prompt, j->lyrics, j->seed, j->bpm, j->duration_sec, tier, j->full_model, job_progress_cb, j, &r);
-    if (rc == 0 && !r.cancelled)
+    ec_studio_music_v8_t mq = {};
+    mq.prompt = j->prompt; mq.lyrics = j->lyrics; mq.seed = j->seed;
+    mq.bpm = j->bpm; mq.duration_sec = j->duration_sec; mq.steps = j->steps > 0 ? j->steps : 8;
+    mq.shift = j->shift; mq.stem_mode = j->stem_mode; mq.tier = tier; mq.full_model = j->full_model;
+    mq.key_scale = j->key_scale[0] ? j->key_scale : NULL;
+    mq.time_sig = j->time_sig[0] ? j->time_sig : NULL;
+    mq.vocal_mode = j->vocal_mode[0] ? j->vocal_mode : NULL;
+    mq.audio_mode = j->audio_mode[0] ? j->audio_mode : NULL;
+    mq.source_audio_path = j->source_audio[0] ? j->source_audio : NULL;
+    mq.denoise = j->denoise; mq.repaint_start_sec = j->repaint_start; mq.repaint_end_sec = j->repaint_end;
+    mq.loras = j->n_loras > 0 ? j->loras : NULL; mq.n_loras = j->n_loras;
+    rc = ec_studio_gen_music_v8(j->st, &mq, job_progress_cb, j, &r);
+    if (rc == 0 && !r.cancelled) {
+      char stems_j[2048];
+      format_stems_json(&r, stems_j, sizeof stems_j);
       snprintf(out, sizeof out,
-          "{\"ok\":true,\"master_wav_url\":\"/artifacts/%s\","
-          "\"stems\":{\"drums\":\"/artifacts/%s\",\"bass\":\"/artifacts/%s\","
-          "\"harmony\":\"/artifacts/%s\",\"lead\":\"/artifacts/%s\"},"
+          "{\"ok\":true,\"master_wav_url\":\"/artifacts/%s\",\"stems\":%s,\"stem_count\":%d,"
           "\"engine_mode\":\"%s\",\"bpm\":%d,\"frames\":%d,\"sample_rate\":%d,"
-          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
-          basename_safe(r.file_main),
-          basename_safe(r.stem_files[0]), basename_safe(r.stem_files[1]),
-          basename_safe(r.stem_files[2]), basename_safe(r.stem_files[3]),
+          "\"lora_tensors_fused\":%d,\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
+          basename_safe(r.file_main), stems_j, r.n_stems,
           r.engine_mode[0] ? r.engine_mode : "dit_smoke",
-          j->bpm, r.frames, r.sample_rate ? r.sample_rate : 44100,
+          j->bpm, r.frames, r.sample_rate ? r.sample_rate : 44100, r.lora_tensors_fused,
           r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
+    }
   } else if (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av")) {
     int wa = (!strcmp(j->kind, "video_av") || j->with_audio) ? 1 : 0;
-    rc = ec_studio_gen_video_ex(j->st, j->prompt, j->seed, j->frames, j->width, j->height, j->fps, j->steps, wa, tier, j->full_model, job_progress_cb, j, &r);
+    ec_studio_video_v8_t vq = {};
+    vq.prompt = j->prompt; vq.neg_prompt = j->neg_prompt[0] ? j->neg_prompt : NULL;
+    vq.seed = j->seed; vq.n_frames = j->frames; vq.width = j->width; vq.height = j->height;
+    vq.fps = j->fps; vq.steps = j->steps; vq.with_audio = wa; vq.tier = tier; vq.full_model = j->full_model;
+    vq.cfg_scale = j->cfg_scale; vq.shift = j->shift; vq.denoise = j->denoise;
+    vq.start_frame_path = j->start_frame[0] ? j->start_frame : NULL;
+    vq.end_frame_path = j->end_frame[0] ? j->end_frame : NULL;
+    vq.camera_motion = j->camera_motion[0] ? j->camera_motion : NULL;
+    vq.loras = j->n_loras > 0 ? j->loras : NULL; vq.n_loras = j->n_loras;
+    rc = ec_studio_gen_video_v8(j->st, &vq, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
       snprintf(out, sizeof out,
           "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\","
@@ -525,7 +640,7 @@ static void *client_thread(void *arg) {
   ec_studio_t *st = ca->st;
   free(ca);
 
-  const size_t REQ_CAP = 8 * 1024 * 1024; // 8 MiB (supports ComfyUI PNG & large workflow uploads)
+  const size_t REQ_CAP = 32 * 1024 * 1024; // 32 MiB (supports WAV/MP3 audio + high-res image & ComfyUI PNG uploads)
   char *req = (char *)calloc(1, REQ_CAP);
   if (!req) { close(cfd); return NULL; }
   size_t got = 0, hdr_end = 0, content_len = 0;
@@ -576,7 +691,7 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/health")) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v7\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v8\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
         "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
         "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,"
@@ -587,7 +702,7 @@ static void *client_thread(void *arg) {
         "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,"
         "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
         "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
-        "\"modalities\":[\"flux2_photoreal\",\"acestep_1.5_music\",\"trellis2_3d\",\"wan2.2_video\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
+        "\"modalities\":[\"flux2_photoreal\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"trellis2_3d\",\"trellis2_photo_multiview\",\"wan2.2_video\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
         g_api_key[0] ? "true" : "false",
         info.photoreal_ready ? "true" : "false",
         info.acestep_ready   ? "true" : "false",
@@ -624,9 +739,26 @@ static void *client_thread(void *arg) {
     atomic_init(&j->cancel_req, 0);
     json_get_str(body, "kind", j->kind, sizeof j->kind, "image");
     json_get_str(body, "prompt", j->prompt, sizeof j->prompt, "eureka async studio");
+    json_get_str(body, "neg_prompt", j->neg_prompt, sizeof j->neg_prompt, "");
     json_get_str(body, "lyrics", j->lyrics, sizeof j->lyrics, "");
     json_get_str(body, "tier", j->tier, sizeof j->tier, "fast");
     json_get_str(body, "checkpoint", j->checkpoint, sizeof j->checkpoint, "");
+    json_get_str(body, "init_image", j->init_image, sizeof j->init_image, "");
+    json_get_str(body, "mask_image", j->mask_image, sizeof j->mask_image, "");
+    json_get_str(body, "start_frame", j->start_frame, sizeof j->start_frame, "");
+    json_get_str(body, "end_frame", j->end_frame, sizeof j->end_frame, "");
+    json_get_str(body, "camera_motion", j->camera_motion, sizeof j->camera_motion, "auto");
+    json_get_str(body, "source_audio", j->source_audio, sizeof j->source_audio, "");
+    json_get_str(body, "audio_mode", j->audio_mode, sizeof j->audio_mode, "");
+    json_get_str(body, "key_scale", j->key_scale, sizeof j->key_scale, "");
+    json_get_str(body, "time_sig", j->time_sig, sizeof j->time_sig, "4");
+    json_get_str(body, "vocal_mode", j->vocal_mode, sizeof j->vocal_mode, "auto");
+    j->n_input_images = json_get_path_array(body, "input_images", j->input_images, 4);
+    if (j->n_input_images == 0) {
+      char single_img[256] = {0};
+      json_get_str(body, "input_image", single_img, sizeof single_img, "");
+      if (single_img[0]) { snprintf(j->input_images[0], sizeof j->input_images[0], "%s", single_img); j->n_input_images = 1; }
+    }
     j->n_loras = json_get_loras(body, j->loras, EC_STUDIO_MAX_LORAS);
     j->seed = (uint32_t)json_get_num(body, "seed", 42 + j->id);
     int is_vid = (!strcmp(j->kind, "video") || !strcmp(j->kind, "video_av"));
@@ -638,19 +770,32 @@ static void *client_thread(void *arg) {
     j->grid_res = (int)json_get_num(body, "grid_res", 20);
     j->bpm = (int)json_get_num(body, "bpm", 124);
     j->duration_sec = (float)json_get_num(body, "duration_sec", req_full == 1 ? 10.0 : 2.0);
-    j->photoreal = json_get_bool(body, "photoreal", (j->width >= 512 || j->height >= 512 || j->checkpoint[0] || j->n_loras > 0) ? 1 : 0);
+    j->cfg_scale = (float)json_get_num(body, "cfg_scale", 0.0);
+    j->shift = (float)json_get_num(body, "shift", 0.0);
+    j->denoise = (float)json_get_num(body, "denoise", 0.0);
+    j->repaint_start = (float)json_get_num(body, "repaint_start", 0.0);
+    j->repaint_end = (float)json_get_num(body, "repaint_end", 0.0);
+    j->rescale_t = (float)json_get_num(body, "rescale_t", 0.0);
+    j->tile_upscale = json_get_bool(body, "tile_upscale", 0);
+    j->isolate_fg = json_get_bool(body, "isolate_fg", 1);
+    j->outpaint_pad[0] = (int)json_get_num(body, "outpaint_left", 0);
+    j->outpaint_pad[1] = (int)json_get_num(body, "outpaint_top", 0);
+    j->outpaint_pad[2] = (int)json_get_num(body, "outpaint_right", 0);
+    j->outpaint_pad[3] = (int)json_get_num(body, "outpaint_bottom", 0);
+    j->stem_mode = parse_stem_mode(body, 4);
+    j->photoreal = json_get_bool(body, "photoreal", (j->width >= 512 || j->height >= 512 || j->checkpoint[0] || j->n_loras > 0 || j->init_image[0]) ? 1 : 0);
     if (req_full >= 0) {
       j->full_model = req_full;
     } else if (!strcmp(j->kind, "3d")) {
-      j->full_model = (j->grid_res >= 32) ? 1 : 0;
+      j->full_model = (j->grid_res >= 32 || j->n_input_images > 0) ? 1 : 0;
     } else if (!strcmp(j->kind, "music")) {
-      j->full_model = (j->duration_sec >= 5.0f || j->lyrics[0]) ? 1 : 0;
+      j->full_model = (j->duration_sec >= 5.0f || j->lyrics[0] || j->source_audio[0]) ? 1 : 0;
     } else if (is_vid) {
-      j->full_model = (j->width >= 640 || j->height >= 384) ? 1 : 0;
+      j->full_model = (j->width >= 640 || j->height >= 384 || j->start_frame[0] || j->end_frame[0]) ? 1 : 0;
     } else {
       j->full_model = j->photoreal;
     }
-    int def_steps = is_vid ? (j->full_model ? 20 : 4) : (j->photoreal ? 4 : 12);
+    int def_steps = is_vid ? (j->full_model ? 20 : 4) : (!strcmp(j->kind, "3d") ? 12 : (!strcmp(j->kind, "music") ? 8 : (j->photoreal ? 4 : 12)));
     j->steps = (int)json_get_num(body, "steps", def_steps);
     j->frames = (int)json_get_num(body, "frames", (is_vid && j->full_model) ? 17 : 24);
     j->fps = (int)json_get_num(body, "fps", (is_vid && j->full_model) ? 16 : 24);
@@ -739,20 +884,38 @@ static void *client_thread(void *arg) {
       send_json(cfd, 200, resp);
     }
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/images/generations")) {
-    char prompt[1024], tier_s[16], ckpt[256];
+    char prompt[1024], neg_prompt[1024], tier_s[16], ckpt[256], init_img[256], mask_img[256];
     ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
     json_get_str(body, "prompt", prompt, sizeof prompt, "A cinematic 35mm photograph, natural light, ultra detailed");
+    json_get_str(body, "neg_prompt", neg_prompt, sizeof neg_prompt, "");
     json_get_str(body, "tier", tier_s, sizeof tier_s, "fast");
     json_get_str(body, "checkpoint", ckpt, sizeof ckpt, "");
+    json_get_str(body, "init_image", init_img, sizeof init_img, "");
+    json_get_str(body, "mask_image", mask_img, sizeof mask_img, "");
     int n_loras = json_get_loras(body, loras, EC_STUDIO_MAX_LORAS);
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 42);
     int w = (int)json_get_num(body, "width", 512), h = (int)json_get_num(body, "height", 512);
-    int photoreal = json_get_bool(body, "photoreal", (w >= 512 || h >= 512 || ckpt[0] || n_loras > 0) ? 1 : 0);
+    int photoreal = json_get_bool(body, "photoreal", (w >= 512 || h >= 512 || ckpt[0] || n_loras > 0 || init_img[0]) ? 1 : 0);
     int steps = (int)json_get_num(body, "steps", photoreal ? 4 : 8);
     ec_tier_t tier = !strcmp(tier_s, "exact") ? EC_TIER_EXACT : EC_TIER_FAST;
+    ec_studio_image_v8_t iq = {0};
+    iq.prompt = prompt;
+    iq.neg_prompt = neg_prompt[0] ? neg_prompt : NULL;
+    iq.seed = seed; iq.width = w; iq.height = h; iq.steps = steps;
+    iq.cfg_scale = (float)json_get_num(body, "cfg_scale", 1.0);
+    iq.tier = tier; iq.photoreal = photoreal;
+    iq.checkpoint_query = ckpt[0] ? ckpt : NULL;
+    iq.loras = n_loras > 0 ? loras : NULL; iq.n_loras = n_loras;
+    iq.init_image_path = init_img[0] ? init_img : NULL;
+    iq.mask_image_path = mask_img[0] ? mask_img : NULL;
+    iq.denoise = (float)json_get_num(body, "denoise", init_img[0] ? 0.72 : 1.0);
+    iq.outpaint_pad[0] = (int)json_get_num(body, "outpaint_left", 0);
+    iq.outpaint_pad[1] = (int)json_get_num(body, "outpaint_top", 0);
+    iq.outpaint_pad[2] = (int)json_get_num(body, "outpaint_right", 0);
+    iq.outpaint_pad[3] = (int)json_get_num(body, "outpaint_bottom", 0);
+    iq.tile_upscale = json_get_bool(body, "tile_upscale", 0);
     ec_studio_result_t r;
-    if (ec_studio_gen_image_ex(st, prompt, seed, w, h, steps, tier, photoreal,
-                               ckpt[0] ? ckpt : NULL, loras, n_loras, NULL, NULL, &r) == 0) {
+    if (ec_studio_gen_image_v8(st, &iq, NULL, NULL, &r) == 0) {
       snprintf(resp, RESP_CAP,
           "{\"ok\":true,\"artifact_url\":\"/artifacts/%s\",\"width\":%d,\"height\":%d,"
           "\"engine_mode\":\"%s\",\"checkpoint\":\"%s\",\"lora_tensors_fused\":%d,"
@@ -789,6 +952,9 @@ static void *client_thread(void *arg) {
     send_json(cfd, 200, resp);
   } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/loras")) {
     ec_studio_loras_json(st, resp, RESP_CAP);
+    send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/lora-catalog")) {
+    ec_studio_lora_catalog_json(st, resp, RESP_CAP);
     send_json(cfd, 200, resp);
   } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/checkpoints")) {
     ec_studio_checkpoints_json(st, resp, RESP_CAP);
@@ -857,13 +1023,26 @@ static void *client_thread(void *arg) {
       send_json(cfd, 400, resp);
     }
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/3d/generations")) {
-    char prompt[1024]; json_get_str(body, "prompt", prompt, sizeof prompt, "sculptural matte-white porcelain teapot");
+    char prompt[1024], in_imgs[4][256], single_img[256];
+    json_get_str(body, "prompt", prompt, sizeof prompt, "sculptural matte-white porcelain teapot");
+    json_get_str(body, "input_image", single_img, sizeof single_img, "");
+    int n_imgs = json_get_path_array(body, "input_images", in_imgs, 4);
+    if (n_imgs == 0 && single_img[0]) { snprintf(in_imgs[0], sizeof in_imgs[0], "%s", single_img); n_imgs = 1; }
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 77);
     int res_g = (int)json_get_num(body, "grid_res", 20);
-    int full_m = json_get_bool(body, "full_model", (res_g >= 32) ? 1 : 0);
+    int full_m = json_get_bool(body, "full_model", (res_g >= 32 || n_imgs > 0) ? 1 : 0);
+    ec_studio_3d_v8_t tq = {0};
+    tq.prompt = prompt; tq.seed = seed; tq.grid_res = res_g;
+    tq.steps = (int)json_get_num(body, "steps", 12);
+    tq.cfg_scale = (float)json_get_num(body, "cfg_scale", 7.5);
+    tq.rescale_t = (float)json_get_num(body, "rescale_t", 3.0);
+    tq.isolate_fg = json_get_bool(body, "isolate_fg", 1);
+    tq.tier = EC_TIER_FAST; tq.full_model = full_m;
+    for (int i = 0; i < n_imgs && i < 4; i++) tq.input_images[i] = in_imgs[i];
+    tq.n_input_images = n_imgs;
     ec_studio_result_t r;
-    if (ec_studio_gen_3d_ex(st, prompt, seed, res_g, EC_TIER_FAST, full_m, NULL, NULL, &r) == 0) {
-      snprintf(resp, 32768,
+    if (ec_studio_gen_3d_v8(st, &tq, NULL, NULL, &r) == 0) {
+      snprintf(resp, RESP_CAP,
           "{\"ok\":true,\"glb_url\":\"/artifacts/%s\",\"splat_ply_url\":\"/artifacts/%s\","
           "\"engine_mode\":\"%s\",\"n_verts\":%d,\"n_tris\":%d,\"n_splats\":%d,"
           "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
@@ -873,49 +1052,88 @@ static void *client_thread(void *arg) {
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"3d generation failed\"}");
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/audio/music")) {
-    char prompt[1024], lyrics[1024];
+    char prompt[1024], lyrics[1536], key_sc[32], tsig[16], vmode[24], amode[24], src_aud[256];
+    ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
     json_get_str(body, "prompt", prompt, sizeof prompt, "ambient electronic pulse");
     json_get_str(body, "lyrics", lyrics, sizeof lyrics, "");
+    json_get_str(body, "key_scale", key_sc, sizeof key_sc, "");
+    json_get_str(body, "time_sig", tsig, sizeof tsig, "4");
+    json_get_str(body, "vocal_mode", vmode, sizeof vmode, "auto");
+    json_get_str(body, "audio_mode", amode, sizeof amode, "generate");
+    json_get_str(body, "source_audio", src_aud, sizeof src_aud, "");
+    int n_loras = json_get_loras(body, loras, EC_STUDIO_MAX_LORAS);
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 101);
     int bpm = (int)json_get_num(body, "bpm", 122);
     float dur = (float)json_get_num(body, "duration_sec", 3.0);
-    int full_m = json_get_bool(body, "full_model", (dur >= 5.0f || lyrics[0]) ? 1 : 0);
+    int full_m = json_get_bool(body, "full_model", (dur >= 5.0f || lyrics[0] || src_aud[0]) ? 1 : 0);
+    ec_studio_music_v8_t mq = {0};
+    mq.prompt = prompt; mq.lyrics = lyrics; mq.seed = seed; mq.bpm = bpm;
+    mq.duration_sec = dur; mq.steps = (int)json_get_num(body, "steps", 8);
+    mq.shift = (float)json_get_num(body, "shift", 3.0);
+    mq.stem_mode = parse_stem_mode(body, 4);
+    mq.key_scale = key_sc[0] ? key_sc : NULL;
+    mq.time_sig = tsig[0] ? tsig : NULL;
+    mq.vocal_mode = vmode[0] ? vmode : NULL;
+    mq.audio_mode = amode[0] ? amode : NULL;
+    mq.source_audio_path = src_aud[0] ? src_aud : NULL;
+    mq.denoise = (float)json_get_num(body, "denoise", 0.65);
+    mq.repaint_start_sec = (float)json_get_num(body, "repaint_start", 0.0);
+    mq.repaint_end_sec = (float)json_get_num(body, "repaint_end", 0.0);
+    mq.loras = n_loras > 0 ? loras : NULL; mq.n_loras = n_loras;
+    mq.tier = EC_TIER_FAST; mq.full_model = full_m;
     ec_studio_result_t r;
-    if (ec_studio_gen_music_ex(st, prompt, lyrics, seed, bpm, dur, EC_TIER_FAST, full_m, NULL, NULL, &r) == 0) {
-      snprintf(resp, 32768,
-          "{\"ok\":true,\"master_wav_url\":\"/artifacts/%s\","
-          "\"stems\":{\"drums\":\"/artifacts/%s\",\"bass\":\"/artifacts/%s\","
-          "\"harmony\":\"/artifacts/%s\",\"lead\":\"/artifacts/%s\"},"
+    if (ec_studio_gen_music_v8(st, &mq, NULL, NULL, &r) == 0) {
+      char stems_j[2048];
+      format_stems_json(&r, stems_j, sizeof stems_j);
+      snprintf(resp, RESP_CAP,
+          "{\"ok\":true,\"master_wav_url\":\"/artifacts/%s\",\"stems\":%s,\"stem_count\":%d,"
           "\"engine_mode\":\"%s\",\"bpm\":%d,\"frames\":%d,\"sample_rate\":%d,"
-          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
-          basename_safe(r.file_main),
-          basename_safe(r.stem_files[0]), basename_safe(r.stem_files[1]),
-          basename_safe(r.stem_files[2]), basename_safe(r.stem_files[3]),
+          "\"lora_tensors_fused\":%d,\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f}",
+          basename_safe(r.file_main), stems_j, r.n_stems,
           r.engine_mode[0] ? r.engine_mode : "dit_smoke",
-          bpm, r.frames, r.sample_rate ? r.sample_rate : 44100,
+          bpm, r.frames, r.sample_rate ? r.sample_rate : 44100, r.lora_tensors_fused,
           r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms);
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"music generation failed\"}");
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/videos/generations")) {
-    char prompt[1024]; json_get_str(body, "prompt", prompt, sizeof prompt, "cinematic studio motion");
+    char prompt[1024], neg_prompt[1024], start_fr[256], end_fr[256], cam[32];
+    ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
+    json_get_str(body, "prompt", prompt, sizeof prompt, "cinematic studio motion");
+    json_get_str(body, "neg_prompt", neg_prompt, sizeof neg_prompt, "");
+    json_get_str(body, "start_frame", start_fr, sizeof start_fr, "");
+    json_get_str(body, "end_frame", end_fr, sizeof end_fr, "");
+    json_get_str(body, "camera_motion", cam, sizeof cam, "");
+    int n_loras = json_get_loras(body, loras, EC_STUDIO_MAX_LORAS);
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 303);
     int req_full = json_get_bool(body, "full_model", -1);
-    int w = (int)json_get_num(body, "width", req_full == 1 ? 832 : 320);
-    int h = (int)json_get_num(body, "height", req_full == 1 ? 480 : 180);
-    int full_m = (req_full >= 0) ? req_full : ((w >= 640 || h >= 384) ? 1 : 0);
+    int w = (int)json_get_num(body, "width", (req_full == 1 || start_fr[0]) ? 832 : 320);
+    int h = (int)json_get_num(body, "height", (req_full == 1 || start_fr[0]) ? 480 : 180);
+    int full_m = (req_full >= 0) ? req_full : ((w >= 640 || h >= 384 || start_fr[0]) ? 1 : 0);
     int n_frames = (int)json_get_num(body, "frames", full_m ? 17 : 24);
     int fps = (int)json_get_num(body, "fps", full_m ? 16 : 24);
     int steps = (int)json_get_num(body, "steps", full_m ? 20 : 4);
     int with_audio = json_get_bool(body, "with_audio", 1);
+    ec_studio_video_v8_t vq = {0};
+    vq.prompt = prompt; vq.neg_prompt = neg_prompt[0] ? neg_prompt : NULL;
+    vq.seed = seed; vq.n_frames = n_frames; vq.width = w; vq.height = h;
+    vq.fps = fps; vq.steps = steps; vq.with_audio = with_audio;
+    vq.cfg_scale = (float)json_get_num(body, "cfg_scale", 5.0);
+    vq.shift = (float)json_get_num(body, "shift", 0.0);
+    vq.denoise = (float)json_get_num(body, "denoise", 1.0);
+    vq.start_frame_path = start_fr[0] ? start_fr : NULL;
+    vq.end_frame_path = end_fr[0] ? end_fr : NULL;
+    vq.camera_motion = cam[0] ? cam : NULL;
+    vq.loras = n_loras > 0 ? loras : NULL; vq.n_loras = n_loras;
+    vq.tier = EC_TIER_FAST; vq.full_model = full_m;
     ec_studio_result_t r;
-    if (ec_studio_gen_video_ex(st, prompt, seed, n_frames, w, h, fps, steps, with_audio, EC_TIER_FAST, full_m, NULL, NULL, &r) == 0) {
-      snprintf(resp, 32768,
+    if (ec_studio_gen_video_v8(st, &vq, NULL, NULL, &r) == 0) {
+      snprintf(resp, RESP_CAP,
           "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\","
           "\"engine_mode\":\"%s\",\"encoder\":\"%s\",\"with_audio\":%s,\"frames\":%d,\"width\":%d,\"height\":%d,"
-          "\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f,\"fps\":%.1f}",
+          "\"lora_tensors_fused\":%d,\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f,\"fps\":%.1f}",
           basename_safe(r.file_mp4), basename_safe(r.file_aux),
           r.engine_mode[0] ? r.engine_mode : "dit_smoke", r.encoder_used,
-          with_audio ? "true" : "false", r.frames, r.width, r.height,
+          with_audio ? "true" : "false", r.frames, r.width, r.height, r.lora_tensors_fused,
           r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms, r.fps);
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"video generation failed\"}");
@@ -940,14 +1158,20 @@ static void *client_thread(void *arg) {
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/clear-cache")) {
     ec_studio_flow_clear_cache(st);
     send_json(cfd, 200, "{\"ok\":true,\"cache_cleared\":true}");
-  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/upload")) {
-    const char *ext = (body_len >= 3 && (uint8_t)body[0] == 0xFF && (uint8_t)body[1] == 0xD8) ? "jpg" : "png";
+  } else if (!strcmp(method, "POST") && (!strcmp(path, "/v1/flows/upload") || !strcmp(path, "/v1/creative/upload"))) {
+    const char *ext = "png";
+    if (body_len >= 12 && !memcmp(body, "RIFF", 4) && !memcmp(body + 8, "WAVE", 4)) ext = "wav";
+    else if (body_len >= 4 && !memcmp(body, "fLaC", 4)) ext = "flac";
+    else if (body_len >= 4 && !memcmp(body, "OggS", 4)) ext = "ogg";
+    else if (body_len >= 3 && (!memcmp(body, "ID3", 3) || ((uint8_t)body[0] == 0xFF && ((uint8_t)body[1] & 0xE0) == 0xE0))) ext = "mp3";
+    else if (body_len >= 12 && !memcmp(body, "RIFF", 4) && !memcmp(body + 8, "WEBP", 4)) ext = "webp";
+    else if (body_len >= 3 && (uint8_t)body[0] == 0xFF && (uint8_t)body[1] == 0xD8) ext = "jpg";
     char fname[96] = {0};
-    if (ec_studio_flow_upload_image(st, (const uint8_t *)body, body_len, ext, fname, sizeof fname) == 0) {
-      snprintf(resp, 4096, "{\"ok\":true,\"name\":\"%s\",\"url\":\"/artifacts/%s\"}", fname, fname);
+    if (ec_studio_upload_media(st, (const uint8_t *)body, body_len, ext, fname, sizeof fname) == 0) {
+      snprintf(resp, 4096, "{\"ok\":true,\"name\":\"%s\",\"ext\":\"%s\",\"url\":\"/artifacts/%s\"}", fname, ext, fname);
       send_json(cfd, 200, resp);
     } else {
-      send_json(cfd, 400, "{\"ok\":false,\"error\":\"invalid image upload\"}");
+      send_json(cfd, 400, "{\"ok\":false,\"error\":\"invalid media upload\"}");
     }
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/flows/queue")) {
     pthread_mutex_lock(&g_jobs_mu);
