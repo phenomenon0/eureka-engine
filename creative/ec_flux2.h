@@ -42,6 +42,7 @@ typedef struct {
   const float          *mask_gray;           // optional [init_h * init_w] float mask (1=repaint, 0=keep)
   float                 denoise;             // 0.05..1.0 (default 1.0 for txt2img, 0.72 for img2img)
   int                   tile_upscale;        // 1 -> run 2x overlapping tiled latent detail upscale
+  ec_tier_t             tier;                // EC_TIER_FAST (Q8_G64 + SageAttn-I8) or EC_TIER_EXACT (BF16 + FA2 oracle)
 } ec_flux2_req_t;
 
 typedef struct {

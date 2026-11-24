@@ -55,6 +55,30 @@ int ec_ops_trellis_cfg_euler(
     float guidance_rescale, float sigma_min, int use_cfg,
     cudaStream_t stream);
 
+// 4. v15 "Comfy-Crusher" Group-Scaled Q8_G64 (m16n8k32 INT8 TensorCore, 130+ TOPS) & Implicit-GEMM NHWC 2D Conv:
+//    Quantizes BF16 [rows, cols] (cols % 64 == 0) into symmetric per-64-group int8_t [rows, cols] + float scales [rows, cols/64].
+int ec_ops_quantize_bf16_q8g64(
+    const uint16_t *src_bf16, int8_t *dst_q8, float *dst_sc,
+    int rows, int cols, cudaStream_t stream);
+
+int ec_ops_dequant_q8g64_bf16(
+    const int8_t *src_q8, const float *src_sc, uint16_t *dst_bf16,
+    int rows, int cols, cudaStream_t stream);
+
+int ec_ops_gemm_q8g64(
+    const int8_t *X_q8, const float *x_sc,
+    const int8_t *W_q8, const float *w_sc,
+    const float *bias, float *Y_f32, uint16_t *Y_bf16,
+    int M, int N, int K, cudaStream_t stream);
+
+//    Implicit-GEMM NHWC 3x3 (pad=1, stride=1) BF16 TensorCore Conv2D (zero im2col, zero transpose, fused bias + residual!):
+//    X_nhwc: [H*W, Cin] BF16 (Cin % 32 == 0), W_ohwi: [Cout, 9*Cin] BF16 (Cout % 64 == 0).
+int ec_ops_conv2d_3x3_nhwc_bf16(
+    const uint16_t *X_nhwc, const uint16_t *W_ohwi,
+    const float *bias, const float *res_f32,
+    float *Y_f32, uint16_t *Y_bf16,
+    int H, int W, int Cin, int Cout, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

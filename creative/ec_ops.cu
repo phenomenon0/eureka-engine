@@ -744,3 +744,555 @@ extern "C" int ec_ops_trellis_cfg_euler(
   }
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+// ===========================================================================
+// 4. v15 Group-Scaled Q8_G64 INT8 TensorCore GEMM (PTX m16n8k32, 130+ TOPS)
+//    & Implicit-GEMM NHWC 3x3 BF16 TensorCore Conv2D (Zero im2col, Zero Transpose)
+// ===========================================================================
+
+static __device__ __forceinline__ void ops_mma_s8(
+    int32_t d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+static __device__ __forceinline__ uint32_t ops_pack_s8x4(float v0, float v1, float v2, float v3, float inv) {
+  int q0 = __float2int_rn(fminf(127.0f, fmaxf(-127.0f, v0 * inv)));
+  int q1 = __float2int_rn(fminf(127.0f, fmaxf(-127.0f, v1 * inv)));
+  int q2 = __float2int_rn(fminf(127.0f, fmaxf(-127.0f, v2 * inv)));
+  int q3 = __float2int_rn(fminf(127.0f, fmaxf(-127.0f, v3 * inv)));
+  return ((uint32_t)(uint8_t)q0) |
+         (((uint32_t)(uint8_t)q1) << 8) |
+         (((uint32_t)(uint8_t)q2) << 16) |
+         (((uint32_t)(uint8_t)q3) << 24);
+}
+
+// 16 lanes (half-warp) quantize one 64-element BF16 group (4 elements = uint2 per lane) via warp shfl
+__global__ void __launch_bounds__(256) k_ops_quantize_bf16_q8g64(
+    const uint16_t *__restrict__ src, int8_t *__restrict__ dst_q8, float *__restrict__ dst_sc,
+    long total_groups) {
+  const long hw_id = (((long)blockIdx.x * blockDim.x) + threadIdx.x) >> 4;
+  if (hw_id >= total_groups) return;
+  const int sub_lane = threadIdx.x & 15;
+  const long elem_off = hw_id * 64 + sub_lane * 4;
+
+  const uint2 raw = *(const uint2 *)(src + elem_off);
+  const float v0 = ops_bf16_to_f32((uint16_t)(raw.x & 0xFFFFu));
+  const float v1 = ops_bf16_to_f32((uint16_t)(raw.x >> 16));
+  const float v2 = ops_bf16_to_f32((uint16_t)(raw.y & 0xFFFFu));
+  const float v3 = ops_bf16_to_f32((uint16_t)(raw.y >> 16));
+
+  float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+
+  const float sc = amax * (1.0f / 127.0f);
+  const float inv = (amax > 1e-30f) ? (127.0f / amax) : 0.0f;
+  *(uint32_t *)(dst_q8 + elem_off) = ops_pack_s8x4(v0, v1, v2, v3, inv);
+  if (sub_lane == 0) dst_sc[hw_id] = sc;
+}
+
+__global__ void __launch_bounds__(256) k_ops_dequant_q8g64_bf16(
+    const int8_t *__restrict__ src_q8, const float *__restrict__ src_sc,
+    uint16_t *__restrict__ dst_bf16, long total_groups) {
+  const long hw_id = (((long)blockIdx.x * blockDim.x) + threadIdx.x) >> 4;
+  if (hw_id >= total_groups) return;
+  const int sub_lane = threadIdx.x & 15;
+  const long elem_off = hw_id * 64 + sub_lane * 4;
+  const float sc = src_sc[hw_id];
+  const uint32_t packed = *(const uint32_t *)(src_q8 + elem_off);
+  const float v0 = (float)(int8_t)(packed & 0xFFu) * sc;
+  const float v1 = (float)(int8_t)((packed >> 8) & 0xFFu) * sc;
+  const float v2 = (float)(int8_t)((packed >> 16) & 0xFFu) * sc;
+  const float v3 = (float)(int8_t)((packed >> 24) & 0xFFu) * sc;
+  uint2 out;
+  out.x = ops_pack_bf16x2(v0, v1);
+  out.y = ops_pack_bf16x2(v2, v3);
+  *(uint2 *)(dst_bf16 + elem_off) = out;
+}
+
+extern "C" int ec_ops_quantize_bf16_q8g64(
+    const uint16_t *src_bf16, int8_t *dst_q8, float *dst_sc,
+    int rows, int cols, cudaStream_t stream) {
+  if (!src_bf16 || !dst_q8 || !dst_sc || rows <= 0 || cols <= 0 || (cols & 63) != 0) return -1;
+  const long total_groups = (long)rows * (cols >> 6);
+  const long total_threads = total_groups * 16;
+  k_ops_quantize_bf16_q8g64<<<(int)((total_threads + 255) / 256), 256, 0, stream>>>(
+      src_bf16, dst_q8, dst_sc, total_groups);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+extern "C" int ec_ops_dequant_q8g64_bf16(
+    const int8_t *src_q8, const float *src_sc, uint16_t *dst_bf16,
+    int rows, int cols, cudaStream_t stream) {
+  if (!src_q8 || !src_sc || !dst_bf16 || rows <= 0 || cols <= 0 || (cols & 63) != 0) return -1;
+  const long total_groups = (long)rows * (cols >> 6);
+  const long total_threads = total_groups * 16;
+  k_ops_dequant_q8g64_bf16<<<(int)((total_threads + 255) / 256), 256, 0, stream>>>(
+      src_q8, src_sc, dst_bf16, total_groups);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+// Double-buffered cp.async BM=128xBN=128xBK=64 L2-swizzled Q8_G64 TensorCore GEMM (zero register spills, interleaved IMMA+FFMA)
+__global__ void __launch_bounds__(256) k_ops_gemm_q8g64_128(
+    const int8_t *__restrict__ X, const float *__restrict__ x_sc,
+    const int8_t *__restrict__ W, const float *__restrict__ w_sc,
+    const float *__restrict__ bias,
+    float *__restrict__ Y_f32, uint16_t *__restrict__ Y_bf16,
+    int M, int N, int K) {
+  constexpr int BM = 128, BN = 128, BK = 64, STRIDE = 80;
+  __shared__ __align__(16) int8_t sX[2][BM * STRIDE];
+  __shared__ __align__(16) int8_t sW[2][BN * STRIDE];
+  __shared__ float sXS[2][BM];
+  __shared__ float sWS[2][BN];
+
+  const int n_tiles = gridDim.x;
+  const int m_tiles = gridDim.y;
+  const int lin = blockIdx.y * n_tiles + blockIdx.x;
+  constexpr int GRP = 8;
+  const int tiles_per_grp = GRP * n_tiles;
+  const int grp_id = lin / tiles_per_grp;
+  const int first_m = grp_id * GRP;
+  const int grp_m = (m_tiles - first_m < GRP) ? (m_tiles - first_m) : GRP;
+  const int in_grp = lin % tiles_per_grp;
+  const int m0 = (first_m + (in_grp % grp_m)) * BM;
+  const int n0 = (in_grp / grp_m) * BN;
+
+  const int tid  = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g    = lane >> 2;
+  const int t    = lane & 3;
+  const int wm   = (warp >> 1) * 32;
+  const int wn   = (warp & 1)  * 64;
+  const int n_groups = K >> 6;
+
+  float acc[2][8][4];
+  #pragma unroll
+  for (int mi = 0; mi < 2; mi++)
+    #pragma unroll
+    for (int ni = 0; ni < 8; ni++)
+      acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
+
+  // 256 threads * 2 uint4s = 512 * 16B = 8192B = 128x64 int8
+  const int r0 = tid >> 2,         c0 = (tid & 3) * 16;
+  const int r1 = (tid + 256) >> 2, c1 = ((tid + 256) & 3) * 16;
+  const int gm0 = m0 + r0, gm1 = m0 + r1;
+  const int gn0 = n0 + r0, gn1 = n0 + r1;
+
+  // Prologue: load stage 0 (kb = 0, grp = 0)
+  {
+    const int px0 = (gm0 < M);
+    const int px1 = (gm1 < M);
+    const int pw0 = (gn0 < N);
+    const int pw1 = (gn1 < N);
+    ops_cp_async_16(sX[0] + r0 * STRIDE + c0, px0 ? (X + (long)gm0 * K + c0) : X, px0);
+    ops_cp_async_16(sX[0] + r1 * STRIDE + c1, px1 ? (X + (long)gm1 * K + c1) : X, px1);
+    ops_cp_async_16(sW[0] + r0 * STRIDE + c0, pw0 ? (W + (long)gn0 * K + c0) : W, pw0);
+    ops_cp_async_16(sW[0] + r1 * STRIDE + c1, pw1 ? (W + (long)gn1 * K + c1) : W, pw1);
+    if (tid < 128) {
+      sXS[0][tid] = (m0 + tid < M) ? x_sc[(long)(m0 + tid) * n_groups] : 0.0f;
+    } else {
+      const int nr = tid - 128;
+      sWS[0][nr] = (n0 + nr < N) ? w_sc[(long)(n0 + nr) * n_groups] : 0.0f;
+    }
+    ops_cp_async_commit();
+  }
+
+  int cur = 0;
+  for (int kb = 0; kb < K; kb += BK) {
+    const int k_next = kb + BK;
+    const int has_next = (k_next < K);
+    const int nxt = cur ^ 1;
+
+    if (has_next) {
+      const int g_next = k_next >> 6;
+      const int px0 = (gm0 < M);
+      const int px1 = (gm1 < M);
+      const int pw0 = (gn0 < N);
+      const int pw1 = (gn1 < N);
+      ops_cp_async_16(sX[nxt] + r0 * STRIDE + c0, px0 ? (X + (long)gm0 * K + k_next + c0) : X, px0);
+      ops_cp_async_16(sX[nxt] + r1 * STRIDE + c1, px1 ? (X + (long)gm1 * K + k_next + c1) : X, px1);
+      ops_cp_async_16(sW[nxt] + r0 * STRIDE + c0, pw0 ? (W + (long)gn0 * K + k_next + c0) : W, pw0);
+      ops_cp_async_16(sW[nxt] + r1 * STRIDE + c1, pw1 ? (W + (long)gn1 * K + k_next + c1) : W, pw1);
+      if (tid < 128) {
+        sXS[nxt][tid] = (m0 + tid < M) ? x_sc[(long)(m0 + tid) * n_groups + g_next] : 0.0f;
+      } else {
+        const int nr = tid - 128;
+        sWS[nxt][nr] = (n0 + nr < N) ? w_sc[(long)(n0 + nr) * n_groups + g_next] : 0.0f;
+      }
+      ops_cp_async_commit();
+      ops_cp_async_wait<1>();
+    } else {
+      ops_cp_async_wait<0>();
+    }
+    __syncthreads();
+
+    const int8_t *curX = sX[cur];
+    const int8_t *curW = sW[cur];
+    const float  *curXS = sXS[cur];
+    const float  *curWS = sWS[cur];
+
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+      const int8_t *xr0 = curX + (wm + mi * 16 + g) * STRIDE;
+      const int8_t *xr8 = xr0 + 8 * STRIDE;
+      const uint32_t af0[4] = {
+        *(const uint32_t *)(xr0 + 4 * t),
+        *(const uint32_t *)(xr8 + 4 * t),
+        *(const uint32_t *)(xr0 + 16 + 4 * t),
+        *(const uint32_t *)(xr8 + 16 + 4 * t),
+      };
+      const uint32_t af1[4] = {
+        *(const uint32_t *)(xr0 + 32 + 4 * t),
+        *(const uint32_t *)(xr8 + 32 + 4 * t),
+        *(const uint32_t *)(xr0 + 48 + 4 * t),
+        *(const uint32_t *)(xr8 + 48 + 4 * t),
+      };
+      const float sx0 = curXS[wm + mi * 16 + g];
+      const float sx1 = curXS[wm + mi * 16 + g + 8];
+      #pragma unroll
+      for (int ni = 0; ni < 8; ni++) {
+        int32_t ts[4] = {0, 0, 0, 0};
+        const int8_t *wr = curW + (wn + ni * 8 + g) * STRIDE;
+        ops_mma_s8(ts, af0, *(const uint32_t *)(wr + 4 * t),      *(const uint32_t *)(wr + 16 + 4 * t));
+        ops_mma_s8(ts, af1, *(const uint32_t *)(wr + 32 + 4 * t), *(const uint32_t *)(wr + 48 + 4 * t));
+        const float sw0 = curWS[wn + ni * 8 + 2 * t + 0];
+        const float sw1 = curWS[wn + ni * 8 + 2 * t + 1];
+        acc[mi][ni][0] = fmaf((float)ts[0], sx0 * sw0, acc[mi][ni][0]);
+        acc[mi][ni][1] = fmaf((float)ts[1], sx0 * sw1, acc[mi][ni][1]);
+        acc[mi][ni][2] = fmaf((float)ts[2], sx1 * sw0, acc[mi][ni][2]);
+        acc[mi][ni][3] = fmaf((float)ts[3], sx1 * sw1, acc[mi][ni][3]);
+      }
+    }
+    __syncthreads();
+    cur = nxt;
+  }
+
+  #pragma unroll
+  for (int ni = 0; ni < 8; ni++) {
+    const int col = n0 + wn + ni * 8 + 2 * t;
+    if (col >= N) continue;
+    const bool col1_ok = (col + 1 < N);
+    const float b0 = bias ? bias[col] : 0.0f;
+    const float b1 = (bias && col1_ok) ? bias[col + 1] : 0.0f;
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+      #pragma unroll
+      for (int h8 = 0; h8 < 2; h8++) {
+        const int r = m0 + wm + mi * 16 + g + 8 * h8;
+        if (r >= M) continue;
+        const float v0 = acc[mi][ni][2 * h8 + 0] + b0;
+        const float v1 = acc[mi][ni][2 * h8 + 1] + b1;
+        const long off = (long)r * N + col;
+        if (col1_ok && ((N & 1) == 0)) {
+          if (Y_f32)  *(float2 *)(Y_f32 + off) = make_float2(v0, v1);
+          if (Y_bf16) *(uint32_t *)(Y_bf16 + off) = ops_pack_bf16x2(v0, v1);
+        } else {
+          if (Y_f32) { Y_f32[off] = v0; if (col1_ok) Y_f32[off + 1] = v1; }
+          if (Y_bf16) { Y_bf16[off] = ops_f32_to_bf16(v0); if (col1_ok) Y_bf16[off + 1] = ops_f32_to_bf16(v1); }
+        }
+      }
+    }
+  }
+}
+
+// High-occupancy BM=64xBN=64xBK=64 fallback for smaller M/N matrices
+__global__ void __launch_bounds__(128) k_ops_gemm_q8g64_64(
+    const int8_t *__restrict__ X, const float *__restrict__ x_sc,
+    const int8_t *__restrict__ W, const float *__restrict__ w_sc,
+    const float *__restrict__ bias,
+    float *__restrict__ Y_f32, uint16_t *__restrict__ Y_bf16,
+    int M, int N, int K) {
+  constexpr int BM = 64, BN = 64, BK = 64, STRIDE = 80;
+  __shared__ __align__(16) int8_t sX[BM * STRIDE];
+  __shared__ __align__(16) int8_t sW[BN * STRIDE];
+  __shared__ float sXS[BM];
+  __shared__ float sWS[BN];
+
+  const int tid  = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g    = lane >> 2;
+  const int t    = lane & 3;
+  const int wm   = (warp >> 1) * 32;
+  const int wn   = (warp & 1)  * 32;
+  const int m0   = blockIdx.y * BM;
+  const int n0   = blockIdx.x * BN;
+  const int n_groups = K >> 6;
+
+  float acc[2][4][4];
+  #pragma unroll
+  for (int mi = 0; mi < 2; mi++)
+    #pragma unroll
+    for (int ni = 0; ni < 4; ni++)
+      acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
+
+  for (int kb = 0; kb < K; kb += BK) {
+    const int grp = kb >> 6;
+    #pragma unroll
+    for (int iter = 0; iter < 2; iter++) {
+      const int idx = tid + iter * 128;
+      const int r = idx >> 2, c = (idx & 3) * 16;
+      uint4 vx = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
+      if (m0 + r < M) vx = *(const uint4 *)(X + (long)(m0 + r) * K + kb + c);
+      if (n0 + r < N) vw = *(const uint4 *)(W + (long)(n0 + r) * K + kb + c);
+      *(uint4 *)(sX + r * STRIDE + c) = vx;
+      *(uint4 *)(sW + r * STRIDE + c) = vw;
+    }
+    if (tid < 64) {
+      sXS[tid] = (m0 + tid < M) ? x_sc[(long)(m0 + tid) * n_groups + grp] : 0.0f;
+    } else {
+      const int nr = tid - 64;
+      sWS[nr] = (n0 + nr < N) ? w_sc[(long)(n0 + nr) * n_groups + grp] : 0.0f;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+      int32_t tile[4][4];
+      #pragma unroll
+      for (int ni = 0; ni < 4; ni++) tile[ni][0] = tile[ni][1] = tile[ni][2] = tile[ni][3] = 0;
+      #pragma unroll
+      for (int ks = 0; ks < 2; ks++) {
+        const int ko = ks * 32;
+        const int8_t *xr0 = sX + (wm + mi * 16 + g) * STRIDE + ko;
+        const int8_t *xr8 = xr0 + 8 * STRIDE;
+        const uint32_t af[4] = {
+          *(const uint32_t *)(xr0 + 4 * t),
+          *(const uint32_t *)(xr8 + 4 * t),
+          *(const uint32_t *)(xr0 + 16 + 4 * t),
+          *(const uint32_t *)(xr8 + 16 + 4 * t),
+        };
+        #pragma unroll
+        for (int ni = 0; ni < 4; ni++) {
+          const int8_t *wr = sW + (wn + ni * 8 + g) * STRIDE + ko;
+          ops_mma_s8(tile[ni], af, *(const uint32_t *)(wr + 4 * t), *(const uint32_t *)(wr + 16 + 4 * t));
+        }
+      }
+      const float sx0 = sXS[wm + mi * 16 + g];
+      const float sx1 = sXS[wm + mi * 16 + g + 8];
+      #pragma unroll
+      for (int ni = 0; ni < 4; ni++) {
+        const float sw0 = sWS[wn + ni * 8 + 2 * t + 0];
+        const float sw1 = sWS[wn + ni * 8 + 2 * t + 1];
+        acc[mi][ni][0] = fmaf((float)tile[ni][0], sx0 * sw0, acc[mi][ni][0]);
+        acc[mi][ni][1] = fmaf((float)tile[ni][1], sx0 * sw1, acc[mi][ni][1]);
+        acc[mi][ni][2] = fmaf((float)tile[ni][2], sx1 * sw0, acc[mi][ni][2]);
+        acc[mi][ni][3] = fmaf((float)tile[ni][3], sx1 * sw1, acc[mi][ni][3]);
+      }
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int ni = 0; ni < 4; ni++) {
+    const int col = n0 + wn + ni * 8 + 2 * t;
+    if (col >= N) continue;
+    const bool col1_ok = (col + 1 < N);
+    const float b0 = bias ? bias[col] : 0.0f;
+    const float b1 = (bias && col1_ok) ? bias[col + 1] : 0.0f;
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+      #pragma unroll
+      for (int h8 = 0; h8 < 2; h8++) {
+        const int r = m0 + wm + mi * 16 + g + 8 * h8;
+        if (r >= M) continue;
+        const float v0 = acc[mi][ni][2 * h8 + 0] + b0;
+        const float v1 = acc[mi][ni][2 * h8 + 1] + b1;
+        const long off = (long)r * N + col;
+        if (Y_f32) { Y_f32[off] = v0; if (col1_ok) Y_f32[off + 1] = v1; }
+        if (Y_bf16) { Y_bf16[off] = ops_f32_to_bf16(v0); if (col1_ok) Y_bf16[off + 1] = ops_f32_to_bf16(v1); }
+      }
+    }
+  }
+}
+
+extern "C" int ec_ops_gemm_q8g64(
+    const int8_t *X_q8, const float *x_sc,
+    const int8_t *W_q8, const float *w_sc,
+    const float *bias, float *Y_f32, uint16_t *Y_bf16,
+    int M, int N, int K, cudaStream_t stream) {
+  if (!X_q8 || !x_sc || !W_q8 || !w_sc || M <= 0 || N <= 0 || K <= 0 || (K & 63) != 0) return -1;
+  const int tiles128 = ((M + 127) / 128) * ((N + 127) / 128);
+  const bool aligned = ((((uintptr_t)X_q8 | (uintptr_t)W_q8) & 15u) == 0);
+  if (aligned && M >= 64 && N >= 64 && tiles128 >= 32) {
+    dim3 grd((N + 127) / 128, (M + 127) / 128);
+    k_ops_gemm_q8g64_128<<<grd, 256, 0, stream>>>(X_q8, x_sc, W_q8, w_sc, bias, Y_f32, Y_bf16, M, N, K);
+  } else {
+    dim3 grd((N + 63) / 64, (M + 63) / 64);
+    k_ops_gemm_q8g64_64<<<grd, 128, 0, stream>>>(X_q8, x_sc, W_q8, w_sc, bias, Y_f32, Y_bf16, M, N, K);
+  }
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+// ===========================================================================
+// 5. Implicit-GEMM NHWC 3x3 (pad=1, stride=1) BF16 TensorCore Conv2D
+//    Zero im2col global traffic, zero CHW<->HWC transposes, fused bias + residual!
+// ===========================================================================
+__global__ void __launch_bounds__(256, 2) k_ops_conv3x3_nhwc_bf16_128(
+    const uint16_t *__restrict__ X_nhwc, const uint16_t *__restrict__ W_ohwi,
+    const float *__restrict__ bias, const float *__restrict__ res_f32,
+    float *__restrict__ Y_f32, uint16_t *__restrict__ Y_bf16,
+    int H, int W, int Cin, int Cout) {
+  constexpr int BM = 128, BN = 128, BK = 32, STRIDE = 40;
+  __shared__ __align__(16) uint16_t sX[2][BM * STRIDE];
+  __shared__ __align__(16) uint16_t sW[2][BN * STRIDE];
+
+  const int M = H * W;
+  const int K = 9 * Cin;
+  const int n_tiles = gridDim.x;
+  const int m_tiles = gridDim.y;
+  const int lin = blockIdx.y * n_tiles + blockIdx.x;
+  constexpr int GRP = 8;
+  const int tiles_per_grp = GRP * n_tiles;
+  const int grp_id = lin / tiles_per_grp;
+  const int first_m = grp_id * GRP;
+  const int grp_m = (m_tiles - first_m < GRP) ? (m_tiles - first_m) : GRP;
+  const int in_grp = lin % tiles_per_grp;
+  const int m0 = (first_m + (in_grp % grp_m)) * BM;
+  const int n0 = (in_grp / grp_m) * BN;
+
+  const int tid  = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g    = lane >> 2;
+  const int t    = lane & 3;
+  const int wm   = (warp >> 1) * 32;
+  const int wn   = (warp & 1)  * 64;
+
+  float acc[2][8][4];
+  #pragma unroll
+  for (int mi = 0; mi < 2; mi++)
+    #pragma unroll
+    for (int ni = 0; ni < 8; ni++)
+      acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
+
+  const int r0 = tid >> 2,         c0 = (tid & 3) * 8;
+  const int r1 = (tid + 256) >> 2, c1 = ((tid + 256) & 3) * 8;
+  const int gm0 = m0 + r0, gm1 = m0 + r1;
+  const int gn0 = n0 + r0, gn1 = n0 + r1;
+  const int oy0 = gm0 / W, ox0 = gm0 - oy0 * W;
+  const int oy1 = gm1 / W, ox1 = gm1 - oy1 * W;
+
+  // Prologue: kb = 0 -> tap = 0 -> (dy=-1, dx=-1, ci_base=0)
+  {
+    const int iy0 = oy0 - 1, ix0 = ox0 - 1;
+    const int iy1 = oy1 - 1, ix1 = ox1 - 1;
+    const int px0 = (gm0 < M) && ((unsigned)iy0 < (unsigned)H) && ((unsigned)ix0 < (unsigned)W);
+    const int px1 = (gm1 < M) && ((unsigned)iy1 < (unsigned)H) && ((unsigned)ix1 < (unsigned)W);
+    const int pw0 = (gn0 < Cout);
+    const int pw1 = (gn1 < Cout);
+    ops_cp_async_16(sX[0] + r0 * STRIDE + c0, px0 ? (X_nhwc + ((long)(iy0 * W + ix0) * Cin + c0)) : X_nhwc, px0);
+    ops_cp_async_16(sX[0] + r1 * STRIDE + c1, px1 ? (X_nhwc + ((long)(iy1 * W + ix1) * Cin + c1)) : X_nhwc, px1);
+    ops_cp_async_16(sW[0] + r0 * STRIDE + c0, pw0 ? (W_ohwi + (long)gn0 * K + c0) : W_ohwi, pw0);
+    ops_cp_async_16(sW[0] + r1 * STRIDE + c1, pw1 ? (W_ohwi + (long)gn1 * K + c1) : W_ohwi, pw1);
+    ops_cp_async_commit();
+  }
+
+  int cur = 0;
+  for (int kb = 0; kb < K; kb += BK) {
+    const int k_next = kb + BK;
+    const int has_next = (k_next < K);
+    const int nxt = cur ^ 1;
+
+    if (has_next) {
+      const int tap = k_next / Cin;
+      const int ci_base = k_next - tap * Cin;
+      const int dy = (tap / 3) - 1;
+      const int dx = (tap % 3) - 1;
+      const int iy0 = oy0 + dy, ix0 = ox0 + dx;
+      const int iy1 = oy1 + dy, ix1 = ox1 + dx;
+      const int px0 = (gm0 < M) && ((unsigned)iy0 < (unsigned)H) && ((unsigned)ix0 < (unsigned)W);
+      const int px1 = (gm1 < M) && ((unsigned)iy1 < (unsigned)H) && ((unsigned)ix1 < (unsigned)W);
+      const int pw0 = (gn0 < Cout);
+      const int pw1 = (gn1 < Cout);
+      ops_cp_async_16(sX[nxt] + r0 * STRIDE + c0, px0 ? (X_nhwc + ((long)(iy0 * W + ix0) * Cin + ci_base + c0)) : X_nhwc, px0);
+      ops_cp_async_16(sX[nxt] + r1 * STRIDE + c1, px1 ? (X_nhwc + ((long)(iy1 * W + ix1) * Cin + ci_base + c1)) : X_nhwc, px1);
+      ops_cp_async_16(sW[nxt] + r0 * STRIDE + c0, pw0 ? (W_ohwi + (long)gn0 * K + k_next + c0) : W_ohwi, pw0);
+      ops_cp_async_16(sW[nxt] + r1 * STRIDE + c1, pw1 ? (W_ohwi + (long)gn1 * K + k_next + c1) : W_ohwi, pw1);
+      ops_cp_async_commit();
+      ops_cp_async_wait<1>();
+    } else {
+      ops_cp_async_wait<0>();
+    }
+    __syncthreads();
+
+    const uint16_t *curX = sX[cur];
+    const uint16_t *curW = sW[cur];
+
+    #pragma unroll
+    for (int ks = 0; ks < 2; ks++) {
+      const int ko = ks * 16;
+      uint32_t a_frag[2][4];
+      #pragma unroll
+      for (int mi = 0; mi < 2; mi++) {
+        const uint16_t *xr0 = curX + (wm + mi * 16 + g) * STRIDE + ko;
+        const uint16_t *xr8 = xr0 + 8 * STRIDE;
+        a_frag[mi][0] = *(const uint32_t *)(xr0 + 2 * t);
+        a_frag[mi][1] = *(const uint32_t *)(xr8 + 2 * t);
+        a_frag[mi][2] = *(const uint32_t *)(xr0 + 8 + 2 * t);
+        a_frag[mi][3] = *(const uint32_t *)(xr8 + 8 + 2 * t);
+      }
+      #pragma unroll
+      for (int ni = 0; ni < 8; ni++) {
+        const uint16_t *wr = curW + (wn + ni * 8 + g) * STRIDE + ko;
+        const uint32_t b0 = *(const uint32_t *)(wr + 2 * t);
+        const uint32_t b1 = *(const uint32_t *)(wr + 8 + 2 * t);
+        ops_mma_bf16(acc[0][ni], a_frag[0], b0, b1);
+        ops_mma_bf16(acc[1][ni], a_frag[1], b0, b1);
+      }
+    }
+    __syncthreads();
+    cur = nxt;
+  }
+
+  #pragma unroll
+  for (int ni = 0; ni < 8; ni++) {
+    const int col = n0 + wn + ni * 8 + 2 * t;
+    if (col >= Cout) continue;
+    const bool col1_ok = (col + 1 < Cout);
+    const float b0 = bias ? bias[col] : 0.0f;
+    const float b1 = (bias && col1_ok) ? bias[col + 1] : 0.0f;
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+      #pragma unroll
+      for (int h8 = 0; h8 < 2; h8++) {
+        const int r = m0 + wm + mi * 16 + g + 8 * h8;
+        if (r >= M) continue;
+        const long off = (long)r * Cout + col;
+        float v0 = acc[mi][ni][2 * h8 + 0] + b0;
+        float v1 = acc[mi][ni][2 * h8 + 1] + b1;
+        if (res_f32) {
+          v0 += res_f32[off];
+          if (col1_ok) v1 += res_f32[off + 1];
+        }
+        if (col1_ok && ((Cout & 1) == 0)) {
+          if (Y_f32)  *(float2 *)(Y_f32 + off) = make_float2(v0, v1);
+          if (Y_bf16) *(uint32_t *)(Y_bf16 + off) = ops_pack_bf16x2(v0, v1);
+        } else {
+          if (Y_f32) { Y_f32[off] = v0; if (col1_ok) Y_f32[off + 1] = v1; }
+          if (Y_bf16) { Y_bf16[off] = ops_f32_to_bf16(v0); if (col1_ok) Y_bf16[off + 1] = ops_f32_to_bf16(v1); }
+        }
+      }
+    }
+  }
+}
+
+extern "C" int ec_ops_conv2d_3x3_nhwc_bf16(
+    const uint16_t *X_nhwc, const uint16_t *W_ohwi,
+    const float *bias, const float *res_f32,
+    float *Y_f32, uint16_t *Y_bf16,
+    int H, int W, int Cin, int Cout, cudaStream_t stream) {
+  if (!X_nhwc || !W_ohwi || H <= 0 || W <= 0 || (Cin & 31) != 0 || (Cout & 63) != 0) return -1;
+  const int M = H * W;
+  dim3 grd((Cout + 127) / 128, (M + 127) / 128);
+  k_ops_conv3x3_nhwc_bf16_128<<<grd, 256, 0, stream>>>(
+      X_nhwc, W_ohwi, bias, res_f32, Y_f32, Y_bf16, H, W, Cin, Cout);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

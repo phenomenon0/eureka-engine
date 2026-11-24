@@ -445,6 +445,7 @@ extern "C" int ec_studio_gen_image_v8(
     freq.mask_gray = mask_gray;
     freq.denoise = req->denoise;
     freq.tile_upscale = req->tile_upscale;
+    freq.tier = req->tier;
 
     uint64_t tag = hash_prompt_seed(req->prompt, req->seed);
     if (init_rgb) tag ^= 0x12101210ULL;

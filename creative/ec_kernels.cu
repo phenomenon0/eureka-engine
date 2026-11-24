@@ -967,6 +967,186 @@ __global__ void __launch_bounds__(128) k_sage_attn_i8(
   }
 }
 
+// High-Throughput BM=128 (8-warp) cp.async + ldmatrix.trans SageAttention-I8 for D=128 bidirectional DiT
+// Cuts K/V global bandwidth 2x and eliminates 16-way shared-memory sVt scatter bank conflicts!
+__global__ void __launch_bounds__(256) k_sage_attn_i8_d128_bm128(
+    const int8_t *__restrict__ Qi, const float *__restrict__ Qs,
+    const int8_t *__restrict__ Ki, const float *__restrict__ Ks,
+    const __half *__restrict__ V,
+    float *__restrict__ O, __half *__restrict__ O_f16,
+    int n_q, int n_kv, int n_q_pad, int n_kv_pad,
+    int n_heads, float scale) {
+  constexpr int D = 128, KC8 = 4, DT = 16, LK8 = 144, LV_ROW = 136;
+  __shared__ __align__(16) int8_t sK8[64 * LK8];
+  __shared__ __align__(16) __half sV[64 * LV_ROW];
+  __shared__ float sKsc[64];
+
+  const int hh   = blockIdx.y;
+  const int tid  = threadIdx.x;
+  const int warp = tid >> 5;   // 0..7 -> 128 query rows per CTA!
+  const int lane = tid & 31;
+  const int g    = lane >> 2;
+  const int t    = lane & 3;
+  const int qr   = blockIdx.x * 128 + warp * 16;
+  const int E    = n_heads * D;
+
+  const int8_t *qg  = Qi + (long)hh * n_q_pad * D;
+  const float  *qsg = Qs + (long)hh * n_q_pad;
+  const int8_t *kg  = Ki + (long)hh * n_kv_pad * D;
+  const float  *ksg = Ks + (long)hh * n_kv_pad;
+  const __half *vg  = V  + (long)hh * n_kv_pad * D;
+
+  const int r0 = min(qr + g,     n_q_pad - 1);
+  const int r8 = min(qr + g + 8, n_q_pad - 1);
+  const float qs0 = (qr + g < n_q)     ? (qsg[r0] * scale) : 0.0f;
+  const float qs1 = (qr + g + 8 < n_q) ? (qsg[r8] * scale) : 0.0f;
+
+  uint32_t qa[KC8][4];
+  {
+    const int8_t *q0p = qg + (long)r0 * D;
+    const int8_t *q8p = qg + (long)r8 * D;
+    #pragma unroll
+    for (int kc = 0; kc < KC8; kc++) {
+      qa[kc][0] = *(const uint32_t *)(q0p + kc * 32 + 4 * t);
+      qa[kc][1] = *(const uint32_t *)(q8p + kc * 32 + 4 * t);
+      qa[kc][2] = *(const uint32_t *)(q0p + kc * 32 + 16 + 4 * t);
+      qa[kc][3] = *(const uint32_t *)(q8p + kc * 32 + 16 + 4 * t);
+    }
+  }
+
+  float o[DT][4];
+  #pragma unroll
+  for (int dt = 0; dt < DT; dt++) o[dt][0] = o[dt][1] = o[dt][2] = o[dt][3] = 0.0f;
+  float M0 = -FLT_MAX * 0.5f, M1 = -FLT_MAX * 0.5f, l0 = 0.0f, l1 = 0.0f;
+
+  // 256 threads load K_i8 [64, 128] = 8192B -> 2 uint4s (32B) per thread!
+  const int kr0 = tid >> 3,         kc0 = (tid & 7) * 16;
+  const int kr1 = (tid + 256) >> 3, kc1 = ((tid + 256) & 7) * 16;
+  // 256 threads load V_f16 [64, 128] = 16384B -> 4 uint4s (64B) per thread!
+
+  for (int kb = 0; kb < n_kv; kb += 64) {
+    __syncthreads();
+    {
+      const int pk0 = (kb + kr0 < n_kv) ? 16 : 0;
+      const int pk1 = (kb + kr1 < n_kv) ? 16 : 0;
+      uint32_t sk0 = static_cast<uint32_t>(__cvta_generic_to_shared(sK8 + kr0 * LK8 + kc0));
+      uint32_t sk1 = static_cast<uint32_t>(__cvta_generic_to_shared(sK8 + kr1 * LK8 + kc1));
+      const void *gk0 = pk0 ? (const void *)(kg + (long)(kb + kr0) * D + kc0) : (const void *)kg;
+      const void *gk1 = pk1 ? (const void *)(kg + (long)(kb + kr1) * D + kc1) : (const void *)kg;
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sk0), "l"(gk0), "r"(pk0) : "memory");
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sk1), "l"(gk1), "r"(pk1) : "memory");
+
+      #pragma unroll
+      for (int vi = 0; vi < 4; vi++) {
+        const int vidx = tid + vi * 256; // 0..1023 -> 64 rows x 16 chunks of 8 halfs (16B)
+        const int vr = vidx >> 4;
+        const int vc = (vidx & 15) * 8;
+        const int pv = (kb + vr < n_kv) ? 16 : 0;
+        uint32_t sv = static_cast<uint32_t>(__cvta_generic_to_shared(sV + vr * LV_ROW + vc));
+        const void *gv = pv ? (const void *)(vg + (long)(kb + vr) * D + vc) : (const void *)vg;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sv), "l"(gv), "r"(pv) : "memory");
+      }
+      if (tid < 64) {
+        sKsc[tid] = (kb + tid < n_kv) ? ksg[kb + tid] : 0.0f;
+      }
+      asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    float s[8][4];
+    float mx0 = -INFINITY, mx1 = -INFINITY;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+      int32_t si[4] = {0, 0, 0, 0};
+      const int8_t *kr = sK8 + (nt * 8 + g) * LK8 + 4 * t;
+      #pragma unroll
+      for (int kc = 0; kc < KC8; kc++) {
+        ec_mma_s8(si, qa[kc], *(const uint32_t *)(kr + kc * 32), *(const uint32_t *)(kr + kc * 32 + 16));
+      }
+      #pragma unroll
+      for (int j = 0; j < 2; j++) {
+        const int kl = nt * 8 + 2 * t + j;
+        const int kidx = kb + kl;
+        const float ksc = sKsc[kl];
+        s[nt][j]     = (kidx < n_kv) ? ((float)si[j]     * qs0 * ksc) : -INFINITY;
+        s[nt][2 + j] = (kidx < n_kv) ? ((float)si[2 + j] * qs1 * ksc) : -INFINITY;
+        mx0 = fmaxf(mx0, s[nt][j]);
+        mx1 = fmaxf(mx1, s[nt][2 + j]);
+      }
+    }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+
+    const float Mn0 = fmaxf(M0, mx0), Mn1 = fmaxf(M1, mx1);
+    const float ms0 = (Mn0 > -1e30f) ? expf(M0 - Mn0) : 0.0f;
+    const float ms1 = (Mn1 > -1e30f) ? expf(M1 - Mn1) : 0.0f;
+    float sum0 = 0.0f, sum1 = 0.0f;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+      #pragma unroll
+      for (int j = 0; j < 2; j++) {
+        s[nt][j]     = (s[nt][j] > -1e30f)     ? expf(s[nt][j] - Mn0)     : 0.0f;
+        s[nt][2 + j] = (s[nt][2 + j] > -1e30f) ? expf(s[nt][2 + j] - Mn1) : 0.0f;
+        sum0 += s[nt][j];
+        sum1 += s[nt][2 + j];
+      }
+    }
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
+
+    l0 = l0 * ms0 + sum0; l1 = l1 * ms1 + sum1;
+    M0 = Mn0; M1 = Mn1;
+    #pragma unroll
+    for (int dt = 0; dt < DT; dt++) {
+      o[dt][0] *= ms0; o[dt][1] *= ms0;
+      o[dt][2] *= ms1; o[dt][3] *= ms1;
+    }
+
+    const int ldm_r = lane & 15;
+    #pragma unroll
+    for (int kc = 0; kc < 4; kc++) {
+      const uint32_t pa[4] = {
+        ec_pack_h2(s[2 * kc][0],     s[2 * kc][1]),
+        ec_pack_h2(s[2 * kc][2],     s[2 * kc][3]),
+        ec_pack_h2(s[2 * kc + 1][0], s[2 * kc + 1][1]),
+        ec_pack_h2(s[2 * kc + 1][2], s[2 * kc + 1][3]),
+      };
+      const __half *v_row = sV + (kc * 16 + ldm_r) * LV_ROW;
+      #pragma unroll
+      for (int dt = 0; dt < DT; dt++) {
+        uint32_t vb0, vb1;
+        uint32_t sm_v = static_cast<uint32_t>(__cvta_generic_to_shared(v_row + dt * 8));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+                     : "=r"(vb0), "=r"(vb1) : "r"(sm_v));
+        ec_mma_f16(o[dt], pa, vb0, vb1);
+      }
+    }
+  }
+
+  const float inv0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f;
+  const float inv1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
+  #pragma unroll
+  for (int half8 = 0; half8 < 2; half8++) {
+    const int q = qr + g + 8 * half8;
+    if (q >= n_q) continue;
+    const float inv = half8 ? inv1 : inv0;
+    float *d = O + (long)q * E + hh * D;
+    __half *dq = O_f16 ? (O_f16 + (long)q * E + hh * D) : nullptr;
+    #pragma unroll
+    for (int dt = 0; dt < DT; dt++) {
+      const float v0 = o[dt][2 * half8] * inv;
+      const float v1 = o[dt][2 * half8 + 1] * inv;
+      const int col = dt * 8 + 2 * t;
+      *(float2 *)(d + col) = make_float2(v0, v1);
+      if (dq) *(__half2 *)(dq + col) = __floats2half2_rn(v0, v1);
+    }
+  }
+}
+
 extern "C" int ec_launch_sage_attn_i8(
     const __half *Q, const __half *K, const __half *V,
     int8_t *q_i8, int8_t *k_i8, float *q_sc, float *k_sc,
@@ -980,10 +1160,14 @@ extern "C" int ec_launch_sage_attn_i8(
   k_quant_rows_i8<<<(rows_q + 7) / 8, 256, 0, stream>>>(Q, q_i8, q_sc, rows_q, head_dim);
   k_quant_rows_i8<<<(rows_k + 7) / 8, 256, 0, stream>>>(K, k_i8, k_sc, rows_k, head_dim);
 
-  dim3 grd((n_q + 63) / 64, n_heads);
   if (head_dim == 64) {
+    dim3 grd((n_q + 63) / 64, n_heads);
     k_sage_attn_i8<64><<<grd, 128, 0, stream>>>(q_i8, q_sc, k_i8, k_sc, V, O, O_f16, n_q, n_kv, n_q_pad, n_kv_pad, n_heads, scale, block_causal_size);
+  } else if (head_dim == 128 && block_causal_size <= 0) {
+    dim3 grd((n_q + 127) / 128, n_heads);
+    k_sage_attn_i8_d128_bm128<<<grd, 256, 0, stream>>>(q_i8, q_sc, k_i8, k_sc, V, O, O_f16, n_q, n_kv, n_q_pad, n_kv_pad, n_heads, scale);
   } else if (head_dim == 128) {
+    dim3 grd((n_q + 63) / 64, n_heads);
     k_sage_attn_i8<128><<<grd, 128, 0, stream>>>(q_i8, q_sc, k_i8, k_sc, V, O, O_f16, n_q, n_kv, n_q_pad, n_kv_pad, n_heads, scale, block_causal_size);
   } else {
     return -2;
