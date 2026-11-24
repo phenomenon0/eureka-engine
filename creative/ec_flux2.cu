@@ -674,6 +674,9 @@ typedef struct {
   char ckpt_path[512];
   char lora_sig[1024];
   int  lora_hits;
+  ec_lora_spec_t active_loras[EC_LORA_MAX_STACK];
+  int  active_n_loras;
+  int  delta_swaps;
 
   uint16_t *img_in, *txt_in, *time_in0, *time_in1;
   uint16_t *mod_img, *mod_txt, *mod_sng;
@@ -681,6 +684,23 @@ typedef struct {
   fx_double_w_t dbl[5];
   fx_single_w_t sng[20];
 } fx_dit_resident_t;
+
+typedef struct {
+  char  name[96];
+  void *ptr;
+  int   is_f32;
+} fx_vae_tensor_t;
+
+typedef struct {
+  fx_vae_tensor_t tensors[320];
+  int             n_tensors;
+  uint16_t       *col_bf;
+  size_t          col_cap;
+  float          *gy_d;
+  size_t          gy_cap;
+  float          *res_tmp[3];
+  size_t          res_cap[3];
+} fx_vae_cache_t;
 
 typedef struct {
   int loaded;
@@ -698,6 +718,7 @@ struct ec_flux2 {
 
   fx_dit_resident_t   dit;
   fx_qwen3_resident_t qwen_res;
+  fx_vae_cache_t      vae_cache;
 
   // Cached prompt embedding [512 * 7680] BF16 on host RAM + persistent Cowrie SHA-NI StatePage
   char      cached_prompt[1024];
@@ -705,6 +726,75 @@ struct ec_flux2 {
   int       has_cached_prompt;
   char      te_sha[65];
 };
+
+static void free_vae_cache(fx_vae_cache_t *vc) {
+  if (!vc) return;
+  for (int i = 0; i < vc->n_tensors; i++) {
+    if (vc->tensors[i].ptr) cudaFree(vc->tensors[i].ptr);
+  }
+  if (vc->col_bf) cudaFree(vc->col_bf);
+  if (vc->gy_d)   cudaFree(vc->gy_d);
+  for (int i = 0; i < 3; i++) if (vc->res_tmp[i]) cudaFree(vc->res_tmp[i]);
+  memset(vc, 0, sizeof *vc);
+}
+
+static uint16_t *get_vae_bf16(ec_flux2_t *fx, const char *name) {
+  fx_vae_cache_t *vc = &fx->vae_cache;
+  for (int i = 0; i < vc->n_tensors; i++) {
+    if (!vc->tensors[i].is_f32 && strcmp(vc->tensors[i].name, name) == 0)
+      return (uint16_t *)vc->tensors[i].ptr;
+  }
+  uint16_t *d = load_bf16_gpu(&fx->vae_st, name, NULL, fx->stream);
+  if (d && vc->n_tensors < 320) {
+    snprintf(vc->tensors[vc->n_tensors].name, sizeof vc->tensors[0].name, "%s", name);
+    vc->tensors[vc->n_tensors].ptr = d;
+    vc->tensors[vc->n_tensors].is_f32 = 0;
+    vc->n_tensors++;
+  }
+  return d;
+}
+
+static float *get_vae_f32(ec_flux2_t *fx, const char *name) {
+  fx_vae_cache_t *vc = &fx->vae_cache;
+  for (int i = 0; i < vc->n_tensors; i++) {
+    if (vc->tensors[i].is_f32 && strcmp(vc->tensors[i].name, name) == 0)
+      return (float *)vc->tensors[i].ptr;
+  }
+  float *d = load_f32_gpu(&fx->vae_st, name, NULL, fx->stream);
+  if (d && vc->n_tensors < 320) {
+    snprintf(vc->tensors[vc->n_tensors].name, sizeof vc->tensors[0].name, "%s", name);
+    vc->tensors[vc->n_tensors].ptr = d;
+    vc->tensors[vc->n_tensors].is_f32 = 1;
+    vc->n_tensors++;
+  }
+  return d;
+}
+
+static int ensure_vae_conv_scratch(fx_vae_cache_t *vc, size_t col_bytes, size_t gy_bytes) {
+  if (col_bytes > vc->col_cap) {
+    if (vc->col_bf) cudaFree(vc->col_bf);
+    vc->col_bf = NULL; vc->col_cap = 0;
+    if (cudaMalloc(&vc->col_bf, col_bytes) != cudaSuccess) return -1;
+    vc->col_cap = col_bytes;
+  }
+  if (gy_bytes > vc->gy_cap) {
+    if (vc->gy_d) cudaFree(vc->gy_d);
+    vc->gy_d = NULL; vc->gy_cap = 0;
+    if (cudaMalloc(&vc->gy_d, gy_bytes) != cudaSuccess) return -1;
+    vc->gy_cap = gy_bytes;
+  }
+  return 0;
+}
+
+static float *ensure_vae_res_slot(fx_vae_cache_t *vc, int slot, size_t bytes) {
+  if (bytes > vc->res_cap[slot]) {
+    if (vc->res_tmp[slot]) cudaFree(vc->res_tmp[slot]);
+    vc->res_tmp[slot] = NULL; vc->res_cap[slot] = 0;
+    if (cudaMalloc(&vc->res_tmp[slot], bytes) != cudaSuccess) return NULL;
+    vc->res_cap[slot] = bytes;
+  }
+  return vc->res_tmp[slot];
+}
 
 static void free_qwen3_resident(fx_qwen3_resident_t *q) {
   if (!q || !q->loaded) return;
@@ -787,14 +877,81 @@ static void build_lora_sig(const ec_lora_spec_t *loras, int n, char *out, size_t
   }
 }
 
-static int ensure_dit_loaded(
+static void apply_lora_stack_to_resident_dit(
+    fx_dit_resident_t *d, const ec_lora_spec_t *stack, int n_stack,
+    ec_lora_apply_stats_t *stats, cudaStream_t s) {
+  if (!stack || n_stack <= 0) return;
+  ec_lora_fuse_onto_bf16(d->img_in,    3072,  128, "img_in.weight",    stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->txt_in,    3072, 7680, "txt_in.weight",    stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->time_in0,  3072,  256, "time_in.in_layer.weight",  stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->time_in1,  3072, 3072, "time_in.out_layer.weight", stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->mod_img,  18432, 3072, "double_stream_modulation_img.lin.weight", stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->mod_txt,  18432, 3072, "double_stream_modulation_txt.lin.weight", stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->mod_sng,   9216, 3072, "single_stream_modulation.lin.weight",      stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->final_mod, 6144, 3072, "final_layer.adaLN_modulation.1.weight",    stack, n_stack, stats, s);
+  ec_lora_fuse_onto_bf16(d->final_lin,  128, 3072, "final_layer.linear.weight",                 stack, n_stack, stats, s);
+  char k[160];
+  for (int i = 0; i < 5; i++) {
+    snprintf(k, sizeof k, "double_blocks.%d.img_attn.qkv.weight", i);  ec_lora_fuse_onto_bf16(d->dbl[i].img_qkv,  9216, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "double_blocks.%d.img_attn.proj.weight", i); ec_lora_fuse_onto_bf16(d->dbl[i].img_proj, 3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "double_blocks.%d.img_mlp.0.weight", i);     ec_lora_fuse_onto_bf16(d->dbl[i].img_mlp0,18432, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "double_blocks.%d.img_mlp.2.weight", i);     ec_lora_fuse_onto_bf16(d->dbl[i].img_mlp2, 3072, 9216, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "double_blocks.%d.txt_attn.qkv.weight", i);  ec_lora_fuse_onto_bf16(d->dbl[i].txt_qkv,  9216, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "double_blocks.%d.txt_attn.proj.weight", i); ec_lora_fuse_onto_bf16(d->dbl[i].txt_proj, 3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "double_blocks.%d.txt_mlp.0.weight", i);     ec_lora_fuse_onto_bf16(d->dbl[i].txt_mlp0,18432, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "double_blocks.%d.txt_mlp.2.weight", i);     ec_lora_fuse_onto_bf16(d->dbl[i].txt_mlp2, 3072, 9216, k, stack, n_stack, stats, s);
+  }
+  for (int i = 0; i < 20; i++) {
+    snprintf(k, sizeof k, "single_blocks.%d.linear1.weight", i); ec_lora_fuse_onto_bf16(d->sng[i].lin1, 27648,  3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "single_blocks.%d.linear2.weight", i); ec_lora_fuse_onto_bf16(d->sng[i].lin2,  3072, 12288, k, stack, n_stack, stats, s);
+  }
+}
+
+static int ensure_dit_loaded_ex(
     ec_flux2_t *fx, const char *ckpt_path,
-    const ec_lora_spec_t *loras, int n_loras, char *err, size_t err_cap) {
+    const ec_lora_spec_t *loras, int n_loras,
+    int *out_delta_used, char *err, size_t err_cap) {
+  if (out_delta_used) *out_delta_used = 0;
+  int clamped_n = (loras && n_loras > 0) ? (n_loras > EC_LORA_MAX_STACK ? EC_LORA_MAX_STACK : n_loras) : 0;
   char lsig[1024];
-  build_lora_sig(loras, n_loras, lsig, sizeof lsig);
+  build_lora_sig(loras, clamped_n, lsig, sizeof lsig);
   if (fx->dit.loaded && strcmp(fx->dit.ckpt_path, ckpt_path) == 0 && strcmp(fx->dit.lora_sig, lsig) == 0) {
+    if (out_delta_used) *out_delta_used = 1;
     return 0;
   }
+
+  // Zero-Reload <8ms GPU BF16 LoRA/QLoRA Delta Unfusing Path:
+  // When base checkpoint is already resident, neither old nor new stack uses nonlinear DoRA row-norm,
+  // and < 16 consecutive delta swaps have accumulated, subtract -prev_stack and add +new_stack in-place!
+  if (fx->dit.loaded && strcmp(fx->dit.ckpt_path, ckpt_path) == 0 &&
+      fx->dit.delta_swaps < 16 &&
+      !ec_lora_stack_has_dora(fx->dit.active_loras, fx->dit.active_n_loras) &&
+      !ec_lora_stack_has_dora(loras, clamped_n)) {
+    fx_dit_resident_t *d = &fx->dit;
+    cudaStream_t s = fx->stream;
+    if (d->active_n_loras > 0) {
+      ec_lora_spec_t neg_prev[EC_LORA_MAX_STACK];
+      for (int i = 0; i < d->active_n_loras; i++) {
+        neg_prev[i] = d->active_loras[i];
+        neg_prev[i].strength = -neg_prev[i].strength;
+      }
+      ec_lora_apply_stats_t undo_st = {};
+      apply_lora_stack_to_resident_dit(d, neg_prev, d->active_n_loras, &undo_st, s);
+    }
+    ec_lora_apply_stats_t lstats = {};
+    if (clamped_n > 0) {
+      apply_lora_stack_to_resident_dit(d, loras, clamped_n, &lstats, s);
+    }
+    cudaStreamSynchronize(s);
+    snprintf(d->lora_sig, sizeof d->lora_sig, "%s", lsig);
+    d->lora_hits = lstats.n_tensors_matched;
+    d->active_n_loras = clamped_n;
+    for (int i = 0; i < clamped_n; i++) d->active_loras[i] = loras[i];
+    d->delta_swaps++;
+    if (out_delta_used) *out_delta_used = 1;
+    return 0;
+  }
+
   free_dit_resident(&fx->dit);
 
   ec_safetensors_t st;
@@ -807,7 +964,7 @@ static int ensure_dit_loaded(
   #define LOAD_W(field, name, out_d, in_d) do { \
     d->field = load_bf16_gpu(&st, name, NULL, s); \
     if (!d->field) { ec_st_close(&st); free_dit_resident(d); snprintf(err, err_cap, "missing %s", name); return -1; } \
-    if (n_loras > 0) ec_lora_fuse_onto_bf16(d->field, (out_d), (in_d), name, loras, n_loras, &lstats, s); \
+    if (clamped_n > 0) ec_lora_fuse_onto_bf16(d->field, (out_d), (in_d), name, loras, clamped_n, &lstats, s); \
   } while (0)
 
   LOAD_W(img_in,    "img_in.weight",    3072, 128);
@@ -848,8 +1005,17 @@ static int ensure_dit_loaded(
   snprintf(d->ckpt_path, sizeof d->ckpt_path, "%s", ckpt_path);
   snprintf(d->lora_sig, sizeof d->lora_sig, "%s", lsig);
   d->lora_hits = lstats.n_tensors_matched;
+  d->active_n_loras = clamped_n;
+  for (int i = 0; i < clamped_n; i++) d->active_loras[i] = loras[i];
+  d->delta_swaps = 0;
   d->loaded = 1;
   return 0;
+}
+
+static int ensure_dit_loaded(
+    ec_flux2_t *fx, const char *ckpt_path,
+    const ec_lora_spec_t *loras, int n_loras, char *err, size_t err_cap) {
+  return ensure_dit_loaded_ex(fx, ckpt_path, loras, n_loras, NULL, err, err_cap);
 }
 
 // ===========================================================================
@@ -1292,23 +1458,22 @@ static int run_flux2_dit(
 // Stage C: AutoencoderKLFlux2 2D VAE Decoder (Strip-Tiled BF16 TensorCore Conv2D)
 // ===========================================================================
 static int vae_conv2d_tc(
-    const ec_safetensors_t *vst, const char *prefix,
+    ec_flux2_t *fx, const char *prefix,
     const float *x_d, const float *res_d, float *y_d,
     int Cin, int Cout, int H, int W, int Ksz, int pad, cudaStream_t s) {
   char kw[160], kb[160];
   snprintf(kw, sizeof kw, "%s.weight", prefix);
   snprintf(kb, sizeof kb, "%s.bias", prefix);
-  uint16_t *w_bf = load_bf16_gpu(vst, kw, NULL, s);
-  float *b_f32 = load_f32_gpu(vst, kb, NULL, s);
-  if (!w_bf || !b_f32) { cudaFree(w_bf); cudaFree(b_f32); return -1; }
+  uint16_t *w_bf = get_vae_bf16(fx, kw);
+  float *b_f32 = get_vae_f32(fx, kb);
+  if (!w_bf || !b_f32) return -1;
 
   int K = Cin * Ksz * Ksz;
   int strip_max = 64;
   if (strip_max > H) strip_max = H;
-  uint16_t *col_bf = NULL;
-  float *gy_d = NULL;
-  cudaMalloc(&col_bf, (size_t)strip_max * W * K * 2);
-  cudaMalloc(&gy_d,   (size_t)strip_max * W * Cout * 4);
+  if (ensure_vae_conv_scratch(&fx->vae_cache, (size_t)strip_max * W * K * 2, (size_t)strip_max * W * Cout * 4) != 0) return -1;
+  uint16_t *col_bf = fx->vae_cache.col_bf;
+  float *gy_d = fx->vae_cache.gy_d;
 
   for (int y0 = 0; y0 < H; y0 += strip_max) {
     int sh = (y0 + strip_max <= H) ? strip_max : (H - y0);
@@ -1318,78 +1483,67 @@ static int vae_conv2d_tc(
     long n_out = (long)Cout * sh * W;
     k_strip_transpose_out<<<(int)((n_out + 255) / 256), 256, 0, s>>>(gy_d, res_d, y_d, Cout, H, W, y0, sh);
   }
-  cudaStreamSynchronize(s);
-  cudaFree(col_bf); cudaFree(gy_d); cudaFree(w_bf); cudaFree(b_f32);
   return 0;
 }
 
 static int vae_gn_silu(
-    const ec_safetensors_t *vst, const char *prefix,
+    ec_flux2_t *fx, const char *prefix,
     const float *x_d, float *y_d, int C, int H, int W, int apply_silu, cudaStream_t s) {
   char kw[160], kb[160];
   snprintf(kw, sizeof kw, "%s.weight", prefix);
   snprintf(kb, sizeof kb, "%s.bias", prefix);
-  float *g = load_f32_gpu(vst, kw, NULL, s);
-  float *b = load_f32_gpu(vst, kb, NULL, s);
-  if (!g || !b) { cudaFree(g); cudaFree(b); return -1; }
+  float *g = get_vae_f32(fx, kw);
+  float *b = get_vae_f32(fx, kb);
+  if (!g || !b) return -1;
   ec_launch_groupnorm_silu(x_d, g, b, y_d, C, H * W, 32, 1e-6f, apply_silu, s);
-  cudaStreamSynchronize(s);
-  cudaFree(g); cudaFree(b);
   return 0;
 }
 
 static int vae_resnet(
-    const ec_safetensors_t *vst, const char *prefix,
+    ec_flux2_t *fx, const char *prefix,
     float *x_d, float *out_d, int Cin, int Cout, int H, int W, cudaStream_t s) {
-  float *tmp1 = NULL, *tmp2 = NULL, *sc = NULL;
-  cudaMalloc(&tmp1, (size_t)Cin * H * W * 4);
-  cudaMalloc(&tmp2, (size_t)Cout * H * W * 4);
+  int maxC = Cin > Cout ? Cin : Cout;
+  float *tmp1 = ensure_vae_res_slot(&fx->vae_cache, 0, (size_t)maxC * H * W * 4);
+  float *tmp2 = ensure_vae_res_slot(&fx->vae_cache, 1, (size_t)Cout * H * W * 4);
+  float *sc   = (Cin != Cout) ? ensure_vae_res_slot(&fx->vae_cache, 2, (size_t)Cout * H * W * 4) : NULL;
+  if (!tmp1 || !tmp2 || (Cin != Cout && !sc)) return -1;
 
   char k[192];
   snprintf(k, sizeof k, "%s.norm1", prefix);
-  if (vae_gn_silu(vst, k, x_d, tmp1, Cin, H, W, 1, s) != 0) goto fail;
+  if (vae_gn_silu(fx, k, x_d, tmp1, Cin, H, W, 1, s) != 0) return -1;
   snprintf(k, sizeof k, "%s.conv1", prefix);
-  if (vae_conv2d_tc(vst, k, tmp1, NULL, tmp2, Cin, Cout, H, W, 3, 1, s) != 0) goto fail;
+  if (vae_conv2d_tc(fx, k, tmp1, NULL, tmp2, Cin, Cout, H, W, 3, 1, s) != 0) return -1;
 
-  cudaFree(tmp1); tmp1 = NULL;
-  cudaMalloc(&tmp1, (size_t)Cout * H * W * 4);
   snprintf(k, sizeof k, "%s.norm2", prefix);
-  if (vae_gn_silu(vst, k, tmp2, tmp1, Cout, H, W, 1, s) != 0) goto fail;
+  if (vae_gn_silu(fx, k, tmp2, tmp1, Cout, H, W, 1, s) != 0) return -1;
 
   if (Cin != Cout) {
-    cudaMalloc(&sc, (size_t)Cout * H * W * 4);
     snprintf(k, sizeof k, "%s.conv_shortcut", prefix);
-    if (vae_conv2d_tc(vst, k, x_d, NULL, sc, Cin, Cout, H, W, 1, 0, s) != 0) goto fail;
+    if (vae_conv2d_tc(fx, k, x_d, NULL, sc, Cin, Cout, H, W, 1, 0, s) != 0) return -1;
   }
   snprintf(k, sizeof k, "%s.conv2", prefix);
-  if (vae_conv2d_tc(vst, k, tmp1, sc ? sc : x_d, out_d, Cout, Cout, H, W, 3, 1, s) != 0) goto fail;
-
-  cudaFree(tmp1); cudaFree(tmp2); cudaFree(sc);
+  if (vae_conv2d_tc(fx, k, tmp1, sc ? sc : x_d, out_d, Cout, Cout, H, W, 3, 1, s) != 0) return -1;
   return 0;
-fail:
-  cudaFree(tmp1); cudaFree(tmp2); cudaFree(sc);
-  return -1;
 }
 
 static int vae_conv2d_s2_tc(
-    const ec_safetensors_t *vst, const char *prefix,
+    ec_flux2_t *fx, const char *prefix,
     const float *x_d, float *y_d,
     int Cin, int Cout, int H_in, int W_in, cudaStream_t s) {
   char kw[160], kb[160];
   snprintf(kw, sizeof kw, "%s.weight", prefix);
   snprintf(kb, sizeof kb, "%s.bias", prefix);
-  uint16_t *w_bf = load_bf16_gpu(vst, kw, NULL, s);
-  float *b_f32 = load_f32_gpu(vst, kb, NULL, s);
-  if (!w_bf || !b_f32) { cudaFree(w_bf); cudaFree(b_f32); return -1; }
+  uint16_t *w_bf = get_vae_bf16(fx, kw);
+  float *b_f32 = get_vae_f32(fx, kb);
+  if (!w_bf || !b_f32) return -1;
 
   int H_out = H_in / 2, W_out = W_in / 2;
   int K = Cin * 9;
   int strip_max = 64;
   if (strip_max > H_out) strip_max = H_out;
-  uint16_t *col_bf = NULL;
-  float *gy_d = NULL;
-  cudaMalloc(&col_bf, (size_t)strip_max * W_out * K * 2);
-  cudaMalloc(&gy_d,   (size_t)strip_max * W_out * Cout * 4);
+  if (ensure_vae_conv_scratch(&fx->vae_cache, (size_t)strip_max * W_out * K * 2, (size_t)strip_max * W_out * Cout * 4) != 0) return -1;
+  uint16_t *col_bf = fx->vae_cache.col_bf;
+  float *gy_d = fx->vae_cache.gy_d;
 
   for (int y0 = 0; y0 < H_out; y0 += strip_max) {
     int sh = (y0 + strip_max <= H_out) ? strip_max : (H_out - y0);
@@ -1399,12 +1553,10 @@ static int vae_conv2d_s2_tc(
     long n_out = (long)Cout * sh * W_out;
     k_strip_transpose_out<<<(int)((n_out + 255) / 256), 256, 0, s>>>(gy_d, NULL, y_d, Cout, H_out, W_out, y0, sh);
   }
-  cudaStreamSynchronize(s);
-  cudaFree(col_bf); cudaFree(gy_d); cudaFree(w_bf); cudaFree(b_f32);
   return 0;
 }
 
-static int vae_mid_attention_ex(const ec_safetensors_t *vst, const char *pfx, float *x_d, int C, int H, int W, cudaStream_t s) {
+static int vae_mid_attention_ex(ec_flux2_t *fx, const char *pfx, float *x_d, int C, int H, int W, cudaStream_t s) {
   int S = H * W;
   float *gn = NULL, *q = NULL, *k = NULL, *v = NULL, *out = NULL;
   uint16_t *sc_bf = NULL, *ao_bf = NULL;
@@ -1418,30 +1570,25 @@ static int vae_mid_attention_ex(const ec_safetensors_t *vst, const char *pfx, fl
 
   char tk[192];
   snprintf(tk, sizeof tk, "%s.group_norm", pfx);
-  if (vae_gn_silu(vst, tk, x_d, gn, C, H, W, 0, s) != 0) goto fail;
+  if (vae_gn_silu(fx, tk, x_d, gn, C, H, W, 0, s) != 0) goto fail;
   k_chw_to_sc_bf16<<<((long)C * S + 255) / 256, 256, 0, s>>>(gn, sc_bf, C, S);
 
   {
-    snprintf(tk, sizeof tk, "%s.to_q.weight", pfx); uint16_t *wq = load_bf16_gpu(vst, tk, NULL, s);
-    snprintf(tk, sizeof tk, "%s.to_q.bias", pfx);   float    *bq = load_f32_gpu(vst,  tk, NULL, s);
-    snprintf(tk, sizeof tk, "%s.to_k.weight", pfx); uint16_t *wk = load_bf16_gpu(vst, tk, NULL, s);
-    snprintf(tk, sizeof tk, "%s.to_k.bias", pfx);   float    *bk = load_f32_gpu(vst,  tk, NULL, s);
-    snprintf(tk, sizeof tk, "%s.to_v.weight", pfx); uint16_t *wv = load_bf16_gpu(vst, tk, NULL, s);
-    snprintf(tk, sizeof tk, "%s.to_v.bias", pfx);   float    *bv = load_f32_gpu(vst,  tk, NULL, s);
-    snprintf(tk, sizeof tk, "%s.to_out.0.weight", pfx); uint16_t *wo = load_bf16_gpu(vst, tk, NULL, s);
-    snprintf(tk, sizeof tk, "%s.to_out.0.bias", pfx);   float    *bo = load_f32_gpu(vst,  tk, NULL, s);
-    if (!wq || !wk || !wv || !wo) {
-      cudaFree(wq); cudaFree(bq); cudaFree(wk); cudaFree(bk); cudaFree(wv); cudaFree(bv); cudaFree(wo); cudaFree(bo);
-      goto fail;
-    }
+    snprintf(tk, sizeof tk, "%s.to_q.weight", pfx); uint16_t *wq = get_vae_bf16(fx, tk);
+    snprintf(tk, sizeof tk, "%s.to_q.bias", pfx);   float    *bq = get_vae_f32(fx,  tk);
+    snprintf(tk, sizeof tk, "%s.to_k.weight", pfx); uint16_t *wk = get_vae_bf16(fx, tk);
+    snprintf(tk, sizeof tk, "%s.to_k.bias", pfx);   float    *bk = get_vae_f32(fx,  tk);
+    snprintf(tk, sizeof tk, "%s.to_v.weight", pfx); uint16_t *wv = get_vae_bf16(fx, tk);
+    snprintf(tk, sizeof tk, "%s.to_v.bias", pfx);   float    *bv = get_vae_f32(fx,  tk);
+    snprintf(tk, sizeof tk, "%s.to_out.0.weight", pfx); uint16_t *wo = get_vae_bf16(fx, tk);
+    snprintf(tk, sizeof tk, "%s.to_out.0.bias", pfx);   float    *bo = get_vae_f32(fx,  tk);
+    if (!wq || !wk || !wv || !wo) goto fail;
     gemm_bf16(sc_bf, wq, bq, q, NULL, S, C, C, s);
     gemm_bf16(sc_bf, wk, bk, k, NULL, S, C, C, s);
     gemm_bf16(sc_bf, wv, bv, v, NULL, S, C, C, s);
     k_vae_mid_attn<<<S, 256, 0, s>>>(q, k, v, ao_bf, S, C, 1.0f / sqrtf((float)C));
     gemm_bf16(ao_bf, wo, bo, out, NULL, S, C, C, s);
     k_sc_add_to_chw<<<((long)C * S + 255) / 256, 256, 0, s>>>(out, x_d, C, S);
-    cudaStreamSynchronize(s);
-    cudaFree(wq); cudaFree(bq); cudaFree(wk); cudaFree(bk); cudaFree(wv); cudaFree(bv); cudaFree(wo); cudaFree(bo);
   }
 
   cudaFree(gn); cudaFree(sc_bf); cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(ao_bf); cudaFree(out);
@@ -1451,8 +1598,8 @@ fail:
   return -1;
 }
 
-static int vae_mid_attention(const ec_safetensors_t *vst, float *x_d, int C, int H, int W, cudaStream_t s) {
-  return vae_mid_attention_ex(vst, "decoder.mid_block.attentions.0", x_d, C, H, W, s);
+static int vae_mid_attention(ec_flux2_t *fx, float *x_d, int C, int H, int W, cudaStream_t s) {
+  return vae_mid_attention_ex(fx, "decoder.mid_block.attentions.0", x_d, C, H, W, s);
 }
 
 // Native AutoencoderKLFlux2 2D VAE Encoder: RGB24 [H, W, 3] -> BN-normalized packed [H/16 * W/16, 128]!
@@ -1461,10 +1608,8 @@ static int run_flux2_vae_encode(
     float *out_packed_latents_d, double *out_ms) {
   double t0 = fx_now_ms();
   cudaStream_t s = fx->stream;
-  const ec_safetensors_t *vst = &fx->vae_st;
   int H_p = H / 16, W_p = W / 16;
 
-  // Convert HWC RGB24 [0..255] -> CHW F32 [-1..1]
   size_t plane = (size_t)H * (size_t)W;
   float *rgb_h = (float *)malloc(3u * plane * sizeof(float));
   if (!rgb_h) return -1;
@@ -1473,19 +1618,24 @@ static int run_flux2_vae_encode(
     rgb_h[1 * plane + i] = (float)in_rgb_hwc[i * 3 + 1] * (2.0f / 255.0f) - 1.0f;
     rgb_h[2 * plane + i] = (float)in_rgb_hwc[i * 3 + 2] * (2.0f / 255.0f) - 1.0f;
   }
-  float *rgb_d = NULL, *cur = NULL, *nxt = NULL;
-  cudaMalloc(&rgb_d, 3u * plane * sizeof(float));
+  size_t ping_bytes = (size_t)256 * H * W * 4;
+  float *ping0 = NULL, *ping1 = NULL, *rgb_d = NULL;
+  if (cudaMalloc(&ping0, ping_bytes) != cudaSuccess ||
+      cudaMalloc(&ping1, ping_bytes) != cudaSuccess ||
+      cudaMalloc(&rgb_d, 3u * plane * 4) != cudaSuccess) {
+    cudaFree(ping0); cudaFree(ping1); cudaFree(rgb_d); free(rgb_h); return -1;
+  }
   cudaMemcpyAsync(rgb_d, rgb_h, 3u * plane * sizeof(float), cudaMemcpyHostToDevice, s);
   free(rgb_h);
 
-  // encoder.conv_in (3 -> 128, 3x3)
-  cudaMalloc(&cur, 128L * H * W * 4);
-  if (vae_conv2d_tc(vst, "encoder.conv_in", rgb_d, NULL, cur, 3, 128, H, W, 3, 1, s) != 0) {
-    cudaFree(rgb_d); cudaFree(cur); return -1;
+  float *cur = ping0, *nxt = ping1;
+  #define SWAP_PING() do { float *_t = cur; cur = nxt; nxt = _t; } while (0)
+
+  if (vae_conv2d_tc(fx, "encoder.conv_in", rgb_d, NULL, cur, 3, 128, H, W, 3, 1, s) != 0) {
+    cudaFree(rgb_d); cudaFree(ping0); cudaFree(ping1); return -1;
   }
   cudaFree(rgb_d);
 
-  // encoder.down_blocks.0..3: (128, down), (256, down), (512, down), (512, no down)
   const int dn_ch[4] = { 128, 256, 512, 512 };
   int C = 128;
   int cH = H, cW = W;
@@ -1494,51 +1644,40 @@ static int run_flux2_vae_encode(
     int Cout = dn_ch[b];
     for (int r = 0; r < 2; r++) {
       int Cin = (r == 0) ? C : Cout;
-      cudaMalloc(&nxt, (size_t)Cout * cH * cW * 4);
       snprintf(pref, sizeof pref, "encoder.down_blocks.%d.resnets.%d", b, r);
-      if (vae_resnet(vst, pref, cur, nxt, Cin, Cout, cH, cW, s) != 0) { cudaFree(cur); cudaFree(nxt); return -1; }
-      cudaFree(cur); cur = nxt; nxt = NULL;
+      if (vae_resnet(fx, pref, cur, nxt, Cin, Cout, cH, cW, s) != 0) { cudaFree(ping0); cudaFree(ping1); return -1; }
+      SWAP_PING();
     }
     C = Cout;
     if (b < 3) {
       int nH = cH / 2, nW = cW / 2;
-      cudaMalloc(&nxt, (size_t)C * nH * nW * 4);
       snprintf(pref, sizeof pref, "encoder.down_blocks.%d.downsamplers.0.conv", b);
-      if (vae_conv2d_s2_tc(vst, pref, cur, nxt, C, C, cH, cW, s) != 0) { cudaFree(cur); cudaFree(nxt); return -1; }
-      cudaFree(cur); cur = nxt; nxt = NULL;
+      if (vae_conv2d_s2_tc(fx, pref, cur, nxt, C, C, cH, cW, s) != 0) { cudaFree(ping0); cudaFree(ping1); return -1; }
+      SWAP_PING();
       cH = nH; cW = nW;
     }
   }
 
-  // encoder.mid_block: resnet0 -> attention -> resnet1
-  cudaMalloc(&nxt, 512L * cH * cW * 4);
-  vae_resnet(vst, "encoder.mid_block.resnets.0", cur, nxt, 512, 512, cH, cW, s);
-  cudaFree(cur); cur = nxt; nxt = NULL;
-  vae_mid_attention_ex(vst, "encoder.mid_block.attentions.0", cur, 512, cH, cW, s);
-  cudaMalloc(&nxt, 512L * cH * cW * 4);
-  vae_resnet(vst, "encoder.mid_block.resnets.1", cur, nxt, 512, 512, cH, cW, s);
-  cudaFree(cur); cur = nxt; nxt = NULL;
+  vae_resnet(fx, "encoder.mid_block.resnets.0", cur, nxt, 512, 512, cH, cW, s);
+  SWAP_PING();
+  vae_mid_attention_ex(fx, "encoder.mid_block.attentions.0", cur, 512, cH, cW, s);
+  vae_resnet(fx, "encoder.mid_block.resnets.1", cur, nxt, 512, 512, cH, cW, s);
+  SWAP_PING();
 
-  // encoder.conv_norm_out (512, GN32+SiLU) -> encoder.conv_out (512 -> 64, 3x3) -> quant_conv (64 -> 64, 1x1)
-  float *gn_out = NULL, *z64 = NULL, *q64 = NULL;
-  cudaMalloc(&gn_out, 512L * cH * cW * 4);
-  cudaMalloc(&z64,     64L * cH * cW * 4);
-  cudaMalloc(&q64,     64L * cH * cW * 4);
-  vae_gn_silu(vst, "encoder.conv_norm_out", cur, gn_out, 512, cH, cW, 1, s);
-  cudaFree(cur);
-  vae_conv2d_tc(vst, "encoder.conv_out", gn_out, NULL, z64, 512, 64, cH, cW, 3, 1, s);
-  cudaFree(gn_out);
-  vae_conv2d_tc(vst, "quant_conv", z64, NULL, q64, 64, 64, cH, cW, 1, 0, s);
-  cudaFree(z64);
+  vae_gn_silu(fx, "encoder.conv_norm_out", cur, nxt, 512, cH, cW, 1, s);
+  SWAP_PING();
+  vae_conv2d_tc(fx, "encoder.conv_out", cur, NULL, nxt, 512, 64, cH, cW, 3, 1, s);
+  SWAP_PING();
+  vae_conv2d_tc(fx, "quant_conv", cur, NULL, nxt, 64, 64, cH, cW, 1, 0, s);
+  SWAP_PING();
 
-  // Patchify 2x2 first 32 channels (mean mu) + normalize by bn.running_mean/var -> [H_p*W_p, 128]
-  float *bn_mean = load_f32_gpu(vst, "bn.running_mean", NULL, s);
-  float *bn_var  = load_f32_gpu(vst, "bn.running_var", NULL, s);
-  if (!bn_mean || !bn_var) { cudaFree(q64); cudaFree(bn_mean); cudaFree(bn_var); return -1; }
+  float *bn_mean = get_vae_f32(fx, "bn.running_mean");
+  float *bn_var  = get_vae_f32(fx, "bn.running_var");
+  if (!bn_mean || !bn_var) { cudaFree(ping0); cudaFree(ping1); return -1; }
   k_flux2_patchify_bn_norm<<<(int)(((long)H_p * W_p * 128 + 255) / 256), 256, 0, s>>>(
-      q64, bn_mean, bn_var, out_packed_latents_d, H_p, W_p, 1e-4f);
+      cur, bn_mean, bn_var, out_packed_latents_d, H_p, W_p, 1e-4f);
   cudaStreamSynchronize(s);
-  cudaFree(q64); cudaFree(bn_mean); cudaFree(bn_var);
+  cudaFree(ping0); cudaFree(ping1);
   if (out_ms) *out_ms = fx_now_ms() - t0;
   return 0;
 }
@@ -1548,44 +1687,40 @@ static int run_flux2_vae_decode(
     uint8_t *out_rgb_hwc, double *out_ms) {
   double t0 = fx_now_ms();
   cudaStream_t s = fx->stream;
-  const ec_safetensors_t *vst = &fx->vae_st;
   int H = H_p * 2, W = W_p * 2;
+  int fullH = H_p * 16, fullW = W_p * 16;
 
-  float *bn_mean = load_f32_gpu(vst, "bn.running_mean", NULL, s);
-  float *bn_var  = load_f32_gpu(vst, "bn.running_var", NULL, s);
-  if (!bn_mean || !bn_var) { cudaFree(bn_mean); cudaFree(bn_var); return -1; }
+  float *bn_mean = get_vae_f32(fx, "bn.running_mean");
+  float *bn_var  = get_vae_f32(fx, "bn.running_var");
+  if (!bn_mean || !bn_var) return -1;
 
-  float *z_d = NULL, *z2_d = NULL;
-  cudaMalloc(&z_d,  32L * H * W * 4);
-  cudaMalloc(&z2_d, 32L * H * W * 4);
+  size_t ping_bytes = (size_t)256 * fullH * fullW * 4;
+  float *ping0 = NULL, *ping1 = NULL;
+  if (cudaMalloc(&ping0, ping_bytes) != cudaSuccess ||
+      cudaMalloc(&ping1, ping_bytes) != cudaSuccess) {
+    cudaFree(ping0); cudaFree(ping1); return -1;
+  }
+  float *cur = ping0, *nxt = ping1;
+
   k_flux2_bn_unpatchify<<<(int)((32L * H * W + 255) / 256), 256, 0, s>>>(
-      packed_latents_d, bn_mean, bn_var, z_d, H_p, W_p, 1e-4f);
-  cudaFree(bn_mean); cudaFree(bn_var);
+      packed_latents_d, bn_mean, bn_var, cur, H_p, W_p, 1e-4f);
 
-  // post_quant_conv (32 -> 32, 1x1)
-  if (vae_conv2d_tc(vst, "post_quant_conv", z_d, NULL, z2_d, 32, 32, H, W, 1, 0, s) != 0) {
-    cudaFree(z_d); cudaFree(z2_d); return -1;
+  if (vae_conv2d_tc(fx, "post_quant_conv", cur, NULL, nxt, 32, 32, H, W, 1, 0, s) != 0) {
+    cudaFree(ping0); cudaFree(ping1); return -1;
   }
-  cudaFree(z_d);
+  SWAP_PING();
 
-  // conv_in (32 -> 512, 3x3)
-  float *cur = NULL, *nxt = NULL;
-  cudaMalloc(&cur, 512L * H * W * 4);
-  if (vae_conv2d_tc(vst, "decoder.conv_in", z2_d, NULL, cur, 32, 512, H, W, 3, 1, s) != 0) {
-    cudaFree(z2_d); cudaFree(cur); return -1;
+  if (vae_conv2d_tc(fx, "decoder.conv_in", cur, NULL, nxt, 32, 512, H, W, 3, 1, s) != 0) {
+    cudaFree(ping0); cudaFree(ping1); return -1;
   }
-  cudaFree(z2_d);
+  SWAP_PING();
 
-  // mid_block: resnet0 -> attention -> resnet1
-  cudaMalloc(&nxt, 512L * H * W * 4);
-  vae_resnet(vst, "decoder.mid_block.resnets.0", cur, nxt, 512, 512, H, W, s);
-  cudaFree(cur); cur = nxt; nxt = NULL;
-  vae_mid_attention(vst, cur, 512, H, W, s);
-  cudaMalloc(&nxt, 512L * H * W * 4);
-  vae_resnet(vst, "decoder.mid_block.resnets.1", cur, nxt, 512, 512, H, W, s);
-  cudaFree(cur); cur = nxt; nxt = NULL;
+  vae_resnet(fx, "decoder.mid_block.resnets.0", cur, nxt, 512, 512, H, W, s);
+  SWAP_PING();
+  vae_mid_attention(fx, cur, 512, H, W, s);
+  vae_resnet(fx, "decoder.mid_block.resnets.1", cur, nxt, 512, 512, H, W, s);
+  SWAP_PING();
 
-  // up_blocks: 0 (512->512, up), 1 (512->512, up), 2 (512->256, up), 3 (256->128, no up)
   const int up_ch[4] = { 512, 512, 256, 128 };
   int C = 512;
   char pref[128];
@@ -1593,39 +1728,33 @@ static int run_flux2_vae_decode(
     int Cout = up_ch[u];
     for (int r = 0; r < 3; r++) {
       int Cin = (r == 0) ? C : Cout;
-      cudaMalloc(&nxt, (size_t)Cout * H * W * 4);
       snprintf(pref, sizeof pref, "decoder.up_blocks.%d.resnets.%d", u, r);
-      vae_resnet(vst, pref, cur, nxt, Cin, Cout, H, W, s);
-      cudaFree(cur); cur = nxt; nxt = NULL;
+      vae_resnet(fx, pref, cur, nxt, Cin, Cout, H, W, s);
+      SWAP_PING();
     }
     C = Cout;
     if (u < 3) {
       int nH = H * 2, nW = W * 2;
-      float *up = NULL;
-      cudaMalloc(&up,  (size_t)C * nH * nW * 4);
-      cudaMalloc(&nxt, (size_t)C * nH * nW * 4);
+      float *up = ensure_vae_res_slot(&fx->vae_cache, 2, (size_t)C * nH * nW * 4);
+      if (!up) { cudaFree(ping0); cudaFree(ping1); return -1; }
       ec_launch_upsample2x_2d(cur, up, C, H, W, s);
-      cudaFree(cur);
       snprintf(pref, sizeof pref, "decoder.up_blocks.%d.upsamplers.0.conv", u);
-      vae_conv2d_tc(vst, pref, up, NULL, nxt, C, C, nH, nW, 3, 1, s);
-      cudaFree(up);
-      cur = nxt; nxt = NULL;
+      vae_conv2d_tc(fx, pref, up, NULL, nxt, C, C, nH, nW, 3, 1, s);
+      SWAP_PING();
       H = nH; W = nW;
     }
   }
 
-  // conv_norm_out (128, GN32 + SiLU) -> conv_out (128 -> 3, 3x3)
-  float *gn_out = NULL, *rgb_d = NULL;
-  cudaMalloc(&gn_out, (size_t)128 * H * W * 4);
-  cudaMalloc(&rgb_d,  (size_t)3 * H * W * 4);
-  vae_gn_silu(vst, "decoder.conv_norm_out", cur, gn_out, 128, H, W, 1, s);
-  cudaFree(cur);
-  vae_conv2d_tc(vst, "decoder.conv_out", gn_out, NULL, rgb_d, 128, 3, H, W, 3, 1, s);
-  cudaFree(gn_out);
+  vae_gn_silu(fx, "decoder.conv_norm_out", cur, nxt, 128, H, W, 1, s);
+  SWAP_PING();
+  vae_conv2d_tc(fx, "decoder.conv_out", cur, NULL, nxt, 128, 3, H, W, 3, 1, s);
+  SWAP_PING();
+  #undef SWAP_PING
 
   float *rgb_h = (float *)malloc((size_t)3 * H * W * 4);
-  cudaMemcpy(rgb_h, rgb_d, (size_t)3 * H * W * 4, cudaMemcpyDeviceToHost);
-  cudaFree(rgb_d);
+  cudaMemcpyAsync(rgb_h, cur, (size_t)3 * H * W * 4, cudaMemcpyDeviceToHost, s);
+  cudaStreamSynchronize(s);
+  cudaFree(ping0); cudaFree(ping1);
 
   size_t plane = (size_t)H * W;
   for (size_t i = 0; i < plane; i++) {
@@ -1639,6 +1768,19 @@ static int run_flux2_vae_decode(
   free(rgb_h);
   if (out_ms) *out_ms = fx_now_ms() - t0;
   return 0;
+}
+
+extern "C" int ec_flux2_hot_swap_loras(
+    ec_flux2_t *fx, const char *ckpt_override,
+    const ec_lora_spec_t *loras, int n_loras,
+    double *out_ms, int *out_delta_used) {
+  if (!ec_flux2_is_ready(fx)) return -1;
+  const char *ckpt = (ckpt_override && ckpt_override[0]) ? ckpt_override : fx->paths.checkpoint_path;
+  char err[256] = {0};
+  double t0 = fx_now_ms();
+  int rc = ensure_dit_loaded_ex(fx, ckpt, loras, n_loras, out_delta_used, err, sizeof err);
+  if (out_ms) *out_ms = fx_now_ms() - t0;
+  return rc;
 }
 
 // ===========================================================================
@@ -1669,6 +1811,7 @@ extern "C" void ec_flux2_unload_vram(ec_flux2_t *fx) {
   if (!fx) return;
   free_dit_resident(&fx->dit);
   free_qwen3_resident(&fx->qwen_res);
+  free_vae_cache(&fx->vae_cache);
 }
 
 extern "C" void ec_flux2_destroy(ec_flux2_t *fx) {

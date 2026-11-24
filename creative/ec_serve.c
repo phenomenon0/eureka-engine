@@ -497,10 +497,11 @@ static void *job_runner_thread(void *arg) {
     rc = ec_studio_gen_video_v8(j->st, &vq, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
       snprintf(out, sizeof out,
-          "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\","
+          "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\",\"last_frame_url\":\"/artifacts/%s\","
           "\"engine_mode\":\"%s\",\"encoder\":\"%s\",\"width\":%d,\"height\":%d,"
           "\"frames\":%d,\"with_audio\":%s,\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f,\"fps\":%.1f}",
           basename_safe(r.file_mp4), basename_safe(r.file_aux),
+          basename_safe(r.file_last[0] ? r.file_last : r.file_aux),
           r.engine_mode[0] ? r.engine_mode : "dit_smoke", r.encoder_used,
           r.width, r.height, r.frames, wa ? "true" : "false",
           r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms, r.fps);
@@ -689,7 +690,7 @@ static void *client_thread(void *arg) {
   ec_studio_info_t info;
   ec_studio_get_info(st, &info);
 
-  if (!strcmp(method, "GET") && !strcmp(path, "/v1/creative/health")) {
+  if (!strcmp(method, "GET") && (!strcmp(path, "/v1/creative/health") || !strcmp(path, "/v1/creative/status"))) {
     snprintf(resp, RESP_CAP,
         "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v8\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
@@ -699,10 +700,11 @@ static void *client_thread(void *arg) {
         "\"cowrie_sp_hits\":%llu,\"cowrie_sp_saves\":%llu,"
         "\"cowrie_sp_mismatches\":%llu,\"cowrie_trust_entries\":%d,"
         "\"gpu\":\"%s\",\"sm\":\"sm_%d%d\",\"vram_total_gb\":%.2f,"
+        "\"vram_free_mb\":%.1f,\"engines_resident_mask\":%d,"
         "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,"
         "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
         "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
-        "\"modalities\":[\"flux2_photoreal\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"trellis2_3d\",\"trellis2_photo_multiview\",\"wan2.2_video\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
+        "\"modalities\":[\"flux2_photoreal\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"trellis2_3d\",\"trellis2_photo_multiview\",\"wan2.2_video\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"lora_delta_hotswap_8ms\",\"vae_arena_slab\",\"vram_lease_broker\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
         g_api_key[0] ? "true" : "false",
         info.photoreal_ready ? "true" : "false",
         info.acestep_ready   ? "true" : "false",
@@ -715,10 +717,18 @@ static void *client_thread(void *arg) {
         (unsigned long long)info.cowrie_sp_mismatches,
         info.cowrie_trust_entries,
         info.gpu_name, info.sm_major, info.sm_minor, info.vram_total_gb,
+        info.vram_free_mb, info.engines_resident_mask,
         info.vram_pool_used_mb, info.vram_pool_budget_mb,
         info.models_discovered, info.storage_roots, info.loras_discovered,
         info.checkpoints_discovered, info.recipes_count);
     send_json(cfd, 200, resp);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/creative/unload")) {
+    double unload_ms = 0.0, free_mb = 0.0;
+    int rc = ec_studio_unload_all_vram(st, &unload_ms, &free_mb);
+    snprintf(resp, 4096,
+        "{\"ok\":%s,\"unloaded_ms\":%.2f,\"vram_free_mb\":%.1f,\"vram_total_mb\":%.1f,\"engines_resident_mask\":0}",
+        rc == 0 ? "true" : "false", unload_ms, free_mb, info.vram_total_gb * 1024.0);
+    send_json(cfd, rc == 0 ? 200 : 500, resp);
   } else if (!strcmp(method, "GET") && !strncmp(path, "/artifacts/", 11)) {
     const char *fname = path + 11;
     if (!fname[0] || strstr(fname, "..") || strchr(fname, '/') || strchr(fname, '\\')) {
@@ -1128,10 +1138,11 @@ static void *client_thread(void *arg) {
     ec_studio_result_t r;
     if (ec_studio_gen_video_v8(st, &vq, NULL, NULL, &r) == 0) {
       snprintf(resp, RESP_CAP,
-          "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\","
+          "{\"ok\":true,\"mp4_url\":\"/artifacts/%s\",\"keyframe0_url\":\"/artifacts/%s\",\"last_frame_url\":\"/artifacts/%s\","
           "\"engine_mode\":\"%s\",\"encoder\":\"%s\",\"with_audio\":%s,\"frames\":%d,\"width\":%d,\"height\":%d,"
           "\"lora_tensors_fused\":%d,\"text_enc_ms\":%.1f,\"dit_ms\":%.1f,\"vae_ms\":%.1f,\"gpu_ms\":%.2f,\"fps\":%.1f}",
           basename_safe(r.file_mp4), basename_safe(r.file_aux),
+          basename_safe(r.file_last[0] ? r.file_last : r.file_aux),
           r.engine_mode[0] ? r.engine_mode : "dit_smoke", r.encoder_used,
           with_audio ? "true" : "false", r.frames, r.width, r.height, r.lora_tensors_fused,
           r.text_enc_ms, r.dit_ms, r.vae_ms, r.gpu_ms, r.fps);

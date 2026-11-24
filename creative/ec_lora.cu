@@ -655,3 +655,15 @@ extern "C" int ec_lora_inspect_ex(
 extern "C" int ec_lora_inspect(const char *path, int *out_pairs, int *out_rank, char *arch_hint, size_t arch_cap) {
   return ec_lora_inspect_ex(path, out_pairs, out_rank, arch_hint, arch_cap, NULL, 0);
 }
+
+extern "C" int ec_lora_stack_has_dora(const ec_lora_spec_t *stack, int n_stack) {
+  if (!stack || n_stack <= 0) return 0;
+  for (int i = 0; i < n_stack && i < EC_LORA_MAX_STACK; i++) {
+    if (!stack[i].path[0]) continue;
+    char fmt[32] = {0};
+    if (ec_lora_inspect_ex(stack[i].path, NULL, NULL, NULL, 0, fmt, sizeof fmt) == 0) {
+      if (strcmp(fmt, "dora") == 0) return 1;
+    }
+  }
+  return 0;
+}

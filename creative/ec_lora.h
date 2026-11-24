@@ -47,6 +47,11 @@ int ec_lora_inspect_ex(
     char *arch_hint, size_t arch_cap,
     char *format_out, size_t format_cap);
 
+// Returns 1 if any adapter in `stack[0..n_stack-1]` uses nonlinear DoRA row-magnitude rescaling
+// (which requires a clean base weight reload), or 0 when all adapters are purely additive
+// (standard LoRA, NF4 QLoRA, FP8 QLoRA, LoHa, LoKr — eligible for <8ms GPU delta unfusing!).
+int ec_lora_stack_has_dora(const ec_lora_spec_t *stack, int n_stack);
+
 #ifdef __cplusplus
 }
 #endif

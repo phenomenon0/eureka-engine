@@ -82,6 +82,17 @@ int ec_wan22_generate_mp4(
     ec_wan22_progress_fn cb, void *cb_ctx,
     ec_wan22_res_t *res);
 
+// Extended generator also exporting the final decoded RGB frame PNG (`out_lastframe_png`) for 1-click Storyboard Chaining!
+int ec_wan22_generate_mp4_ex(
+    ec_wan22_t *w,
+    const ec_wan22_req_t *req,
+    const char *out_mp4_path,
+    const char *out_keyframe_png,  // optional
+    const char *out_lastframe_png, // optional final frame PNG for 1-click Extend
+    const char *audio_wav_path,    // optional synced audio track to mux into MP4
+    ec_wan22_progress_fn cb, void *cb_ctx,
+    ec_wan22_res_t *res);
+
 // Native Wan2.2 Causal 3D VAE single-frame RGB -> normalized [H/16, W/16, 48] latent helper (for G-C7!)
 int ec_wan22_vae_encode_image(
     ec_wan22_t *w, const uint8_t *rgb, int width, int height,

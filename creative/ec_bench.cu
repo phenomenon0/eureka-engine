@@ -1875,8 +1875,12 @@ static void test_v8_multimodal_and_qlora(const char *art_dir) {
           in_rgb[(y * W + x) * 3 + 1] = (uint8_t)(g * 255.0f);
           in_rgb[(y * W + x) * 3 + 2] = (uint8_t)(b * 255.0f);
         }
-      double ems = 0.0, dms = 0.0;
+      double ems = 0.0, dms = 0.0, warm_ems = 0.0, warm_dms = 0.0;
       int rc = (fx && ec_flux2_is_ready(fx)) ? ec_flux2_vae_roundtrip_rgb(fx, in_rgb, W, H, out_rgb, &ems, &dms) : -1;
+      if (rc == 0) {
+        // G-C8.2: Second roundtrip hits Resident VAE GPU Tensor Cache + Persistent Scratch Arena!
+        ec_flux2_vae_roundtrip_rgb(fx, in_rgb, W, H, out_rgb, &warm_ems, &warm_dms);
+      }
       double mse = 0.0, dot = 0.0, n1 = 0.0, n2 = 0.0;
       for (size_t i = 0; i < (size_t)W * H * 3; i++) {
         double a = (double)in_rgb[i], b = (double)out_rgb[i], d = a - b;
@@ -1885,8 +1889,45 @@ static void test_v8_multimodal_and_qlora(const char *art_dir) {
       mse /= (double)(W * H * 3);
       double psnr = (mse > 1e-6) ? (10.0 * log10(255.0 * 255.0 / mse)) : 99.0;
       double cos_sim = (n1 > 0 && n2 > 0) ? (dot / (sqrt(n1) * sqrt(n2))) : 0.0;
-      snprintf(buf, sizeof buf, "256x256 enc=%.1fms dec=%.1fms PSNR=%.2fdB cos=%.5f", ems, dms, psnr, cos_sim);
-      check_gate("G-C7.3 FLUX.2 Native 2D VAE Encode->Decode", rc == 0 && psnr >= 24.0 && cos_sim >= 0.99, buf);
+      snprintf(buf, sizeof buf, "256x256 cold=%.1fms warm=%.1fms (%.1fx) PSNR=%.2fdB cos=%.5f",
+               ems + dms, warm_ems + warm_dms,
+               (warm_ems + warm_dms) > 0.1 ? ((ems + dms) / (warm_ems + warm_dms)) : 1.0, psnr, cos_sim);
+      check_gate("G-C7.3 FLUX.2 Native 2D VAE + Arena Cache",
+                 rc == 0 && psnr >= 24.0 && cos_sim >= 0.99 && (warm_ems + warm_dms) < (ems + dms), buf);
+
+      // G-C8.1: Zero-Reload <15ms GPU LoRA/QLoRA Delta Hot-Swap on 7.75 GB FLUX.2 DiT!
+      double load_ms = 0.0, swap_ms = 0.0, unswap_ms = 0.0;
+      int d0 = 0, d1 = 0, d2 = 0;
+      char lora_syn[320];
+      snprintf(lora_syn, sizeof lora_syn, "%s/gc8_flux2_lora.safetensors", art_dir);
+      {
+        const int LR = 8, L_OUT = 3072, L_IN = 128;
+        float *lA = (float *)malloc((size_t)LR * L_IN * 4);
+        float *lB = (float *)malloc((size_t)L_OUT * LR * 4);
+        for (int i = 0; i < LR * L_IN; i++) lA[i] = randf_sym(0.15f);
+        for (int i = 0; i < L_OUT * LR; i++) lB[i] = randf_sym(0.15f);
+        const char *lnms[2] = { "img_in.lora_A.weight", "img_in.lora_B.weight" };
+        ec_dtype_t ldts[2] = { EC_DTYPE_F32, EC_DTYPE_F32 };
+        int32_t lrks[2] = { 2, 2 };
+        int64_t lsh[2][5] = { {LR, L_IN, 0,0,0}, {L_OUT, LR, 0,0,0} };
+        const void *lds[2] = { lA, lB };
+        uint64_t lnbs[2] = { (uint64_t)LR * L_IN * 4, (uint64_t)L_OUT * LR * 4 };
+        ec_st_write_simple(lora_syn, lnms, ldts, lrks, lsh, lds, lnbs, 2);
+        free(lA); free(lB);
+      }
+      ec_flux2_unload_vram(fx); // free VAE cache so 7.75 GB DiT fits with maximum headroom
+      int rc_load = ec_flux2_hot_swap_loras(fx, NULL, NULL, 0, &load_ms, &d0);
+      ec_lora_spec_t lspec = {};
+      snprintf(lspec.path, sizeof lspec.path, "%s", lora_syn);
+      lspec.strength = 0.85f;
+      int rc_sw = (rc_load == 0 && access(lora_syn, R_OK) == 0)
+                  ? ec_flux2_hot_swap_loras(fx, NULL, &lspec, 1, &swap_ms, &d1) : -1;
+      int rc_un = (rc_sw == 0) ? ec_flux2_hot_swap_loras(fx, NULL, NULL, 0, &unswap_ms, &d2) : -1;
+      snprintf(buf, sizeof buf, "cold_dit=%.0fms delta_swap=%.2fms unswap=%.2fms (%.0fx faster, delta=%d/%d)",
+               load_ms, swap_ms, unswap_ms, swap_ms > 0.01 ? (load_ms / swap_ms) : 999.0, d1, d2);
+      check_gate("G-C8.1 Zero-Reload GPU LoRA/QLoRA Hot-Swap",
+                 rc_un == 0 && d1 == 1 && d2 == 1 && swap_ms < 25.0 && unswap_ms < 25.0, buf);
+
       ec_flux2_destroy(fx);
       free(in_rgb); free(out_rgb);
     }

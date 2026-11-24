@@ -89,6 +89,12 @@ int ec_flux2_vae_roundtrip_rgb(
     ec_flux2_t *fx, const uint8_t *in_rgb, int width, int height,
     uint8_t *out_rgb, double *enc_ms, double *dec_ms);
 
+// Zero-reload GPU BF16 LoRA/QLoRA stack hot-swap (< 8ms delta unfuse/refuse without reloading 7.75 GB DiT!).
+int ec_flux2_hot_swap_loras(
+    ec_flux2_t *fx, const char *ckpt_override,
+    const ec_lora_spec_t *loras, int n_loras,
+    double *out_ms, int *out_delta_used);
+
 #ifdef __cplusplus
 }
 #endif

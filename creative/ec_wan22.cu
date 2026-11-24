@@ -823,6 +823,9 @@ typedef struct {
   int loaded;
   char lora_sig[1024];
   int  lora_hits;
+  ec_lora_spec_t active_loras[EC_LORA_MAX_STACK];
+  int  active_n_loras;
+  int  delta_swaps;
   uint16_t *patch_w, *txt0_w, *txt2_w, *t0_w, *t2_w, *tproj_w, *head_w;
   float    *patch_b, *txt0_b, *txt2_b, *t0_b, *t2_b, *tproj_b, *head_b, *head_mod;
   wn_dit_blk_t blocks[30];
@@ -920,10 +923,59 @@ static void build_wan_lora_sig(const ec_lora_spec_t *loras, int n_loras, char *o
   }
 }
 
+static void apply_wan_lora_stack_to_resident(
+    wn_dit_res_t *d, const ec_lora_spec_t *stack, int n_stack,
+    ec_lora_apply_stats_t *stats, cudaStream_t s) {
+  if (!stack || n_stack <= 0) return;
+  char k[192];
+  for (int i = 0; i < 30; i++) {
+    wn_dit_blk_t *B = &d->blocks[i];
+    snprintf(k, sizeof k, "blocks.%d.self_attn.q.weight", i);  ec_lora_fuse_onto_bf16(B->sa_qkv_w + 0L,           3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.k.weight", i);  ec_lora_fuse_onto_bf16(B->sa_qkv_w + 3072L*3072L,  3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.v.weight", i);  ec_lora_fuse_onto_bf16(B->sa_qkv_w + 6144L*3072L,  3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.o.weight", i);  ec_lora_fuse_onto_bf16(B->sa_o_w,                  3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.q.weight", i); ec_lora_fuse_onto_bf16(B->ca_q_w,                  3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.k.weight", i); ec_lora_fuse_onto_bf16(B->ca_k_w,                  3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.v.weight", i); ec_lora_fuse_onto_bf16(B->ca_v_w,                  3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.o.weight", i); ec_lora_fuse_onto_bf16(B->ca_o_w,                  3072, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.ffn.0.weight", i);        ec_lora_fuse_onto_bf16(B->ffn0_w,                 14336, 3072, k, stack, n_stack, stats, s);
+    snprintf(k, sizeof k, "blocks.%d.ffn.2.weight", i);        ec_lora_fuse_onto_bf16(B->ffn2_w,                  3072,14336, k, stack, n_stack, stats, s);
+  }
+}
+
 static int ensure_dit_loaded(ec_wan22_t *w, const ec_lora_spec_t *loras, int n_loras) {
+  int clamped_n = (loras && n_loras > 0) ? (n_loras > EC_LORA_MAX_STACK ? EC_LORA_MAX_STACK : n_loras) : 0;
   char lsig[1024];
-  build_wan_lora_sig(loras, n_loras, lsig, sizeof lsig);
+  build_wan_lora_sig(loras, clamped_n, lsig, sizeof lsig);
   if (w->dit.loaded && strcmp(w->dit.lora_sig, lsig) == 0) return 0;
+
+  // Zero-Reload <10ms GPU BF16 LoRA/QLoRA Delta Unfusing on resident 10GB Wan 2.2 DiT!
+  if (w->dit.loaded && w->dit.delta_swaps < 16 &&
+      !ec_lora_stack_has_dora(w->dit.active_loras, w->dit.active_n_loras) &&
+      !ec_lora_stack_has_dora(loras, clamped_n)) {
+    wn_dit_res_t *d = &w->dit;
+    if (d->active_n_loras > 0) {
+      ec_lora_spec_t neg_prev[EC_LORA_MAX_STACK];
+      for (int i = 0; i < d->active_n_loras; i++) {
+        neg_prev[i] = d->active_loras[i];
+        neg_prev[i].strength = -neg_prev[i].strength;
+      }
+      ec_lora_apply_stats_t undo_st = {};
+      apply_wan_lora_stack_to_resident(d, neg_prev, d->active_n_loras, &undo_st, w->stream);
+    }
+    ec_lora_apply_stats_t lstats = {};
+    if (clamped_n > 0) {
+      apply_wan_lora_stack_to_resident(d, loras, clamped_n, &lstats, w->stream);
+    }
+    cudaStreamSynchronize(w->stream);
+    snprintf(d->lora_sig, sizeof d->lora_sig, "%s", lsig);
+    d->lora_hits = lstats.n_tensors_matched;
+    d->active_n_loras = clamped_n;
+    for (int i = 0; i < clamped_n; i++) d->active_loras[i] = loras[i];
+    d->delta_swaps++;
+    return 0;
+  }
+
   if (w->dit.loaded) free_dit_res(&w->dit);
   const ec_safetensors_t *st = &w->dit_st;
   wn_dit_res_t *d = &w->dit;
@@ -1005,6 +1057,9 @@ static int ensure_dit_loaded(ec_wan22_t *w, const ec_lora_spec_t *loras, int n_l
   }
   snprintf(d->lora_sig, sizeof d->lora_sig, "%s", lsig);
   d->lora_hits = lstats.n_tensors_matched;
+  d->active_n_loras = clamped_n;
+  for (int i = 0; i < clamped_n; i++) d->active_loras[i] = loras[i];
+  d->delta_swaps = 0;
   d->loaded = 1;
   return 0;
 }
@@ -2057,11 +2112,30 @@ extern "C" int ec_wan22_is_ready(const ec_wan22_t *w) {
   return (w && w->ug && w->dit_open && w->vae_open && w->te_open) ? 1 : 0;
 }
 
-extern "C" int ec_wan22_generate_mp4(
+static int has_distilled_wan_lora(const ec_lora_spec_t *loras, int n_loras) {
+  if (!loras || n_loras <= 0) return 0;
+  for (int i = 0; i < n_loras; i++) {
+    const char *p = loras[i].path;
+    if (!p || !p[0]) continue;
+    char low[256];
+    size_t j = 0;
+    for (; p[j] && j + 1 < sizeof low; j++) {
+      char c = p[j];
+      low[j] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    low[j] = '\0';
+    if (strstr(low, "lightning") || strstr(low, "causvid") || strstr(low, "lcm") || strstr(low, "4step") || strstr(low, "6step"))
+      return 1;
+  }
+  return 0;
+}
+
+extern "C" int ec_wan22_generate_mp4_ex(
     ec_wan22_t *w,
     const ec_wan22_req_t *req,
     const char *out_mp4_path,
     const char *out_keyframe_png,
+    const char *out_lastframe_png,
     const char *audio_wav_path,
     ec_wan22_progress_fn cb, void *cb_ctx,
     ec_wan22_res_t *res) {
@@ -2085,6 +2159,13 @@ extern "C" int ec_wan22_generate_mp4(
   int steps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 20;
   float cfg = (req->cfg_scale > 0.0f) ? req->cfg_scale : 5.0f;
   float shf = (req->shift > 0.0f) ? req->shift : ((W * H <= 832 * 480) ? 3.0f : 5.0f);
+
+  // Auto-engage Step-Distilled Fast Schedule (6 single-pass steps, CFG=1.0) when a Lightning/CausVid QLoRA is active!
+  if (has_distilled_wan_lora(req->loras, req->n_loras) && steps >= 16 && cfg >= 4.5f) {
+    steps = 6;
+    cfg = 1.0f;
+    shf = 3.0f;
+  }
 
   int H_lat = H / 16, W_lat = W / 16;
   int Hp = H_lat / 2, Wp = W_lat / 2;
@@ -2134,14 +2215,19 @@ extern "C" int ec_wan22_generate_mp4(
     }
   }
 
-  // Stage 1: UMT5-XXL FP8-Scaled Text Encoding (before loading 9.4 GB DiT -> minimal peak VRAM!)
+  // Stage 1: UMT5-XXL FP8-Scaled Text Encoding (skips negative pass when cfg <= 1.01 -> saves 1.3s!)
   if (cb) cb(0, steps + 3, "wan22_umt5_encode", cb_ctx);
   uint16_t *t5_pos_d = NULL, *t5_neg_d = NULL;
   cudaMalloc(&t5_pos_d, 512L * 4096 * 2);
   cudaMalloc(&t5_neg_d, 512L * 4096 * 2);
   double ms_p = 0, ms_n = 0;
-  if (run_umt5_xxl(w, pos_p, t5_pos_d, &ms_p) != 0 ||
-      run_umt5_xxl(w, neg_p, t5_neg_d, &ms_n) != 0) {
+  int t5_err = run_umt5_xxl(w, pos_p, t5_pos_d, &ms_p);
+  if (t5_err == 0 && cfg > 1.01f) {
+    t5_err = run_umt5_xxl(w, neg_p, t5_neg_d, &ms_n);
+  } else if (t5_err == 0) {
+    cudaMemsetAsync(t5_neg_d, 0, 512L * 4096 * 2, w->stream);
+  }
+  if (t5_err != 0) {
     cudaFree(t5_pos_d); cudaFree(t5_neg_d); cudaFree(start_z_d); cudaFree(end_z_d);
     snprintf(res->error, sizeof res->error, "umt5-xxl text encoder failed");
     return -1;
@@ -2184,10 +2270,13 @@ extern "C" int ec_wan22_generate_mp4(
   res->vae_ms += enc_frame_ms;
   cudaFree(z_d);
 
-  // Stage 4: Export Keyframe PNG + Hardware NVENC H.264 (+ optional AAC) MP4!
+  // Stage 4: Export Keyframe0 PNG + Final Frame PNG + Hardware NVENC H.264 (+ optional AAC) MP4!
   if (cb) cb(steps + 2, steps + 3, "wan22_nvenc_mp4", cb_ctx);
   if (out_keyframe_png && out_keyframe_png[0]) {
     ec_export_png(out_keyframe_png, rgb_all, (uint32_t)W, (uint32_t)H);
+  }
+  if (out_lastframe_png && out_lastframe_png[0] && n_frames >= 1) {
+    ec_export_png(out_lastframe_png, rgb_all + (size_t)(n_frames - 1) * W * H * 3u, (uint32_t)W, (uint32_t)H);
   }
   double te0 = wn_now_ms();
   ec_mp4_writer_t *enc = ec_mp4_open(
@@ -2218,4 +2307,15 @@ extern "C" int ec_wan22_generate_mp4(
   res->steps_run = steps;
   res->total_ms = wn_now_ms() - t_all;
   return 0;
+}
+
+extern "C" int ec_wan22_generate_mp4(
+    ec_wan22_t *w,
+    const ec_wan22_req_t *req,
+    const char *out_mp4_path,
+    const char *out_keyframe_png,
+    const char *audio_wav_path,
+    ec_wan22_progress_fn cb, void *cb_ctx,
+    ec_wan22_res_t *res) {
+  return ec_wan22_generate_mp4_ex(w, req, out_mp4_path, out_keyframe_png, NULL, audio_wav_path, cb, cb_ctx, res);
 }

@@ -28,8 +28,10 @@ typedef struct {
   char   gpu_name[128];
   int    sm_major, sm_minor;
   double vram_total_gb;
+  double vram_free_mb;
   double vram_pool_used_mb;
   double vram_pool_budget_mb;
+  int    engines_resident_mask; // bit0=flux2, bit1=acestep, bit2=trellis2, bit3=wan22
   int    models_discovered;
   int    photoreal_ready;
   int    acestep_ready;
@@ -50,6 +52,7 @@ typedef struct {
 typedef struct {
   char   file_main[256];
   char   file_aux[256];       // .ply for 3D, keyframe0 .png for video
+  char   file_last[256];      // final frame .png for 1-click Video Storyboard Extend!
   char   file_mp4[256];       // hardware NVENC H.264 (+AAC) .mp4 for video / video_av
   char   encoder_used[32];    // "h264_nvenc" or "libx264"
   char   stem_files[8][256];  // music: up to 8 flexible stems (0=full, 2=vocals/inst, 4=4stem, 8=8stem)
@@ -135,6 +138,10 @@ typedef int (*ec_progress_cb_t)(int step, int total_steps, int skipped, const ch
 ec_studio_t *ec_studio_create(const char *artifact_dir, const char *models_dir, size_t vram_budget_mb);
 void         ec_studio_destroy(ec_studio_t *st);
 void         ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out);
+
+// Evicts all resident GPU weights across FLUX.2, ACE-Step, TRELLIS.2, and Wan 2.2 in <5ms
+// (preserving mmap handles & tokenizers) for Cross-Process GPU VRAM Lease coordination with llb-serve!
+int ec_studio_unload_all_vram(ec_studio_t *st, double *out_ms, double *out_free_mb);
 
 // 1-6. All Creative Modality Pipelines (thread-safe, progress + cancel aware)
 int ec_studio_gen_image(

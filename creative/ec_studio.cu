@@ -59,16 +59,35 @@ struct ec_studio {
   ec_trellis2_t      *trellis2;
   ec_wan22_t         *wan22;
   char                dag_model_sha[65];
+  int                 active_engine_mask;
   int                 initialized;
 };
 
-// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2).
+// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2, 0=ALL).
 // Lightweight mmap handles & tokenizers stay open so switching modalities incurs zero file re-parsing!
 static void studio_evict_other_engines_locked(ec_studio_t *st, int keep_id) {
   if (keep_id != 1 && st->flux2)    ec_flux2_unload_vram(st->flux2);
   if (keep_id != 2 && st->acestep)  ec_acestep_unload_vram(st->acestep);
   if (keep_id != 3 && st->trellis2) ec_trellis2_unload_vram(st->trellis2);
   if (keep_id != 4 && st->wan22)    ec_wan22_unload_vram(st->wan22);
+  st->active_engine_mask = (keep_id >= 1 && keep_id <= 4) ? (1 << (keep_id - 1)) : 0;
+}
+
+extern "C" int ec_studio_unload_all_vram(ec_studio_t *st, double *out_ms, double *out_free_mb) {
+  if (!st || !st->initialized) return -1;
+  struct timespec ts0, ts1;
+  clock_gettime(CLOCK_MONOTONIC, &ts0);
+  pthread_mutex_lock(&st->gpu_mu);
+  studio_evict_other_engines_locked(st, 0);
+  cudaDeviceSynchronize();
+  size_t free_b = 0, tot_b = 0;
+  if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess && out_free_mb) {
+    *out_free_mb = (double)free_b / (1024.0 * 1024.0);
+  }
+  pthread_mutex_unlock(&st->gpu_mu);
+  clock_gettime(CLOCK_MONOTONIC, &ts1);
+  if (out_ms) *out_ms = ((double)(ts1.tv_sec - ts0.tv_sec) * 1000.0) + ((double)(ts1.tv_nsec - ts0.tv_nsec) / 1e6);
+  return 0;
 }
 
 static void studio_try_init_all_engines_locked(ec_studio_t *st) {
@@ -298,8 +317,13 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
   out->sm_major = st->sm_major;
   out->sm_minor = st->sm_minor;
   out->vram_total_gb = st->vram_total_gb;
+  size_t free_b = 0, tot_b = 0;
+  if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess) {
+    out->vram_free_mb = (double)free_b / (1024.0 * 1024.0);
+  }
   out->vram_pool_used_mb = (double)st->vram_pool.used_bytes / (1024.0 * 1024.0);
   out->vram_pool_budget_mb = (double)st->vram_pool.budget_bytes / (1024.0 * 1024.0);
+  out->engines_resident_mask = st->active_engine_mask;
   out->models_discovered = st->registry.n_models;
   out->photoreal_ready = (st->flux2    && ec_flux2_is_ready(st->flux2))       ? 1 : 0;
   out->acestep_ready   = (st->acestep  && ec_acestep_is_ready(st->acestep))   ? 1 : 0;
@@ -685,6 +709,8 @@ extern "C" int ec_studio_gen_video_v8(
              st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu), req->with_audio ? "_av" : "");
     snprintf(res->file_aux, sizeof res->file_aux, "%s/wan22_%u_%04x_kf0.png",
              st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+    snprintf(res->file_last, sizeof res->file_last, "%s/wan22_%u_%04x_last.png",
+             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
     snprintf(res->file_main, sizeof res->file_main, "%s", res->file_mp4);
 
     ec_wan22_req_t wreq = {};
@@ -706,9 +732,9 @@ extern "C" int ec_studio_gen_video_v8(
     ec_wan22_res_t wres = {};
     pthread_mutex_lock(&st->gpu_mu);
     studio_evict_other_engines_locked(st, 4);
-    int rc = ec_wan22_generate_mp4(st->wan22, &wreq, res->file_mp4, res->file_aux,
-                                   wav_path[0] ? wav_path : NULL,
-                                   cb ? fx_progress_bridge : NULL, &bridge, &wres);
+    int rc = ec_wan22_generate_mp4_ex(st->wan22, &wreq, res->file_mp4, res->file_aux, res->file_last,
+                                      wav_path[0] ? wav_path : NULL,
+                                      cb ? fx_progress_bridge : NULL, &bridge, &wres);
     pthread_mutex_unlock(&st->gpu_mu);
     free(start_rgb); free(end_rgb);
 
@@ -1424,6 +1450,7 @@ extern "C" int ec_studio_gen_video(
   snprintf(res->file_mp4, sizeof res->file_mp4, "%s/video_%u%s.mp4",
            st->artifact_dir, seed, with_audio ? "_av" : "");
   snprintf(res->file_aux, sizeof res->file_aux, "%s/video_%u_kf0.png", st->artifact_dir, seed);
+  snprintf(res->file_last, sizeof res->file_last, "%s/video_%u_last.png", st->artifact_dir, seed);
   snprintf(res->file_main, sizeof res->file_main, "%s", res->file_mp4);
 
   ec_mp4_writer_t *mp4 = ec_mp4_open(res->file_mp4, wav_path[0] ? wav_path : NULL,
@@ -1447,6 +1474,7 @@ extern "C" int ec_studio_gen_video(
       }
     }
     if (f == 0) ec_export_png(res->file_aux, rgb, (uint32_t)width, (uint32_t)height);
+    if (f == n_frames - 1) ec_export_png(res->file_last, rgb, (uint32_t)width, (uint32_t)height);
     rc |= ec_mp4_write_rgb24(mp4, rgb, (size_t)width * height * 3u);
   }
   free(rgb);
