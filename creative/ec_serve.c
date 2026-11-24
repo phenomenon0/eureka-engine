@@ -351,6 +351,7 @@ static int json_get_loras(const char *j, ec_studio_lora_t *out, int max_n) {
     memset(&out[cnt], 0, sizeof out[cnt]);
     json_get_str(tmp, "path", out[cnt].path, sizeof out[cnt].path, "");
     if (!out[cnt].path[0]) json_get_str(tmp, "id", out[cnt].path, sizeof out[cnt].path, "");
+    if (!out[cnt].path[0]) json_get_str(tmp, "name", out[cnt].path, sizeof out[cnt].path, "");
     out[cnt].strength = (float)json_get_num(tmp, "strength", 0.85);
     if (out[cnt].path[0]) cnt++;
     p = end + 1;

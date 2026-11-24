@@ -727,14 +727,21 @@ struct ec_flux2 {
   char      te_sha[65];
 };
 
+static void trim_vae_conv_scratch(fx_vae_cache_t *vc) {
+  if (!vc) return;
+  if (vc->col_bf) { cudaFree(vc->col_bf); vc->col_bf = NULL; vc->col_cap = 0; }
+  if (vc->gy_d)   { cudaFree(vc->gy_d);   vc->gy_d   = NULL; vc->gy_cap  = 0; }
+  for (int i = 0; i < 3; i++) {
+    if (vc->res_tmp[i]) { cudaFree(vc->res_tmp[i]); vc->res_tmp[i] = NULL; vc->res_cap[i] = 0; }
+  }
+}
+
 static void free_vae_cache(fx_vae_cache_t *vc) {
   if (!vc) return;
   for (int i = 0; i < vc->n_tensors; i++) {
     if (vc->tensors[i].ptr) cudaFree(vc->tensors[i].ptr);
   }
-  if (vc->col_bf) cudaFree(vc->col_bf);
-  if (vc->gy_d)   cudaFree(vc->gy_d);
-  for (int i = 0; i < 3; i++) if (vc->res_tmp[i]) cudaFree(vc->res_tmp[i]);
+  trim_vae_conv_scratch(vc);
   memset(vc, 0, sizeof *vc);
 }
 
@@ -1799,6 +1806,9 @@ static int run_flux2_vae_decode(
   cudaMemcpyAsync(rgb_h, cur, (size_t)3 * H * W * 4, cudaMemcpyDeviceToHost, s);
   cudaStreamSynchronize(s);
   cudaFree(ping0); cudaFree(ping1);
+  // Reclaim ~1.85 GB of transient 2D VAE Conv2D workspace immediately (keep ~160 MB VAE weights hot!)
+  // so Chat LLM + Q8 KV Cache + FLUX.2 DiT fit comfortably co-resident on 24 GB GPUs!
+  trim_vae_conv_scratch(&fx->vae_cache);
 
   size_t plane = (size_t)H * W;
   for (size_t i = 0; i < plane; i++) {
