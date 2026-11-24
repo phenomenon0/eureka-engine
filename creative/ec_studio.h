@@ -112,8 +112,10 @@ typedef struct {
   float       cfg_scale, rescale_t;
   float       base_color[4];
   ec_tier_t   tier;
-  const char *input_images[4]; // 1..4 direct photo uploads -> DINOv3 multi-view (skips FLUX.2!)
-  int         n_input_images;
+  const char             *input_images[4]; // 1..4 direct photo uploads -> DINOv3 multi-view (skips FLUX.2!)
+  int                     n_input_images;
+  const ec_studio_lora_t *loras;
+  int                     n_loras;
 } ec_studio_3d_v8_t;
 
 typedef struct {

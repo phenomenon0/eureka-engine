@@ -623,13 +623,16 @@ extern "C" int ec_lora_inspect_ex(
     if (e->dtype == EC_DTYPE_FP8_E4M3) has_fp8 = 1;
     if (strstr(e->name, "lora_magnitude_vector") || strstr(e->name, "dora_scale")) has_dora = 1;
 
-    if (strstr(e->name, "to_qkv_mlp_proj") || strstr(e->name, "double_stream_modulation")) has_flux2 = 1;
+    if (strstr(e->name, "to_qkv_mlp_proj") || strstr(e->name, "double_stream_modulation") ||
+        (strstr(e->name, "double_blocks") && strstr(e->name, "img_attn.qkv"))) has_flux2 = 1;
     if (strstr(e->name, "double_blocks") || strstr(e->name, "single_blocks")) has_flux1 = 1;
     if (strstr(e->name, "transformer_blocks") && strstr(e->name, "img_mod")) has_qwen = 1;
     if ((strstr(e->name, "self_attn") && strstr(e->name, "cross_attn") && strstr(e->name, "blocks.")) ||
         strstr(e->name, "attn1.to_q")) has_wan = 1;
-    if (strstr(e->name, "decoder.layers.") || strstr(e->name, "lyric_encoder") || strstr(e->name, "acestep")) has_acestep = 1;
-    if (strstr(e->name, "ss_flow") || strstr(e->name, "trellis")) has_trellis = 1;
+    if (strstr(e->name, "decoder.layers.") || strstr(e->name, "lyric_encoder") || strstr(e->name, "acestep") ||
+        (strstr(e->name, "layers.") && strstr(e->name, "cross_attn.k_proj"))) has_acestep = 1;
+    if (strstr(e->name, "ss_flow") || strstr(e->name, "trellis") ||
+        strstr(e->name, "cross_attn.to_kv")) has_trellis = 1;
   }
   if (out_pairs) *out_pairs = pairs;
   if (out_rank) *out_rank = rank;

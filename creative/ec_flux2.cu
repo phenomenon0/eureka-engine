@@ -810,8 +810,9 @@ static int try_load_qwen3_resident(ec_flux2_t *fx) {
   if (fx->qwen_res.loaded) return 1;
   size_t free_b = 0, tot_b = 0;
   if (cudaMemGetInfo(&free_b, &tot_b) != cudaSuccess) return 0;
-  // Need ~5.5 GB for 27 BF16 layers + 8 GB for DiT if not loaded yet + 2.5 GB workspace headroom
-  size_t need_b = fx->dit.loaded ? (8ULL * 1024ULL * 1024ULL * 1024ULL) : (16ULL * 1024ULL * 1024ULL * 1024ULL);
+  // Require generous VRAM headroom (13 GB when DiT is already resident, 20 GB when DiT not yet loaded)
+  // so 5.4 GB Qwen3-4B resident weights NEVER starve FLUX.2 DiT (~2 GB workspace) or VAE (~1.8 GB) on 24 GB GPUs!
+  size_t need_b = fx->dit.loaded ? (13ULL * 1024ULL * 1024ULL * 1024ULL) : (20ULL * 1024ULL * 1024ULL * 1024ULL);
   if (free_b < need_b) return 0;
   cudaStream_t s = fx->stream;
   char key[128];
@@ -1255,24 +1256,41 @@ static int run_flux2_dit(
   cudaStream_t s = fx->stream;
   const fx_dit_resident_t *d = &fx->dit;
 
-  // Shifted sigmas schedule
-  double mu = compute_empirical_mu(N_img, steps);
-  double emu = exp(mu);
-  float sigmas[64];
-  for (int i = 0; i < steps; i++) {
-    double t_lin = 1.0 - (double)i * (1.0 - 1.0 / (double)steps) / (double)(steps > 1 ? steps - 1 : 1);
-    if (steps == 1) t_lin = 1.0;
-    double sh = (t_lin >= 1.0) ? 1.0 : (emu / (emu + (1.0 / t_lin - 1.0)));
-    sigmas[i] = (float)sh;
+  // Pre-evict resident Qwen3-4B (5.4 GB) or VAE cache if VRAM is below 3.8 GB so ~2.0 GB DiT workspaces never OOM!
+  {
+    size_t free_b = 0, tot_b = 0;
+    if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess && free_b < 3800ULL * 1024ULL * 1024ULL) {
+      free_qwen3_resident(&fx->qwen_res);
+      if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess && free_b < 2800ULL * 1024ULL * 1024ULL) {
+        free_vae_cache(&fx->vae_cache);
+      }
+    }
   }
-  sigmas[steps] = 0.0f;
 
-  // Determine start step for Img2Img / Inpaint
+  // Shifted sigmas schedule (with FLUX.2 empirical mu-shifted SDEdit starting at t_lin = denoise for unmasked Img2Img!)
   int s0 = 0;
+  float sigmas[64];
   if (z0_init_d && !mask_p_d && denoise > 0.01f && denoise < 0.99f) {
-    s0 = (int)roundf((1.0f - denoise) * (float)steps);
-    if (s0 < 0) s0 = 0;
-    if (s0 >= steps) s0 = steps - 1;
+    if (steps < 6) steps = 6;
+    double mu = compute_empirical_mu(N_img, steps);
+    double emu = exp(mu);
+    for (int i = 0; i < steps; i++) {
+      double t_lin = (double)denoise * (1.0 - (double)i / (double)steps);
+      double sh = (t_lin >= 1.0) ? 1.0 : ((t_lin <= 1e-5) ? 0.0 : (emu / (emu + (1.0 / t_lin - 1.0))));
+      sigmas[i] = (float)sh;
+    }
+    sigmas[steps] = 0.0f;
+  } else {
+    if (z0_init_d && mask_p_d && steps < 6) steps = 6;
+    double mu = compute_empirical_mu(N_img, steps);
+    double emu = exp(mu);
+    for (int i = 0; i < steps; i++) {
+      double t_lin = 1.0 - (double)i * (1.0 - 1.0 / (double)steps) / (double)(steps > 1 ? steps - 1 : 1);
+      if (steps == 1) t_lin = 1.0;
+      double sh = (t_lin >= 1.0) ? 1.0 : (emu / (emu + (1.0 / t_lin - 1.0)));
+      sigmas[i] = (float)sh;
+    }
+    sigmas[steps] = 0.0f;
   }
 
   // Initial unit Gaussian noise eps [N_img, 128]
@@ -1343,6 +1361,20 @@ static int run_flux2_dit(
   cudaMalloc(&Q_h, (size_t)H * N_pad * D * 2);
   cudaMalloc(&K_h, (size_t)H * N_pad * D * 2);
   cudaMalloc(&V_h, (size_t)H * N_pad * D * 2);
+
+  // Never allow a failed workspace allocation to silently produce Gaussian noise!
+  if (!eps_d || !lin1_out || !Q_h || !K_h || !V_h || !v_pred || (use_cfg && !v_neg) || cudaGetLastError() != cudaSuccess) {
+    cudaFree(eps_d); cudaFree(rope_cos); cudaFree(rope_sin);
+    cudaFree(temb_256); cudaFree(temb_256_bf); cudaFree(temb_0); cudaFree(temb_0_bf);
+    cudaFree(temb); cudaFree(silu_temb_bf);
+    cudaFree(mod_img_v); cudaFree(mod_txt_v); cudaFree(mod_sng_v); cudaFree(fmod_v);
+    cudaFree(x_bf16); cudaFree(img_d); cudaFree(txt_d); cudaFree(h_cat);
+    cudaFree(norm_bf); cudaFree(norm_txt_bf); cudaFree(cat_bf);
+    cudaFree(qkv_img); cudaFree(qkv_txt); cudaFree(attn_out); cudaFree(proj_out);
+    cudaFree(mlp_2f); cudaFree(lin1_out); cudaFree(v_pred); cudaFree(v_neg);
+    cudaFree(Q_h); cudaFree(K_h); cudaFree(V_h);
+    return -1;
+  }
 
   auto eval_mmdit_pass = [&](const uint16_t *emb_bf, float *out_v) {
     k_f32_to_bf16<<<((long)N_img * 128 + 255) / 256, 256, 0, s>>>(out_latents_gpu_f32, x_bf16, (long)N_img * 128);
@@ -1619,6 +1651,12 @@ static int run_flux2_vae_encode(
     rgb_h[2 * plane + i] = (float)in_rgb_hwc[i * 3 + 2] * (2.0f / 255.0f) - 1.0f;
   }
   size_t ping_bytes = (size_t)256 * H * W * 4;
+  {
+    size_t free_b = 0, tot_b = 0;
+    if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess && free_b < ping_bytes * 2 + 1200ULL * 1024ULL * 1024ULL) {
+      free_qwen3_resident(&fx->qwen_res);
+    }
+  }
   float *ping0 = NULL, *ping1 = NULL, *rgb_d = NULL;
   if (cudaMalloc(&ping0, ping_bytes) != cudaSuccess ||
       cudaMalloc(&ping1, ping_bytes) != cudaSuccess ||
@@ -1695,6 +1733,12 @@ static int run_flux2_vae_decode(
   if (!bn_mean || !bn_var) return -1;
 
   size_t ping_bytes = (size_t)256 * fullH * fullW * 4;
+  {
+    size_t free_b = 0, tot_b = 0;
+    if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess && free_b < ping_bytes * 2 + 1200ULL * 1024ULL * 1024ULL) {
+      free_qwen3_resident(&fx->qwen_res);
+    }
+  }
   float *ping0 = NULL, *ping1 = NULL;
   if (cudaMalloc(&ping0, ping_bytes) != cudaSuccess ||
       cudaMalloc(&ping1, ping_bytes) != cudaSuccess) {
@@ -1849,18 +1893,51 @@ extern "C" int ec_flux2_generate_rgb(
 
   // 1. Text Encode (Qwen3-4B layers 0..26) + optional negative prompt for CFG > 1.05
   if (cb) cb(0, steps + 2, "qwen3_text_encode", cb_ctx);
+  char enriched_prompt[1536];
+  const char *eff_prompt = (req->prompt && req->prompt[0]) ? req->prompt : "";
+  if (req->init_rgb) {
+    // If user supplies an edit verb ("make it better", "enhance", "upscale", "fix") or empty prompt on Img2Img,
+    // enrich with concrete optical quality cues so pure flow-matching T2I enhances structure instead of hallucinating!
+    size_t plen = strlen(eff_prompt);
+    int is_edit_verb = (plen == 0 || plen < 22);
+    if (!is_edit_verb) {
+      char low[128] = {0};
+      for (size_t i = 0; i < plen && i + 1 < sizeof low; i++) {
+        char c = eff_prompt[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+      }
+      if (strstr(low, "make it") || strstr(low, "enhance") || strstr(low, "improve") ||
+          strstr(low, "upscale") || strstr(low, "sharpen") || strstr(low, "fix")) {
+        is_edit_verb = 1;
+      }
+    }
+    if (is_edit_verb) {
+      if (plen > 0) {
+        snprintf(enriched_prompt, sizeof enriched_prompt,
+                 "%s, masterpiece photorealistic 35mm cinema still, ultra-detailed natural textures, dramatic volumetric lighting, crisp micro-contrast, razor-sharp focus",
+                 eff_prompt);
+      } else {
+        snprintf(enriched_prompt, sizeof enriched_prompt,
+                 "Masterpiece photorealistic 35mm cinema still, ultra-detailed natural textures, dramatic volumetric lighting, crisp micro-contrast, razor-sharp focus");
+      }
+      eff_prompt = enriched_prompt;
+    }
+  }
   uint16_t *prompt_emb_d = NULL, *neg_emb_d = NULL;
-  cudaMalloc(&prompt_emb_d, 512L * 7680L * 2);
-  if (run_qwen3_text_encoder(fx, req->prompt ? req->prompt : "", prompt_emb_d, &res->text_enc_ms) != 0) {
+  if (cudaMalloc(&prompt_emb_d, 512L * 7680L * 2) != cudaSuccess ||
+      run_qwen3_text_encoder(fx, eff_prompt, prompt_emb_d, &res->text_enc_ms) != 0) {
     cudaFree(prompt_emb_d);
     snprintf(res->error, sizeof res->error, "qwen3 text encoder failed");
     return -1;
   }
-  float cfg = (req->cfg_scale > 1.05f && req->neg_prompt && req->neg_prompt[0]) ? req->cfg_scale : 1.0f;
+  const char *eff_neg = (req->neg_prompt && req->neg_prompt[0])
+                        ? req->neg_prompt
+                        : "blurry, low quality, out of focus, distorted anatomy, oversaturated, plastic skin, watermark, text, artifacts";
+  float cfg = (req->cfg_scale > 1.05f) ? req->cfg_scale : 1.0f;
   if (cfg > 1.05f) {
     double neg_ms = 0.0;
     cudaMalloc(&neg_emb_d, 512L * 7680L * 2);
-    if (run_qwen3_text_encoder(fx, req->neg_prompt, neg_emb_d, &neg_ms) == 0) {
+    if (neg_emb_d && run_qwen3_text_encoder(fx, eff_neg, neg_emb_d, &neg_ms) == 0) {
       res->text_enc_ms += neg_ms;
     } else {
       cudaFree(neg_emb_d); neg_emb_d = NULL; cfg = 1.0f;
@@ -1868,17 +1945,24 @@ extern "C" int ec_flux2_generate_rgb(
   }
 
   // 2. Ensure FLUX.2 DiT checkpoint + LoRA/QLoRA stack is resident on GPU
+  //    (If an imported workflow overrides checkpoint with an incompatible arch like SDXL/9B-Quanto, fall back cleanly!)
   if (cb) cb(1, steps + 2, "load_dit_and_loras", cb_ctx);
   if (ensure_dit_loaded(fx, ckpt, req->loras, req->n_loras, res->error, sizeof res->error) != 0) {
-    cudaFree(prompt_emb_d); cudaFree(neg_emb_d);
-    return -1;
+    if (ckpt != fx->paths.checkpoint_path && strcmp(ckpt, fx->paths.checkpoint_path) != 0 &&
+        ensure_dit_loaded(fx, fx->paths.checkpoint_path, req->loras, req->n_loras, res->error, sizeof res->error) == 0) {
+      ckpt = fx->paths.checkpoint_path;
+      res->error[0] = '\0';
+    } else {
+      cudaFree(prompt_emb_d); cudaFree(neg_emb_d);
+      return -1;
+    }
   }
 
   // 2b. Optional Native AutoencoderKLFlux2 VAE Encode (for Img2Img / Masked Inpainting / Outpainting!)
   int H_p = H / 16, W_p = W / 16;
   float *z0_init_d = NULL, *mask_p_d = NULL;
   double enc_ms = 0.0;
-  float denoise = (req->denoise > 0.01f && req->denoise <= 1.0f) ? req->denoise : (req->init_rgb ? 0.72f : 1.0f);
+  float denoise = (req->denoise > 0.01f && req->denoise <= 1.0f) ? req->denoise : (req->init_rgb ? 0.48f : 1.0f);
   if (req->init_rgb && req->init_w > 0 && req->init_h > 0) {
     uint8_t *resized = ec_rgb_resize_bilinear(req->init_rgb, req->init_w, req->init_h, W, H);
     if (resized) {

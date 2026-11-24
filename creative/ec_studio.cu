@@ -529,6 +529,8 @@ extern "C" int ec_studio_gen_3d_v8(
     }
 
     if (n_loaded > 0) {
+      ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
+      int nl = resolve_lora_stack(st, req->loras, req->n_loras, lstack);
       ec_trellis2_req_t treq = {};
       treq.rgb = views[0]; treq.img_w = vw[0]; treq.img_h = vh[0];
       for (int i = 1; i < n_loaded; i++) {
@@ -540,6 +542,8 @@ extern "C" int ec_studio_gen_3d_v8(
       treq.cfg_scale = (req->cfg_scale > 0.0f) ? req->cfg_scale : 7.5f;
       treq.rescale_t = (req->rescale_t > 0.0f) ? req->rescale_t : 5.0f;
       memcpy(treq.base_color, req->base_color, sizeof treq.base_color);
+      treq.loras = nl > 0 ? lstack : NULL;
+      treq.n_loras = nl;
 
       ec_trellis2_res_t tres = {};
       pthread_mutex_lock(&st->gpu_mu);
@@ -554,6 +558,7 @@ extern "C" int ec_studio_gen_3d_v8(
                  req->n_input_images > 1 ? "trellis2_multiview" : (req->n_input_images == 1 ? "trellis2_photo" : "trellis2_1.3b"));
         res->n_verts = tres.n_verts; res->n_tris = tres.n_tris; res->n_splats = tres.n_splats;
         res->steps_run = tres.steps_run;
+        res->lora_tensors_fused = tres.lora_tensors_fused;
         res->text_enc_ms = ref_ms; res->dit_ms = tres.dino_ms + tres.flow_ms;
         res->vae_ms = tres.dec_ms + tres.mesh_ms; res->gpu_ms = ref_ms + tres.total_ms;
         return 0;
@@ -720,7 +725,7 @@ extern "C" int ec_studio_gen_video_v8(
     wreq.width = W; wreq.height = H; wreq.num_frames = actual_f;
     wreq.fps = afps; wreq.steps = asteps;
     wreq.cfg_scale = (req->cfg_scale > 0.0f) ? req->cfg_scale : 5.0f;
-    wreq.shift = (req->shift > 0.0f) ? req->shift : ((W * H <= 832 * 480) ? 3.0f : 5.0f);
+    wreq.shift = req->shift; // 0 -> ec_wan22 picks 5.0f for base Wan 2.2 TI2V-5B or 3.0f for Turbo LoRA!
     wreq.start_rgb = start_rgb; wreq.start_w = sw; wreq.start_h = sh;
     wreq.end_rgb = end_rgb; wreq.end_w = ew; wreq.end_h = eh;
     wreq.denoise = req->denoise;
@@ -745,6 +750,7 @@ extern "C" int ec_studio_gen_video_v8(
       snprintf(res->encoder_used, sizeof res->encoder_used, "%s", wres.encoder_used);
       res->width = wres.width; res->height = wres.height; res->frames = wres.num_frames;
       res->steps_run = wres.steps_run;
+      res->lora_tensors_fused = wres.lora_tensors_fused;
       res->text_enc_ms = wres.text_enc_ms; res->dit_ms = wres.dit_ms;
       res->vae_ms = wres.vae_ms; res->gpu_ms = wres.total_ms + audio_ms;
       res->fps = (double)wres.num_frames / ((wres.total_ms > 1.0 ? wres.total_ms : 1.0) * 1e-3);
@@ -1344,7 +1350,7 @@ extern "C" int ec_studio_gen_video_ex(
     wreq.fps = afps;
     wreq.steps = asteps;
     wreq.cfg_scale = 5.0f;
-    wreq.shift = (W * H <= 832 * 480) ? 3.0f : 5.0f;
+    wreq.shift = 5.0f;
 
     fx_cb_bridge_t bridge = { cb, cb_ctx };
     ec_wan22_res_t wres = {};
@@ -2363,7 +2369,7 @@ extern "C" int ec_studio_flow_object_info_json(ec_studio_t *st, char *buf, size_
       "\"LoadAudio\":{\"category\":\"audio\",\"title\":\"Load Audio (WAV/MP3/FLAC)\",\"outputs\":[\"AUDIO\"],\"inputs\":{\"audio\":{\"type\":\"AUDIO_UPLOAD\",\"default\":\"\"}}},"
       "\"VAEEncode\":{\"category\":\"latent\",\"title\":\"VAE Encode (FLUX.2 Img2Img)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"pixels\":{\"type\":\"IMAGE\"},\"denoise\":{\"type\":\"FLOAT\",\"default\":0.65,\"min\":0.05,\"max\":1.0,\"step\":0.05}}},"
       "\"ImageInpaintMask\":{\"category\":\"latent\",\"title\":\"Image + Inpaint Mask\",\"outputs\":[\"LATENT\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"mask\":{\"type\":\"IMAGE_UPLOAD\",\"default\":\"\"}}},"
-      "\"WanFirstLastFrameToVideo\":{\"category\":\"video\",\"title\":\"Wan 2.2 First + Last Frame (FLF2V)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"start_image\":{\"type\":\"IMAGE\"},\"end_image\":{\"type\":\"IMAGE\"},\"width\":{\"type\":\"INT\",\"default\":832,\"min\":320,\"max\":1280,\"step\":32},\"height\":{\"type\":\"INT\",\"default\":480,\"min\":320,\"max\":1024,\"step\":32},\"length\":{\"type\":\"INT\",\"default\":17,\"min\":5,\"max\":81,\"step\":4},\"camera_motion\":{\"type\":\"COMBO\",\"options\":[\"auto\",\"orbit\",\"dolly_in\",\"pan_left\",\"pan_right\",\"crane_up\",\"fpv\",\"static\"],\"default\":\"auto\"}}},"
+      "\"WanFirstLastFrameToVideo\":{\"category\":\"video\",\"title\":\"Wan 2.2 First + Last Frame (FLF2V)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"start_image\":{\"type\":\"IMAGE\"},\"end_image\":{\"type\":\"IMAGE\"},\"width\":{\"type\":\"INT\",\"default\":832,\"min\":480,\"max\":1280,\"step\":32},\"height\":{\"type\":\"INT\",\"default\":480,\"min\":480,\"max\":1024,\"step\":32},\"length\":{\"type\":\"INT\",\"default\":17,\"min\":17,\"max\":81,\"step\":4},\"camera_motion\":{\"type\":\"COMBO\",\"options\":[\"auto\",\"orbit\",\"dolly_in\",\"pan_left\",\"pan_right\",\"crane_up\",\"fpv\",\"static\"],\"default\":\"auto\"}}},"
       "\"TrellisImageTo3D\":{\"category\":\"3d\",\"title\":\"TRELLIS.2 Direct Photo -> 3D\",\"outputs\":[\"MESH3D\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"steps\":{\"type\":\"INT\",\"default\":12,\"min\":4,\"max\":30},\"cfg\":{\"type\":\"FLOAT\",\"default\":7.5,\"min\":1,\"max\":12,\"step\":0.5},\"isolate_fg\":{\"type\":\"BOOL\",\"default\":true},\"seed\":{\"type\":\"INT\",\"default\":101},\"full_model\":{\"type\":\"BOOL\",\"default\":true}}},"
       "\"AceStepAudioEncode\":{\"category\":\"audio\",\"title\":\"ACE-Step Oobleck VAE Encode (Cover)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"audio\":{\"type\":\"AUDIO\"},\"audio_mode\":{\"type\":\"COMBO\",\"options\":[\"cover\",\"repaint\",\"extend\"],\"default\":\"cover\"},\"denoise\":{\"type\":\"FLOAT\",\"default\":0.65,\"min\":0.1,\"max\":1.0,\"step\":0.05}}},"
       "\"AceStepRepaint\":{\"category\":\"audio\",\"title\":\"ACE-Step Audio Repaint [t0..t1]\",\"outputs\":[\"LATENT\"],\"inputs\":{\"audio\":{\"type\":\"AUDIO\"},\"start_sec\":{\"type\":\"FLOAT\",\"default\":4.0,\"min\":0,\"max\":115,\"step\":0.5},\"end_sec\":{\"type\":\"FLOAT\",\"default\":8.0,\"min\":0.5,\"max\":120,\"step\":0.5}}},"
@@ -2375,7 +2381,7 @@ extern "C" int ec_studio_flow_object_info_json(ec_studio_t *st, char *buf, size_
       "\"EmptyFlux2LatentImage\":{\"category\":\"latent\",\"title\":\"Empty FLUX.2 Latent\",\"outputs\":[\"LATENT\"],\"inputs\":{\"width\":{\"type\":\"INT\",\"default\":512,\"min\":256,\"max\":1536,\"step\":64},\"height\":{\"type\":\"INT\",\"default\":512,\"min\":256,\"max\":1536,\"step\":64}}},"
       "\"EmptyLatentImage\":{\"category\":\"latent\",\"title\":\"Empty Latent Image\",\"outputs\":[\"LATENT\"],\"inputs\":{\"width\":{\"type\":\"INT\",\"default\":512,\"min\":256,\"max\":1536,\"step\":64},\"height\":{\"type\":\"INT\",\"default\":512,\"min\":256,\"max\":1536,\"step\":64}}},"
       "\"EmptyAceStepLatentAudio\":{\"category\":\"audio\",\"title\":\"Empty ACE-Step Latent Audio\",\"outputs\":[\"LATENT\"],\"inputs\":{\"seconds\":{\"type\":\"FLOAT\",\"default\":10,\"min\":2,\"max\":30,\"step\":1}}},"
-      "\"Wan22ImageToVideoLatent\":{\"category\":\"video\",\"title\":\"Wan 2.2 TI2V Latent\",\"outputs\":[\"LATENT\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"width\":{\"type\":\"INT\",\"default\":832,\"min\":320,\"max\":1280,\"step\":16},\"height\":{\"type\":\"INT\",\"default\":480,\"min\":180,\"max\":704,\"step\":16},\"length\":{\"type\":\"INT\",\"default\":17,\"min\":5,\"max\":49,\"step\":4}}},"
+      "\"Wan22ImageToVideoLatent\":{\"category\":\"video\",\"title\":\"Wan 2.2 TI2V Latent\",\"outputs\":[\"LATENT\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"width\":{\"type\":\"INT\",\"default\":832,\"min\":480,\"max\":1280,\"step\":32},\"height\":{\"type\":\"INT\",\"default\":480,\"min\":480,\"max\":1024,\"step\":32},\"length\":{\"type\":\"INT\",\"default\":17,\"min\":17,\"max\":81,\"step\":4}}},"
       "\"KSampler\":{\"category\":\"sampling\",\"title\":\"KSampler (Native CUDA PTX)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"model\":{\"type\":\"MODEL\"},\"positive\":{\"type\":\"CONDITIONING\"},\"negative\":{\"type\":\"CONDITIONING\"},\"latent_image\":{\"type\":\"LATENT\"},\"seed\":{\"type\":\"INT\",\"default\":1042,\"min\":0,\"max\":9999999},\"steps\":{\"type\":\"INT\",\"default\":4,\"min\":1,\"max\":36},\"cfg\":{\"type\":\"FLOAT\",\"default\":3.5,\"min\":1,\"max\":12,\"step\":0.5},\"full_model\":{\"type\":\"BOOL\",\"default\":true}}},"
       "\"VAEDecode\":{\"category\":\"decoders\",\"title\":\"VAE Decode (Image)\",\"outputs\":[\"IMAGE\"],\"inputs\":{\"samples\":{\"type\":\"LATENT\"},\"vae\":{\"type\":\"VAE\"}}},"
       "\"VAEDecodeAudio\":{\"category\":\"audio\",\"title\":\"Oobleck 48kHz Audio Decode\",\"outputs\":[\"AUDIO\"],\"inputs\":{\"samples\":{\"type\":\"LATENT\"}}},"
@@ -2760,6 +2766,20 @@ extern "C" int ec_studio_loras_json(ec_studio_t *st, char *buf, size_t cap) {
   return n;
 }
 
+static int is_compatible_flux2_klein4b_ckpt(const char *path) {
+  if (!path || !path[0]) return 0;
+  ec_safetensors_t st;
+  char err[128] = {0};
+  if (ec_st_open(&st, path, err, sizeof err) != 0) return 0;
+  const ec_st_entry_t *qkv = ec_st_find(&st, "double_blocks.0.img_attn.qkv.weight");
+  const ec_st_entry_t *s19 = ec_st_find(&st, "single_blocks.19.linear1.weight");
+  int ok = (qkv && s19 && qkv->rank == 2 && qkv->shape[0] == 9216 && qkv->shape[1] == 3072 &&
+            s19->rank == 2 && s19->shape[0] == 27648 && s19->shape[1] == 3072 &&
+            (qkv->dtype == EC_DTYPE_BF16 || qkv->dtype == EC_DTYPE_F16 || qkv->dtype == EC_DTYPE_F32)) ? 1 : 0;
+  ec_st_close(&st);
+  return ok;
+}
+
 extern "C" int ec_studio_checkpoints_json(ec_studio_t *st, char *buf, size_t cap) {
   if (!st || !st->initialized || !buf) return -1;
   pthread_mutex_lock(&st->gpu_mu);
@@ -2768,6 +2788,7 @@ extern "C" int ec_studio_checkpoints_json(ec_studio_t *st, char *buf, size_t cap
   for (int i = 0; i < st->vault.n_assets && (size_t)n < cap - 320; i++) {
     const ec_storage_asset_t *a = &st->vault.assets[i];
     if (a->kind != EC_ASSET_CHECKPOINT) continue;
+    if (!is_compatible_flux2_klein4b_ckpt(a->path)) continue;
     n += snprintf(buf + n, cap - (size_t)n,
         "%s{\"id\":\"%s\",\"name\":\"%s\",\"path\":\"%s\",\"root\":\"%s\","
         "\"bytes\":%llu,\"is_network\":%s}",

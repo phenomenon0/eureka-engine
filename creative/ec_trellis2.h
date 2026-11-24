@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "ec_lora.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -34,8 +35,10 @@ typedef struct {
   uint32_t       seed;
   int            steps;      // default 12
   float          cfg_scale;  // default 7.5
-  float          rescale_t;  // default 5.0
-  float          base_color[4]; // optional PBR tint (if alpha <= 0, auto-sampled from conditioning image!)
+  float                 rescale_t;     // default 5.0
+  float                 base_color[4]; // optional PBR tint (if alpha <= 0, auto-sampled from conditioning image!)
+  const ec_lora_spec_t *loras;
+  int                   n_loras;
 } ec_trellis2_req_t;
 
 typedef struct {
@@ -45,6 +48,7 @@ typedef struct {
   int    n_tris;
   int    n_splats;
   int    steps_run;
+  int    lora_tensors_fused;
   double dino_ms;
   double flow_ms;
   double dec_ms;

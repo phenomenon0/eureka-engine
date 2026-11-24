@@ -474,6 +474,8 @@ typedef struct {
 
 typedef struct {
   int loaded;
+  char lora_sig[1024];
+  int  lora_hits;
   uint16_t *in_w, *out_w, *t0_w, *t2_w, *adaln_w;
   float    *in_b, *out_b, *t0_b, *t2_b, *adaln_b;
   tr_ss_block_t blocks[30];
@@ -541,10 +543,24 @@ static void free_dec_res(tr_ss_dec_res_t *d) {
   memset(d, 0, sizeof *d);
 }
 
-static int ensure_flow_loaded(ec_trellis2_t *tr) {
-  if (tr->flow.loaded) return 0;
+static void build_tr_lora_sig(const ec_lora_spec_t *loras, int n_loras, char *out, size_t cap) {
+  out[0] = '\0';
+  size_t pos = 0;
+  for (int i = 0; i < n_loras && pos + 8 < cap; i++) {
+    if (!loras[i].path[0]) continue;
+    pos += (size_t)snprintf(out + pos, cap - pos, "%s%.3f|", loras[i].path, loras[i].strength);
+  }
+}
+
+static int ensure_flow_loaded(ec_trellis2_t *tr, const ec_lora_spec_t *loras, int n_loras) {
+  int clamped_n = (loras && n_loras > 0) ? (n_loras > EC_LORA_MAX_STACK ? EC_LORA_MAX_STACK : n_loras) : 0;
+  char lsig[1024];
+  build_tr_lora_sig(loras, clamped_n, lsig, sizeof lsig);
+  if (tr->flow.loaded && strcmp(tr->flow.lora_sig, lsig) == 0) return 0;
+  if (tr->flow.loaded) free_flow_res(&tr->flow);
   const ec_safetensors_t *st = &tr->flow_st;
   tr_ss_flow_res_t *f = &tr->flow;
+  ec_lora_apply_stats_t lstats = {};
   f->in_w    = tr_upload_bf16(st, "input_layer.weight");
   f->in_b    = tr_upload_f32(st,  "input_layer.bias");
   f->out_w   = tr_upload_bf16(st, "out_layer.weight");
@@ -562,27 +578,36 @@ static int ensure_flow_loaded(ec_trellis2_t *tr) {
     tr_ss_block_t *B = &f->blocks[i];
     snprintf(k, sizeof k, "blocks.%d.modulation", i);                    B->modulation = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.to_qkv.weight", i);      B->sa_qkv_w   = tr_upload_bf16(st, k);
+    if (clamped_n > 0 && B->sa_qkv_w) ec_lora_fuse_onto_bf16(B->sa_qkv_w, 4608, 1536, k, loras, clamped_n, &lstats, tr->stream);
     snprintf(k, sizeof k, "blocks.%d.self_attn.to_qkv.bias", i);        B->sa_qkv_b   = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.to_out.weight", i);      B->sa_out_w   = tr_upload_bf16(st, k);
+    if (clamped_n > 0 && B->sa_out_w) ec_lora_fuse_onto_bf16(B->sa_out_w, 1536, 1536, k, loras, clamped_n, &lstats, tr->stream);
     snprintf(k, sizeof k, "blocks.%d.self_attn.to_out.bias", i);        B->sa_out_b   = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.q_rms_norm.gamma", i);   B->sa_qn      = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.self_attn.k_rms_norm.gamma", i);   B->sa_kn      = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.norm2.weight", i);                 B->norm2_w    = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.norm2.bias", i);                   B->norm2_b    = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.to_q.weight", i);       B->ca_q_w     = tr_upload_bf16(st, k);
+    if (clamped_n > 0 && B->ca_q_w) ec_lora_fuse_onto_bf16(B->ca_q_w, 1536, 1536, k, loras, clamped_n, &lstats, tr->stream);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.to_q.bias", i);         B->ca_q_b     = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.to_kv.weight", i);      B->ca_kv_w    = tr_upload_bf16(st, k);
+    if (clamped_n > 0 && B->ca_kv_w) ec_lora_fuse_onto_bf16(B->ca_kv_w, 3072, 1024, k, loras, clamped_n, &lstats, tr->stream);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.to_kv.bias", i);        B->ca_kv_b    = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.to_out.weight", i);     B->ca_out_w   = tr_upload_bf16(st, k);
+    if (clamped_n > 0 && B->ca_out_w) ec_lora_fuse_onto_bf16(B->ca_out_w, 1536, 1536, k, loras, clamped_n, &lstats, tr->stream);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.to_out.bias", i);       B->ca_out_b   = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.q_rms_norm.gamma", i);  B->ca_qn      = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.cross_attn.k_rms_norm.gamma", i);  B->ca_kn      = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.mlp.mlp.0.weight", i);             B->mlp0_w     = tr_upload_bf16(st, k);
+    if (clamped_n > 0 && B->mlp0_w) ec_lora_fuse_onto_bf16(B->mlp0_w, 6144, 1536, k, loras, clamped_n, &lstats, tr->stream);
     snprintf(k, sizeof k, "blocks.%d.mlp.mlp.0.bias", i);               B->mlp0_b     = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.mlp.mlp.2.weight", i);             B->mlp2_w     = tr_upload_bf16(st, k);
+    if (clamped_n > 0 && B->mlp2_w) ec_lora_fuse_onto_bf16(B->mlp2_w, 1536, 6144, k, loras, clamped_n, &lstats, tr->stream);
     snprintf(k, sizeof k, "blocks.%d.mlp.mlp.2.bias", i);               B->mlp2_b     = tr_upload_f32(st, k);
     if (!B->sa_qkv_w || !B->ca_kv_w || !B->mlp2_w) { free_flow_res(f); return -1; }
   }
+  snprintf(f->lora_sig, sizeof f->lora_sig, "%s", lsig);
+  f->lora_hits = lstats.n_tensors_matched;
   f->loaded = 1;
   return 0;
 }
@@ -1551,12 +1576,13 @@ extern "C" int ec_trellis2_generate_3d(
     cudaFree(acc_d); cudaFree(tmp_d);
   }
 
-  // Stage 2: 30-Block SparseStructureFlowModel 1.3B BF16 (12-step Flow Euler CFG)
-  if (ensure_flow_loaded(tr) != 0) {
+  // Stage 2: 30-Block SparseStructureFlowModel 1.3B BF16 (12-step Flow Euler CFG + hot-fused LoRA/DoRA!)
+  if (ensure_flow_loaded(tr, req->loras, req->n_loras) != 0) {
     cudaFree(cond_bf16_d);
     snprintf(res->error, sizeof res->error, "trellis2 ss_flow load failed");
     return -1;
   }
+  int lora_hits = tr->flow.lora_hits;
   float *z_d = NULL;
   cudaMalloc(&z_d, 4096L * 8 * 4);
   int rc = run_ss_flow(tr, cond_bf16_d, steps, cfg, rsc, req->seed, z_d, cb, cb_ctx, &res->flow_ms);
@@ -1613,6 +1639,7 @@ extern "C" int ec_trellis2_generate_3d(
   }
   res->ok = 1;
   res->steps_run = steps;
+  res->lora_tensors_fused = lora_hits;
   res->total_ms = tr_now_ms() - t_all;
   return 0;
 }

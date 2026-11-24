@@ -1307,6 +1307,7 @@ typedef struct {
   uint16_t *t_f_d, *t_hb_d;
   float *x_d, *qkv_d, *tmp_d, *ffn_d, *head_d;
   float *e_d, *e0_d, *mod_d, *hmod_d, *t_hf_d;
+  float *e_z_d, *e0_z_d, *mod_z_d, *hmod_z_d;
 } wn_dit_work_t;
 
 static void compute_wan_time(ec_wan22_t *w, float t_val, wn_dit_work_t *W, float *out_e_d, float *out_e0_d) {
@@ -1328,37 +1329,86 @@ static void compute_wan_time(ec_wan22_t *w, float t_val, wn_dit_work_t *W, float
 
 static void wan_dit_forward(
     ec_wan22_t *w, const float *xt_d, float t_input,
-    int F, int Hp, int Wp,
+    int F, int Hp, int Wp, int pin_first, int pin_last,
     uint16_t *const ck_cache[30], uint16_t *const cv_cache[30],
     wn_dit_work_t *W, float *out_v_d) {
   const wn_dit_res_t *d = &w->dit;
   const int N = F * Hp * Wp, DIM = 3072, H = 24, FFN = 14336, Lctx = 512;
+  const int n_tok_f = Hp * Wp;
   const float scale = 1.0f / sqrtf(128.0f);
+  const int has_pin = ((pin_first || pin_last) && F >= 2) ? 1 : 0;
 
   compute_wan_time(w, t_input, W, W->e_d, W->e0_d);
+  if (has_pin) {
+    // Official Wan 2.2 TI2V-5B mask2 conditioning: clean anchored frames receive timestep t = 0.0f!
+    compute_wan_time(w, 0.0f, W, W->e_z_d, W->e0_z_d);
+  }
   k_wn_patchify<<<((long)N * 192 + 255) / 256, 256, 0, w->stream>>>(xt_d, W->patch_bf16, F, Hp, Wp);
   wn_gemm(W->patch_bf16, d->patch_w, d->patch_b, W->x_d, NULL, N, DIM, 192, w->stream);
 
   int nw = N * H;
+  int mid_start = (has_pin && pin_first) ? n_tok_f : 0;
+  int mid_end   = (has_pin && pin_last)  ? (N - n_tok_f) : N;
+  int mid_rows  = mid_end - mid_start;
+
+  auto run_adaln_ln = [&](const float *sc_main, const float *sh_main, const float *sc_zero, const float *sh_zero) {
+    if (!has_pin) {
+      k_wn_layernorm<<<N, 256, 0, w->stream>>>(W->x_d, NULL, NULL, sc_main, sh_main, W->xn_bf16, N, DIM, 1e-6f);
+    } else {
+      if (pin_first) {
+        k_wn_layernorm<<<n_tok_f, 256, 0, w->stream>>>(W->x_d, NULL, NULL, sc_zero, sh_zero, W->xn_bf16, n_tok_f, DIM, 1e-6f);
+      }
+      if (mid_rows > 0) {
+        k_wn_layernorm<<<mid_rows, 256, 0, w->stream>>>(
+            W->x_d + (long)mid_start * DIM, NULL, NULL, sc_main, sh_main,
+            W->xn_bf16 + (long)mid_start * DIM, mid_rows, DIM, 1e-6f);
+      }
+      if (pin_last) {
+        k_wn_layernorm<<<n_tok_f, 256, 0, w->stream>>>(
+            W->x_d + (long)(N - n_tok_f) * DIM, NULL, NULL, sc_zero, sh_zero,
+            W->xn_bf16 + (long)(N - n_tok_f) * DIM, n_tok_f, DIM, 1e-6f);
+      }
+    }
+  };
+
+  auto run_gated_add = [&](const float *g_main, const float *g_zero) {
+    if (!has_pin) {
+      k_wn_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, g_main, N, DIM);
+    } else {
+      if (pin_first) {
+        k_wn_add_scaled<<<((long)n_tok_f * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, g_zero, n_tok_f, DIM);
+      }
+      if (mid_rows > 0) {
+        k_wn_add_scaled<<<((long)mid_rows * DIM + 255) / 256, 256, 0, w->stream>>>(
+            W->x_d + (long)mid_start * DIM, W->tmp_d + (long)mid_start * DIM, g_main, mid_rows, DIM);
+      }
+      if (pin_last) {
+        long off = (long)(N - n_tok_f) * DIM;
+        k_wn_add_scaled<<<((long)n_tok_f * DIM + 255) / 256, 256, 0, w->stream>>>(
+            W->x_d + off, W->tmp_d + off, g_zero, n_tok_f, DIM);
+      }
+    }
+  };
 
   for (int l = 0; l < 30; l++) {
     const wn_dit_blk_t *B = &d->blocks[l];
     k_wn_add_vec<<<(18432 + 255) / 256, 256, 0, w->stream>>>(B->mod, W->e0_d, W->mod_d, 18432);
-    const float *m0 = W->mod_d + 0 * DIM;
-    const float *m1 = W->mod_d + 1 * DIM;
-    const float *m2 = W->mod_d + 2 * DIM;
-    const float *m3 = W->mod_d + 3 * DIM;
-    const float *m4 = W->mod_d + 4 * DIM;
-    const float *m5 = W->mod_d + 5 * DIM;
+    if (has_pin) {
+      k_wn_add_vec<<<(18432 + 255) / 256, 256, 0, w->stream>>>(B->mod, W->e0_z_d, W->mod_z_d, 18432);
+    }
+    const float *m0 = W->mod_d + 0 * DIM, *m1 = W->mod_d + 1 * DIM, *m2 = W->mod_d + 2 * DIM;
+    const float *m3 = W->mod_d + 3 * DIM, *m4 = W->mod_d + 4 * DIM, *m5 = W->mod_d + 5 * DIM;
+    const float *z0 = W->mod_z_d + 0 * DIM, *z1 = W->mod_z_d + 1 * DIM, *z2 = W->mod_z_d + 2 * DIM;
+    const float *z3 = W->mod_z_d + 3 * DIM, *z4 = W->mod_z_d + 4 * DIM, *z5 = W->mod_z_d + 5 * DIM;
 
     // 1. Self-Attention: LN + AdaLN -> 1 Fused QKV GEMM -> 1 Fused WanRMSNorm+3DRoPE+BF16 -> TensorCore BF16 FA2!
-    k_wn_layernorm<<<N, 256, 0, w->stream>>>(W->x_d, NULL, NULL, m1, m0, W->xn_bf16, N, DIM, 1e-6f);
+    run_adaln_ln(m1, m0, z1, z0);
     wn_gemm(W->xn_bf16, B->sa_qkv_w, B->sa_qkv_b, W->qkv_d, NULL, N, 3 * DIM, DIM, w->stream);
     k_wn_sa_qkv_norm_rope_bf16<<<N, 256, 0, w->stream>>>(
         W->qkv_d, B->sa_nq, B->sa_nk, W->qr_b, W->kr_b, W->vr_b, N, F, Hp, Wp);
     ec_ops_fa2_bf16(W->qr_b, W->kr_b, W->vr_b, NULL, W->ao_bf16, N, N, N, N, H, H, 128, scale, 0, w->stream);
     wn_gemm(W->ao_bf16, B->sa_o_w, B->sa_o_b, W->tmp_d, NULL, N, DIM, DIM, w->stream);
-    k_wn_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, m2, N, DIM);
+    run_gated_add(m2, z2);
 
     // 2. Cross-Attention: affine norm3 -> q + WanRMSNorm(3072) -> TensorCore BF16 FA2 against cached KV -> residual
     k_wn_layernorm<<<N, 256, 0, w->stream>>>(W->x_d, B->norm3_w, B->norm3_b, NULL, NULL, W->xn_bf16, N, DIM, 1e-6f);
@@ -1370,16 +1420,19 @@ static void wan_dit_forward(
     k_wn_add_inplace<<<((long)N * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, (long)N * DIM);
 
     // 3. FFN: LN(no affine) + AdaLN -> 3072->14336 GELU(tanh) -> 14336->3072 -> gated residual
-    k_wn_layernorm<<<N, 256, 0, w->stream>>>(W->x_d, NULL, NULL, m4, m3, W->xn_bf16, N, DIM, 1e-6f);
+    run_adaln_ln(m4, m3, z4, z3);
     wn_gemm(W->xn_bf16, B->ffn0_w, B->ffn0_b, W->ffn_d, NULL, N, FFN, DIM, w->stream);
     k_wn_gelu_tanh_bf16<<<((long)N * FFN + 255) / 256, 256, 0, w->stream>>>(W->ffn_d, W->ffn_bf16, (long)N * FFN);
     wn_gemm(W->ffn_bf16, B->ffn2_w, B->ffn2_b, W->tmp_d, NULL, N, DIM, FFN, w->stream);
-    k_wn_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, m5, N, DIM);
+    run_gated_add(m5, z5);
   }
 
   // Head + Unpatchify
   k_wn_add_head_mod<<<(2 * DIM + 255) / 256, 256, 0, w->stream>>>(d->head_mod, W->e_d, W->hmod_d, DIM);
-  k_wn_layernorm<<<N, 256, 0, w->stream>>>(W->x_d, NULL, NULL, W->hmod_d + DIM, W->hmod_d, W->xn_bf16, N, DIM, 1e-6f);
+  if (has_pin) {
+    k_wn_add_head_mod<<<(2 * DIM + 255) / 256, 256, 0, w->stream>>>(d->head_mod, W->e_z_d, W->hmod_z_d, DIM);
+  }
+  run_adaln_ln(W->hmod_d + DIM, W->hmod_d, W->hmod_z_d + DIM, W->hmod_z_d);
   wn_gemm(W->xn_bf16, d->head_w, d->head_b, W->head_d, NULL, N, 192, DIM, w->stream);
   k_wn_unpatchify<<<((long)N * 192 + 255) / 256, 256, 0, w->stream>>>(W->head_d, out_v_d, F, Hp, Wp);
 }
@@ -1457,6 +1510,10 @@ static int run_wan_dit(
   cudaMalloc(&W.e0_d,        6 * DIM * 4);
   cudaMalloc(&W.mod_d,       6 * DIM * 4);
   cudaMalloc(&W.hmod_d,      2 * DIM * 4);
+  cudaMalloc(&W.e_z_d,       DIM * 4);
+  cudaMalloc(&W.e0_z_d,      6 * DIM * 4);
+  cudaMalloc(&W.mod_z_d,     6 * DIM * 4);
+  cudaMalloc(&W.hmod_z_d,    2 * DIM * 4);
   cudaMalloc(&W.t_f_d,       256 * 2);
   cudaMalloc(&W.t_hf_d,      3072 * 4);
   cudaMalloc(&W.t_hb_d,      3072 * 2);
@@ -1493,6 +1550,8 @@ static int run_wan_dit(
   const char *env_ex = getenv("EC_EXACT");
   const int exact_mode = (env_ex && atoi(env_ex) == 1) ? 1 : 0;
 
+  int pin_first = (start_z_d != NULL) ? 1 : 0;
+  int pin_last  = (end_z_d != NULL && F >= 2) ? 1 : 0;
   int cancelled = 0;
   for (int s = 0; s < steps; s++) {
     if (cb && cb(s + 1, steps + 3, "wan22_dit_step", cb_ctx) != 0) {
@@ -1500,12 +1559,12 @@ static int run_wan_dit(
       break;
     }
     float t_cur = sig[s], t_next = sig[s + 1], dt = t_cur - t_next;
-    wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, ck_pos, cv_pos, &W, vp_d);
+    wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, pin_first, pin_last, ck_pos, cv_pos, &W, vp_d);
 
     if (cfg_scale > 1.01f) {
-      int reuse_delta = (!exact_mode && steps >= 10 && s >= 4 && s < steps - 2 && (s & 1) == 1);
+      int reuse_delta = (!exact_mode && steps >= 20 && s >= 6 && s < steps - 3 && (s & 1) == 1);
       if (!reuse_delta) {
-        wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, ck_neg, cv_neg, &W, vn_d);
+        wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, pin_first, pin_last, ck_neg, cv_neg, &W, vn_d);
         ec_ops_wan_cfg_euler(xt_d, vp_d, vn_d, delta_d, Z_ELEMS, dt, cfg_scale, 1, w->stream);
       } else {
         ec_ops_wan_cfg_euler(xt_d, vp_d, NULL, delta_d, Z_ELEMS, dt, cfg_scale, 2, w->stream);
@@ -1535,6 +1594,7 @@ static int run_wan_dit(
   cudaFree(W.qr_b); cudaFree(W.kr_b); cudaFree(W.vr_b);
   cudaFree(W.ao_bf16); cudaFree(W.tmp_d); cudaFree(W.ffn_d); cudaFree(W.ffn_bf16);
   cudaFree(W.head_d); cudaFree(W.e_d); cudaFree(W.e0_d); cudaFree(W.mod_d); cudaFree(W.hmod_d);
+  cudaFree(W.e_z_d); cudaFree(W.e0_z_d); cudaFree(W.mod_z_d); cudaFree(W.hmod_z_d);
   cudaFree(W.t_f_d); cudaFree(W.t_hf_d); cudaFree(W.t_hb_d);
   cudaFree(xt_d); cudaFree(vp_d); cudaFree(vn_d); cudaFree(delta_d);
 
@@ -2124,7 +2184,9 @@ static int has_distilled_wan_lora(const ec_lora_spec_t *loras, int n_loras) {
       low[j] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     }
     low[j] = '\0';
-    if (strstr(low, "lightning") || strstr(low, "causvid") || strstr(low, "lcm") || strstr(low, "4step") || strstr(low, "6step"))
+    if (strstr(low, "lightning") || strstr(low, "causvid") || strstr(low, "lcm") ||
+        strstr(low, "4step") || strstr(low, "6step") || strstr(low, "turbo") ||
+        strstr(low, "fastwan") || strstr(low, "dmd") || strstr(low, "lightx2v"))
       return 1;
   }
   return 0;
@@ -2148,23 +2210,36 @@ extern "C" int ec_wan22_generate_mp4_ex(
 
   int W = req->width  > 0 ? ((req->width  + 31) & ~31) : 832;
   int H = req->height > 0 ? ((req->height + 31) & ~31) : 480;
-  if (W < 320) W = 320; if (W > 1280) W = 1280;
-  if (H < 320) H = 320; if (H > 1024) H = 1024;
+  // Wan 2.2 TI2V-5B 3D-RoPE requires >= 480px short edge & >= 640px long edge (sub-480p collapses spatial frequencies)
+  if (W < 480 || H < 480 || (W < 640 && H < 640)) {
+    if (W > H) { W = 832; H = 480; }
+    else if (H > W) { W = 480; H = 832; }
+    else { W = 640; H = 640; }
+  }
+  if (W > 1280) W = 1280;
+  if (H > 1024) H = 1024;
   int req_f = req->num_frames > 0 ? req->num_frames : 17;
+  int is_distilled = has_distilled_wan_lora(req->loras, req->n_loras);
   int F_lat = (req_f - 1) / 4 + 1;
-  if (F_lat < 2) F_lat = 2;
+  // Wan 2.2 TI2V-5B temporal 3D-RoPE requires F_lat >= 5 (>= 17 frames) on non-distilled CFG runs (sub-17f swirls!)
+  int min_flat = is_distilled ? 3 : 5;
+  if (F_lat < min_flat) F_lat = min_flat;
   if (F_lat > 21) F_lat = 21;
   int n_frames = 1 + 4 * (F_lat - 1);
   int fps   = (req->fps >= 8 && req->fps <= 60) ? req->fps : 16;
   int steps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 20;
   float cfg = (req->cfg_scale > 0.0f) ? req->cfg_scale : 5.0f;
-  float shf = (req->shift > 0.0f) ? req->shift : ((W * H <= 832 * 480) ? 3.0f : 5.0f);
+  // Official Wan 2.2 TI2V-5B requires sample_shift = 5.0 (3.0 is only for step-distilled Turbo/Lightning LoRAs)
+  float shf = (req->shift > 0.0f) ? req->shift : (is_distilled ? 3.0f : 5.0f);
 
-  // Auto-engage Step-Distilled Fast Schedule (6 single-pass steps, CFG=1.0) when a Lightning/CausVid QLoRA is active!
-  if (has_distilled_wan_lora(req->loras, req->n_loras) && steps >= 16 && cfg >= 4.5f) {
+  // Auto-engage Step-Distilled Fast Schedule (6 single-pass steps, CFG=1.0) when a Turbo/Lightning/CausVid LoRA is active,
+  // or enforce >= 18 steps when running non-distilled base Wan 2.2 TI2V-5B with high CFG so Euler integration never overshoots!
+  if (is_distilled && steps >= 16 && cfg >= 4.5f) {
     steps = 6;
     cfg = 1.0f;
     shf = 3.0f;
+  } else if (!is_distilled && cfg > 1.5f && steps < 18) {
+    steps = 18;
   }
 
   int H_lat = H / 16, W_lat = W / 16;
@@ -2240,6 +2315,7 @@ extern "C" int ec_wan22_generate_mp4_ex(
     snprintf(res->error, sizeof res->error, "wan22 dit load failed");
     return -1;
   }
+  int lora_hits = w->dit.lora_hits;
   float *z_d = NULL;
   cudaMalloc(&z_d, (size_t)F_lat * H_lat * W_lat * 48 * 4);
   int rc = run_wan_dit(w, t5_pos_d, t5_neg_d, F_lat, Hp, Wp, steps, cfg, shf, req->seed,
@@ -2251,8 +2327,14 @@ extern "C" int ec_wan22_generate_mp4_ex(
     return rc;
   }
 
-  // Stage 3: Causal 3D VAE Streaming Decode
+  // Stage 3: Causal 3D VAE Streaming Decode (evict 10GB DiT first if free VRAM < 5.5 GB so 3D causal caches never OOM!)
   if (cb) cb(steps + 1, steps + 3, "wan22_causal_vae_decode", cb_ctx);
+  {
+    size_t free_b = 0, tot_b = 0;
+    if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess && free_b < 5600ULL * 1024ULL * 1024ULL) {
+      free_dit_res(&w->dit);
+    }
+  }
   if (ensure_vae_loaded(w) != 0) {
     free_dit_res(&w->dit);
     if (ensure_vae_loaded(w) != 0) {
@@ -2305,6 +2387,7 @@ extern "C" int ec_wan22_generate_mp4_ex(
   res->num_frames = n_frames;
   res->latent_frames = F_lat;
   res->steps_run = steps;
+  res->lora_tensors_fused = lora_hits;
   res->total_ms = wn_now_ms() - t_all;
   return 0;
 }

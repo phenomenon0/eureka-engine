@@ -54,6 +54,7 @@ typedef struct {
   int    num_frames;
   int    latent_frames;
   int    steps_run;
+  int    lora_tensors_fused;
   char   encoder_used[32];
   double text_enc_ms;
   double dit_ms;
