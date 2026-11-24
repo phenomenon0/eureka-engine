@@ -338,70 +338,70 @@ typedef struct {
 } ec_lora_catalog_item_t;
 
 static const ec_lora_catalog_item_t ELITE_LORA_CATALOG[] = {
-  // --- FLUX.2 Photoreal Image LoRAs & QLoRAs (8) ---
-  {"flux2-kodak-portra-dora", "Kodak Portra 400 Film Science", "flux2", "dora", 32, 0.85f,
-   "portra400, natural skin grain", "eureka-labs/flux2-kodak-portra-dora", "flux2_kodak_portra400_dora.safetensors",
-   "Authentic medium-format Kodak Portra 400 highlight rolloff, skin tones, and organic film grain via weight-decomposed DoRA."},
-  {"flux2-hyperreal-skin-nf4", "Editorial Skin & Micro-Texture (QLoRA NF4)", "flux2", "qlora_nf4", 64, 0.75f,
-   "editorial candid, natural pores", "eureka-labs/flux2-editorial-skin-nf4", "flux2_editorial_skin_nf4.safetensors",
-   "4-bit NormalFloat QLoRA adapter tuned on medium-format editorial portraits — eliminates AI plastic sheen at 4x smaller size."},
-  {"flux2-cinestill-800t-fp8", "CineStill 800T Night Halation (QLoRA FP8)", "flux2", "qlora_fp8", 32, 0.90f,
-   "cinestill800t, tungsten halation", "eureka-labs/flux2-cinestill-800t-fp8", "flux2_cinestill800t_fp8.safetensors",
-   "OCP FP8 E4M3FN quantized tungsten night cinema adapter adding genuine red halation around practical neon & streetlamps."},
-  {"flux2-arch-monograph-lora", "Architectural Monograph & Tilt-Shift", "flux2", "lora", 32, 0.80f,
-   "archmonograph, crisp verticals", "eureka-labs/flux2-arch-monograph", "flux2_arch_monograph_r32.safetensors",
-   "Enforces razor-sharp rectilinear architectural lines, natural daylight falloff, and editorial concrete/timber materiality."},
-  {"flux2-product-studio-loha", "Luxury Commercial Product Studio (LoHa)", "flux2", "loha", 32, 0.85f,
-   "commercial macro, strip softbox", "eureka-labs/flux2-product-studio-loha", "flux2_product_studio_loha.safetensors",
-   "Hadamard-product LoHa adapter for immaculate reflections on brushed titanium, glass, watches, ceramics, and studio packaging."},
-  {"flux2-swiss-typography-lokr", "Swiss Editorial & Typography (LoKr)", "flux2", "lokr", 16, 0.90f,
-   "swissgrid, crisp typography", "eureka-labs/flux2-swiss-type-lokr", "flux2_swiss_typography_lokr.safetensors",
-   "Kronecker-product LoKr adapter dramatically improving crisp poster lettering, editorial grids, and book cover design."},
-  {"flux2-leica-monochrome-lora", "Leica Monochrom Silver Gelatin B&W", "flux2", "lora", 16, 0.95f,
-   "silvergelatin, leicamonochrom", "eureka-labs/flux2-leica-monochrom", "flux2_leica_monochrom_r16.safetensors",
-   "Rich tonal zone-system black-and-white documentary photography inspired by Ilford HP5 & Tri-X darkroom prints."},
-  {"flux2-anime-cel-nf4", "Makoto Cel Cinema & Painterly (QLoRA NF4)", "flux2", "qlora_nf4", 64, 0.80f,
-   "celcinema, handpainted sky", "eureka-labs/flux2-cel-cinema-nf4", "flux2_cel_cinema_nf4.safetensors",
-   "High-rank NF4 QLoRA for theatrical Japanese cel animation lighting, painterly clouds, and crisp linework."},
-  // --- Wan 2.2 TI2V-5B Cinema Video LoRAs & QLoRAs (6) ---
-  {"wan22-lightning-4step-fp8", "Wan 2.2 CausVid 6-Step Turbo (QLoRA FP8)", "wan22", "qlora_fp8", 32, 1.00f,
-   "", "lightx2v/Wan2.2-Lightning", "wan22_lightning_fp8_lora.safetensors",
-   "Step-distillation FP8 QLoRA enabling crisp 6–8 step cinema video generation at 2.5x faster DiT latency on RTX 3090."},
-  {"wan22-orbital-dolly-lora", "Cinema 360 Orbital & Dolly Camera Control", "wan22", "lora", 32, 0.85f,
-   "orbital dolly, steady arc", "eureka-labs/wan22-camera-orbit", "wan22_camera_orbit_r32.safetensors",
-   "Trained on real cinema crane & Steadicam arcs for physically accurate parallax during 360-degree orbits and push-ins."},
-  {"wan22-35mm-anamorphic-dora", "35mm Anamorphic Film Motion (DoRA)", "wan22", "dora", 32, 0.80f,
-   "anamorphic35mm, natural motion blur", "eureka-labs/wan22-anamorphic-dora", "wan22_anamorphic_35mm_dora.safetensors",
-   "DoRA cinema motion adapter delivering authentic 180-degree shutter motion blur, subtle lens breathing, and filmic contrast."},
-  {"wan22-fluid-physics-nf4", "Fluid, Cloth & Smoke Physics (QLoRA NF4)", "wan22", "qlora_nf4", 64, 0.85f,
-   "realistic fluid motion", "eureka-labs/wan22-physics-nf4", "wan22_fluid_physics_nf4.safetensors",
-   "NF4 QLoRA sharpening liquid splashes, billowing fabrics, curling steam, and natural wind dynamics without temporal smear."},
-  {"wan22-fpv-drone-lora", "Aerial FPV Drone & Hyperlapse Glide", "wan22", "lora", 24, 0.80f,
-   "fpv drone glide, sweeping aerial", "eureka-labs/wan22-fpv-drone", "wan22_fpv_drone_r24.safetensors",
-   "High-speed smooth forward FPV camera trajectory control for landscapes, coastal cliffs, and architectural flythroughs."},
-  {"wan22-product-turntable-loha", "Studio 360 Product Commercial (LoHa)", "wan22", "loha", 32, 0.90f,
-   "studio turntable, smooth rotation", "eureka-labs/wan22-product-turntable", "wan22_product_turntable_loha.safetensors",
-   "Ultra-clean commercial product rotation & lighting sweep with zero background drift — ideal with Start-Frame I2V."},
-  // --- ACE-Step 1.5 Music & Audio LoKr / QLoRA Adapters (4) ---
-  {"acestep-analog-master-lokr", "Analog Tape & Neve Mastering (LoKr)", "acestep", "lokr", 16, 0.85f,
-   "analog tape warmth, wide stereo master", "ACE-Step/acestep15-analog-master-lokr", "acestep_analog_master_lokr.safetensors",
-   "Native Kronecker LoKr adapter trained on Studer A800 & Neve console stems for punchy low-end clarity and silk treble."},
-  {"acestep-orchestral-score-lokr", "Symphonic Cinema Soundstage (LoKr)", "acestep", "lokr", 32, 0.90f,
-   "abbey road soundstage, live orchestra", "ACE-Step/acestep15-orchestral-lokr", "acestep_orchestral_lokr.safetensors",
-   "Elevates brass realism, string bowing dynamics, and concert-hall room acoustics for film trailers & game soundtracks."},
-  {"acestep-afro-amapiano-nf4", "Afrobeats & Amapiano Percussion (QLoRA NF4)", "acestep", "qlora_nf4", 64, 0.85f,
-   "amapiano log drum, lagos groove", "eureka-labs/acestep15-amapiano-nf4", "acestep_afro_amapiano_nf4.safetensors",
-   "4-bit NF4 QLoRA specializing in authentic log-drum syncopation, warm shakers, and modern Afro-fusion pocket grooves."},
-  {"acestep-vocal-clarity-dora", "Studio Lead Vocal Presence (DoRA)", "acestep", "dora", 32, 0.80f,
-   "intimate studio vocal, crisp diction", "eureka-labs/acestep15-vocal-dora", "acestep_vocal_clarity_dora.safetensors",
-   "Weight-decomposed DoRA improving sung lyric articulation, breath realism, and center-channel vocal separation."},
-  // --- TRELLIS.2 1.3B 3D Asset LoRAs (2) ---
-  {"trellis2-hardsurface-cad-lora", "Hard-Surface CAD & Mecha Bevels", "trellis2", "lora", 32, 0.85f,
-   "clean hard-surface geometry", "eureka-labs/trellis2-hardsurface", "trellis2_hardsurface_r32.safetensors",
-   "Sharpens planar panels, crisp mechanical bevels, and symmetric silhouettes for game props & industrial design."},
-  {"trellis2-stylized-sculpt-nf4", "Stylized Character & Maquette Sculpt (QLoRA NF4)", "trellis2", "qlora_nf4", 64, 0.80f,
-   "stylized sculptural silhouette", "eureka-labs/trellis2-stylized-nf4", "trellis2_stylized_sculpt_nf4.safetensors",
-   "NF4 QLoRA tuned for expressive figurines, ceramic sculptures, and clean watertight collectibles."}
+  // --- FLUX.2-klein-4B Photoreal Image LoRAs (8 live-verified HuggingFace repos) ---
+  {"flux2-consistence-edit", "Identity & Subject Consistency (r128)", "flux2", "lora", 128, 0.85f,
+   "consistent subject, natural lighting", "xocialize/consistence-edit-FLUX.2-klein-4B-lora", "f2k_4B_consist_20260314.safetensors",
+   "High-rank BF16 adapter locking character identity, wardrobe, and studio lighting continuity across multi-shot edits."},
+  {"flux2-refcontrol-depth", "Depth & Architectural Structure Control", "flux2", "lora", 32, 0.85f,
+   "crisp depth perspective, rectilinear lines", "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora", "flux2_klein_4b_refcontrol_depth.safetensors",
+   "Precision spatial depth conditioning adapter for razor-sharp architectural geometry, interior staging, and product perspective."},
+  {"flux2-refcontrol-pose", "Editorial Portrait & Pose Director", "flux2", "lora", 32, 0.80f,
+   "editorial pose, natural anatomy", "xocialize/refcontrol-FLUX.2-klein-4B-pose-lora", "refcontrol-pose-klein-4b.safetensors",
+   "Articulated human pose and gesture control tuned on medium-format fashion and documentary portrait sessions."},
+  {"flux2-360-outpaint", "360 Panorama & Equirectangular Outpaint", "flux2", "lora", 16, 0.90f,
+   "360 panorama, seamless horizon", "nomadoor/flux-2-klein-4B-360-erp-outpaint-lora", "flux-2-klein-4B-360-erp-outpaint-lora_V1.safetensors",
+   "Seamless 360-degree environment & skybox expansion for virtual production stages and 3D lighting domes."},
+  {"flux2-studio-outpaint", "Seamless Canvas & Frame Expansion", "flux2", "lora", 32, 0.85f,
+   "wide angle expansion, seamless border", "xocialize/outpaint-FLUX.2-klein-4B-lora", "flux-outpaint-lora.safetensors",
+   "Eliminates seam boundaries when expanding aspect ratios from portrait/square into wide cinema frames."},
+  {"flux2-vintage-editorial", "Vintage Print & Editorial Book Cover", "flux2", "lora", 32, 0.85f,
+   "vintage book cover, tactile paper grain", "Norod78/flux2-klein-4b-base-lora-vintage-book-cover", "flux2-klein-4b-base-lora-vintage-book-cover.safetensors",
+   "Warm halftone ink texture, classic serif cover composition, and authentic mid-century print color science."},
+  {"flux2-clean-bg-isolate", "Studio Packshot & Clean Isolation", "flux2", "lora", 32, 0.90f,
+   "isolated studio backdrop, crisp silhouette", "xocialize/background-remove-FLUX.2-klein-4B-lora", "flux-background-remove-lora.safetensors",
+   "Isolates hero subjects on pure studio backdrops — ideal before lifting shots into TRELLIS.2 3D reconstruction."},
+  {"flux2-pixel-art", "Crisp 16-Bit Pixel Art & Isometric", "flux2", "lora", 128, 0.85f,
+   "pixel art, crisp sprite palette", "adirik/pixel-art-lora-flux.2-klein-4B", "pixelart_lora.safetensors",
+   "True grid-locked pixel clusters, hand-dithered shading, and zero anti-aliased smear for game assets."},
+  // --- Wan 2.2 TI2V-5B Cinema Video LoRAs (6 live-verified HuggingFace repos) ---
+  {"wan22-turbo-r64-fp16", "Wan 2.2 TI2V-5B 6-Step Turbo (FP16 r64)", "wan22", "lora", 64, 1.00f,
+   "", "hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF", "Wan22_TI2V_5B_Turbo_lora_rank_64_fp16.safetensors",
+   "Step-distillation rank-64 FP16 adapter enabling crisp 6-step cinema video generation at 2.5x faster DiT latency."},
+  {"wan22-fastwan-r128-bf16", "FastWan Full-Attention High-Motion (r128)", "wan22", "lora", 128, 0.95f,
+   "dynamic camera motion, sharp temporal detail", "hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF", "Wan2_2_5B_FastWanFullAttn_lora_rank_128_bf16.safetensors",
+   "Full-attention rank-128 BF16 distillation adapter preserving fast subject motion and camera pans at low step counts."},
+  {"wan22-cinemagraph-motion", "Subtle Living Cinemagraph Loop", "wan22", "lora", 16, 0.85f,
+   "cinemagraph, locked tripod, subtle atmospheric motion", "hmb/wan22-ti2v-5b-cinemagraph-lora", "checkpoint-1000/pytorch_lora_weights.safetensors",
+   "Locks architectural & portrait framing on a rock-steady tripod while animating water, steam, foliage, and light."},
+  {"wan22-travel-camera", "Cinema Gimbal & Travel Documentary", "wan22", "lora", 16, 0.85f,
+   "gimbal glide, golden hour travel cinematography", "satoshinji/wan22-ti2v-5b-travel-lora", "travel_lora_step380.safetensors",
+   "Smooth forward Steadicam & aerial travel cinematography with natural parallax and golden-hour atmospheric depth."},
+  {"wan22-oil-cinema", "Impasto Oil Painting Motion Cinema", "wan22", "lora", 32, 0.80f,
+   "living oil painting, expressive brushwork", "svjack/Landscape_to_Oil_Painting_wan_2_2_5B_TI2V_lora", "wan2_2_oil_painting_lora_v1_000000250.safetensors",
+   "Transforms landscapes and start-frame keyframes into tactile animated oil-on-canvas brushwork."},
+  {"wan22-stylized-3d-motion", "Stylized 3D Studio Animation", "wan22", "lora", 32, 0.80f,
+   "stylized 3d animation, clean studio lighting", "FalconNet/Wan2.2-TI2V-5B-ZackDFilms-LoRA", "step-600.safetensors",
+   "Clean physically-lit stylized 3D motion picture aesthetic with crisp silhouettes and smooth keyframe transitions."},
+  // --- ACE-Step 1.5 Music & Audio Adapters (4 live-verified HuggingFace repos) ---
+  {"acestep-afro-amapiano-nf4", "Naija Afrobeats & Amapiano Percussion", "acestep", "lora", 128, 0.85f,
+   "afrobeats groove, talking drum, amapiano log drum", "David-A-Amoo/ACE-Step-1.5-Naija-Legacy-Rhythms-LoRA-v1", "adapter_model.safetensors",
+   "Authentic West African percussion, syncopated log-drum basslines, warm shakers, and modern Lagos studio pocket."},
+  {"acestep-vocal-clarity-dora", "Raspy Soul & Expressive Lead Vocals", "acestep", "lora", 64, 0.80f,
+   "intimate raspy lead vocal, live studio mic", "DisturbingTheField/ACE-Step-v1.5-raspy-vocal-and-instrumental-5-LoRAs", "adapter_model.safetensors",
+   "Enhances emotional vocal grit, breath realism, and center-channel lyric articulation for rock, soul, and indie."},
+  {"acestep-acoustic-studio", "Acoustic Guitar & Unplugged Session", "acestep", "lora", 64, 0.85f,
+   "close-mic acoustic guitar, fingerpicked warmth", "DisturbingTheField/ACE-Step-v1.5-acoustic-guitar-and-a-merge-LoRA", "vocal_instrument_merge_adapter_model.safetensors",
+   "Captures natural steel-string transient detail, wood body resonance, and intimate unplugged vocal-guitar balance."},
+  {"acestep-ambient-cinema", "Ambient Dreamscape & Film Texture", "acestep", "lora", 64, 0.85f,
+   "ambient dreamscape, lush analog pads, wide reverb", "DisturbingTheField/ACE-Step-v1.5-ambient_dream1-LoRA", "adapter_model.safetensors",
+   "Expansive stereo soundstage tuned for atmospheric cinema scores, modular synth pads, and meditative textures."},
+  // --- TRELLIS.2 1.3B 3D Asset LoRAs (2 live-verified HuggingFace repos) ---
+  {"trellis2-hardsurface-cad-lora", "Automotive & Hard-Surface CAD Sculpt", "trellis2", "lora", 16, 0.85f,
+   "clean automotive surfacing, crisp panel bevels", "PoochieMama/trellis2-cars-lora-v2", "shape_lora/adapter-1200.safetensors",
+   "Sharpens hard-surface body lines, wheel arches, and symmetric industrial silhouettes in TRELLIS.2 sparse-structure flow."},
+  {"trellis2-stylized-sculpt-nf4", "Voxel Block & Stylized Game Prop", "trellis2", "lora", 16, 0.85f,
+   "crisp voxel block geometry, stylized game asset", "unfundedResearcher/TRELLIS2-Minecraft-Texture-LoRA-v1", "adapter_model.safetensors",
+   "Produces crisp orthogonal block silhouettes and stylized low-poly game prop proportions."}
 };
 
 int ec_lora_catalog_to_json(const ec_storage_vault_t *vault, char *buf, size_t cap) {
@@ -409,8 +409,12 @@ int ec_lora_catalog_to_json(const ec_storage_vault_t *vault, char *buf, size_t c
   int n = snprintf(buf, cap, "{\"count\":%zu,\"catalog\":[", n_items);
   for (size_t i = 0; i < n_items && (size_t)n < cap - 640; i++) {
     const ec_lora_catalog_item_t *c = &ELITE_LORA_CATALOG[i];
-    const ec_storage_asset_t *found = vault ? ec_storage_find(vault, EC_ASSET_LORA, c->filename) : NULL;
-    if (!found && vault) found = ec_storage_find(vault, EC_ASSET_LORA, c->id);
+    const ec_storage_asset_t *found = vault ? ec_storage_find(vault, EC_ASSET_LORA, c->id) : NULL;
+    if (!found && vault && !strchr(c->filename, '/') &&
+        strcmp(c->filename, "adapter_model.safetensors") != 0 &&
+        strcmp(c->filename, "pytorch_lora_weights.safetensors") != 0) {
+      found = ec_storage_find(vault, EC_ASSET_LORA, c->filename);
+    }
     char ed[512], et[256], ep[512];
     json_esc(c->desc, ed, sizeof ed);
     json_esc(c->trigger, et, sizeof et);

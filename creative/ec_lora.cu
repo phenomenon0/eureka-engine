@@ -273,6 +273,8 @@ static int apply_one_pair(
     float strength, ec_lora_apply_stats_t *stats, cudaStream_t stream) {
   const char *prefixes[] = {
     "", "diffusion_model.", "model.diffusion_model.", "transformer.", "base_model.model.",
+    "base_model.model.base_model.model.",
+    "base_model.model.base_model.model.base_model.model.base_model.model.",
     "base_model.model.decoder.", "decoder.", "lora_unet_", "lycoris_"
   };
   const char *a_sufs[] = { ".lora_A.weight", ".lora_down.weight", ".lora_A.default.weight" };
