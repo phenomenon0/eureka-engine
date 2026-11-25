@@ -87,8 +87,7 @@ __global__ void k_dora_rescale_rows_bf16(
 static void host_dora_rescale_rows_bf16(
     uint16_t *W_bf16, int row_off, int out_sub, int in_dim, const float *mag_f32, cudaStream_t s) {
   ec_hal_stream_sync(s);
-  #pragma omp parallel for schedule(static)
-  for (int r = 0; r < out_sub; r++) {
+  EC_PAR_FOR_BEGIN(r, out_sub)
     uint16_t *row = W_bf16 + (long)(row_off + r) * in_dim;
     float ss = 0.0f;
     for (int c = 0; c < in_dim; c++) {
@@ -100,7 +99,8 @@ static void host_dora_rescale_rows_bf16(
       float v = __uint_as_float(((uint32_t)row[c]) << 16);
       row[c] = dev_f32_to_bf16(v * ratio);
     }
-  }
+  EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(W_bf16);
 }
 #endif
 

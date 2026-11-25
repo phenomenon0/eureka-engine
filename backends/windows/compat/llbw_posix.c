@@ -1150,6 +1150,85 @@ char *stpcpy(char *d, const char *s) { size_t n = strlen(s); memcpy(d, s, n + 1)
 int strerror_r(int e, char *buf, size_t n) { return strerror_s(buf, n, e); }
 
 /* ======================================================================== */
+/* dlfcn / dirent / statvfs (shared by LLM + Creative Studio native Win64)    */
+/* ======================================================================== */
+
+void *dlopen(const char *path, int flags) {
+  (void)flags;
+  if (!path || !*path) return (void *)GetModuleHandleA(NULL);
+  return (void *)LoadLibraryA(path);
+}
+void *dlsym(void *handle, const char *symbol) {
+  if (!handle || !symbol) return NULL;
+  return (void *)GetProcAddress((HMODULE)handle, symbol);
+}
+int dlclose(void *handle) {
+  if (!handle) return 0;
+  return FreeLibrary((HMODULE)handle) ? 0 : -1;
+}
+const char *dlerror(void) { return NULL; }
+
+struct llbw_dir {
+  HANDLE          h;
+  WIN32_FIND_DATAA fd;
+  int             first;
+  struct dirent   ent;
+};
+DIR *opendir(const char *path) {
+  if (!path || !*path) { errno = ENOENT; return NULL; }
+  char pat[1024];
+  size_t len = strlen(path);
+  if (len + 4 >= sizeof pat) { errno = ENAMETOOLONG; return NULL; }
+  memcpy(pat, path, len);
+  if (pat[len - 1] != '\\' && pat[len - 1] != '/') pat[len++] = '\\';
+  pat[len++] = '*';
+  pat[len] = '\0';
+  struct llbw_dir *d = calloc(1, sizeof *d);
+  if (!d) { errno = ENOMEM; return NULL; }
+  d->h = FindFirstFileA(pat, &d->fd);
+  if (d->h == INVALID_HANDLE_VALUE) {
+    free(d);
+    errno = ENOENT;
+    return NULL;
+  }
+  d->first = 1;
+  return d;
+}
+struct dirent *readdir(DIR *d) {
+  if (!d) return NULL;
+  if (d->first) {
+    d->first = 0;
+  } else {
+    if (!FindNextFileA(d->h, &d->fd)) return NULL;
+  }
+  d->ent.d_type = (d->fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? DT_DIR : DT_REG;
+  snprintf(d->ent.d_name, sizeof d->ent.d_name, "%s", d->fd.cFileName);
+  return &d->ent;
+}
+int closedir(DIR *d) {
+  if (!d) return -1;
+  if (d->h != INVALID_HANDLE_VALUE) FindClose(d->h);
+  free(d);
+  return 0;
+}
+
+int statvfs(const char *path, struct statvfs *buf) {
+  if (!path || !buf) { errno = EINVAL; return -1; }
+  ULARGE_INTEGER avail, total, free_b;
+  if (!GetDiskFreeSpaceExA(path, &avail, &total, &free_b)) {
+    errno = ENOENT;
+    return -1;
+  }
+  const unsigned long bs = 4096ul;
+  buf->f_bsize  = bs;
+  buf->f_frsize = bs;
+  buf->f_blocks = total.QuadPart / bs;
+  buf->f_bfree  = free_b.QuadPart / bs;
+  buf->f_bavail = avail.QuadPart / bs;
+  return 0;
+}
+
+/* ======================================================================== */
 /* process start                                                              */
 /* ======================================================================== */
 

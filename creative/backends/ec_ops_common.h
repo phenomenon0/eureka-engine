@@ -1,7 +1,8 @@
 // ec_ops_common.h — Shared Coherent/Unified-Memory Auxiliary Operators for Metal & Vulkan Backends
 // Heavy matrix/attention/conv ops (GEMM_BF16, GEMM_F16, GEMM_Q8_G64, Quantize_Q8_G64, FA2_BF16,
 // FA2_F16, Conv2D_3x3_NHWC_BF16, Conv2D_TC, CrossAttn) execute on the GPU in ec_backend_{metal,vulkan};
-// this header provides exact OpenMP-parallel coherent implementations for auxiliary 1D/3D/sparse/Euler ops.
+// this header provides exact parallel implementations for auxiliary 1D/3D/sparse/Euler ops,
+// marking outputs via ec_hal_mark_host_dirty so discrete Vulkan DEVICE_LOCAL mirrors stay coherent.
 
 #pragma once
 
@@ -52,6 +53,7 @@ int ec_ops_dequant_q8g64_bf16(
     uint16_t *db = dst_bf16 + g * 64;
     for (int i = 0; i < 64; i++) db[i] = ec_cmn_f32_to_bf16((float)sq[i] * sc);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(dst_bf16);
   return 0;
 }
 
@@ -59,6 +61,7 @@ int ec_ops_silu_f32_to_bf16(const float *src, uint16_t *dst, long n, cudaStream_
   if (n <= 0) return -1;
   ec_hal_stream_sync(stream);
   EC_PAR_FOR_BEGIN(i, n) dst[i] = ec_cmn_f32_to_bf16(ec_cmn_silu(src[i])); EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(dst);
   return 0;
 }
 
@@ -80,6 +83,8 @@ int ec_ops_wan_cfg_euler(
     }
     xt[i] -= dt * v;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(xt);
+  if (delta_cache) ec_hal_mark_host_dirty(delta_cache);
   return 0;
 }
 
@@ -92,6 +97,7 @@ int ec_ops_trellis_cfg_euler(
   ec_hal_stream_sync(stream);
   if (!use_cfg || !vn) {
     EC_PAR_FOR_BEGIN(i, n) xt[i] -= dt * vp[i]; EC_PAR_FOR_END
+    ec_hal_mark_host_dirty(xt);
     return 0;
   }
   const float a = 1.0f - sigma_min;
@@ -123,6 +129,7 @@ int ec_ops_trellis_cfg_euler(
     float v_fin = (a * x - x0_fin) * inv_b;
     xt[i] = x - dt * v_fin;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(xt);
   return 0;
 }
 
@@ -146,6 +153,8 @@ int ec_ops_rmsnorm_adaln(
       if (yb) yb[c] = ec_cmn_f32_to_bf16(v);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y_f32);
+  ec_hal_mark_host_dirty(y_bf16);
   return 0;
 }
 
@@ -174,6 +183,8 @@ int ec_ops_layernorm_adaln(
       if (yb) yb[c] = ec_cmn_f32_to_bf16(v);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y_f32);
+  ec_hal_mark_host_dirty(y_bf16);
   return 0;
 }
 
@@ -206,6 +217,8 @@ int ec_launch_adaln_zero(
       if (yh) yh[i] = __float2half_rn(out);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y);
+  ec_hal_mark_host_dirty(y_f16);
   return 0;
 }
 
@@ -214,6 +227,7 @@ int ec_launch_gated_res(float *x, const float *h, const float *gate, int n_rows,
   if (total <= 0) return -1;
   ec_hal_stream_sync(stream);
   EC_PAR_FOR_BEGIN(i, total) x[i] += gate[i % dim] * h[i]; EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(x);
   return 0;
 }
 
@@ -269,6 +283,9 @@ int ec_launch_rope_nd(
       if (vo && vs) { vo[d0] = __float2half_rn(vs[d0]); vo[d1] = __float2half_rn(vs[d1]); }
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(q_out);
+  ec_hal_mark_host_dirty(k_out);
+  ec_hal_mark_host_dirty(v_out);
   return 0;
 }
 
@@ -291,6 +308,7 @@ int ec_launch_lora_add(
     for (int k = 0; k < R; k++) s += __half2float(hr[k]) * __half2float(br[k]);
     Y[idx] += lora->scale * s;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(Y);
   return 0;
 }
 
@@ -314,6 +332,7 @@ int ec_launch_gemm_i8(
       Y[(long)m * N + n] = v;
     }
   }
+  ec_hal_mark_host_dirty(Y);
   return 0;
 }
 #endif
@@ -356,6 +375,7 @@ int ec_launch_gemm_svd4(
       Y[(long)r * N + c] = acc;
     }
   }
+  ec_hal_mark_host_dirty(Y);
   if (outlier_branch && outlier_branch->rank > 0) {
     return ec_launch_lora_add(X_f16, outlier_branch, tmp_f32, tmp_f16, Y, M, N, K, stream);
   }
@@ -389,6 +409,7 @@ int ec_launch_groupnorm_silu(
       yg[i] = val;
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y);
   return 0;
 }
 
@@ -416,6 +437,7 @@ int ec_launch_conv1d_f32(
     }
     y[idx] = acc;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y);
   return 0;
 }
 
@@ -448,6 +470,7 @@ int ec_launch_conv2d_f32(
     }
     y[idx] = acc;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y);
   return 0;
 }
 
@@ -489,6 +512,7 @@ int ec_launch_conv3d_causal_f32(
     }
     y[idx] = acc;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y);
   return 0;
 }
 
@@ -528,6 +552,8 @@ int ec_launch_ovoxel_hash_build(ec_ovoxel_t *ov, cudaStream_t stream) {
     ov->hash_keys_d[slot] = key;
     ov->hash_vals_d[slot] = i;
   }
+  ec_hal_mark_host_dirty(ov->hash_keys_d);
+  ec_hal_mark_host_dirty(ov->hash_vals_d);
   return 0;
 }
 
@@ -556,6 +582,7 @@ int ec_launch_ovoxel_sparse_conv3d(
         }
     feats_out[idx] = acc;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(feats_out);
   return 0;
 }
 
@@ -568,6 +595,7 @@ int ec_launch_flow_cfg_euler(
     float v = v_uncond ? (v_uncond[i] + cfg_scale * (v_cond[i] - v_uncond[i])) : v_cond[i];
     x_next[i] = x[i] + dt * v;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(x_next);
   return 0;
 }
 
@@ -582,6 +610,7 @@ int ec_launch_l1_rel_diff(const float *a, const float *b, float *out_stats_d, in
   }
   out_stats_d[0] = (float)ld;
   out_stats_d[1] = (float)lr;
+  ec_hal_mark_host_dirty(out_stats_d);
   return 0;
 }
 
@@ -603,6 +632,8 @@ int ec_launch_kv_ring_append(
     kr[dst_o] = chunk_k[idx];
     vr[dst_o] = chunk_v[idx];
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(ring->k_ring_d);
+  ec_hal_mark_host_dirty(ring->v_ring_d);
   ring->write_pos = (ring->write_pos + chunk_tokens) % ring->cap_tokens;
   ring->valid_tokens += chunk_tokens;
   if (ring->valid_tokens > ring->cap_tokens) ring->valid_tokens = ring->cap_tokens;
@@ -613,6 +644,7 @@ int ec_launch_bf16_to_f16(const uint16_t *src_bf16, __half *dst_f16, size_t n, c
   if (!src_bf16 || !dst_f16 || n == 0) return -1;
   ec_hal_stream_sync(stream);
   EC_PAR_FOR_BEGIN(i, n) dst_f16[i] = __float2half_rn(ec_cmn_bf16_to_f32(src_bf16[i])); EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(dst_f16);
   return 0;
 }
 
@@ -620,6 +652,7 @@ int ec_launch_fp8_to_f16(const uint8_t *src_fp8, __half *dst_f16, size_t n, floa
   if (!src_fp8 || !dst_f16 || n == 0) return -1;
   ec_hal_stream_sync(stream);
   EC_PAR_FOR_BEGIN(i, n) dst_f16[i] = __float2half_rn(ec_cmn_fp8_e4m3_to_f32(src_fp8[i]) * scale); EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(dst_f16);
   return 0;
 }
 
@@ -660,6 +693,7 @@ int ec_launch_conv2d_tc(
     float v = (hi >= 0 && hi < H && wi >= 0 && wi < W) ? x[((long)ci * H + hi) * W + wi] : 0.0f;
     col_f16[idx] = __float2half_rn(v);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(col_f16);
   if (ec_launch_gemm_f16(col_f16, w_f16, bias, NULL, y_rowmajor_tmp, NULL, M, Cout, K, bias ? 1 : 0, stream) != 0)
     return -1;
   ec_hal_stream_sync(stream);
@@ -668,6 +702,7 @@ int ec_launch_conv2d_tc(
     int c = (int)(idx / M), m = (int)(idx % M);
     y[idx] = y_rowmajor_tmp[(long)m * Cout + c];
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y);
   return 0;
 }
 
@@ -683,6 +718,7 @@ int ec_launch_upsample2x_2d(const float *x, float *y, int C, int H, int W, cudaS
     int c = (int)(rem / H2);
     y[idx] = x[((long)c * H + (h >> 1)) * W + (w >> 1)];
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y);
   return 0;
 }
 
@@ -694,7 +730,6 @@ int ec_launch_sage_attn_i8(
     int n_heads, int head_dim, float scale, int block_causal_size,
     cudaStream_t stream) {
   (void)q_i8; (void)k_i8; (void)q_sc; (void)k_sc;
-  // On Metal & Vulkan (no INT8 TensorCore s8->s32), exact FP16/BF16 FlashAttention-2 runs directly at full speed!
   return ec_launch_fa2_f16(Q, K, V, O, O_f16, n_q, n_kv, n_q_pad, n_kv_pad, n_heads, head_dim, scale, block_causal_size, stream);
 }
 
@@ -717,6 +752,8 @@ int ec_launch_swiglu_mul(const float *gate, const float *up, float *out, __half 
     out[i] = v;
     if (out_f16) out_f16[i] = __float2half_rn(v);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(out);
+  ec_hal_mark_host_dirty(out_f16);
   return 0;
 }
 
@@ -731,6 +768,7 @@ int ec_launch_timestep_embed(float t_val, float *out_emb, int dim, float max_per
     out_emb[i] = cosf(arg);
     out_emb[i + half_d] = sinf(arg);
   }
+  ec_hal_mark_host_dirty(out_emb);
   return 0;
 }
 
@@ -747,6 +785,7 @@ int ec_launch_flow_heun(const float *x, const float *v1, const float *v2, float 
   if (n_elems <= 0) return -1;
   ec_hal_stream_sync(stream);
   EC_PAR_FOR_BEGIN(i, n_elems) x_next[i] = x[i] + 0.5f * dt * (v1[i] + v2[i]); EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(x_next);
   return 0;
 }
 
@@ -760,6 +799,7 @@ int ec_launch_modality_cfg(
     if (v_modal) v += cfg_modal * (v_modal[i] - v_text[i]);
     v_out[i] = v;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(v_out);
   return 0;
 }
 

@@ -446,6 +446,39 @@ typedef struct {
 } cookie_io_functions_t;
 typedef cookie_io_functions_t llbw_cookie_fns;
 
+/* ---- dlfcn (LoadLibraryA / GetProcAddress) ------------------------------- */
+#define RTLD_LAZY   0x0001
+#define RTLD_NOW    0x0002
+#define RTLD_LOCAL  0x0000
+#define RTLD_GLOBAL 0x0100
+void *dlopen(const char *path, int flags);
+void *dlsym(void *handle, const char *symbol);
+int   dlclose(void *handle);
+const char *dlerror(void);
+
+/* ---- dirent (FindFirstFileA / FindNextFileA) ----------------------------- */
+#define DT_UNKNOWN 0
+#define DT_DIR     4
+#define DT_REG     8
+struct dirent {
+  unsigned char d_type;
+  char          d_name[260];
+};
+typedef struct llbw_dir DIR;
+DIR           *opendir(const char *path);
+struct dirent *readdir(DIR *d);
+int            closedir(DIR *d);
+
+/* ---- sys/statvfs (GetDiskFreeSpaceExA) ----------------------------------- */
+struct statvfs {
+  unsigned long      f_bsize;
+  unsigned long      f_frsize;
+  unsigned long long f_blocks;
+  unsigned long long f_bfree;
+  unsigned long long f_bavail;
+};
+int statvfs(const char *path, struct statvfs *buf);
+
 #ifdef __cplusplus
 }
 #endif

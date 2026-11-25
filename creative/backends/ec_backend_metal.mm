@@ -422,6 +422,13 @@ extern "C" cudaError_t ec_hal_device_sync(void) {
   pthread_mutex_unlock(&g_mtl.mu);
   return cudaSuccess;
 }
+extern "C" void ec_hal_sync_ptr_for_cpu(const void *ptr) {
+  (void)ptr;
+  ec_hal_device_sync();
+}
+extern "C" void ec_hal_mark_host_dirty(const void *ptr) {
+  (void)ptr; // Apple Silicon MTLResourceStorageModeShared is hardware coherent
+}
 
 typedef struct { struct timespec ts; } EcMetalEv;
 extern "C" cudaError_t ec_hal_event_create(cudaEvent_t *e, unsigned int f) {

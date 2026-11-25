@@ -1,7 +1,7 @@
 // ec_model_kernels_portable.h — Barrier-Free Portable Implementations of the 25 Warp/Shared Model Helpers
 // Used ONLY when compiling without nvcc (EC_BACKEND_METAL & EC_BACKEND_VULKAN).
-// Routes norms & GQA/FA2 attention through GPU ec_ops_* where applicable, and runs per-head RoPE /
-// NHWC GroupNorm / VAE RGB8 epilogues across OpenMP threads on Unified / Host-Coherent GPU buffers.
+// Routes norms & GQA/FA2 attention through GPU ec_ops_* where applicable, and marks CPU-written
+// outputs via ec_hal_mark_host_dirty so discrete Vulkan DEVICE_LOCAL VRAM mirrors stay coherent.
 
 #pragma once
 #ifndef __CUDACC__
@@ -61,6 +61,8 @@ static inline void ec_port_k_tr_layernorm(
       if (yb) yb[c] = ecp_f32_to_bf16(v);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y_f32);
+  ec_hal_mark_host_dirty(y_bf16);
 }
 
 static inline void ec_port_k_wn_rmsnorm(
@@ -84,6 +86,8 @@ static inline void ec_port_k_wn_rmsnorm(
       if (yb) yb[c] = ecp_f32_to_bf16(v);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y_f32);
+  ec_hal_mark_host_dirty(y_bf16);
 }
 
 static inline void ec_port_k_wn_layernorm(
@@ -139,6 +143,9 @@ static inline void ec_port_k_qwen3_qk_rope(
       }
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(q_out);
+  ec_hal_mark_host_dirty(k_out);
+  ec_hal_mark_host_dirty(v_out);
 }
 
 static inline void ec_port_k_qwen3_gqa_attn(
@@ -168,6 +175,7 @@ static inline void ec_port_k_qwen3_gqa_attn(
     uint16_t *out = O_bf16 + ((long)qpos * Hq + hq) * D;
     for (int d = 0; d < D; d++) out[d] = ecp_f32_to_bf16(acc[d] * inv);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(O_bf16);
 }
 
 static inline void ec_port_k_flux2_pack_qkv_rope(
@@ -203,6 +211,9 @@ static inline void ec_port_k_flux2_pack_qkv_rope(
       vo[d1] = __float2half_rn(fmaxf(-65000.0f, fminf(65000.0f, vs[d1])));
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(Q_out);
+  ec_hal_mark_host_dirty(K_out);
+  ec_hal_mark_host_dirty(V_out);
 }
 
 static inline void ec_port_k_flux2_single_cat_q8g64(
@@ -240,6 +251,8 @@ static inline void ec_port_k_flux2_single_cat_q8g64(
       oq[i] = (int8_t)q;
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(dst_q8);
+  ec_hal_mark_host_dirty(dst_sc);
 }
 
 static inline void ec_port_k_vae_mid_attn(
@@ -265,6 +278,7 @@ static inline void ec_port_k_vae_mid_attn(
     uint16_t *out = O_bf16 + (long)q * C;
     for (int c = 0; c < C; c++) out[c] = ecp_f32_to_bf16(acc[c] * inv);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(O_bf16);
 }
 
 static inline void ec_port_k_vae_mid_attn_tc_d512(
@@ -291,6 +305,7 @@ static inline void ec_port_k_vae_mid_attn_tc_d512(
     uint16_t *out = O_bf + (long)q * 512;
     for (int c = 0; c < 512; c++) out[c] = ecp_f32_to_bf16(acc[c] * inv);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(O_bf);
 }
 
 static inline void ec_port_k_nhwc_gn_stats(
@@ -307,6 +322,7 @@ static inline void ec_port_k_nhwc_gn_stats(
     stats64[grp] = (float)s1;
     stats64[32 + grp] = (float)s2;
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(stats64);
 }
 
 static inline void ec_port_k_nhwc_gn_apply_bf16(
@@ -331,6 +347,7 @@ static inline void ec_port_k_nhwc_gn_apply_bf16(
     if (apply_silu) v = ecp_silu(v);
     y_bf16[i] = ecp_f32_to_bf16(v);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y_bf16);
 }
 
 static inline void ec_port_k_upsample2x_nhwc_bf16(
@@ -343,6 +360,7 @@ static inline void ec_port_k_upsample2x_nhwc_bf16(
     uint16_t *dst = y_bf16 + (long)pix * C;
     for (int c = 0; c < C; c++) dst[c] = ecp_f32_to_bf16(src[c]);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(y_bf16);
 }
 
 static inline void ec_port_k_vae_conv_out_rgb8_nhwc(
@@ -375,6 +393,7 @@ static inline void ec_port_k_vae_conv_out_rgb8_nhwc(
     out_rgb[(long)pix * 3 + 1] = to_u8(g);
     out_rgb[(long)pix * 3 + 2] = to_u8(b);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(out_rgb);
 }
 
 // --- 3. ACE-Step 1.5 Per-Head RoPE & GQA ---
@@ -428,6 +447,9 @@ static inline void ec_port_k_as_qk_norm_rope_bf16(
       }
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(q_out);
+  ec_hal_mark_host_dirty(k_out);
+  ec_hal_mark_host_dirty(v_out);
 }
 
 static inline void ec_port_k_as_qk_norm_rope(
@@ -475,6 +497,9 @@ static inline void ec_port_k_as_qk_norm_rope(
       }
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(q_out);
+  ec_hal_mark_host_dirty(k_out);
+  ec_hal_mark_host_dirty(v_out);
 }
 
 static inline void ec_port_k_as_gqa_attn(
@@ -507,6 +532,7 @@ static inline void ec_port_k_as_gqa_attn(
     uint16_t *out = O_bf16 + ((long)qpos * Hq + hq) * D;
     for (int d = 0; d < D; d++) out[d] = ecp_f32_to_bf16(acc[d] * inv);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(O_bf16);
 }
 
 // --- 4. TRELLIS.2 Per-Head 3D RoPE & Cross-Norm ---
@@ -540,6 +566,9 @@ static inline void ec_port_k_ss_self_qkv_rope(
       vo[d0] = ecp_f32_to_bf16(vs[d0]); vo[d1] = ecp_f32_to_bf16(vs[d1]);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(Q);
+  ec_hal_mark_host_dirty(K);
+  ec_hal_mark_host_dirty(V);
 }
 
 static inline void ec_port_k_ss_cross_q_norm(
@@ -554,6 +583,7 @@ static inline void ec_port_k_ss_cross_q_norm(
     float inv = rsqrtf(sq / 128.0f + 1e-12f);
     for (int d = 0; d < 128; d++) qo[d] = ecp_f32_to_bf16(qs[d] * inv * qg[d]);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(Q);
 }
 
 static inline void ec_port_k_ss_cross_kv_norm(
@@ -573,6 +603,8 @@ static inline void ec_port_k_ss_cross_kv_norm(
       vo[d] = ecp_f32_to_bf16(vs[d]);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(K);
+  ec_hal_mark_host_dirty(V);
 }
 
 // --- 5. Wan 2.2 UMT5 Relative-Bias Attention, 3D RoPE & VAE Spatial Attention ---
@@ -611,6 +643,7 @@ static inline void ec_port_k_wn_t5_attn_d64(
     uint16_t *out = O_bf16 + ((long)qpos * H + h) * 64;
     for (int d = 0; d < 64; d++) out[d] = ecp_f32_to_bf16(acc[d] * inv);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(O_bf16);
 }
 
 static inline void ec_port_k_wn_sa_qkv_norm_rope_bf16(
@@ -645,6 +678,9 @@ static inline void ec_port_k_wn_sa_qkv_norm_rope_bf16(
       vr_b[out_off + d1] = ecp_f32_to_bf16(vs[c1]);
     }
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(qr_b);
+  ec_hal_mark_host_dirty(kr_b);
+  ec_hal_mark_host_dirty(vr_b);
 }
 
 static inline void ec_port_k_wn_vae_attn_1h(
@@ -669,6 +705,7 @@ static inline void ec_port_k_wn_vae_attn_1h(
     uint16_t *out = out_bf16 + (long)qpos * C;
     for (int c = 0; c < C; c++) out[c] = ecp_f32_to_bf16(acc[c] * inv);
   EC_PAR_FOR_END
+  ec_hal_mark_host_dirty(out_bf16);
 }
 
 #endif // !__CUDACC__

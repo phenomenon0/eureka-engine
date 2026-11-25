@@ -835,6 +835,9 @@ int ec_load_image_rgb(const char *path, uint8_t **out_rgb, int *out_w, int *out_
 #ifdef __APPLE__
       g_libz = dlopen("libz.1.dylib", RTLD_LAZY);
       if (!g_libz) g_libz = dlopen("/usr/lib/libz.1.dylib", RTLD_LAZY);
+#elif defined(_WIN32)
+      g_libz = dlopen("zlib1.dll", RTLD_LAZY);
+      if (!g_libz) g_libz = dlopen("zlib.dll", RTLD_LAZY);
 #else
       g_libz = dlopen("libz.so.1", RTLD_LAZY);
       if (!g_libz) g_libz = dlopen("libz.so", RTLD_LAZY);
@@ -1233,12 +1236,16 @@ int ec_shm_ring_create(ec_shm_ring_t *r, const char *name, uint32_t w, uint32_t 
   memset(r, 0, sizeof *r);
   r->fd = -1;
   snprintf(r->shm_name, sizeof r->shm_name, "%s", name);
-  shm_unlink(r->shm_name);
-  r->fd = shm_open(r->shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
-  if (r->fd < 0) return -1;
   const uint64_t fbytes = (uint64_t)w * h * 4ULL;
   const size_t hdr_aligned = (sizeof(ec_shm_ring_hdr_t) + 63u) & ~(size_t)63u;
   r->map_bytes = hdr_aligned + (size_t)fbytes * EC_RING_SLOTS;
+#ifdef _WIN32
+  void *p = calloc(1, r->map_bytes);
+  if (!p) return -1;
+#else
+  shm_unlink(r->shm_name);
+  r->fd = shm_open(r->shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+  if (r->fd < 0) return -1;
   if (ftruncate(r->fd, (off_t)r->map_bytes) != 0) {
     close(r->fd); shm_unlink(r->shm_name); r->fd = -1; return -1;
   }
@@ -1246,6 +1253,7 @@ int ec_shm_ring_create(ec_shm_ring_t *r, const char *name, uint32_t w, uint32_t 
   if (p == MAP_FAILED) {
     close(r->fd); shm_unlink(r->shm_name); r->fd = -1; return -1;
   }
+#endif
   r->hdr = (ec_shm_ring_hdr_t *)p;
   r->slots_base = (uint8_t *)p + hdr_aligned;
   memset(r->hdr, 0, hdr_aligned);
@@ -1262,6 +1270,9 @@ int ec_shm_ring_open(ec_shm_ring_t *r, const char *name) {
   memset(r, 0, sizeof *r);
   r->fd = -1;
   snprintf(r->shm_name, sizeof r->shm_name, "%s", name);
+#ifdef _WIN32
+  return -1;
+#else
   r->fd = shm_open(r->shm_name, O_RDWR, 0600);
   if (r->fd < 0) return -1;
   struct stat sb;
@@ -1279,6 +1290,7 @@ int ec_shm_ring_open(ec_shm_ring_t *r, const char *name) {
   r->slots_base = (uint8_t *)p + hdr_aligned;
   r->is_owner = 0;
   return 0;
+#endif
 }
 
 int ec_shm_ring_push(ec_shm_ring_t *r, const uint8_t *rgba, uint64_t pts_us) {
@@ -1317,9 +1329,13 @@ int ec_shm_ring_pop(ec_shm_ring_t *r, uint8_t *dst_rgba, uint64_t *out_seq, uint
 
 void ec_shm_ring_close(ec_shm_ring_t *r) {
   if (!r) return;
+#ifdef _WIN32
+  free(r->hdr);
+#else
   if (r->hdr) munmap(r->hdr, r->map_bytes);
   if (r->fd >= 0) close(r->fd);
   if (r->is_owner && r->shm_name[0]) shm_unlink(r->shm_name);
+#endif
   memset(r, 0, sizeof *r);
   r->fd = -1;
 }

@@ -77,12 +77,20 @@ VH=$s/vision; mkdir -p "$VH"; cp -R "$APP/engine-src/vision/host" "$APP/engine-s
 "$CC" -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -pthread -I"$VH/host" "$s/src/serve.c" "$s/src/json.c" "$s/src/speak_route.c" \
   "$s/src/vendor/tools/sys1dual/serve_structured.c" "$s/src/vendor/host/llb_structured.c" "$s/vpre.o" -lm -o "$s/llb-serve"
 
-step "5b. eureka-creative-serve (100% native Eureka Creative Studio CUDA/C11 engine)"
+step "5b. eureka-creative-serve (100% native Eureka Creative Studio CUDA + Vulkan C11 engine)"
 if [ -x "$SRC/creative/build.sh" ]; then
   OUT="$OUT/creative" bash "$SRC/creative/build.sh"
+  if pkg-config --exists vulkan 2>/dev/null || [ -e /usr/include/vulkan/vulkan.h ]; then
+    EC_BACKEND=vulkan OUT="$OUT/creative-vulkan" bash "$SRC/creative/build.sh"
+  fi
 fi
 
-step "6. stage $DEST/{cuda,cpu} (SINGLE-ENGINE PURITY: one engine_gpu + one engine_cpu + one llb-serve for Qwen AND Inkling!)"
+step "5c. engine_vulkan (native cross-vendor Vulkan 1.2+ LLM engine for AMD Radeon / Intel Arc)"
+if [ -f "$SRC/backends/vulkan/build.sh" ] && (pkg-config --exists vulkan 2>/dev/null || [ -e /usr/include/vulkan/vulkan.h ]); then
+  SRC="$SRC" OUT="$OUT/vulkan" CC="$CC" bash "$SRC/backends/vulkan/build.sh"
+fi
+
+step "6. stage $DEST/{cuda,vulkan,cpu} (SINGLE-ENGINE PURITY: CUDA + Vulkan + CPU across LLM AND Creative!)"
 rm -rf "$DEST"; mkdir -p "$DEST/cuda" "$DEST/cpu"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$DEST/cuda/"
 cp "$OUT/gpu/engine_gpu" "$DEST/cuda/engine_gpu"
@@ -94,4 +102,9 @@ NVRTC_BUILTINS=$(ls "$CUDA"/lib64/libnvrtc-builtins.so.[0-9]*.[0-9]* 2>/dev/null
 cp -L "$NVRTC_MAIN" "$NVRTC_BUILTINS" "$DEST/cuda/"
 cp "$v/cudavis-cli" "$DEST/cuda/"
 cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$OUT/cpu/engine_cpu" "$DEST/cpu/"
+if [ -x "$OUT/vulkan/engine_vulkan" ]; then
+  mkdir -p "$DEST/vulkan"
+  cp "$s/llb-serve" "$OUT/gguf2pack" "$OUT/llb-tok" "$OUT/vulkan/engine_vulkan" "$DEST/vulkan/"
+  [ -x "$OUT/creative-vulkan/eureka-creative-serve" ] && install -m 0755 "$OUT/creative-vulkan/eureka-creative-serve" "$DEST/vulkan/eureka-creative-serve"
+fi
 ls -la "$DEST"/*

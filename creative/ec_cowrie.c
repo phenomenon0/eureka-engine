@@ -118,6 +118,9 @@ static void cw_load_once(void) {
   cands[nc++] = "/tmp/cowrie-cargo-target/release/libcowrie_core.dylib";
   cands[nc++] = "/usr/local/lib/libcowrie_core.dylib";
   cands[nc++] = "libcowrie_core.dylib";
+#elif defined(_WIN32)
+  cands[nc++] = "cowrie_core.dll";
+  cands[nc++] = "libcowrie_core.dll";
 #else
   cands[nc++] = "/tmp/cowrie-cargo-target/release/libcowrie_core.so";
   cands[nc++] = "/home/omen/.local/lib/libcowrie_core.so";

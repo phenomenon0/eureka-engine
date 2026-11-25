@@ -171,6 +171,8 @@
   cudaError_t ec_hal_stream_destroy(cudaStream_t stream);
   cudaError_t ec_hal_stream_sync(cudaStream_t stream);
   cudaError_t ec_hal_device_sync(void);
+  void        ec_hal_sync_ptr_for_cpu(const void *ptr);
+  void        ec_hal_mark_host_dirty(const void *ptr);
   cudaError_t ec_hal_event_create(cudaEvent_t *event, unsigned int flags);
   cudaError_t ec_hal_event_destroy(cudaEvent_t event);
   cudaError_t ec_hal_event_record(cudaEvent_t event, cudaStream_t stream);
@@ -250,9 +252,20 @@
   // NOTE: Intentionally does NOT define __syncthreads() or __shfl_xor_sync() so any barrier/warp-shuffle kernel
   // MUST route to a GPU shader (ec_ops_*) or explicit row/head implementation — enforced at compile time!
   #ifdef __cplusplus
+  #include <type_traits>
   #ifdef __APPLE__
   #include <dispatch/dispatch.h>
   #endif
+  template <typename T>
+  static inline void ec_hal_mark_mut_ptr_arg(T v) {
+    if constexpr (std::is_pointer_v<T> && !std::is_const_v<std::remove_pointer_t<T>>) {
+      ec_hal_mark_host_dirty((const void *)v);
+    }
+  }
+  template <typename... Args>
+  static inline void ec_hal_mark_mut_ptrs(Args... args) {
+    (ec_hal_mark_mut_ptr_arg(args), ...);
+  }
   struct dim3 {
     unsigned int x, y, z;
     constexpr dim3(unsigned int vx = 1, unsigned int vy = 1, unsigned int vz = 1) : x(vx), y(vy), z(vz) {}
@@ -312,6 +325,7 @@
         } \
       } \
     }); \
+    ec_hal_mark_mut_ptrs(__VA_ARGS__); \
   } while (0)
   #endif
 

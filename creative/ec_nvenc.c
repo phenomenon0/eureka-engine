@@ -9,14 +9,26 @@
 #include <unistd.h>
 
 struct ec_mp4_writer {
+#ifdef _WIN32
+  FILE  *pipe_fp;
+#else
   pid_t  pid;
   int    stdin_fd;
+#endif
   size_t frame_bytes;
   int    frames_written;
 };
 
 static int probe_encoder_works(const char *enc) {
   char cmd[320];
+#ifdef _WIN32
+  snprintf(cmd, sizeof cmd,
+           "ffmpeg -hide_banner -loglevel error -f lavfi -i color=black:s=256x256:r=16 -frames:v 1 "
+           "-c:v %s -pix_fmt yuv420p -f null NUL >NUL 2>&1", enc);
+  FILE *p = _popen(cmd, "r");
+  if (!p) return 0;
+  return _pclose(p) == 0 ? 1 : 0;
+#else
   snprintf(cmd, sizeof cmd,
            "ffmpeg -hide_banner -loglevel error -f lavfi -i color=black:s=256x256:r=16 -frames:v 1 "
            "-c:v %s -pix_fmt yuv420p -f null - >/dev/null 2>&1", enc);
@@ -24,6 +36,7 @@ static int probe_encoder_works(const char *enc) {
   if (!p) return 0;
   int st = pclose(p);
   return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 1 : 0;
+#endif
 }
 
 static int has_nvenc(void) {
@@ -77,6 +90,30 @@ static const char *select_video_codec(int prefer_nvenc) {
 static ec_mp4_writer_t *spawn_ffmpeg(
     const char *out_mp4, const char *audio_wav,
     uint32_t w, uint32_t h, uint32_t fps, const char *vcodec) {
+#ifdef _WIN32
+  char cmd[2048];
+  char audio_in[512] = "";
+  char audio_enc[128] = "";
+  if (audio_wav && audio_wav[0]) {
+    snprintf(audio_in, sizeof audio_in, "-i \"%s\" ", audio_wav);
+    snprintf(audio_enc, sizeof audio_enc, "-c:a aac -b:a 256k -shortest ");
+  }
+  const char *vopts = (!strcmp(vcodec, "h264_nvenc") || !strcmp(vcodec, "hevc_nvenc") || !strcmp(vcodec, "av1_nvenc"))
+    ? "-preset p5 -tune hq -rc vbr -cq 19 -spatial-aq 1 -aq-strength 8 -temporal-aq 1 -rc-lookahead 12"
+    : (!strcmp(vcodec, "libsvtav1") ? "-preset 8 -crf 24" : "-preset fast -crf 18");
+  snprintf(cmd, sizeof cmd,
+           "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s %ux%u -r %u -i pipe:0 "
+           "%s-c:v %s %s -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709 "
+           "%s-movflags +faststart \"%s\" >NUL 2>&1",
+           w, h, fps, audio_in, vcodec, vopts, audio_enc, out_mp4);
+  FILE *fp = _popen(cmd, "wb");
+  if (!fp) return NULL;
+  ec_mp4_writer_t *wr = (ec_mp4_writer_t *)calloc(1, sizeof *wr);
+  if (!wr) { _pclose(fp); return NULL; }
+  wr->pipe_fp = fp;
+  wr->frame_bytes = (size_t)w * h * 3u;
+  return wr;
+#else
   int pipefd[2];
   if (pipe(pipefd) != 0) return NULL;
 
@@ -154,6 +191,7 @@ static ec_mp4_writer_t *spawn_ffmpeg(
   wr->stdin_fd = pipefd[1];
   wr->frame_bytes = (size_t)w * h * 3u;
   return wr;
+#endif
 }
 
 ec_mp4_writer_t *ec_mp4_open(
@@ -168,23 +206,34 @@ ec_mp4_writer_t *ec_mp4_open(
 }
 
 int ec_mp4_write_rgb24(ec_mp4_writer_t *w, const uint8_t *rgb, size_t nbytes) {
-  if (!w || w->stdin_fd < 0 || !rgb || nbytes != w->frame_bytes) return -1;
+  if (!w || !rgb || nbytes != w->frame_bytes) return -1;
+#ifdef _WIN32
+  if (!w->pipe_fp) return -1;
+  if (fwrite(rgb, 1, nbytes, w->pipe_fp) != nbytes) return -1;
+#else
+  if (w->stdin_fd < 0) return -1;
   size_t off = 0;
   while (off < nbytes) {
     ssize_t n = write(w->stdin_fd, rgb + off, nbytes - off);
     if (n <= 0) return -1;
     off += (size_t)n;
   }
+#endif
   w->frames_written++;
   return 0;
 }
 
 int ec_mp4_close(ec_mp4_writer_t *w) {
   if (!w) return -1;
+#ifdef _WIN32
+  int st = w->pipe_fp ? _pclose(w->pipe_fp) : -1;
+  int ok = (st == 0 && w->frames_written > 0) ? 0 : -1;
+#else
   if (w->stdin_fd >= 0) close(w->stdin_fd);
   int status = 0;
   waitpid(w->pid, &status, 0);
   int ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0 && w->frames_written > 0) ? 0 : -1;
+#endif
   free(w);
   return ok;
 }

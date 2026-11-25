@@ -21,7 +21,10 @@ param(
   [string] $Arch = '',
   [switch] $NoCuda,
   [switch] $NoCpu,
+  [switch] $NoVulkan,
+  [switch] $NoCreative,
   [string] $CudaPath = '',
+  [string] $VulkanSdk = '',
   [string] $LlbServe = ''
 )
 
@@ -516,8 +519,126 @@ if ($NoCuda) {
   }
 }
 
+# ---- Vulkan lane (LLM engine_vulkan.exe + Creative eureka-creative-serve.exe) --------------
+# Reuses the exact same POSIX shim (llbw_posix.o) + Naga-compiled SPIR-V 1.3 shaders so AMD Radeon
+# and Intel Arc Windows machines get native GPU acceleration across BOTH LLM and Creative Studio!
+function Find-VulkanSdk {
+  $cands = @()
+  if ($VulkanSdk -ne '') { $cands += $VulkanSdk }
+  if ($env:VULKAN_SDK) { $cands += $env:VULKAN_SDK }
+  $rootVk = 'C:\VulkanSDK'
+  if (Test-Path $rootVk) {
+    $cands += @(Get-ChildItem $rootVk -Directory | Sort-Object Name -Descending | ForEach-Object { $_.FullName })
+  }
+  foreach ($c in $cands) { if (Test-Path (Join-Path $c 'Include\vulkan\vulkan.h')) { return (Resolve-Path $c).Path } }
+  return ''
+}
+
+$VkOut = Join-Path $Build 'win\vulkan'
+$VkObj = Join-Path $VkOut 'obj'
+if ($NoVulkan) {
+  Write-Host 'Vulkan: skipped (-NoVulkan)'
+} elseif ($Cc -ne 'clang') {
+  Record 'engine_vulkan.exe' 127 'needs clang (LLVM for Windows)'
+} else {
+  $VkSdk = Find-VulkanSdk
+  if ($VkSdk -eq '') {
+    Write-Host 'Vulkan: no Vulkan SDK found under -VulkanSdk, VULKAN_SDK, or C:\VulkanSDK (skipping native Vulkan targets)'
+  } else {
+    Write-Host "Vulkan SDK: $VkSdk"
+    foreach ($d in @($VkOut, $VkObj)) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d | Out-Null } }
+    $vkInc = Join-Path $VkSdk 'Include'
+    $vkLib = Join-Path $VkSdk 'Lib\vulkan-1.lib'
+    $nonstd = '-D_CRT_DECLARE_NONSTDC_NAMES=0'
+    $vkShimObj = Join-Path $VkObj 'llbw_posix.o'
+    $rc = Run $ClangExe @('-std=c11', '-O2', $nonstd, '-Wall', '-c', (Join-Path $Compat 'llbw_posix.c'), '-o', $vkShimObj)
+    $rtDir = (& $ClangExe --print-resource-dir | Select-Object -First 1).ToString().Trim()
+    $rtLib = Join-Path $rtDir 'lib\windows\clang_rt.builtins-x86_64.lib'
+    $sysLibs = @($rtLib, '-lws2_32', '-lwinmm')
+
+    # 1. Native Vulkan LLM engine (engine_vulkan.exe)
+    $vkReq = @('-std=c11', '-O2', '-ffp-contract=off', '-fno-fast-math', '-D_POSIX_C_SOURCE=200809L',
+               '-D_CRT_SECURE_NO_WARNINGS', $nonstd, '-Wall', '-Wextra', '-Wno-unused-function', '-Wno-unused-parameter',
+               '-I', $Compat, '-I', $vkInc)
+    $vkObjs = @()
+    $vkUnits = @(
+      (Join-Path $Tools 'sys1dual\dual.c'), (Join-Path $Tools 'metrics\metrics.c'),
+      (Join-Path $Tools 'metrics\tokstream.c'), (Join-Path $Tools 'glue\glue_out.c'),
+      (Join-Path $Tools 'clef3\head.c'), (Join-Path $Tools 'clef3\weights.c'),
+      (Join-Path $Tools 'clef3\spans.c'), (Join-Path $Tools 'clef3\json.c'),
+      (Join-Path $Root 'host\llb_sampler.c'), (Join-Path $WinSrc 'cblas_sgemm.c'),
+      (Join-Path $WinSrc 'engine_cpu_gguf.c'), (Join-Path $Root 'backends\vulkan\llb_vulkan_gemv.c')
+    )
+    foreach ($u in $vkUnits) {
+      if ($rc -ne 0) { break }
+      $o = Join-Path $VkObj ([IO.Path]::GetFileNameWithoutExtension($u) + '.o')
+      $rc = Run $ClangExe ($vkReq + @('-c', $u, '-o', $o))
+      $vkObjs += $o
+    }
+    if ($rc -eq 0) {
+      $o = Join-Path $VkObj 'engine_vulkan.o'
+      $rc = Run $ClangExe ($vkReq + @('-DLLB_VULKAN=1', '-c', (Join-Path $WinSrc 'engine_cpu.c'), '-o', $o))
+      $vkObjs += $o
+    }
+    $vkExe = Join-Path $VkOut 'engine_vulkan.exe'
+    if ($rc -eq 0) {
+      $rc = Run $ClangExe (@('-O2', '-o', $vkExe) + $vkObjs + @($vkShimObj, $vkLib) + $sysLibs + @('-Wl,/STACK:8388608'))
+    }
+    Record 'engine_vulkan.exe' $rc 'Native Vulkan 1.2+ LLM engine (AMD/Intel/NVIDIA)'
+
+    # 2. Native Vulkan Creative Studio server (eureka-creative-serve.exe)
+    $CrSrc = Join-Path $Root 'creative'
+    if (-not $NoCreative -and (Test-Path (Join-Path $CrSrc 'ec_serve.c'))) {
+      $ClangXX = $ClangExe -replace 'clang(\.exe)?$', 'clang++$1'
+      $crCObjs = @()
+      $crCFlags = @('-std=c11', '-O3', '-DEC_BACKEND_VULKAN=1', '-D_POSIX_C_SOURCE=200809L',
+                    '-D_CRT_SECURE_NO_WARNINGS', $nonstd, '-I', $Compat, '-I', $CrSrc, '-I', $vkInc)
+      $crCFiles = @('ec_safetensors.c', 'ec_flow.c', 'ec_media.c', 'ec_cowrie.c', 'ec_director.c',
+                    'ec_storage.c', 'ec_nvenc.c', 'ec_serve.c', 'ec_tokenizer.c', 'ec_tokenizer_umt5.c',
+                    'backends\ec_backend_vulkan.c')
+      $rcCr = 0
+      foreach ($f in $crCFiles) {
+        if ($rcCr -ne 0) { break }
+        $o = Join-Path $VkObj ('cr_' + ([IO.Path]::GetFileNameWithoutExtension($f)) + '.o')
+        $rcCr = Run $ClangExe ($crCFlags + @('-c', (Join-Path $CrSrc $f), '-o', $o))
+        $crCObjs += $o
+      }
+      $crCppFlags = @('-std=c++17', '-O3', '-DEC_BACKEND_VULKAN=1', '-D_POSIX_C_SOURCE=200809L',
+                      '-D_CRT_SECURE_NO_WARNINGS', $nonstd, '-Wno-unknown-pragmas', '-x', 'c++',
+                      '-I', $Compat, '-I', $CrSrc, '-I', $vkInc)
+      $crCuFiles = @('ec_dit.cu', 'ec_vram.cu', 'ec_models.cu', 'ec_flux2.cu',
+                     'ec_acestep.cu', 'ec_wan22.cu', 'ec_trellis2.cu', 'ec_lora.cu')
+      foreach ($f in $crCuFiles) {
+        if ($rcCr -ne 0) { break }
+        $o = Join-Path $VkObj ('cr_' + ([IO.Path]::GetFileNameWithoutExtension($f)) + '.o')
+        $rcCr = Run $ClangXX ($crCppFlags + @('-c', (Join-Path $CrSrc $f), '-o', $o))
+        $crCObjs += $o
+      }
+      $crVkExe = Join-Path $VkOut 'eureka-creative-serve.exe'
+      if ($rcCr -eq 0) {
+        $rcCr = Run $ClangXX (@('-O3', '-o', $crVkExe) + $crCObjs + @($vkShimObj, $vkLib) + $sysLibs + @('-Wl,/STACK:8388608'))
+      }
+      Record 'eureka-creative-serve.exe (Vulkan)' $rcCr 'Unified C11 Creative Studio Vulkan'
+    }
+
+    # Stage build\win\vulkan\engine\vulkan\
+    $vkStage = Join-Path $VkOut 'engine\vulkan'
+    if (Test-Path $vkStage) { Remove-Item $vkStage -Recurse -Force }
+    New-Item -ItemType Directory -Path $vkStage | Out-Null
+    foreach ($n in @('engine_vulkan.exe', 'eureka-creative-serve.exe')) {
+      $p = Join-Path $VkOut $n
+      if (Test-Path $p) { Copy-Item $p (Join-Path $vkStage $n) -Force }
+    }
+    foreach ($n in @('gguf2pack.exe', 'llb-tok.exe')) {
+      $p = Join-Path $CpuOut $n
+      if (Test-Path $p) { Copy-Item $p (Join-Path $vkStage $n) -Force }
+    }
+    if ($LlbServe -ne '' -and (Test-Path $LlbServe)) { Copy-Item $LlbServe (Join-Path $vkStage 'llb-serve.exe') -Force }
+  }
+}
+
 # ---- summary ----------------------------------------------------------------
-$order = @('qwen35-cli.exe', 'qwen35-cli-gpu.exe', 'gguf2pack.exe', 'llbw_posix.o (POSIX shim)', 'test_shim.exe', 'llb-tok.exe', 'engine_cpu.exe', 'engine_gpu.exe')
+$order = @('qwen35-cli.exe', 'qwen35-cli-gpu.exe', 'gguf2pack.exe', 'llbw_posix.o (POSIX shim)', 'test_shim.exe', 'llb-tok.exe', 'engine_cpu.exe', 'engine_gpu.exe', 'engine_vulkan.exe', 'eureka-creative-serve.exe (Vulkan)')
 $sorted = @($results | Sort-Object { [array]::IndexOf($order, $_.name) })
 $ok = @($sorted | Where-Object { $_.ok } | ForEach-Object { $_.text })
 $bad = @($sorted | Where-Object { -not $_.ok } | ForEach-Object { $_.text })

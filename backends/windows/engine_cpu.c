@@ -36,6 +36,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef LLB_VULKAN
+#include "../vulkan/llb_vulkan_gemv.h"
+#endif
+
 /* the twin's GEMV row loop, split over this file's workers (tools/qwen35_engine.c LLB_GEMV_ROWS) */
 static int ecpu_gemv_rows(int fmt, const uint8_t *W, int rb, int rows, int cols, const float *x, float *y);
 #define LLB_GEMV_ROWS ecpu_gemv_rows
@@ -206,6 +210,9 @@ static void pool_start(int n) {
   }
 }
 static int ecpu_gemv_rows(int fmt, const uint8_t *W, int rb, int rows, int cols, const float *x, float *y) {
+#ifdef LLB_VULKAN
+  if ((size_t)rows * (size_t)cols >= 131072ULL && llb_vk_gemv(fmt, W, rb, rows, cols, x, y)) return 1;
+#endif
   if (pool_n < 2 || rows < 64) return 0; /* the twin's own loop */
   pthread_mutex_lock(&pool_mu);
   pool_job = (GemvJob){ fmt, rb, rows, cols, W, x, y };
@@ -485,7 +492,11 @@ int main(int argc, char **argv) {
   maxlen = nrun;
   if (steps < 1 || maxlen < 1) ecpu_die("needs at least one prompt id and --steps >= 1%s", NULL);
   if (threads < 1) threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef LLB_VULKAN
+  if (gpu_note) fprintf(stderr, "engine_vulkan: --gpu accepted (Vulkan GPU residency)\n");
+#else
   if (gpu_note) fprintf(stderr, "engine_cpu: --gpu ignored: this is the CPU engine\n");
+#endif
   const char *r4 = getenv("LLB_CPU_ROWS4");
   ecpu_rows4 = !(r4 && !strcmp(r4, "0"));
   const char *ep = getenv("LLB_CPU_EOG_PAD");
@@ -512,6 +523,27 @@ int main(int argc, char **argv) {
   ids_buf = malloc(sizeof *ids_buf * (size_t)cap_pos);
   if (!hist || !ids_buf) ecpu_die("out of memory for %s positions", "the");
   pool_start(threads);
+#ifdef LLB_VULKAN
+  {
+    int max_r = V, max_c = D;
+    llb_vk_tensor_span_t *vk_spans = (llb_vk_tensor_span_t *)malloc((size_t)(gNT > 0 ? gNT : 1) * sizeof *vk_spans);
+    int n_vk_spans = 0;
+    if (vk_spans) {
+      for (int i = 0; i < gNT; i++) {
+        if (gT[i].rows > max_r) max_r = gT[i].rows;
+        if (gT[i].cols > max_c) max_c = gT[i].cols;
+        vk_spans[n_vk_spans++] = (llb_vk_tensor_span_t){ gT[i].off, gT[i].bytes };
+      }
+      u64 tvk0 = now_ms();
+      if (llb_vk_init(gPack, psz, vk_spans, n_vk_spans, max_r, max_c) == 0) {
+        fprintf(stderr, "engine_vulkan: %s in %llu ms\n", llb_vk_device_info(), (unsigned long long)(now_ms() - tvk0));
+      } else {
+        fprintf(stderr, "engine_vulkan: no hardware Vulkan GPU usable; falling back to %d CPU GEMV threads\n", pool_n);
+      }
+      free(vk_spans);
+    }
+  }
+#endif
   fprintf(stderr, "engine_cpu: %d tensors, %zu weight bytes from %s in %llu ms; L=%d D=%d H=%d KV=%d hd=%d dff=%d V=%d; "
           "KV capacity %d positions; %d GEMV threads\n", gNT, psz, from, (unsigned long long)(now_ms() - t0), L, D, H, KV,
           HDIM, dff, V, cap_pos, pool_n);
@@ -586,5 +618,11 @@ void llb_vis_request(const char *rows, unsigned n) { (void)rows, (void)n; }
 void llb_vis_request_list(const char *spec) { (void)spec; }
 /* host/llb_pf.h IMG-FAST: dual.c marks image requests for the exact prefill; the CPU engine has one prefill */
 int llb_pf_hold_req;
-/* dual.c's LLB_MEMPROBE line asks libcuda for device memory; the CPU engine has no device (no line) */
-int cuMemGetInfo_v2(size_t *free_b, size_t *total_b) { (void)free_b, (void)total_b; return 1; }
+/* dual.c's LLB_MEMPROBE line asks libcuda for device memory; engine_vulkan reports Vulkan VRAM */
+int cuMemGetInfo_v2(size_t *free_b, size_t *total_b) {
+#ifdef LLB_VULKAN
+  return llb_vk_mem_info(free_b, total_b) == 0 ? 0 : 1;
+#else
+  (void)free_b, (void)total_b; return 1;
+#endif
+}
