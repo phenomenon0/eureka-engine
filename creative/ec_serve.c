@@ -235,7 +235,7 @@ typedef struct {
   int           photoreal;
   int           full_model;
   uint32_t      seed;
-  int           width, height, steps, frames, bpm, with_audio, grid_res, fps;
+  int           width, height, steps, frames, bpm, with_audio, grid_res, fps, num_gaussians;
   float         duration_sec, cfg_scale, shift, denoise, repaint_start, repaint_end, rescale_t;
   // v8 Multimodal Inputs
   char          init_image[256];
@@ -447,7 +447,11 @@ static void *job_runner_thread(void *arg) {
   } else if (!strcmp(j->kind, "3d")) {
     ec_studio_3d_v8_t tq = {};
     tq.prompt = j->prompt; tq.seed = j->seed; tq.grid_res = j->grid_res;
-    tq.steps = j->steps > 0 ? j->steps : 12; tq.cfg_scale = j->cfg_scale; tq.rescale_t = j->rescale_t;
+    tq.num_gaussians = j->num_gaussians;
+    tq.checkpoint_query = j->checkpoint[0] ? j->checkpoint : NULL;
+    int is_idol = (j->checkpoint[0] && (strstr(j->checkpoint, "idol") || strstr(j->checkpoint, "IDOL"))) ? 1 : 0;
+    tq.steps = j->steps > 0 ? j->steps : (is_idol ? 32 : 12);
+    tq.cfg_scale = j->cfg_scale; tq.rescale_t = j->rescale_t;
     tq.tier = tier; tq.full_model = j->full_model; tq.isolate_fg = j->isolate_fg;
     memcpy(tq.base_color, j->base_color, sizeof tq.base_color);
     for (int i = 0; i < j->n_input_images && i < 4; i++) tq.input_images[i] = j->input_images[i];
@@ -701,10 +705,10 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && (!strcmp(path, "/v1/creative/health") || !strcmp(path, "/v1/creative/status"))) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v17\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v18\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
         "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,\"zimage_ready\":%s,"
-        "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,\"ltx2_ready\":%s,"
+        "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"idol_ready\":%s,\"wan22_ready\":%s,\"ltx2_ready\":%s,"
         "\"cowrie_enabled\":%s,\"cowrie_shani\":%s,"
         "\"cowrie_sp_hits\":%llu,\"cowrie_sp_saves\":%llu,"
         "\"cowrie_sp_mismatches\":%llu,\"cowrie_trust_entries\":%d,"
@@ -713,12 +717,13 @@ static void *client_thread(void *arg) {
         "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,"
         "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
         "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
-        "\"modalities\":[\"z_image_turbo_6b\",\"flux2_photoreal\",\"flux2_base_4b\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_xl_4b\",\"acestep_1.5_sft\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"studio_master_lufs\",\"trellis2_3d\",\"trellis2_512_ovoxel_pbr\",\"trellis2_color0_pbr\",\"trellis2_photo_multiview\",\"ltx2.3_22b_joint_av\",\"wan2.2_video\",\"wan2.2_hero_i2v\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"lora_delta_hotswap_8ms\",\"vae_arena_slab\",\"vram_lease_broker\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
+        "\"modalities\":[\"z_image_turbo_6b\",\"flux2_photoreal\",\"flux2_base_4b\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_xl_4b\",\"acestep_1.5_sft\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"studio_master_lufs\",\"trellis2_3d\",\"trellis2_512_ovoxel_pbr\",\"trellis2_color0_pbr\",\"trellis2_photo_multiview\",\"idol_3dgs_1m\",\"ltx2.3_22b_joint_av\",\"wan2.2_video\",\"wan2.2_hero_i2v\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"lora_delta_hotswap_8ms\",\"vae_arena_slab\",\"vram_lease_broker\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
         g_api_key[0] ? "true" : "false",
         info.photoreal_ready ? "true" : "false",
         info.zimage_ready    ? "true" : "false",
         info.acestep_ready   ? "true" : "false",
         info.trellis2_ready  ? "true" : "false",
+        info.idol_ready      ? "true" : "false",
         info.wan22_ready     ? "true" : "false",
         info.ltx2_ready      ? "true" : "false",
         info.cowrie_enabled  ? "true" : "false",
@@ -764,6 +769,7 @@ static void *client_thread(void *arg) {
     json_get_str(body, "lyrics", j->lyrics, sizeof j->lyrics, "");
     json_get_str(body, "tier", j->tier, sizeof j->tier, "fast");
     json_get_str(body, "checkpoint", j->checkpoint, sizeof j->checkpoint, "");
+    if (!j->checkpoint[0]) json_get_str(body, "engine", j->checkpoint, sizeof j->checkpoint, "");
     json_get_str(body, "init_image", j->init_image, sizeof j->init_image, "");
     json_get_str(body, "mask_image", j->mask_image, sizeof j->mask_image, "");
     json_get_str(body, "start_frame", j->start_frame, sizeof j->start_frame, "");
@@ -789,6 +795,7 @@ static void *client_thread(void *arg) {
     j->width = (int)json_get_num(body, "width", def_w);
     j->height = (int)json_get_num(body, "height", def_h);
     j->grid_res = (int)json_get_num(body, "grid_res", 20);
+    j->num_gaussians = (int)json_get_num(body, "num_gaussians", 0);
     j->bpm = (int)json_get_num(body, "bpm", 124);
     j->duration_sec = (float)json_get_num(body, "duration_sec", req_full == 1 ? 10.0 : 2.0);
     j->cfg_scale = (float)json_get_num(body, "cfg_scale", 0.0);
@@ -809,7 +816,7 @@ static void *client_thread(void *arg) {
     if (req_full >= 0) {
       j->full_model = req_full;
     } else if (!strcmp(j->kind, "3d")) {
-      j->full_model = (j->grid_res >= 32 || j->n_input_images > 0) ? 1 : 0;
+      j->full_model = (j->grid_res >= 32 || j->n_input_images > 0 || j->checkpoint[0] || j->num_gaussians > 0) ? 1 : 0;
     } else if (!strcmp(j->kind, "music")) {
       j->full_model = (j->duration_sec >= 5.0f || j->lyrics[0] || j->source_audio[0]) ? 1 : 0;
     } else if (is_vid) {
@@ -817,7 +824,8 @@ static void *client_thread(void *arg) {
     } else {
       j->full_model = j->photoreal;
     }
-    int def_steps = is_vid ? (j->full_model ? 20 : 4) : (!strcmp(j->kind, "3d") ? 12 : (!strcmp(j->kind, "music") ? 8 : (j->photoreal ? 4 : 12)));
+    int is_idol_3d = (!strcmp(j->kind, "3d") && j->checkpoint[0] && (strstr(j->checkpoint, "idol") || strstr(j->checkpoint, "IDOL"))) ? 1 : 0;
+    int def_steps = is_vid ? (j->full_model ? 20 : 4) : (!strcmp(j->kind, "3d") ? (is_idol_3d ? 32 : 12) : (!strcmp(j->kind, "music") ? 8 : (j->photoreal ? 4 : 12)));
     j->steps = (int)json_get_num(body, "steps", def_steps);
     j->frames = (int)json_get_num(body, "frames", (is_vid && j->full_model) ? 17 : 24);
     j->fps = (int)json_get_num(body, "fps", (is_vid && j->full_model) ? 16 : 24);
@@ -1045,21 +1053,27 @@ static void *client_thread(void *arg) {
       send_json(cfd, 400, resp);
     }
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/3d/generations")) {
-    char prompt[1024], in_imgs[4][256], single_img[256];
+    char prompt[1024], ckpt[256], in_imgs[4][256], single_img[256];
     ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
     json_get_str(body, "prompt", prompt, sizeof prompt, "sculptural matte-white porcelain teapot");
+    json_get_str(body, "checkpoint", ckpt, sizeof ckpt, "");
+    if (!ckpt[0]) json_get_str(body, "engine", ckpt, sizeof ckpt, "");
     json_get_str(body, "input_image", single_img, sizeof single_img, "");
     int n_imgs = json_get_path_array(body, "input_images", in_imgs, 4);
     int n_loras = json_get_loras(body, loras, EC_STUDIO_MAX_LORAS);
     if (n_imgs == 0 && single_img[0]) { snprintf(in_imgs[0], sizeof in_imgs[0], "%s", single_img); n_imgs = 1; }
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 77);
     int res_g = (int)json_get_num(body, "grid_res", 20);
-    int full_m = json_get_bool(body, "full_model", (res_g >= 32 || n_imgs > 0 || n_loras > 0) ? 1 : 0);
+    int num_gs = (int)json_get_num(body, "num_gaussians", 0);
+    int is_idol = (ckpt[0] && (strstr(ckpt, "idol") || strstr(ckpt, "IDOL"))) ? 1 : 0;
+    int full_m = json_get_bool(body, "full_model", (res_g >= 32 || n_imgs > 0 || n_loras > 0 || is_idol || num_gs > 0) ? 1 : 0);
     ec_studio_3d_v8_t tq = {0};
     tq.prompt = prompt; tq.seed = seed; tq.grid_res = res_g;
-    tq.steps = (int)json_get_num(body, "steps", 12);
-    tq.cfg_scale = (float)json_get_num(body, "cfg_scale", 7.5);
-    tq.rescale_t = (float)json_get_num(body, "rescale_t", 5.0);
+    tq.num_gaussians = num_gs;
+    tq.checkpoint_query = ckpt[0] ? ckpt : NULL;
+    tq.steps = (int)json_get_num(body, "steps", is_idol ? 32 : 12);
+    tq.cfg_scale = (float)json_get_num(body, "cfg_scale", is_idol ? 3.0 : 7.5);
+    tq.rescale_t = (float)json_get_num(body, "rescale_t", is_idol ? 3.0 : 5.0);
     tq.isolate_fg = json_get_bool(body, "isolate_fg", 1);
     tq.tier = EC_TIER_FAST; tq.full_model = full_m;
     for (int i = 0; i < n_imgs && i < 4; i++) tq.input_images[i] = in_imgs[i];

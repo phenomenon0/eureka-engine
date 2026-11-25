@@ -16,7 +16,7 @@ GENC=(-gencode arch=compute_80,code=sm_80
       -gencode arch=compute_90,code=sm_90
       -gencode arch=compute_120,code=[sm_120,compute_120])
 
-echo "=== Building 100% Native Eureka Creative Engine v17 Frontier Peak (Z-Image-Turbo 6.15B + FLUX.2 + LTX-2.3 22B Joint A/V + Wan 2.2 + ACE-Step 1.5-XL 4B + TRELLIS.2-4B 512^3 O-Voxel PBR) in $OUT ==="
+echo "=== Building 100% Native Eureka Creative Engine v18 Frontier Peak (Z-Image-Turbo 6.15B + FLUX.2 + LTX-2.3 22B Joint A/V + Wan 2.2 + ACE-Step 1.5-XL 4B + TRELLIS.2-4B 512^3 O-Voxel PBR + speridlabs/idol 1M 3DGS) in $OUT ==="
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_safetensors.c" -o "$OUT/obj/ec_safetensors.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_cowrie.c"      -o "$OUT/obj/ec_cowrie.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_flow.c"        -o "$OUT/obj/ec_flow.o"
@@ -39,6 +39,7 @@ echo "=== Building 100% Native Eureka Creative Engine v17 Frontier Peak (Z-Image
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_zimage.cu"     -o "$OUT/obj/ec_zimage.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_acestep.cu"    -o "$OUT/obj/ec_acestep.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_trellis2.cu"   -o "$OUT/obj/ec_trellis2.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_idol.cu"       -o "$OUT/obj/ec_idol.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_wan22.cu"      -o "$OUT/obj/ec_wan22.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_ltx2.cu"       -o "$OUT/obj/ec_ltx2.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_studio.cu"     -o "$OUT/obj/ec_studio.o"
@@ -65,6 +66,7 @@ COMMON_OBJS=(
   "$OUT/obj/ec_zimage.o"
   "$OUT/obj/ec_acestep.o"
   "$OUT/obj/ec_trellis2.o"
+  "$OUT/obj/ec_idol.o"
   "$OUT/obj/ec_wan22.o"
   "$OUT/obj/ec_ltx2.o"
 )

@@ -18,6 +18,7 @@
 #include "ec_recipes.h"
 #include "ec_storage.h"
 #include "ec_trellis2.h"
+#include "ec_idol.h"
 #include "ec_vram_pool.h"
 #include "ec_wan22.h"
 #include "ec_ltx2.h"
@@ -61,6 +62,7 @@ struct ec_studio {
   ec_zimage_t        *zimage;
   ec_acestep_t       *acestep;
   ec_trellis2_t      *trellis2;
+  ec_idol_t          *idol;
   ec_wan22_t         *wan22;
   ec_ltx2_t          *ltx2;
   char                dag_model_sha[65];
@@ -69,7 +71,7 @@ struct ec_studio {
   int                 initialized;
 };
 
-// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2, 5=Z-Image, 6=LTX-2.3, 0=ALL).
+// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2, 5=Z-Image, 6=LTX-2.3, 7=Idol, 0=ALL).
 // Lightweight mmap handles & tokenizers stay open so switching modalities incurs zero file re-parsing!
 static void studio_evict_other_engines_locked(ec_studio_t *st, int keep_id) {
   if (keep_id != 1 && st->flux2)    ec_flux2_unload_vram(st->flux2);
@@ -78,7 +80,8 @@ static void studio_evict_other_engines_locked(ec_studio_t *st, int keep_id) {
   if (keep_id != 4 && st->wan22)    ec_wan22_unload_vram(st->wan22);
   if (keep_id != 5 && st->zimage)   ec_zimage_unload_vram(st->zimage);
   if (keep_id != 6 && st->ltx2)     ec_ltx2_unload_vram(st->ltx2);
-  st->active_engine_mask = (keep_id >= 1 && keep_id <= 6) ? (1 << (keep_id - 1)) : 0;
+  if (keep_id != 7 && st->idol)     ec_idol_unload_vram(st->idol);
+  st->active_engine_mask = (keep_id >= 1 && keep_id <= 7) ? (1 << (keep_id - 1)) : 0;
 }
 
 extern "C" int ec_studio_unload_all_vram(ec_studio_t *st, double *out_ms, double *out_free_mb) {
@@ -214,6 +217,29 @@ static void studio_try_init_all_engines_locked(ec_studio_t *st) {
       snprintf(lp.tokenizer_path,    sizeof lp.tokenizer_path,    "%s", tok->path);
       if (st->ltx2) { ec_ltx2_destroy(st->ltx2); st->ltx2 = NULL; }
       st->ltx2 = ec_ltx2_create(&lp);
+    }
+  }
+
+  // 6. v18 Single Image -> 1M 3D Gaussian Splats Frontier: speridlabs/idol (Apache-2.0)
+  if (!st->idol || !ec_idol_is_ready(st->idol)) {
+    const char *bases[18];
+    int nb = 0;
+    if (st->models_dir[0]) bases[nb++] = st->models_dir;
+    for (int r = 0; r < st->vault.n_roots && nb < 18; r++) {
+      if (st->vault.roots[r].exists && st->vault.roots[r].path[0]) bases[nb++] = st->vault.roots[r].path;
+    }
+    for (int bi = 0; bi < nb; bi++) {
+      ec_idol_paths_t ip = {};
+      snprintf(ip.dinov3_path,     sizeof ip.dinov3_path,     "%s/idol/dinov3_vith16plus.safetensors", bases[bi]);
+      snprintf(ip.denoiser_path,   sizeof ip.denoiser_path,   "%s/idol/denoiser.safetensors",          bases[bi]);
+      snprintf(ip.decoder_path,    sizeof ip.decoder_path,    "%s/idol/decoder.safetensors",           bases[bi]);
+      snprintf(ip.decoder_gs_path, sizeof ip.decoder_gs_path, "%s/idol/decoder_gs.safetensors",        bases[bi]);
+      if (access(ip.dinov3_path, R_OK) == 0 && access(ip.denoiser_path, R_OK) == 0 &&
+          access(ip.decoder_path, R_OK) == 0 && access(ip.decoder_gs_path, R_OK) == 0) {
+        if (st->idol) { ec_idol_destroy(st->idol); st->idol = NULL; }
+        st->idol = ec_idol_create(&ip);
+        if (st->idol) break;
+      }
     }
   }
 
@@ -374,6 +400,7 @@ extern "C" void ec_studio_destroy(ec_studio_t *st) {
     if (st->zimage)   { ec_zimage_destroy(st->zimage);     st->zimage = NULL; }
     if (st->acestep)  { ec_acestep_destroy(st->acestep);   st->acestep = NULL; }
     if (st->trellis2) { ec_trellis2_destroy(st->trellis2); st->trellis2 = NULL; }
+    if (st->idol)     { ec_idol_destroy(st->idol);         st->idol = NULL; }
     if (st->wan22)    { ec_wan22_destroy(st->wan22);       st->wan22 = NULL; }
     if (st->ltx2)     { ec_ltx2_destroy(st->ltx2);         st->ltx2 = NULL; }
     ec_registry_free(&st->registry);
@@ -412,6 +439,7 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
   out->zimage_ready    = (st->zimage   && ec_zimage_is_ready(st->zimage))     ? 1 : 0;
   out->acestep_ready   = (st->acestep  && ec_acestep_is_ready(st->acestep))   ? 1 : 0;
   out->trellis2_ready  = (st->trellis2 && ec_trellis2_is_ready(st->trellis2)) ? 1 : 0;
+  out->idol_ready      = (st->idol     && ec_idol_is_ready(st->idol) && st->flux2 && ec_flux2_is_ready(st->flux2)) ? 1 : 0;
   out->wan22_ready     = (st->wan22    && ec_wan22_is_ready(st->wan22))       ? 1 : 0;
   out->ltx2_ready      = (st->ltx2     && ec_ltx2_is_ready(st->ltx2))         ? 1 : 0;
   out->storage_roots = st->vault.n_roots;
@@ -626,6 +654,117 @@ extern "C" int ec_studio_gen_3d_v8(
     ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
   memset(res, 0, sizeof *res);
   if (!st || !st->initialized || !req) return -1;
+
+  // v18 Frontier 3D Gaussian Splatting: speridlabs/idol (Single Image -> 262K..1M 3DGS .ply, Apache-2.0)
+  int want_idol = (req->full_model && st->idol && ec_idol_is_ready(st->idol) &&
+                   st->flux2 && ec_flux2_is_ready(st->flux2) &&
+                   req->checkpoint_query && ci_substr(req->checkpoint_query, "idol")) ? 1 : 0;
+  if (want_idol) {
+    uint8_t *in_rgb = NULL, *in_alpha = NULL;
+    int in_w = 0, in_h = 0, has_photo = 0;
+    if (req->n_input_images > 0 && req->input_images[0]) {
+      char pbuf[512];
+      if (resolve_studio_media_path(st, req->input_images[0], pbuf, sizeof pbuf) == 0) {
+        uint8_t *rgba = NULL; int has_a = 0;
+        if (ec_load_image_rgba(pbuf, &rgba, &in_w, &in_h, &has_a) == 0 && rgba) {
+          size_t np = (size_t)in_w * (size_t)in_h;
+          in_rgb = (uint8_t *)malloc(np * 3u);
+          if (has_a) in_alpha = (uint8_t *)malloc(np);
+          if (in_rgb) {
+            for (size_t i = 0; i < np; i++) {
+              in_rgb[i*3+0] = rgba[i*4+0]; in_rgb[i*3+1] = rgba[i*4+1]; in_rgb[i*3+2] = rgba[i*4+2];
+              if (in_alpha) in_alpha[i] = rgba[i*4+3];
+            }
+            has_photo = 1;
+          }
+          free(rgba);
+        } else if (ec_load_image_rgb(pbuf, &in_rgb, &in_w, &in_h) == 0 && in_rgb) {
+          has_photo = 1;
+        }
+      }
+    }
+
+    uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ 0x49444F4C3344ULL ^ (uint64_t)req->num_gaussians;
+    uint32_t tag32 = next_artifact_hash32(st, tag);
+    snprintf(res->file_main, sizeof res->file_main, "%s/idol_%u_%08x.glb", st->artifact_dir, req->seed, tag32);
+    snprintf(res->file_aux,  sizeof res->file_aux,  "%s/idol_%u_%08x.ply", st->artifact_dir, req->seed, tag32);
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    double ref_ms = 0.0;
+    if (!in_rgb && ((st->zimage && ec_zimage_is_ready(st->zimage)) || (st->flux2 && ec_flux2_is_ready(st->flux2)))) {
+      char hero_prompt[1536], ref_png[256];
+      snprintf(hero_prompt, sizeof hero_prompt,
+          "Single isolated 3D turntable product cutout of %s, three-quarter front-elevated view, 100mm telephoto lens with zero distortion, full object floating cleanly centered with 18%% empty margin on all four sides, even shadowless neutral softbox lighting, flat solid uniform neutral medium-gray #888888 void background with zero gradient and zero cast shadows, crisp true material albedo, no studio wall, no table, no floor, no horizon, no props, no text",
+          (req->prompt && req->prompt[0]) ? req->prompt : "sculptural matte-white porcelain teapot with bamboo handle");
+      snprintf(ref_png, sizeof ref_png, "%s/idol_%u_%08x_ref.png", st->artifact_dir, req->seed, tag32);
+      int rc_ref = -1;
+      if (st->zimage && ec_zimage_is_ready(st->zimage)) {
+        ec_zimage_req_t zreq = {};
+        zreq.prompt = hero_prompt; zreq.seed = req->seed; zreq.width = 1024; zreq.height = 1024; zreq.steps = 8; zreq.shift = 3.0f;
+        ec_zimage_res_t zres = {};
+        pthread_mutex_lock(&st->gpu_mu);
+        studio_evict_other_engines_locked(st, 5);
+        rc_ref = ec_zimage_generate_rgb(st->zimage, &zreq, &in_rgb, ref_png,
+                                        cb ? tr_ref_progress_bridge : NULL, &bridge, &zres);
+        ec_zimage_unload_vram(st->zimage);
+        pthread_mutex_unlock(&st->gpu_mu);
+        if (rc_ref == 0 && in_rgb) { in_w = zres.width; in_h = zres.height; ref_ms = zres.total_ms; }
+      }
+      if ((rc_ref != 0 || !in_rgb) && rc_ref != -2 && st->flux2 && ec_flux2_is_ready(st->flux2)) {
+        ec_flux2_req_t freq = {};
+        freq.prompt = hero_prompt; freq.seed = req->seed; freq.width = 1024; freq.height = 1024; freq.steps = 4; freq.tier = EC_TIER_EXACT;
+        ec_flux2_res_t fres = {};
+        pthread_mutex_lock(&st->gpu_mu);
+        studio_evict_other_engines_locked(st, 1);
+        rc_ref = ec_flux2_generate_rgb(st->flux2, &freq, &in_rgb, ref_png,
+                                       cb ? tr_ref_progress_bridge : NULL, &bridge, &fres);
+        ec_flux2_unload_vram(st->flux2);
+        pthread_mutex_unlock(&st->gpu_mu);
+        if (rc_ref == 0 && in_rgb) { in_w = fres.width; in_h = fres.height; ref_ms = fres.total_ms; }
+      }
+      if (rc_ref != 0 || !in_rgb) {
+        free(in_rgb); free(in_alpha);
+        if (rc_ref == -2) { res->cancelled = 1; return 0; }
+        return -1;
+      }
+    }
+
+    if (in_rgb) {
+      ec_idol_req_t ireq = {};
+      ireq.rgb = in_rgb; ireq.alpha = in_alpha;
+      ireq.img_w = in_w; ireq.img_h = in_h;
+      ireq.seed = req->seed;
+      ireq.steps = (req->steps >= 4 && req->steps <= 80) ? req->steps : 32;
+      ireq.cfg_scale = (req->cfg_scale > 0.0f && req->cfg_scale <= 10.0f) ? req->cfg_scale : 3.0f;
+      ireq.rescale_t = (req->rescale_t > 0.1f && req->rescale_t <= 10.0f) ? req->rescale_t : 3.0f;
+      ireq.crop_margin = 1.2f;
+      ireq.num_gaussians = (req->num_gaussians >= 32768 && req->num_gaussians <= 1048576) ? req->num_gaussians : 262144;
+      ireq.skip_matte = req->isolate_fg ? 0 : 1;
+
+      ec_idol_res_t ires = {};
+      pthread_mutex_lock(&st->gpu_mu);
+      studio_evict_other_engines_locked(st, 7);
+      int rc_id = ec_idol_generate_splats(st->idol, st->flux2, &ireq, res->file_aux, res->file_main,
+                                          cb ? tr_flow_progress_bridge : NULL, &bridge, &ires);
+      pthread_mutex_unlock(&st->gpu_mu);
+      free(in_rgb); free(in_alpha);
+      if (rc_id == -2) { res->cancelled = 1; return 0; }
+      if (rc_id == 0 && ires.ok) {
+        snprintf(res->engine_mode, sizeof res->engine_mode, "%s", has_photo ? "idol_3dgs_photo" : "idol_3dgs");
+        snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "speridlabs/idol");
+        int proxy_a = (ires.n_anchors > 4096) ? 4096 : ires.n_anchors;
+        res->n_verts = proxy_a * 6; res->n_tris = proxy_a * 8;
+        res->n_splats = ires.n_splats;
+        res->steps_run = ires.steps_run;
+        res->text_enc_ms = ref_ms + ires.enc_ms;
+        res->dit_ms = ires.flow_ms;
+        res->vae_ms = ires.dec_ms;
+        res->gpu_ms = ref_ms + ires.total_ms;
+        return 0;
+      }
+      return -1;
+    }
+  }
 
   if (req->full_model && st->trellis2 && ec_trellis2_is_ready(st->trellis2)) {
     uint8_t *views[4] = {0};

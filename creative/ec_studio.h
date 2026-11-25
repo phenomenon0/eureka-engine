@@ -31,12 +31,13 @@ typedef struct {
   double vram_free_mb;
   double vram_pool_used_mb;
   double vram_pool_budget_mb;
-  int    engines_resident_mask; // bit0=flux2, bit1=acestep, bit2=trellis2, bit3=wan22, bit4=zimage, bit5=ltx2
+  int    engines_resident_mask; // bit0=flux2, bit1=acestep, bit2=trellis2, bit3=wan22, bit4=zimage, bit5=ltx2, bit6=idol
   int    models_discovered;
   int    photoreal_ready;
   int    zimage_ready;
   int    acestep_ready;
   int    trellis2_ready;
+  int    idol_ready;
   int    wan22_ready;
   int    ltx2_ready;
   int    storage_roots;
@@ -113,9 +114,11 @@ typedef struct {
   const char *prompt;
   uint32_t    seed;
   int         grid_res, steps, full_model, isolate_fg;
+  int         num_gaussians;               // Optional for speridlabs/idol (32768..1048576, default 262144)
   float       cfg_scale, rescale_t;
   float       base_color[4];
   ec_tier_t   tier;
+  const char             *checkpoint_query; // Optional: "idol" (1M 3DGS) vs "trellis2" (512^3 PBR Mesh)
   const char             *input_images[4]; // 1..4 direct photo uploads -> DINOv3 multi-view (skips FLUX.2!)
   int                     n_input_images;
   const ec_studio_lora_t *loras;

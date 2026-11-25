@@ -90,6 +90,11 @@ int ec_flux2_vae_roundtrip_rgb(
     ec_flux2_t *fx, const uint8_t *in_rgb, int width, int height,
     uint8_t *out_rgb, double *enc_ms, double *dec_ms);
 
+// Native AutoencoderKLFlux2 2D VAE Encoder -> GPU BN-normalized packed latents [H/16 * W/16, 128] F32 (used by Idol 3DGS!)
+int ec_flux2_vae_encode_packed_d(
+    ec_flux2_t *fx, const uint8_t *in_rgb, int width, int height,
+    float *out_packed_latents_d, double *enc_ms);
+
 // Zero-reload GPU BF16 LoRA/QLoRA stack hot-swap (< 8ms delta unfuse/refuse without reloading 7.75 GB DiT!).
 int ec_flux2_hot_swap_loras(
     ec_flux2_t *fx, const char *ckpt_override,

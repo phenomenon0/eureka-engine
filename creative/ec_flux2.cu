@@ -3022,3 +3022,11 @@ extern "C" int ec_flux2_vae_roundtrip_rgb(
   cudaFree(lat_d);
   return rc;
 }
+
+extern "C" int ec_flux2_vae_encode_packed_d(
+    ec_flux2_t *fx, const uint8_t *in_rgb, int width, int height,
+    float *out_packed_latents_d, double *enc_ms) {
+  if (!ec_flux2_is_ready(fx) || !in_rgb || !out_packed_latents_d || width < 64 || height < 64 || (width & 15) || (height & 15))
+    return -1;
+  return run_flux2_vae_encode(fx, in_rgb, height, width, out_packed_latents_d, enc_ms);
+}
