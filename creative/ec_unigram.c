@@ -26,6 +26,7 @@ struct ec_unigram {
   int        max_piece_len;
   int32_t    unk_id;
   int32_t    eos_id;
+  int32_t    byte_ids[256]; // SentencePiece <0x00>..<0xFF> UTF-8 byte fallback IDs (-1 if absent)
 };
 
 static inline uint64_t ug_fnv1a(const char *s, size_t n) {
@@ -185,8 +186,9 @@ ec_unigram_t *ec_unigram_load(const char *tokenizer_json_path) {
   p++; // inside vocab array
 
   ec_unigram_t *ug = (ec_unigram_t *)calloc(1, sizeof *ug);
-  ug->unk_id = 3;
+  ug->unk_id = 2; // official google/umt5-xxl: <pad>=0, </s>=1, <unk>=2
   ug->eos_id = 1;
+  for (int b = 0; b < 256; b++) ug->byte_ids[b] = -1;
   size_t table_cap = 1 << 20; // 1,048,576 slots (~25% load factor for 256k vocab!)
   ug->table_mask = table_cap - 1;
   ug->table = (ug_slot_t *)malloc(table_cap * sizeof(ug_slot_t));
@@ -217,8 +219,16 @@ ec_unigram_t *ec_unigram_load(const char *tokenizer_json_path) {
     skip_ws(&p, end);
     if (p < end && *p == ']') p++;
 
-    // Skip special/control tokens 0..3 from matching raw text, insert all valid pieces
-    if (id >= 4 && plen > 0 && plen < 256) {
+    // Detect <unk> & SentencePiece <0xXX> UTF-8 byte fallback tokens!
+    if (plen == 5 && memcmp(piece, "<unk>", 5) == 0) {
+      ug->unk_id = id;
+    } else if (plen == 6 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && piece[5] == '>') {
+      int hi = hex_val(piece[3]), lo = hex_val(piece[4]);
+      if (hi >= 0 && lo >= 0) ug->byte_ids[(hi << 4) | lo] = id;
+    }
+
+    // Skip special/control tokens 0..2 from matching raw text, insert all valid pieces
+    if (id >= 3 && plen > 0 && plen < 256 && !(plen == 6 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && piece[5] == '>')) {
       if (ug->arena_len + plen + 1 > arena_cap) {
         arena_cap *= 2;
         ug->arena = (char *)realloc(ug->arena, arena_cap);
@@ -323,13 +333,29 @@ int ec_unigram_encode(const ec_unigram_t *ug, const char *text, int32_t *out_ids
     }
   }
 
-  // 3. Backtrack & reverse
-  int32_t *rev = (int32_t *)malloc((nl + 2) * sizeof(int32_t));
+  // 3. Backtrack & reverse (with exact SentencePiece <0xXX> UTF-8 byte-fallback for unknown codepoints!)
+  int32_t *rev = (int32_t *)malloc((nl * 4 + 4) * sizeof(int32_t));
   int count = 0;
   int cur = (int)nl;
   while (cur > 0 && prev[cur] >= 0) {
-    rev[count++] = tok[cur];
-    cur = prev[cur];
+    int pcur = prev[cur];
+    if (tok[cur] == ug->unk_id) {
+      int all_bytes_known = 1;
+      for (int bi = pcur; bi < cur; bi++) {
+        if (ug->byte_ids[(unsigned char)norm[bi]] < 0) { all_bytes_known = 0; break; }
+      }
+      if (all_bytes_known && cur > pcur) {
+        // Push in reverse order so reversal emits forward UTF-8 bytes
+        for (int bi = cur - 1; bi >= pcur; bi--) {
+          rev[count++] = ug->byte_ids[(unsigned char)norm[bi]];
+        }
+      } else {
+        rev[count++] = ug->unk_id;
+      }
+    } else {
+      rev[count++] = tok[cur];
+    }
+    cur = pcur;
   }
 
   int out_n = 0;

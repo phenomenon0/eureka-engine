@@ -79,6 +79,23 @@ int ec_ops_conv2d_3x3_nhwc_bf16(
     float *Y_f32, uint16_t *Y_bf16,
     int H, int W, int Cin, int Cout, cudaStream_t stream);
 
+// 5. v16 "Taste & Mastery" Native CUDA Operators:
+//    - Pure IEEE FP32 SGEMM for AutoencoderOobleck 1D Stereo Audio VAE (zero BF16 stereo phase smear!)
+//    - CFG-Zero* optimal scalar projection (Fan et al. arXiv:2503.18886 — kills high-CFG oversaturation!)
+//    - Exact Exponential Integrator RES-Multistep (phi_1/phi_2 in log-sigma space, 0 extra NFEs!)
+int ec_ops_gemm_f32(
+    const float *X, const float *W, const float *bias,
+    float *Y_f32, int M, int N, int K, cudaStream_t stream);
+
+int ec_ops_cfg_zerostar_vel(
+    const float *vp, const float *vn, float *v_out,
+    long n, float cfg_scale, int zero_init_step, cudaStream_t stream);
+
+int ec_ops_res_multistep_step(
+    float *xt, const float *v_cur, float *old_x0,
+    long n, float sigma_cur, float sigma_next, float h_prev, int has_prev,
+    cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

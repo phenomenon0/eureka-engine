@@ -18,20 +18,27 @@ int ec_export_glb(const char *path, const ec_mesh_t *mesh);
 // 2. Native 3D Gaussian Splat (.ply) Exporter
 int ec_export_splat_ply(const char *path, const ec_splat3d_t *splat);
 
-// 3. Native 16-bit PCM Stereo/Mono WAV Exporter, Loader & Multi-Stem Splitter (0/2/4/8 Stems)
+// 3. Native 16-bit PCM Stereo/Mono WAV Exporter, Loader, Studio Mastering DSP & Multi-Stem Splitter (0/2/4/8 Stems)
 int ec_export_wav(const char *path, const ec_audio_t *audio);
 int ec_load_wav_stereo_f32(const char *path, int target_sr, float **out_pcm_lr, int *out_samples);
+// Studio 48kHz Mastering DSP: DC removal + 28Hz Butterworth HPF + anti-mud EQ (-2.2dB@300Hz)
+// + air shelf (+1.8dB@11.5kHz) + <120Hz bass mono + ITU-R BS.1770 K-weighted LUFS norm + 4x True-Peak Limiter!
+void ec_audio_master_studio(
+    float *pcm_lr, int n_samples, int sr, float target_lufs, float true_peak_dbtp,
+    float *out_lufs, float *out_peak_dbtp);
 // Splits stereo PCM into 0 (full mix), 2 (vocals/instrumental), 4 (drums/bass/harmony/lead),
 // or 8 (drums/bass/vocals/guitar/piano/synth/strings/fx) complementary stems summing to master!
 int ec_audio_split_stems(
     const float *pcm_lr, int n_samples, int sr, int stem_mode,
     const char *dir_prefix, char out_paths[8][256], char out_names[8][24], int *out_n_stems);
 
-// 4. Native Image Exporters, Universal Loaders (PNG/JPG/PPM), Resizer, Mask & Outpaint Pad
+// 4. Native Image Exporters, Universal Loaders (PNG/JPG/PPM + RGBA Alpha), Lanczos3/Bilinear Resizers, Mask & Outpaint Pad
 int ec_export_ppm(const char *path, const uint8_t *rgb, uint32_t width, uint32_t height);
 int ec_export_png(const char *path, const uint8_t *rgb, uint32_t width, uint32_t height);
 int ec_load_image_rgb(const char *path, uint8_t **out_rgb, int *out_w, int *out_h);
+int ec_load_image_rgba(const char *path, uint8_t **out_rgba, int *out_w, int *out_h, int *out_has_alpha);
 uint8_t *ec_rgb_resize_bilinear(const uint8_t *src, int sw, int sh, int dw, int dh);
+uint8_t *ec_rgb_resize_lanczos3(const uint8_t *src, int sw, int sh, int dw, int dh);
 int ec_load_mask_gray(const char *path, int target_w, int target_h, float **out_mask);
 int ec_rgb_pad_outpaint(
     const uint8_t *src, int sw, int sh,

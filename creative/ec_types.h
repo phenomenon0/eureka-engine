@@ -84,6 +84,7 @@ typedef struct {
   float      *positions;    // [n_verts * 3]
   float      *normals;      // [n_verts * 3] (optional)
   float      *uvs;          // [n_verts * 2] (optional)
+  float      *colors;       // [n_verts * 3] linear RGB vertex colors -> COLOR_0 (optional)
   uint32_t   *indices;      // [n_tris * 3]
   uint32_t    n_verts;
   uint32_t    n_tris;

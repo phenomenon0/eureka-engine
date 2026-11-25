@@ -31,9 +31,10 @@ typedef struct {
   double vram_free_mb;
   double vram_pool_used_mb;
   double vram_pool_budget_mb;
-  int    engines_resident_mask; // bit0=flux2, bit1=acestep, bit2=trellis2, bit3=wan22
+  int    engines_resident_mask; // bit0=flux2, bit1=acestep, bit2=trellis2, bit3=wan22, bit4=zimage
   int    models_discovered;
   int    photoreal_ready;
+  int    zimage_ready;
   int    acestep_ready;
   int    trellis2_ready;
   int    wan22_ready;
@@ -101,6 +102,7 @@ typedef struct {
   const char             *start_frame_path;  // I2V start frame
   const char             *end_frame_path;    // FLF2V end frame (set == start_frame for Seamless Loop!)
   const char             *camera_motion;     // auto|orbit|dolly_in|pan_left|pan_right|crane_up|fpv|static
+  int                     hero_keyframe_i2v; // 1 -> synthesize photoreal hero still first, then animate via Wan 2.2 I2V
   const ec_studio_lora_t *loras;
   int                     n_loras;
 } ec_studio_video_v8_t;
@@ -123,8 +125,9 @@ typedef struct {
   const char             *lyrics;
   uint32_t                seed;
   int                     bpm, steps, stem_mode, full_model; // stem_mode: 0=full, 2, 4, 8
-  float                   duration_sec, shift, denoise, repaint_start_sec, repaint_end_sec;
+  float                   duration_sec, shift, cfg_scale, denoise, repaint_start_sec, repaint_end_sec;
   ec_tier_t               tier;
+  const char             *checkpoint_query;  // optional: acestep_v15_sft vs acestep_v15_turbo
   const char             *key_scale;
   const char             *time_sig;
   const char             *vocal_mode;

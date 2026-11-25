@@ -1284,6 +1284,189 @@ __global__ void __launch_bounds__(256, 2) k_ops_conv3x3_nhwc_bf16_128(
   }
 }
 
+// ===========================================================================
+// 5. v16 "Taste & Mastery" Native CUDA Operators:
+//    - Pure IEEE FP32 SGEMM (for AutoencoderOobleck 1D Stereo Audio VAE!)
+//    - CFG-Zero* Optimal Scalar Projection (kills high-CFG oversaturation/burn!)
+//    - RES-Multistep Exact Exponential Integrator (phi_1 / phi_2 in log-sigma space)
+// ===========================================================================
+
+// Tiled 32x32 FP32 SGEMM: Y[M, N] = X[M, K] @ W[N, K]^T + bias[N] (100% pure FP32, zero BF16 truncation!)
+__global__ void __launch_bounds__(256) k_ops_gemm_f32_32x32(
+    const float *__restrict__ X, const float *__restrict__ W,
+    const float *__restrict__ bias, float *__restrict__ Y,
+    int M, int N, int K) {
+  __shared__ float sA[32][33];
+  __shared__ float sB[32][33];
+  const int tx = threadIdx.x & 15;  // 0..15 (2 cols per thread -> 32)
+  const int ty = threadIdx.x >> 4;  // 0..15 (2 rows per thread -> 32)
+  const int row0 = blockIdx.y * 32 + ty * 2;
+  const int col0 = blockIdx.x * 32 + tx * 2;
+
+  float acc[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+  for (int k0 = 0; k0 < K; k0 += 32) {
+    // Load 32x32 tiles into shared memory (256 threads x 4 loads each = 1024 floats)
+    #pragma unroll
+    for (int p = 0; p < 4; p++) {
+      int idx = threadIdx.x + p * 256;
+      int r = idx >> 5, c = idx & 31;
+      int gm = blockIdx.y * 32 + r;
+      int gn = blockIdx.x * 32 + r;
+      int gk = k0 + c;
+      sA[r][c] = (gm < M && gk < K) ? X[(long)gm * K + gk] : 0.0f;
+      sB[r][c] = (gn < N && gk < K) ? W[(long)gn * K + gk] : 0.0f;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 32; k++) {
+      float a0 = sA[ty * 2 + 0][k], a1 = sA[ty * 2 + 1][k];
+      float b0 = sB[tx * 2 + 0][k], b1 = sB[tx * 2 + 1][k];
+      acc[0][0] = fmaf(a0, b0, acc[0][0]);
+      acc[0][1] = fmaf(a0, b1, acc[0][1]);
+      acc[1][0] = fmaf(a1, b0, acc[1][0]);
+      acc[1][1] = fmaf(a1, b1, acc[1][1]);
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int dr = 0; dr < 2; dr++) {
+    int r = row0 + dr;
+    if (r >= M) continue;
+    #pragma unroll
+    for (int dc = 0; dc < 2; dc++) {
+      int c = col0 + dc;
+      if (c >= N) continue;
+      float v = acc[dr][dc] + (bias ? bias[c] : 0.0f);
+      Y[(long)r * N + c] = v;
+    }
+  }
+}
+
+extern "C" int ec_ops_gemm_f32(
+    const float *X, const float *W, const float *bias,
+    float *Y_f32, int M, int N, int K, cudaStream_t stream) {
+  if (!X || !W || !Y_f32 || M <= 0 || N <= 0 || K <= 0) return -1;
+  dim3 grd((N + 31) / 32, (M + 31) / 32);
+  k_ops_gemm_f32_32x32<<<grd, 256, 0, stream>>>(X, W, bias, Y_f32, M, N, K);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+// CFG-Zero*: Stage 1 partial dot(vp, vn) & ||vn||^2 reduction (uses atomicAdd into 2-double device scratch)
+__global__ void k_ops_cfg_zerostar_dot(
+    const float *__restrict__ vp, const float *__restrict__ vn, long n, double *__restrict__ sums2) {
+  __shared__ double sm_dot[8], sm_nrm[8];
+  const long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long stride = (long)gridDim.x * blockDim.x;
+  double d_acc = 0.0, n_acc = 0.0;
+  for (long i = tid; i < n; i += stride) {
+    double p = (double)vp[i], u = (double)vn[i];
+    d_acc += p * u;
+    n_acc += u * u;
+  }
+  d_acc = ops_warp_sum_d(d_acc);
+  n_acc = ops_warp_sum_d(n_acc);
+  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (lane == 0) { sm_dot[warp] = d_acc; sm_nrm[warp] = n_acc; }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    double bd = (threadIdx.x < 8) ? sm_dot[threadIdx.x] : 0.0;
+    double bn = (threadIdx.x < 8) ? sm_nrm[threadIdx.x] : 0.0;
+    bd = ops_warp_sum_d(bd);
+    bn = ops_warp_sum_d(bn);
+    if (threadIdx.x == 0) {
+      atomicAdd(&sums2[0], bd);
+      atomicAdd(&sums2[1], bn);
+    }
+  }
+}
+
+__global__ void k_ops_cfg_zerostar_apply(
+    const float *__restrict__ vp, const float *__restrict__ vn, float *__restrict__ v_out,
+    long n, float cfg_scale, const double *__restrict__ sums2, int zero_init_step) {
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  if (zero_init_step) { v_out[i] = 0.0f; return; }
+  double dot = sums2[0], nrm = sums2[1];
+  float s_star = (nrm > 1e-12) ? (float)(dot / (nrm + 1e-12)) : 1.0f;
+  // Clamp s_star conservatively to [0.5, 1.5] so pathological noise frames never invert sign
+  if (s_star < 0.5f) s_star = 0.5f;
+  if (s_star > 1.5f) s_star = 1.5f;
+  float us = s_star * vn[i];
+  v_out[i] = us + cfg_scale * (vp[i] - us);
+}
+
+extern "C" int ec_ops_cfg_zerostar_vel(
+    const float *vp, const float *vn, float *v_out,
+    long n, float cfg_scale, int zero_init_step, cudaStream_t stream) {
+  if (!vp || !vn || !v_out || n <= 0) return -1;
+  static double *s_sums2 = NULL;
+  if (!s_sums2) {
+    if (cudaMalloc(&s_sums2, 2 * sizeof(double)) != cudaSuccess) return -1;
+  }
+  if (!zero_init_step) {
+    cudaMemsetAsync(s_sums2, 0, 2 * sizeof(double), stream);
+    int blocks = (int)((n + 255) / 256);
+    if (blocks > 512) blocks = 512;
+    k_ops_cfg_zerostar_dot<<<blocks, 256, 0, stream>>>(vp, vn, n, s_sums2);
+  }
+  k_ops_cfg_zerostar_apply<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+      vp, vn, v_out, n, cfg_scale, s_sums2, zero_init_step);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+// Exact RES-Multistep Exponential Integrator in log-sigma space (arXiv:2308.02157):
+//   x0_i = x - sigma_cur * v_cur
+//   If has_prev && sigma_next > 1e-6:
+//     h = ln(sigma_cur / sigma_next), phi1(-h) = (1 - e^-h)/h, phi2(-h) = (h - 1 + e^-h)/h^2
+//     c2 = -h_prev / h, b2 = phi2(-h) / c2, b1 = phi1(-h) - b2
+//     x_next = e^-h * x + h * (b1 * x0_i + b2 * old_x0)
+//   Else (step 0 or final step sigma_next == 0):
+//     x_next = x + (sigma_next - sigma_cur) * v_cur
+__global__ void k_ops_res_multistep(
+    float *__restrict__ xt, const float *__restrict__ v_cur, float *__restrict__ old_x0,
+    long n, float sigma_cur, float sigma_next, float exp_neg_h, float c_cur, float c_prev, int use_2nd) {
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float x = xt[i];
+  const float v = v_cur[i];
+  const float x0 = x - sigma_cur * v;
+  if (use_2nd) {
+    const float prev = old_x0[i];
+    xt[i] = exp_neg_h * x + c_cur * x0 + c_prev * prev;
+  } else {
+    xt[i] = x + (sigma_next - sigma_cur) * v;
+  }
+  if (old_x0) old_x0[i] = x0;
+}
+
+extern "C" int ec_ops_res_multistep_step(
+    float *xt, const float *v_cur, float *old_x0,
+    long n, float sigma_cur, float sigma_next, float h_prev, int has_prev,
+    cudaStream_t stream) {
+  if (!xt || !v_cur || n <= 0) return -1;
+  int use_2nd = (has_prev && old_x0 != NULL && sigma_cur > 1e-5f && sigma_next > 1e-5f && h_prev > 1e-5f) ? 1 : 0;
+  float exp_neg_h = 1.0f, c_cur = 0.0f, c_prev = 0.0f;
+  if (use_2nd) {
+    double h = log((double)sigma_cur / (double)sigma_next);
+    if (h > 1e-5) {
+      double emh = exp(-h);
+      double phi1 = (1.0 - emh) / h;
+      double phi2 = (h - 1.0 + emh) / (h * h);
+      double c2 = -(double)h_prev / h;
+      double b2 = phi2 / c2;
+      double b1 = phi1 - b2;
+      exp_neg_h = (float)emh;
+      c_cur  = (float)(h * b1);
+      c_prev = (float)(h * b2);
+    } else {
+      use_2nd = 0;
+    }
+  }
+  k_ops_res_multistep<<<(int)((n + 255) / 256), 256, 0, stream>>>(
+      xt, v_cur, old_x0, n, sigma_cur, sigma_next, exp_neg_h, c_cur, c_prev, use_2nd);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
 extern "C" int ec_ops_conv2d_3x3_nhwc_bf16(
     const uint16_t *X_nhwc, const uint16_t *W_ohwi,
     const float *bias, const float *res_f32,

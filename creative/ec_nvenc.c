@@ -89,23 +89,27 @@ static ec_mp4_writer_t *spawn_ffmpeg(
     }
     argv[ac++] = "-c:v"; argv[ac++] = vcodec;
     if (!strcmp(vcodec, "h264_nvenc") || !strcmp(vcodec, "hevc_nvenc") || !strcmp(vcodec, "av1_nvenc")) {
-      // Ampere/Ada NVENC psycho-visual HQ tuning: Spatial + Temporal Adaptive Quantization + Lookahead!
+      // Ampere/Ada NVENC psycho-visual HQ tuning: true uncapped VBR (-b:v 0 -cq 16) + Spatial/Temporal AQ!
       argv[ac++] = "-preset";      argv[ac++] = "p5";
       argv[ac++] = "-tune";        argv[ac++] = "hq";
       argv[ac++] = "-rc";          argv[ac++] = "vbr";
-      argv[ac++] = "-cq";          argv[ac++] = "19";
+      argv[ac++] = "-cq";          argv[ac++] = "16";
+      argv[ac++] = "-b:v";         argv[ac++] = "0";
       argv[ac++] = "-spatial-aq";  argv[ac++] = "1";
       argv[ac++] = "-aq-strength"; argv[ac++] = "8";
       argv[ac++] = "-temporal-aq"; argv[ac++] = "1";
       argv[ac++] = "-rc-lookahead";argv[ac++] = "12";
     } else if (!strcmp(vcodec, "libsvtav1")) {
       argv[ac++] = "-preset"; argv[ac++] = "8";
-      argv[ac++] = "-crf";    argv[ac++] = "24";
+      argv[ac++] = "-crf";    argv[ac++] = "22";
     } else {
       argv[ac++] = "-preset"; argv[ac++] = "fast";
-      argv[ac++] = "-crf";    argv[ac++] = "18";
+      argv[ac++] = "-crf";    argv[ac++] = "16";
     }
+    // Critical color-science fix: convert RGB24 -> YUV420p using true BT.709 matrix (never legacy BT.601!)
+    argv[ac++] = "-vf";              argv[ac++] = "scale=out_color_matrix=bt709:out_range=tv";
     argv[ac++] = "-pix_fmt";         argv[ac++] = "yuv420p";
+    argv[ac++] = "-color_range";     argv[ac++] = "tv";
     argv[ac++] = "-colorspace";      argv[ac++] = "bt709";
     argv[ac++] = "-color_primaries"; argv[ac++] = "bt709";
     argv[ac++] = "-color_trc";       argv[ac++] = "bt709";

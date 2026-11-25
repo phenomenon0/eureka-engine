@@ -29,9 +29,11 @@ typedef struct {
   const char           *lyrics;           // optional lyrics (NULL or "" -> "[Instrumental]")
   uint32_t              seed;
   int                   bpm;              // 40..240 (default 120)
-  float                 duration_sec;     // 4.0..120.0 (default 10.0)
-  int                   steps;            // 1..8 (default 8 for Turbo Shift=3.0 ODE)
-  float                 shift;            // 1.0, 2.0, or 3.0 (default 3.0)
+  float                 duration_sec;     // 4.0..120.0 (default 20.0)
+  int                   steps;            // 1..64 (default 8 for Turbo, 32-48 for SFT)
+  float                 shift;            // 0.5..5.0 (default 3.0)
+  float                 cfg_scale;        // 1.0 default (Turbo); 5.0..7.5 for undistilled SFT/Base!
+  const char           *checkpoint_override; // optional SFT/Base/Turbo checkpoint path!
   // v8 Native Audio-to-Audio, Repaint [t0..t1], Extend (up to 120s), Musical Controls, Flexible Stems & LoRA/LoKr
   const char           *key_scale;        // e.g. "D minor", "C major", "F# minor" (NULL -> "N/A")
   const char           *time_sig;         // e.g. "4", "3", "6" (NULL -> "4")

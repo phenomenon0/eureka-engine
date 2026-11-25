@@ -85,6 +85,7 @@ static void send_file(int fd, const char *path) {
   char hdr[512];
   int hn = snprintf(hdr, sizeof hdr,
       "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nAccess-Control-Allow-Origin: *\r\n"
+      "Cache-Control: no-store, max-age=0\r\n"
       "Content-Length: %ld\r\nConnection: close\r\n\r\n", mime, sz);
   send_all(fd, hdr, (size_t)hn);
   uint8_t buf[16384];
@@ -244,6 +245,7 @@ typedef struct {
   char          start_frame[256];
   char          end_frame[256];
   char          camera_motion[32];
+  int           hero_keyframe_i2v;
   char          input_images[4][256];
   int           n_input_images;
   int           isolate_fg;
@@ -466,7 +468,8 @@ static void *job_runner_thread(void *arg) {
     ec_studio_music_v8_t mq = {};
     mq.prompt = j->prompt; mq.lyrics = j->lyrics; mq.seed = j->seed;
     mq.bpm = j->bpm; mq.duration_sec = j->duration_sec; mq.steps = j->steps > 0 ? j->steps : 8;
-    mq.shift = j->shift; mq.stem_mode = j->stem_mode; mq.tier = tier; mq.full_model = j->full_model;
+    mq.shift = j->shift; mq.cfg_scale = j->cfg_scale; mq.stem_mode = j->stem_mode; mq.tier = tier; mq.full_model = j->full_model;
+    mq.checkpoint_query = j->checkpoint[0] ? j->checkpoint : NULL;
     mq.key_scale = j->key_scale[0] ? j->key_scale : NULL;
     mq.time_sig = j->time_sig[0] ? j->time_sig : NULL;
     mq.vocal_mode = j->vocal_mode[0] ? j->vocal_mode : NULL;
@@ -497,6 +500,7 @@ static void *job_runner_thread(void *arg) {
     vq.start_frame_path = j->start_frame[0] ? j->start_frame : NULL;
     vq.end_frame_path = j->end_frame[0] ? j->end_frame : NULL;
     vq.camera_motion = j->camera_motion[0] ? j->camera_motion : NULL;
+    vq.hero_keyframe_i2v = j->hero_keyframe_i2v;
     vq.loras = j->n_loras > 0 ? j->loras : NULL; vq.n_loras = j->n_loras;
     rc = ec_studio_gen_video_v8(j->st, &vq, job_progress_cb, j, &r);
     if (rc == 0 && !r.cancelled)
@@ -696,9 +700,9 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && (!strcmp(path, "/v1/creative/health") || !strcmp(path, "/v1/creative/status"))) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v8\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v16\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
-        "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
+        "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,\"zimage_ready\":%s,"
         "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,"
         "\"cowrie_enabled\":%s,\"cowrie_shani\":%s,"
         "\"cowrie_sp_hits\":%llu,\"cowrie_sp_saves\":%llu,"
@@ -708,9 +712,10 @@ static void *client_thread(void *arg) {
         "\"vram_pool_used_mb\":%.2f,\"vram_pool_budget_mb\":%.2f,"
         "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
         "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
-        "\"modalities\":[\"flux2_photoreal\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"trellis2_3d\",\"trellis2_photo_multiview\",\"wan2.2_video\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"lora_delta_hotswap_8ms\",\"vae_arena_slab\",\"vram_lease_broker\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
+        "\"modalities\":[\"z_image_turbo_6b\",\"flux2_photoreal\",\"flux2_base_4b\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_sft\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"studio_master_lufs\",\"trellis2_3d\",\"trellis2_color0_pbr\",\"trellis2_photo_multiview\",\"wan2.2_video\",\"wan2.2_hero_i2v\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"lora_delta_hotswap_8ms\",\"vae_arena_slab\",\"vram_lease_broker\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
         g_api_key[0] ? "true" : "false",
         info.photoreal_ready ? "true" : "false",
+        info.zimage_ready    ? "true" : "false",
         info.acestep_ready   ? "true" : "false",
         info.trellis2_ready  ? "true" : "false",
         info.wan22_ready     ? "true" : "false",
@@ -791,6 +796,7 @@ static void *client_thread(void *arg) {
     j->repaint_end = (float)json_get_num(body, "repaint_end", 0.0);
     j->rescale_t = (float)json_get_num(body, "rescale_t", 0.0);
     j->tile_upscale = json_get_bool(body, "tile_upscale", 0);
+    j->hero_keyframe_i2v = json_get_bool(body, "hero_keyframe_i2v", 0);
     j->isolate_fg = json_get_bool(body, "isolate_fg", 1);
     j->outpaint_pad[0] = (int)json_get_num(body, "outpaint_left", 0);
     j->outpaint_pad[1] = (int)json_get_num(body, "outpaint_top", 0);
@@ -1051,7 +1057,7 @@ static void *client_thread(void *arg) {
     tq.prompt = prompt; tq.seed = seed; tq.grid_res = res_g;
     tq.steps = (int)json_get_num(body, "steps", 12);
     tq.cfg_scale = (float)json_get_num(body, "cfg_scale", 7.5);
-    tq.rescale_t = (float)json_get_num(body, "rescale_t", 3.0);
+    tq.rescale_t = (float)json_get_num(body, "rescale_t", 5.0);
     tq.isolate_fg = json_get_bool(body, "isolate_fg", 1);
     tq.tier = EC_TIER_FAST; tq.full_model = full_m;
     for (int i = 0; i < n_imgs && i < 4; i++) tq.input_images[i] = in_imgs[i];
@@ -1071,10 +1077,11 @@ static void *client_thread(void *arg) {
       send_json(cfd, 200, resp);
     } else send_json(cfd, 500, "{\"error\":\"3d generation failed\"}");
   } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/audio/music")) {
-    char prompt[1024], lyrics[1536], key_sc[32], tsig[16], vmode[24], amode[24], src_aud[256];
+    char prompt[1024], lyrics[1536], ckpt[256], key_sc[32], tsig[16], vmode[24], amode[24], src_aud[256];
     ec_studio_lora_t loras[EC_STUDIO_MAX_LORAS];
     json_get_str(body, "prompt", prompt, sizeof prompt, "ambient electronic pulse");
     json_get_str(body, "lyrics", lyrics, sizeof lyrics, "");
+    json_get_str(body, "checkpoint", ckpt, sizeof ckpt, "");
     json_get_str(body, "key_scale", key_sc, sizeof key_sc, "");
     json_get_str(body, "time_sig", tsig, sizeof tsig, "4");
     json_get_str(body, "vocal_mode", vmode, sizeof vmode, "auto");
@@ -1084,11 +1091,13 @@ static void *client_thread(void *arg) {
     uint32_t seed = (uint32_t)json_get_num(body, "seed", 101);
     int bpm = (int)json_get_num(body, "bpm", 122);
     float dur = (float)json_get_num(body, "duration_sec", 3.0);
-    int full_m = json_get_bool(body, "full_model", (dur >= 5.0f || lyrics[0] || src_aud[0]) ? 1 : 0);
+    int full_m = json_get_bool(body, "full_model", (dur >= 5.0f || lyrics[0] || src_aud[0] || ckpt[0]) ? 1 : 0);
     ec_studio_music_v8_t mq = {0};
     mq.prompt = prompt; mq.lyrics = lyrics; mq.seed = seed; mq.bpm = bpm;
-    mq.duration_sec = dur; mq.steps = (int)json_get_num(body, "steps", 8);
+    mq.duration_sec = dur; mq.steps = (int)json_get_num(body, "steps", 0);
     mq.shift = (float)json_get_num(body, "shift", 3.0);
+    mq.cfg_scale = (float)json_get_num(body, "cfg_scale", 0.0);
+    mq.checkpoint_query = ckpt[0] ? ckpt : NULL;
     mq.stem_mode = parse_stem_mode(body, 4);
     mq.key_scale = key_sc[0] ? key_sc : NULL;
     mq.time_sig = tsig[0] ? tsig : NULL;
@@ -1136,12 +1145,13 @@ static void *client_thread(void *arg) {
     vq.prompt = prompt; vq.neg_prompt = neg_prompt[0] ? neg_prompt : NULL;
     vq.seed = seed; vq.n_frames = n_frames; vq.width = w; vq.height = h;
     vq.fps = fps; vq.steps = steps; vq.with_audio = with_audio;
-    vq.cfg_scale = (float)json_get_num(body, "cfg_scale", 5.0);
+    vq.cfg_scale = (float)json_get_num(body, "cfg_scale", 4.0);
     vq.shift = (float)json_get_num(body, "shift", 0.0);
     vq.denoise = (float)json_get_num(body, "denoise", 1.0);
     vq.start_frame_path = start_fr[0] ? start_fr : NULL;
     vq.end_frame_path = end_fr[0] ? end_fr : NULL;
     vq.camera_motion = cam[0] ? cam : NULL;
+    vq.hero_keyframe_i2v = json_get_bool(body, "hero_keyframe_i2v", 0);
     vq.loras = n_loras > 0 ? loras : NULL; vq.n_loras = n_loras;
     vq.tier = EC_TIER_FAST; vq.full_model = full_m;
     ec_studio_result_t r;

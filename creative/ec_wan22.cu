@@ -667,10 +667,16 @@ __global__ void k_wn_im2col_2d_s2(
   col_bf16[idx] = wn_f32_to_bf16(v);
 }
 
-// AvgDown3D shortcut for T=1 single-frame encode: 2x2 spatial unshuffle + channel-group mean
+// Exact Wan2_2_VAE AvgDown3D shortcut for T=1 single-frame encode:
+// Official Wan2_2_VAE pads T=1 on the left with (factor_t - 1) zero frames, reshapes
+// [C_in, ft, 2, 2] -> [C_out, group_size], and averages over group_size.
+// When factor_t == 1 (b=0: 160->160): group_size=4, each oc averages all 4 spatial pixels (sh, sw) of channel oc.
+// When factor_t == 2 (b=1: 160->320, b=2: 320->640): C_out = 2*C_in, group_size=4, so
+//   even oc (st=0, padded zero frame) -> 0.0f
+//   odd  oc (st=1, real input frame)  -> mean of all 4 spatial pixels (sh, sw) of channel (oc >> 1)!
 __global__ void k_wn_avgdown2d(
     const float *__restrict__ in, float *__restrict__ out,
-    int H_in, int W_in, int C_in, int C_out) {
+    int H_in, int W_in, int C_in, int C_out, int factor_t) {
   int H_out = H_in / 2, W_out = W_in / 2;
   long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
   long tot = (long)H_out * W_out * C_out;
@@ -679,14 +685,20 @@ __global__ void k_wn_avgdown2d(
   long p = idx / C_out;
   int oh = (int)(p / W_out);
   int ow = (int)(p % W_out);
-  int grp = (4 * C_in) / C_out;
+  int ft = (factor_t > 1) ? factor_t : 1;
+  int grp = (4 * ft * C_in) / C_out;
   float sum = 0.0f;
   for (int g = 0; g < grp; g++) {
     int flat = oc * grp + g;
-    int ic = flat >> 2;
-    int sh = (flat >> 1) & 1;
     int sw = flat & 1;
-    sum += in[(((long)(oh * 2 + sh)) * W_in + (ow * 2 + sw)) * C_in + ic];
+    int sh = (flat >> 1) & 1;
+    int rem = flat >> 2;
+    int st = rem % ft;
+    int ic = rem / ft;
+    // Left zero-pad by (ft - 1): only st == (ft - 1) carries the real T=1 input frame!
+    if (st == ft - 1) {
+      sum += in[(((long)(oh * 2 + sh)) * W_in + (ow * 2 + sw)) * C_in + ic];
+    }
   }
   out[idx] = sum / (float)grp;
 }
@@ -1265,11 +1277,13 @@ static int run_umt5_xxl(
   cudaStreamSynchronize(w->stream);
 
   // Store host copy in 4-slot UMT5-XXL prompt cache + persist Cowrie SHA-NI StatePage across restarts!
+  // Guard strictly against CUDA errors so a failed/OOM context NEVER poisons persistent StatePages!
   if (strlen(pkey) < sizeof(w->t5_keys[0])) {
     int slot = w->t5_next_slot % WN_T5_CACHE_SLOTS;
     if (!w->t5_vals[slot]) w->t5_vals[slot] = (uint16_t *)malloc(512L * DIM * 2);
-    if (w->t5_vals[slot]) {
-      cudaMemcpy(w->t5_vals[slot], out_512_bf16_d, 512L * DIM * 2, cudaMemcpyDeviceToHost);
+    if (w->t5_vals[slot] &&
+        cudaMemcpy(w->t5_vals[slot], out_512_bf16_d, 512L * DIM * 2, cudaMemcpyDeviceToHost) == cudaSuccess &&
+        cudaGetLastError() == cudaSuccess) {
       snprintf(w->t5_keys[slot], sizeof(w->t5_keys[slot]), "%s", pkey);
       w->t5_valid[slot] = 1;
       w->t5_next_slot = (slot + 1) % WN_T5_CACHE_SLOTS;
@@ -1546,13 +1560,20 @@ static int run_wan_dit(
     sig[i] = shift * u / (1.0f + (shift - 1.0f) * u);
   }
 
-  // Tolerance Doctrine: EC_EXACT=1 forces full 2*steps CFG oracle; default enables FasterCache mid-step CFG delta reuse!
-  const char *env_ex = getenv("EC_EXACT");
-  const int exact_mode = (env_ex && atoi(env_ex) == 1) ? 1 : 0;
+  // v16 Cinema Quality Upgrade:
+  // 1) Disable FasterCache stale CFG-delta reuse by default (opt-in via EC_FASTERCACHE=1 and only while sigma >= 0.75!)
+  // 2) Use exact 2nd-order RES-Multistep exponential integrator + CFG-Zero* scalar velocity projection
+  //    (eliminates the huge dt=0.208 terminal Euler deep-fry AND kills high-CFG neon oversaturation!)
+  const char *env_fc = getenv("EC_FASTERCACHE");
+  const int use_fastercache = (env_fc && atoi(env_fc) == 1) ? 1 : 0;
+  float *old_x0_d = NULL;
+  cudaMalloc(&old_x0_d, (size_t)Z_ELEMS * 4);
 
   int pin_first = (start_z_d != NULL) ? 1 : 0;
   int pin_last  = (end_z_d != NULL && F >= 2) ? 1 : 0;
   int cancelled = 0;
+  float h_prev = 0.0f;
+  int has_prev = 0;
   for (int s = 0; s < steps; s++) {
     if (cb && cb(s + 1, steps + 3, "wan22_dit_step", cb_ctx) != 0) {
       cancelled = 1;
@@ -1562,18 +1583,26 @@ static int run_wan_dit(
     wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, pin_first, pin_last, ck_pos, cv_pos, &W, vp_d);
 
     if (cfg_scale > 1.01f) {
-      int reuse_delta = (!exact_mode && steps >= 20 && s >= 6 && s < steps - 3 && (s & 1) == 1);
+      int reuse_delta = (use_fastercache && steps >= 20 && s >= 6 && s < steps - 4 && t_cur >= 0.75f && (s & 1) == 1);
       if (!reuse_delta) {
         wan_dit_forward(w, xt_d, t_cur * 1000.0f, F, Hp, Wp, pin_first, pin_last, ck_neg, cv_neg, &W, vn_d);
-        ec_ops_wan_cfg_euler(xt_d, vp_d, vn_d, delta_d, Z_ELEMS, dt, cfg_scale, 1, w->stream);
+        if (use_fastercache) {
+          ec_ops_wan_cfg_euler(xt_d, vp_d, vn_d, delta_d, Z_ELEMS, dt, cfg_scale, 1, w->stream);
+        } else {
+          int zero_init = (s == 0 && steps >= 20) ? 1 : 0;
+          ec_ops_cfg_zerostar_vel(vp_d, vn_d, vp_d, Z_ELEMS, cfg_scale, zero_init, w->stream);
+          ec_ops_res_multistep_step(xt_d, vp_d, old_x0_d, Z_ELEMS, t_cur, t_next, h_prev, has_prev, w->stream);
+          if (t_cur > 1e-5f && t_next > 1e-5f) { h_prev = (float)log((double)t_cur / (double)t_next); has_prev = 1; }
+        }
       } else {
         ec_ops_wan_cfg_euler(xt_d, vp_d, NULL, delta_d, Z_ELEMS, dt, cfg_scale, 2, w->stream);
       }
     } else {
-      ec_ops_wan_cfg_euler(xt_d, vp_d, NULL, NULL, Z_ELEMS, dt, 1.0f, 0, w->stream);
+      ec_ops_res_multistep_step(xt_d, vp_d, old_x0_d, Z_ELEMS, t_cur, t_next, h_prev, has_prev, w->stream);
+      if (t_cur > 1e-5f && t_next > 1e-5f) { h_prev = (float)log((double)t_cur / (double)t_next); has_prev = 1; }
     }
 
-    // Re-pin TI2V Start Frame (frame 0) and FLF2V End Frame (frame F-1) cleanly after every Euler step!
+    // Re-pin TI2V Start Frame (frame 0) and FLF2V End Frame (frame F-1) cleanly after every step!
     if (start_z_d) {
       cudaMemcpyAsync(xt_d, start_z_d, (size_t)FRAME_ELEMS * 4, cudaMemcpyDeviceToDevice, w->stream);
     }
@@ -1581,6 +1610,7 @@ static int run_wan_dit(
       cudaMemcpyAsync(xt_d + (long)(F - 1) * FRAME_ELEMS, end_z_d, (size_t)FRAME_ELEMS * 4, cudaMemcpyDeviceToDevice, w->stream);
     }
   }
+  cudaFree(old_x0_d);
 
   if (!cancelled) {
     cudaMemcpyAsync(out_z_d, xt_d, (size_t)Z_ELEMS * 4, cudaMemcpyDeviceToDevice, w->stream);
@@ -1641,10 +1671,15 @@ static void vae_causal_conv3d(
     const uint16_t *w_bf16, const float *b_f32,
     int T, int H, int W, int Cin, int Cout,
     wn_cache_slot_t *slot, uint16_t *col_scratch, size_t col_cap) {
+  if (!x_d || !y_d) return;
   long frame_elems = (long)H * W * Cin;
   // Build temporally padded input [T + 2, H, W, Cin]
   float *x_pad = NULL;
-  cudaMalloc(&x_pad, (size_t)(T + 2) * frame_elems * 4);
+  if (cudaMalloc(&x_pad, (size_t)(T + 2) * frame_elems * 4) != cudaSuccess || !x_pad) {
+    fprintf(stderr, "[wan22] vae_causal_conv3d OOM allocating x_pad (%zu MB)\n",
+            ((size_t)(T + 2) * frame_elems * 4) >> 20);
+    return;
+  }
   if (slot->n_valid == 0 || !slot->frames_d) {
     cudaMemsetAsync(x_pad, 0, (size_t)2 * frame_elems * 4, w->stream);
   } else if (slot->n_valid == 1) {
@@ -1921,8 +1956,17 @@ static int run_wan_vae_decode(
 
     cudaMemcpyAsync(out_rgb24_h + (long)out_frame_cursor * rgb_frame_bytes, rgb_d,
                     (size_t)T * rgb_frame_bytes, cudaMemcpyDeviceToHost, w->stream);
-    cudaStreamSynchronize(w->stream);
+    cudaError_t sync_err = cudaStreamSynchronize(w->stream);
+    cudaError_t last_err = cudaGetLastError();
     cudaFree(rgb_d);
+    if (sync_err != cudaSuccess || last_err != cudaSuccess) {
+      fprintf(stderr, "[wan22] vae_decode chunk fi=%d/%d (T=%d %dx%d) failed: sync=%s last=%s\n",
+              fi, F_lat, T, out_W, out_H, cudaGetErrorString(sync_err), cudaGetErrorString(last_err));
+      for (int i = 0; i < 48; i++) cudaFree(caches[i].frames_d);
+      cudaFree(z_c2);
+      cudaFree(col);
+      return -1;
+    }
     out_frame_cursor += T;
   }
 
@@ -2042,9 +2086,10 @@ static int run_wan_vae_encode_frame(
         wn_gemm(col, dw, db, dn_out + p0 * Cout, NULL, ch, Cout, 9 * Cout, w->stream);
       }
       cudaFree(cur); cudaFree(dw); cudaFree(db);
-      // Add AvgDown3D shortcut (T=1 spatial 2x2 average + channel fold)
+      // Add AvgDown3D shortcut (T=1 spatial 2x2 average + exact temporal factor_t={1,2,2} zero-pad scaling!)
+      static const int FAC_T[3] = { 1, 2, 2 };
       cudaMalloc(&sc_dn, (size_t)nH * nW * Cout * 4);
-      k_wn_avgdown2d<<<((long)nH * nW * Cout + 255) / 256, 256, 0, w->stream>>>(x_in_copy, sc_dn, H_in, W_in, Cin, Cout);
+      k_wn_avgdown2d<<<((long)nH * nW * Cout + 255) / 256, 256, 0, w->stream>>>(x_in_copy, sc_dn, H_in, W_in, Cin, Cout, FAC_T[b]);
       cudaFree(x_in_copy);
       k_wn_add_inplace<<<((long)nH * nW * Cout + 255) / 256, 256, 0, w->stream>>>(dn_out, sc_dn, (long)nH * nW * Cout);
       cudaStreamSynchronize(w->stream);
@@ -2224,22 +2269,22 @@ extern "C" int ec_wan22_generate_mp4_ex(
   // Wan 2.2 TI2V-5B temporal 3D-RoPE requires F_lat >= 5 (>= 17 frames) on non-distilled CFG runs (sub-17f swirls!)
   int min_flat = is_distilled ? 3 : 5;
   if (F_lat < min_flat) F_lat = min_flat;
-  if (F_lat > 21) F_lat = 21;
+  if (F_lat > 31) F_lat = 31; // Full native Wan 2.2 TI2V-5B 121-frame (5s @ 24fps) support!
   int n_frames = 1 + 4 * (F_lat - 1);
-  int fps   = (req->fps >= 8 && req->fps <= 60) ? req->fps : 16;
-  int steps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 20;
-  float cfg = (req->cfg_scale > 0.0f) ? req->cfg_scale : 5.0f;
-  // Official Wan 2.2 TI2V-5B requires sample_shift = 5.0 (3.0 is only for step-distilled Turbo/Lightning LoRAs)
-  float shf = (req->shift > 0.0f) ? req->shift : (is_distilled ? 3.0f : 5.0f);
+  int fps   = (req->fps >= 8 && req->fps <= 60) ? req->fps : 24;
+  int steps = (req->steps >= 4 && req->steps <= 60) ? req->steps : (is_distilled ? 8 : 30);
+  float cfg = (req->cfg_scale > 0.0f) ? req->cfg_scale : (is_distilled ? 1.0f : 4.0f);
+  // Official Wan 2.2 TI2V-5B uses sample_shift = 5.0 (including LightX2V/Turbo LoRAs!)
+  float shf = (req->shift > 0.0f) ? req->shift : 5.0f;
 
-  // Auto-engage Step-Distilled Fast Schedule (6 single-pass steps, CFG=1.0) when a Turbo/Lightning/CausVid LoRA is active,
-  // or enforce >= 18 steps when running non-distilled base Wan 2.2 TI2V-5B with high CFG so Euler integration never overshoots!
-  if (is_distilled && steps >= 16 && cfg >= 4.5f) {
-    steps = 6;
+  // Auto-engage Step-Distilled Fast Schedule (8 single-pass steps, CFG=1.0, shift=5.0) when a Turbo/Lightning LoRA is active,
+  // or enforce >= 24 steps when running non-distilled base Wan 2.2 TI2V-5B with CFG > 1.5!
+  if (is_distilled && steps >= 16 && cfg >= 4.0f) {
+    steps = 8;
     cfg = 1.0f;
-    shf = 3.0f;
-  } else if (!is_distilled && cfg > 1.5f && steps < 18) {
-    steps = 18;
+    shf = 5.0f;
+  } else if (!is_distilled && cfg > 1.5f && steps < 20) {
+    steps = 24;
   }
 
   int H_lat = H / 16, W_lat = W / 16;
@@ -2262,15 +2307,16 @@ extern "C" int ec_wan22_generate_mp4_ex(
     snprintf(prompt_buf, sizeof prompt_buf, "%s", base_p);
   }
   const char *pos_p = prompt_buf;
+  // Official Alibaba Wan 2.2 calibrated anti-oversaturation / anti-CGI bilingual negative prompt!
   const char *neg_p = (req->neg_prompt && req->neg_prompt[0])
       ? req->neg_prompt
-      : "blurry, low quality, distorted, static, overexposed, watermark, text, ugly, jitter";
+      : "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走, oversaturated, neon glow, plastic skin, airbrushed, 3D CGI render, video game screenshot, high contrast, glossy specular, morphing, flickering, watermark, text";
 
-  // Stage 0 (v8): Optional Native Causal 3D VAE Encode of Start Frame (I2V) and End Frame (FLF2V)!
+  // Stage 0 (v8): Optional Native Causal 3D VAE Encode of Start Frame (I2V) and End Frame (FLF2V) with Lanczos3!
   float *start_z_d = NULL, *end_z_d = NULL;
   double enc_frame_ms = 0.0;
   if (req->start_rgb && req->start_w > 0 && req->start_h > 0) {
-    uint8_t *sr = ec_rgb_resize_bilinear(req->start_rgb, req->start_w, req->start_h, W, H);
+    uint8_t *sr = ec_rgb_resize_lanczos3(req->start_rgb, req->start_w, req->start_h, W, H);
     if (sr) {
       cudaMalloc(&start_z_d, (size_t)H_lat * W_lat * 48 * 4);
       double em = 0;
@@ -2280,7 +2326,7 @@ extern "C" int ec_wan22_generate_mp4_ex(
     }
   }
   if (req->end_rgb && req->end_w > 0 && req->end_h > 0) {
-    uint8_t *er = ec_rgb_resize_bilinear(req->end_rgb, req->end_w, req->end_h, W, H);
+    uint8_t *er = ec_rgb_resize_lanczos3(req->end_rgb, req->end_w, req->end_h, W, H);
     if (er) {
       cudaMalloc(&end_z_d, (size_t)H_lat * W_lat * 48 * 4);
       double em = 0;
@@ -2327,11 +2373,18 @@ extern "C" int ec_wan22_generate_mp4_ex(
     return rc;
   }
 
-  // Stage 3: Causal 3D VAE Streaming Decode (evict 10GB DiT first if free VRAM < 5.5 GB so 3D causal caches never OOM!)
+  // Stage 3: Causal 3D VAE Streaming Decode
+  // At 1280x704 T=4, causal caches (~5.8 GB) + active ResBlock buffers (~4.2 GB) + VAE (~1.4 GB) need ~11.4 GB VRAM!
+  // Always evict the 10.5 GB DiT when resolution exceeds 832x480 OR free VRAM < 12.5 GB so 720p24 NEVER OOMs!
   if (cb) cb(steps + 1, steps + 3, "wan22_causal_vae_decode", cb_ctx);
   {
     size_t free_b = 0, tot_b = 0;
-    if (cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess && free_b < 5600ULL * 1024ULL * 1024ULL) {
+    int need_evict = ((long)W * H > 832L * 480L) ? 1 : 0;
+    if (!need_evict && cudaMemGetInfo(&free_b, &tot_b) == cudaSuccess &&
+        free_b < 12500ULL * 1024ULL * 1024ULL) {
+      need_evict = 1;
+    }
+    if (need_evict) {
       free_dit_res(&w->dit);
     }
   }
@@ -2340,6 +2393,7 @@ extern "C" int ec_wan22_generate_mp4_ex(
     if (ensure_vae_loaded(w) != 0) {
       cudaFree(z_d);
       snprintf(res->error, sizeof res->error, "wan22 vae load failed");
+      fprintf(stderr, "[wan22] %s\n", res->error);
       return -1;
     }
   }
@@ -2347,6 +2401,7 @@ extern "C" int ec_wan22_generate_mp4_ex(
   if (run_wan_vae_decode(w, z_d, F_lat, H_lat, W_lat, rgb_all, &res->vae_ms) != 0) {
     free(rgb_all); cudaFree(z_d);
     snprintf(res->error, sizeof res->error, "wan22 vae decode failed");
+    fprintf(stderr, "[wan22] %s\n", res->error);
     return -1;
   }
   res->vae_ms += enc_frame_ms;

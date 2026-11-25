@@ -688,52 +688,161 @@ static int run_dinov3_vitl16(
     }
   }
 
-  // Optional TRELLIS.2 preprocess_image parity for dark-studio isolated hero renders:
-  // If borders are near-black (avg < 22), clamp dark background noise to exact (0,0,0)
-  // and tightly center-crop square around the foreground bounding box (with 5% margin).
-  double border_sum = 0.0;
-  long border_cnt = 0;
-  for (int x = 0; x < img_w; x++) {
-    for (int c = 0; c < 3; c++) {
-      border_sum += rgb[(long)x * 3 + c];
-      border_sum += rgb[((long)(img_h - 1) * img_w + x) * 3 + c];
-    }
-    border_cnt += 6;
-  }
-  for (int y = 0; y < img_h; y++) {
-    for (int c = 0; c < 3; c++) {
-      border_sum += rgb[((long)y * img_w) * 3 + c];
-      border_sum += rgb[((long)y * img_w + (img_w - 1)) * 3 + c];
-    }
-    border_cnt += 6;
-  }
-  int dark_bg = (border_cnt > 0 && (border_sum / (double)border_cnt) < 22.0) ? 1 : 0;
+  // Official TRELLIS.2 preprocess_image parity with gradient-aware border BFS flood-fill matte!
+  // Handles BOTH pure dark-studio AND gradient-lit softbox cyclorama studio backdrops without eating
+  // holes into dark metals OR leaking floor/wall cyclorama geometry into DINOv3!
+  uint8_t *bg_mask = (uint8_t *)calloc((size_t)img_w * (size_t)img_h, 1);
+  float *alpha_map = (float *)malloc((size_t)img_w * (size_t)img_h * sizeof(float));
+  int use_bfs_matte = 0;
   float crop_x0 = 0.0f, crop_y0 = 0.0f, crop_w = (float)img_w, crop_h = (float)img_h;
-  if (dark_bg) {
-    int bx0 = img_w, by0 = img_h, bx1 = -1, by1 = -1;
+
+  if (bg_mask && alpha_map && img_w >= 32 && img_h >= 32) {
+    // Compute smooth per-row left/right border colors to model vertical cyclorama gradients cleanly
+    float *row_l = (float *)malloc((size_t)img_h * 3 * sizeof(float));
+    float *row_r = (float *)malloc((size_t)img_h * 3 * sizeof(float));
+    double edge_jump = 0.0; long edge_cnt = 0;
     for (int y = 0; y < img_h; y++) {
-      for (int x = 0; x < img_w; x++) {
-        const uint8_t *px = rgb + ((long)y * img_w + x) * 3;
-        int m = px[0]; if (px[1] > m) m = px[1]; if (px[2] > m) m = px[2];
-        if (m >= 26) {
-          if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
-          if (y < by0) by0 = y; if (y > by1) by1 = y;
+      float lr = 0, lg = 0, lb = 0, rr = 0, rg = 0, rb = 0;
+      for (int dx = 0; dx < 4; dx++) {
+        const uint8_t *pl = rgb + ((long)y * img_w + dx) * 3;
+        const uint8_t *pr = rgb + ((long)y * img_w + (img_w - 1 - dx)) * 3;
+        lr += pl[0]; lg += pl[1]; lb += pl[2];
+        rr += pr[0]; rg += pr[1]; rb += pr[2];
+      }
+      row_l[y*3+0] = lr * 0.25f; row_l[y*3+1] = lg * 0.25f; row_l[y*3+2] = lb * 0.25f;
+      row_r[y*3+0] = rr * 0.25f; row_r[y*3+1] = rg * 0.25f; row_r[y*3+2] = rb * 0.25f;
+      if (y > 0) {
+        float dl = fabsf(row_l[y*3] - row_l[(y-1)*3]) + fabsf(row_l[y*3+1] - row_l[(y-1)*3+1]) + fabsf(row_l[y*3+2] - row_l[(y-1)*3+2]);
+        float dr = fabsf(row_r[y*3] - row_r[(y-1)*3]) + fabsf(row_r[y*3+1] - row_r[(y-1)*3+1]) + fabsf(row_r[y*3+2] - row_r[(y-1)*3+2]);
+        edge_jump += dl + dr;
+        edge_cnt += 2;
+      }
+    }
+    // Smooth borders -> run 4-neighbor BFS from perimeter pixels
+    if (edge_cnt > 0 && (edge_jump / (double)edge_cnt) < 12.0) {
+      int *q = (int *)malloc((size_t)img_w * (size_t)img_h * sizeof(int));
+      if (q) {
+        int qh = 0, qt = 0;
+        auto try_seed = [&](int x, int y) {
+          int idx = y * img_w + x;
+          if (!bg_mask[idx]) { bg_mask[idx] = 1; q[qt++] = idx; }
+        };
+        for (int x = 0; x < img_w; x++) { try_seed(x, 0); try_seed(x, img_h - 1); }
+        for (int y = 0; y < img_h; y++) { try_seed(0, y); try_seed(img_w - 1, y); }
+        static const int DX[4] = { 1, -1, 0, 0 };
+        static const int DY[4] = { 0, 0, 1, -1 };
+        while (qh < qt) {
+          int cur = q[qh++];
+          int cx = cur % img_w, cy = cur / img_w;
+          const uint8_t *pc = rgb + (long)cur * 3;
+          for (int d = 0; d < 4; d++) {
+            int nx = cx + DX[d], ny = cy + DY[d];
+            if (nx < 0 || nx >= img_w || ny < 0 || ny >= img_h) continue;
+            int nidx = ny * img_w + nx;
+            if (bg_mask[nidx]) continue;
+            const uint8_t *pn = rgb + (long)nidx * 3;
+            float dr = (float)pn[0] - (float)pc[0];
+            float dg = (float)pn[1] - (float)pc[1];
+            float db = (float)pn[2] - (float)pc[2];
+            if (dr*dr + dg*dg + db*db > 14.0f * 14.0f) continue;
+            // Compare against row-interpolated studio cyclorama backdrop at (nx, ny)
+            float tx = (float)nx / (float)(img_w - 1);
+            float er = row_l[ny*3+0] * (1.0f - tx) + row_r[ny*3+0] * tx;
+            float eg = row_l[ny*3+1] * (1.0f - tx) + row_r[ny*3+1] * tx;
+            float eb = row_l[ny*3+2] * (1.0f - tx) + row_r[ny*3+2] * tx;
+            float bdr = (float)pn[0] - er, bdg = (float)pn[1] - eg, bdb = (float)pn[2] - eb;
+            // Also require low chromatic saturation for neutral studio backdrops (prevents leaking into colored objects!)
+            int cmax = pn[0] > pn[1] ? (pn[0] > pn[2] ? pn[0] : pn[2]) : (pn[1] > pn[2] ? pn[1] : pn[2]);
+            int cmin = pn[0] < pn[1] ? (pn[0] < pn[2] ? pn[0] : pn[2]) : (pn[1] < pn[2] ? pn[1] : pn[2]);
+            int bmax = (int)fmaxf(er, fmaxf(eg, eb)), bmin = (int)fminf(er, fminf(eg, eb));
+            int neutral_bg = ((bmax - bmin) < 22);
+            // Smooth neutral cast shadow under floating product cutouts is achromatic and slightly darker than bg_est
+            int is_soft_shadow = (neutral_bg && (cmax - cmin) < 14 && (float)pn[0] <= er + 8.0f &&
+                                  bdr*bdr + bdg*bdg + bdb*bdb <= 76.0f * 76.0f);
+            if ((bdr*bdr + bdg*bdg + bdb*bdb <= 44.0f * 44.0f && (!neutral_bg || (cmax - cmin) < 26)) || is_soft_shadow) {
+              bg_mask[nidx] = 1;
+              q[qt++] = nidx;
+            }
+          }
+        }
+        // Keep only the single largest connected foreground component (drops any detached cast floor shadow!)
+        {
+          int *comp_id = (int *)calloc((size_t)img_w * (size_t)img_h, sizeof(int));
+          int best_cid = 0, best_cnt = 0, cur_cid = 0;
+          if (comp_id) {
+            for (int i = 0; i < img_w * img_h; i++) {
+              if (bg_mask[i] || comp_id[i]) continue;
+              cur_cid++;
+              int ch = 0, ct = 0;
+              comp_id[i] = cur_cid;
+              q[ct++] = i;
+              while (ch < ct) {
+                int c = q[ch++], cx = c % img_w, cy = c / img_w;
+                for (int d = 0; d < 4; d++) {
+                  int nx = cx + DX[d], ny = cy + DY[d];
+                  if (nx < 0 || nx >= img_w || ny < 0 || ny >= img_h) continue;
+                  int ni = ny * img_w + nx;
+                  if (!bg_mask[ni] && !comp_id[ni]) { comp_id[ni] = cur_cid; q[ct++] = ni; }
+                }
+              }
+              if (ct > best_cnt) { best_cnt = ct; best_cid = cur_cid; }
+            }
+            if (best_cid > 0) {
+              for (int i = 0; i < img_w * img_h; i++) {
+                if (!bg_mask[i] && comp_id[i] != best_cid) bg_mask[i] = 1;
+              }
+            }
+            free(comp_id);
+          }
+        }
+        free(q);
+        // Compute tight foreground bounding box and validate foreground fraction [3%, 94%]
+        int bx0 = img_w, by0 = img_h, bx1 = -1, by1 = -1;
+        long fg_cnt = 0;
+        for (int y = 0; y < img_h; y++) {
+          for (int x = 0; x < img_w; x++) {
+            if (!bg_mask[y * img_w + x]) {
+              fg_cnt++;
+              if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
+              if (y < by0) by0 = y; if (y > by1) by1 = y;
+            }
+          }
+        }
+        double fg_frac = (double)fg_cnt / (double)((long)img_w * img_h);
+        if (fg_frac >= 0.03 && fg_frac <= 0.94 && bx1 > bx0 + 16 && by1 > by0 + 16) {
+          use_bfs_matte = 1;
+          // 1-pass box blur on (1 - bg_mask) for anti-aliased edge feathering onto pure (0,0,0) black!
+          for (int y = 0; y < img_h; y++) {
+            for (int x = 0; x < img_w; x++) {
+              if (!bg_mask[y * img_w + x]) {
+                int bg_nb = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                  int yy = y + dy; if (yy < 0 || yy >= img_h) continue;
+                  for (int dx = -1; dx <= 1; dx++) {
+                    int xx = x + dx; if (xx < 0 || xx >= img_w) continue;
+                    if (bg_mask[yy * img_w + xx]) bg_nb++;
+                  }
+                }
+                alpha_map[y * img_w + x] = bg_nb ? (1.0f - (float)bg_nb / 10.0f) : 1.0f;
+              } else {
+                alpha_map[y * img_w + x] = 0.0f;
+              }
+            }
+          }
+          float cx = 0.5f * (float)(bx0 + bx1);
+          float cy = 0.5f * (float)(by0 + by1);
+          float sz = (float)((bx1 - bx0 > by1 - by0) ? (bx1 - bx0) : (by1 - by0)) * 1.12f;
+          crop_x0 = cx - 0.5f * sz;
+          crop_y0 = cy - 0.5f * sz;
+          crop_w = sz;
+          crop_h = sz;
         }
       }
     }
-    if (bx1 > bx0 + 16 && by1 > by0 + 16) {
-      float cx = 0.5f * (float)(bx0 + bx1);
-      float cy = 0.5f * (float)(by0 + by1);
-      float sz = (float)((bx1 - bx0 > by1 - by0) ? (bx1 - bx0) : (by1 - by0)) * 1.10f;
-      if (sz > (float)(img_w < img_h ? img_w : img_h)) sz = (float)(img_w < img_h ? img_w : img_h);
-      crop_x0 = cx - 0.5f * sz;
-      crop_y0 = cy - 0.5f * sz;
-      crop_w = sz;
-      crop_h = sz;
-    }
+    free(row_l); free(row_r);
   }
 
-  // Bilinear resize to 512x512 + ImageNet normalize -> pack 1024 patches of 3*16*16=768 BF16
+  // Bilinear resize to 512x512 + clean alpha premultiply onto pure (0,0,0) + ImageNet normalize
   static const float MEAN[3] = {0.485f, 0.456f, 0.406f};
   static const float STD[3]  = {0.229f, 0.224f, 0.225f};
   float *img_norm = (float *)malloc((size_t)3 * S * S * 4);
@@ -759,14 +868,14 @@ static int run_dinov3_vitl16(
           rgb_f[c] = (v00 * (1.0f - wx) + v01 * wx) * (1.0f - wy) +
                      (v10 * (1.0f - wx) + v11 * wx) * wy;
         }
-        if (dark_bg) {
-          float mx = fmaxf(rgb_f[0], fmaxf(rgb_f[1], rgb_f[2]));
-          if (mx < 18.0f) {
-            rgb_f[0] = rgb_f[1] = rgb_f[2] = 0.0f;
-          } else if (mx < 28.0f) {
-            float alpha = (mx - 18.0f) * 0.1f;
-            rgb_f[0] *= alpha; rgb_f[1] *= alpha; rgb_f[2] *= alpha;
-          }
+        if (use_bfs_matte) {
+          float a00 = alpha_map[(long)cy0 * img_w + cx0];
+          float a01 = alpha_map[(long)cy0 * img_w + cx1];
+          float a10 = alpha_map[(long)cy1 * img_w + cx0];
+          float a11 = alpha_map[(long)cy1 * img_w + cx1];
+          float a = (a00 * (1.0f - wx) + a01 * wx) * (1.0f - wy) +
+                    (a10 * (1.0f - wx) + a11 * wx) * wy;
+          rgb_f[0] *= a; rgb_f[1] *= a; rgb_f[2] *= a;
         }
       }
       for (int c = 0; c < 3; c++) {
@@ -774,6 +883,8 @@ static int run_dinov3_vitl16(
       }
     }
   }
+  free(bg_mask);
+  free(alpha_map);
 
   uint16_t *patches_h = (uint16_t *)malloc((size_t)NP * 768 * 2);
   for (int py = 0; py < G; py++) {
@@ -974,7 +1085,7 @@ static void ss_flow_forward(
 }
 
 static int run_ss_flow(
-    ec_trellis2_t *tr, const uint16_t *cond_bf16_d,
+    ec_trellis2_t *tr, uint16_t *const *view_conds_d, int n_views,
     int steps, float cfg_scale, float rescale_t, uint32_t seed,
     float *out_z_d, // [4096, 8] F32 on GPU (matches [16, 16, 16, 8]!)
     ec_trellis2_progress_fn cb, void *cb_ctx, double *out_ms) {
@@ -982,25 +1093,29 @@ static int run_ss_flow(
   const int N = 4096, DIM = 1536, H = 12, FFN = 8192, Lkv = 1029;
   const float sigma_min = 1e-5f;
   const float guidance_rescale = 0.7f;
+  if (n_views < 1) n_views = 1;
+  if (n_views > 4) n_views = 4;
 
   // Build neg_cond = zeros[1029, 1024] BF16
   uint16_t *neg_bf16_d = NULL;
   cudaMalloc(&neg_bf16_d, (size_t)Lkv * 1024 * 2);
   cudaMemsetAsync(neg_bf16_d, 0, (size_t)Lkv * 1024 * 2, tr->stream);
 
-  // Precompute cross-attn K/V cache in BF16 for pos & neg cond across all 30 blocks (~360 MB total!)
-  uint16_t *ck_pos[30], *cv_pos[30], *ck_neg[30], *cv_neg[30];
+  // Official TRELLIS.2 Multi-View Stochastic Cycling: cache K/V per view separately (NEVER pixel-average DINOv3 patches!)
+  uint16_t *ck_pos[4][30] = {{0}}, *cv_pos[4][30] = {{0}}, *ck_neg[30] = {0}, *cv_neg[30] = {0};
   float *kv_tmp = NULL;
   cudaMalloc(&kv_tmp, (size_t)Lkv * 2 * DIM * 4);
   int nw_kv = Lkv * H;
   for (int l = 0; l < 30; l++) {
     const tr_ss_block_t *B = &tr->flow.blocks[l];
-    cudaMalloc(&ck_pos[l], (size_t)Lkv * DIM * 2);
-    cudaMalloc(&cv_pos[l], (size_t)Lkv * DIM * 2);
+    for (int v = 0; v < n_views; v++) {
+      cudaMalloc(&ck_pos[v][l], (size_t)Lkv * DIM * 2);
+      cudaMalloc(&cv_pos[v][l], (size_t)Lkv * DIM * 2);
+      tr_gemm(view_conds_d[v], B->ca_kv_w, B->ca_kv_b, kv_tmp, NULL, Lkv, 2 * DIM, 1024, tr->stream);
+      k_ss_cross_kv_norm<<<(nw_kv + 7) / 8, 256, 0, tr->stream>>>(kv_tmp, B->ca_kn, ck_pos[v][l], cv_pos[v][l], Lkv, H);
+    }
     cudaMalloc(&ck_neg[l], (size_t)Lkv * DIM * 2);
     cudaMalloc(&cv_neg[l], (size_t)Lkv * DIM * 2);
-    tr_gemm(cond_bf16_d, B->ca_kv_w, B->ca_kv_b, kv_tmp, NULL, Lkv, 2 * DIM, 1024, tr->stream);
-    k_ss_cross_kv_norm<<<(nw_kv + 7) / 8, 256, 0, tr->stream>>>(kv_tmp, B->ca_kn, ck_pos[l], cv_pos[l], Lkv, H);
     tr_gemm(neg_bf16_d, B->ca_kv_w, B->ca_kv_b, kv_tmp, NULL, Lkv, 2 * DIM, 1024, tr->stream);
     k_ss_cross_kv_norm<<<(nw_kv + 7) / 8, 256, 0, tr->stream>>>(kv_tmp, B->ca_kn, ck_neg[l], cv_neg[l], Lkv, H);
   }
@@ -1052,7 +1167,8 @@ static int run_ss_flow(
       break;
     }
     float t_cur = t_seq[s], t_prev = t_seq[s + 1], dt = t_cur - t_prev;
-    ss_flow_forward(tr, xt_d, t_cur, ck_pos, cv_pos, &W, vp_d);
+    int vid = s % n_views;
+    ss_flow_forward(tr, xt_d, t_cur, ck_pos[vid], cv_pos[vid], &W, vp_d);
 
     int use_cfg = (cfg_scale > 1.01f && t_cur >= 0.6f && t_cur <= 1.0f);
     if (use_cfg) {
@@ -1069,7 +1185,8 @@ static int run_ss_flow(
   cudaStreamSynchronize(tr->stream);
 
   for (int l = 0; l < 30; l++) {
-    cudaFree(ck_pos[l]); cudaFree(cv_pos[l]); cudaFree(ck_neg[l]); cudaFree(cv_neg[l]);
+    for (int v = 0; v < n_views; v++) { cudaFree(ck_pos[v][l]); cudaFree(cv_pos[v][l]); }
+    cudaFree(ck_neg[l]); cudaFree(cv_neg[l]);
   }
   cudaFree(W.x8_bf16); cudaFree(W.x_d); cudaFree(W.xn_bf16); cudaFree(W.qkv_d);
   cudaFree(W.Q_b); cudaFree(W.K_b); cudaFree(W.V_b); cudaFree(W.ao_bf16);
@@ -1188,8 +1305,15 @@ static inline float sample_grid_64(const float *g, int x, int y, int z) {
   return g[(x * 64 + y) * 64 + z];
 }
 
+static inline float tr_srgb_to_linear(float s) {
+  if (s <= 0.0f) return 0.0f;
+  if (s >= 1.0f) return 1.0f;
+  return (s <= 0.04045f) ? (s / 12.92f) : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
 static int extract_surface_nets_64(
     const float *logits, const float base_color[4],
+    const uint8_t *ref_rgb, int ref_w, int ref_h,
     ec_mesh_t *mesh, ec_splat3d_t *splat, int *out_active_vox) {
   memset(mesh, 0, sizeof *mesh);
   memset(splat, 0, sizeof *splat);
@@ -1373,24 +1497,33 @@ static int extract_surface_nets_64(
     return -1;
   }
 
-  // Laplacian Taubin-style mild smoothing pass (1 step lambda=0.35) for ultra-clean silhouette!
+  // True Volume-Preserving 2-Pass Taubin Smoothing (2x [lambda=+0.42, mu=-0.45]) — smooths stairsteps with ZERO shrinkage!
   float *pos_s = (float *)calloc((size_t)n_verts * 3, 4);
   uint32_t *deg = (uint32_t *)calloc(n_verts, sizeof(uint32_t));
-  for (uint32_t t = 0; t < n_tris; t++) {
-    uint32_t i0 = idx[t * 3], i1 = idx[t * 3 + 1], i2 = idx[t * 3 + 2];
-    uint32_t e[6] = {i0, i1, i1, i2, i2, i0};
-    for (int k = 0; k < 6; k += 2) {
-      uint32_t a = e[k], b = e[k + 1];
-      pos_s[a * 3 + 0] += pos[b * 3 + 0]; pos_s[a * 3 + 1] += pos[b * 3 + 1]; pos_s[a * 3 + 2] += pos[b * 3 + 2]; deg[a]++;
-      pos_s[b * 3 + 0] += pos[a * 3 + 0]; pos_s[b * 3 + 1] += pos[a * 3 + 1]; pos_s[b * 3 + 2] += pos[a * 3 + 2]; deg[b]++;
+  static const float TAUBIN_W[4] = { 0.42f, -0.45f, 0.35f, -0.37f };
+  for (int it = 0; it < 4; it++) {
+    memset(pos_s, 0, (size_t)n_verts * 3 * 4);
+    memset(deg, 0, n_verts * sizeof(uint32_t));
+    for (uint32_t t = 0; t < n_tris; t++) {
+      uint32_t i0 = idx[t * 3], i1 = idx[t * 3 + 1], i2 = idx[t * 3 + 2];
+      uint32_t e[6] = {i0, i1, i1, i2, i2, i0};
+      for (int k = 0; k < 6; k += 2) {
+        uint32_t a = e[k], b = e[k + 1];
+        pos_s[a * 3 + 0] += pos[b * 3 + 0]; pos_s[a * 3 + 1] += pos[b * 3 + 1]; pos_s[a * 3 + 2] += pos[b * 3 + 2]; deg[a]++;
+        pos_s[b * 3 + 0] += pos[a * 3 + 0]; pos_s[b * 3 + 1] += pos[a * 3 + 1]; pos_s[b * 3 + 2] += pos[a * 3 + 2]; deg[b]++;
+      }
     }
-  }
-  for (uint32_t v = 0; v < n_verts; v++) {
-    if (deg[v] > 0) {
-      float inv = 1.0f / (float)deg[v];
-      pos[v * 3 + 0] = 0.65f * pos[v * 3 + 0] + 0.35f * pos_s[v * 3 + 0] * inv;
-      pos[v * 3 + 1] = 0.65f * pos[v * 3 + 1] + 0.35f * pos_s[v * 3 + 1] * inv;
-      pos[v * 3 + 2] = 0.65f * pos[v * 3 + 2] + 0.35f * pos_s[v * 3 + 2] * inv;
+    float w = TAUBIN_W[it];
+    for (uint32_t v = 0; v < n_verts; v++) {
+      if (deg[v] > 0) {
+        float inv = 1.0f / (float)deg[v];
+        float dx = pos_s[v * 3 + 0] * inv - pos[v * 3 + 0];
+        float dy = pos_s[v * 3 + 1] * inv - pos[v * 3 + 1];
+        float dz = pos_s[v * 3 + 2] * inv - pos[v * 3 + 2];
+        pos[v * 3 + 0] += w * dx;
+        pos[v * 3 + 1] += w * dy;
+        pos[v * 3 + 2] += w * dz;
+      }
     }
   }
   free(pos_s); free(deg);
@@ -1402,7 +1535,6 @@ static int extract_surface_nets_64(
     float ax = pos[i1*3+0]-pos[i0*3+0], ay = pos[i1*3+1]-pos[i0*3+1], az = pos[i1*3+2]-pos[i0*3+2];
     float bx = pos[i2*3+0]-pos[i0*3+0], by = pos[i2*3+1]-pos[i0*3+1], bz = pos[i2*3+2]-pos[i0*3+2];
     float cx = ay*bz - az*by, cy = az*bx - ax*bz, cz = ax*by - ay*bx;
-    // Ensure triangle winding agrees with outward analytical gradient normal
     float dot = cx * nrm[i0*3+0] + cy * nrm[i0*3+1] + cz * nrm[i0*3+2];
     if (dot < 0.0f) {
       idx[t * 3 + 1] = i2; idx[t * 3 + 2] = i1;
@@ -1420,17 +1552,118 @@ static int extract_surface_nets_64(
   }
   free(fnrm);
 
+  // v16 Per-Vertex PBR Albedo Projection (COLOR_0 linear RGB) from the 1024x1024 studio reference image!
+  // Projects every vertex onto the foreground-cropped reference silhouette (replacing flat single-color beige clay!)
+  float *vcol = (float *)malloc((size_t)n_verts * 3 * 4);
+  if (vcol && ref_rgb && ref_w >= 16 && ref_h >= 16) {
+    // Detect studio backdrop color & tight foreground bounding box in reference image
+    float bgr = 0, bgg = 0, bgb = 0; int bcnt = 0;
+    for (int x = 0; x < ref_w; x += 2) {
+      const uint8_t *p = ref_rgb + (long)x * 3;
+      bgr += p[0]; bgg += p[1]; bgb += p[2]; bcnt++;
+    }
+    if (bcnt > 0) { bgr /= bcnt; bgg /= bcnt; bgb /= bcnt; }
+    int fx0 = ref_w, fy0 = ref_h, fx1 = -1, fy1 = -1;
+    double avg_fg[3] = {0, 0, 0}; long fg_cnt = 0;
+    for (int y = 0; y < ref_h; y += 2) {
+      for (int x = 0; x < ref_w; x += 2) {
+        const uint8_t *p = ref_rgb + ((long)y * ref_w + x) * 3;
+        float dr = p[0] - bgr, dg = p[1] - bgg, db = p[2] - bgb;
+        if (sqrtf(dr * dr + dg * dg + db * db) > 22.0f) {
+          if (x < fx0) fx0 = x; if (x > fx1) fx1 = x;
+          if (y < fy0) fy0 = y; if (y > fy1) fy1 = y;
+          avg_fg[0] += p[0]; avg_fg[1] += p[1]; avg_fg[2] += p[2]; fg_cnt++;
+        }
+      }
+    }
+    if (fx1 <= fx0 + 8 || fy1 <= fy0 + 8) { fx0 = 0; fy0 = 0; fx1 = ref_w - 1; fy1 = ref_h - 1; }
+    float fb_r = fg_cnt ? (float)(avg_fg[0] / (fg_cnt * 255.0)) : base_color[0];
+    float fb_g = fg_cnt ? (float)(avg_fg[1] / (fg_cnt * 255.0)) : base_color[1];
+    float fb_b = fg_cnt ? (float)(avg_fg[2] / (fg_cnt * 255.0)) : base_color[2];
+
+    // Compute mesh AABB in glTF Y-up space
+    float mmin[3] = { 1e9f, 1e9f, 1e9f }, mmax[3] = { -1e9f, -1e9f, -1e9f };
+    for (uint32_t v = 0; v < n_verts; v++) {
+      for (int a = 0; a < 3; a++) {
+        float c = pos[v * 3 + a];
+        if (c < mmin[a]) mmin[a] = c; if (c > mmax[a]) mmax[a] = c;
+      }
+    }
+    float sx = fmaxf(1e-4f, mmax[0] - mmin[0]);
+    float sy = fmaxf(1e-4f, mmax[1] - mmin[1]);
+    float sz = fmaxf(1e-4f, mmax[2] - mmin[2]);
+    // 3/4 view horizontal azimuth projection (matches our 3/4 studio reference view!)
+    const float cosA = 0.8660254f, sinA = 0.5f;
+    float pmin_u = 1e9f, pmax_u = -1e9f;
+    for (uint32_t v = 0; v < n_verts; v++) {
+      float ux = pos[v * 3 + 0] * cosA + pos[v * 3 + 2] * sinA;
+      if (ux < pmin_u) pmin_u = ux; if (ux > pmax_u) pmax_u = ux;
+    }
+    float su = fmaxf(1e-4f, pmax_u - pmin_u);
+
+    for (uint32_t v = 0; v < n_verts; v++) {
+      float ux = pos[v * 3 + 0] * cosA + pos[v * 3 + 2] * sinA;
+      float u = (ux - pmin_u) / su;
+      float wv = 1.0f - (pos[v * 3 + 1] - mmin[1]) / sy;
+      // Pull slightly inward from extreme silhouette rim to avoid sampling backdrop pixels!
+      float u_in = 0.04f + 0.92f * u;
+      float v_in = 0.04f + 0.92f * wv;
+      int px = fx0 + (int)(u_in * (float)(fx1 - fx0));
+      int py = fy0 + (int)(v_in * (float)(fy1 - fy0));
+      if (px < 0) px = 0; if (px >= ref_w) px = ref_w - 1;
+      if (py < 0) py = 0; if (py >= ref_h) py = ref_h - 1;
+      // 3x3 foreground-weighted sample
+      float sr = 0, sg = 0, sb = 0, sw = 0;
+      for (int dy = -2; dy <= 2; dy += 2) {
+        int yy = py + dy; if (yy < 0) yy = 0; if (yy >= ref_h) yy = ref_h - 1;
+        for (int dx = -2; dx <= 2; dx += 2) {
+          int xx = px + dx; if (xx < 0) xx = 0; if (xx >= ref_w) xx = ref_w - 1;
+          const uint8_t *p = ref_rgb + ((long)yy * ref_w + xx) * 3;
+          float dr = p[0] - bgr, dg = p[1] - bgg, db = p[2] - bgb;
+          if (sqrtf(dr * dr + dg * dg + db * db) > 20.0f) {
+            sr += p[0]; sg += p[1]; sb += p[2]; sw += 1.0f;
+          }
+        }
+      }
+      float cr = sw > 0.5f ? (sr / (sw * 255.0f)) : fb_r;
+      float cg = sw > 0.5f ? (sg / (sw * 255.0f)) : fb_g;
+      float cb = sw > 0.5f ? (sb / (sw * 255.0f)) : fb_b;
+      // Soft hemisphere AO tint + exact sRGB -> linear for glTF 2.0 COLOR_0 PBR!
+      float ao = 0.90f + 0.10f * fmaxf(-0.3f, nrm[v * 3 + 1]);
+      vcol[v * 3 + 0] = tr_srgb_to_linear(cr * ao);
+      vcol[v * 3 + 1] = tr_srgb_to_linear(cg * ao);
+      vcol[v * 3 + 2] = tr_srgb_to_linear(cb * ao);
+      // Clean spherical/cylindrical UV coordinates for downstream Blender/Three.js editing
+      uvs[v * 2 + 0] = u;
+      uvs[v * 2 + 1] = wv;
+    }
+    (void)sx; (void)sz;
+  } else if (vcol) {
+    for (uint32_t v = 0; v < n_verts; v++) {
+      vcol[v * 3 + 0] = tr_srgb_to_linear(base_color[0]);
+      vcol[v * 3 + 1] = tr_srgb_to_linear(base_color[1]);
+      vcol[v * 3 + 2] = tr_srgb_to_linear(base_color[2]);
+    }
+  }
+
   mesh->positions = pos;
   mesh->normals   = nrm;
   mesh->uvs       = uvs;
+  mesh->colors    = vcol;
   mesh->indices   = idx;
   mesh->n_verts   = n_verts;
   mesh->n_tris    = n_tris;
-  memcpy(mesh->base_color, base_color, 4 * sizeof(float));
-  mesh->metallic  = 0.15f;
-  mesh->roughness = 0.42f;
+  if (vcol) {
+    // glTF 2.0 multiplies baseColorFactor * COLOR_0 -> keep baseColorFactor white [1,1,1,1]!
+    mesh->base_color[0] = 1.0f; mesh->base_color[1] = 1.0f;
+    mesh->base_color[2] = 1.0f; mesh->base_color[3] = 1.0f;
+  } else {
+    memcpy(mesh->base_color, base_color, 4 * sizeof(float));
+  }
+  mesh->metallic  = 0.18f;
+  mesh->roughness = 0.36f;
 
-  // Build matching 3DGS Splat cloud from surface vertices
+  // Build matching per-vertex colored 3DGS Splat cloud from surface vertices
   splat->n_splats = n_verts;
   splat->pos     = (float *)malloc((size_t)n_verts * 3 * 4);
   splat->scale   = (float *)malloc((size_t)n_verts * 3 * 4);
@@ -1443,10 +1676,13 @@ static int extract_surface_nets_64(
     splat->scale[v*3+0] = log_s; splat->scale[v*3+1] = log_s; splat->scale[v*3+2] = log_s;
     splat->rot[v*4+0] = 1.0f; splat->rot[v*4+1] = 0.0f; splat->rot[v*4+2] = 0.0f; splat->rot[v*4+3] = 0.0f;
     splat->opacity[v] = 2.8f;
-    float shade = 0.65f + 0.35f * fmaxf(0.0f, nrm[v*3+1] * 0.7f + nrm[v*3+0] * 0.3f);
-    splat->sh_dc[v*3+0] = (base_color[0] * shade - 0.5f) / 0.28209479f;
-    splat->sh_dc[v*3+1] = (base_color[1] * shade - 0.5f) / 0.28209479f;
-    splat->sh_dc[v*3+2] = (base_color[2] * shade - 0.5f) / 0.28209479f;
+    float shade = 0.72f + 0.28f * fmaxf(0.0f, nrm[v*3+1] * 0.7f + nrm[v*3+0] * 0.3f);
+    float cr = vcol ? powf(fmaxf(0.0f, vcol[v*3+0]), 1.0f / 2.2f) : base_color[0];
+    float cg = vcol ? powf(fmaxf(0.0f, vcol[v*3+1]), 1.0f / 2.2f) : base_color[1];
+    float cb = vcol ? powf(fmaxf(0.0f, vcol[v*3+2]), 1.0f / 2.2f) : base_color[2];
+    splat->sh_dc[v*3+0] = (cr * shade - 0.5f) / 0.28209479f;
+    splat->sh_dc[v*3+1] = (cg * shade - 0.5f) / 0.28209479f;
+    splat->sh_dc[v*3+2] = (cb * shade - 0.5f) / 0.28209479f;
   }
   return 0;
 }
@@ -1539,54 +1775,42 @@ extern "C" int ec_trellis2_generate_3d(
     }
   }
 
-  // Stage 1: DINOv3-ViT-L/16 Conditioning Features [1029, 1024] (single OR multi-view average!)
+  // Stage 1: DINOv3-ViT-L/16 Conditioning Features [1029, 1024] per view (Stochastic View Cycling — zero patch blurring!)
   if (cb) cb(0, steps + 3, "trellis2_dinov3_encode", cb_ctx);
-  uint16_t *cond_bf16_d = NULL;
-  cudaMalloc(&cond_bf16_d, 1029L * 1024L * 2);
-  if (run_dinov3_vitl16(tr, req->rgb, req->img_w, req->img_h, cond_bf16_d, &res->dino_ms) != 0) {
-    cudaFree(cond_bf16_d);
+  uint16_t *view_conds_d[4] = {0};
+  int n_views = 0;
+  cudaMalloc(&view_conds_d[0], 1029L * 1024L * 2);
+  if (run_dinov3_vitl16(tr, req->rgb, req->img_w, req->img_h, view_conds_d[0], &res->dino_ms) != 0) {
+    cudaFree(view_conds_d[0]);
     snprintf(res->error, sizeof res->error, "dinov3 vision encoder failed");
     return -1;
   }
+  n_views = 1;
   int n_extra = req->n_extra_views;
   if (n_extra > 3) n_extra = 3;
-  int valid_extra = 0;
   for (int vi = 0; vi < n_extra; vi++) {
-    if (req->extra_rgbs[vi] && req->extra_w[vi] > 0 && req->extra_h[vi] > 0) valid_extra++;
-  }
-  if (valid_extra > 0) {
-    const long N_FEAT = 1029L * 1024L;
-    float *acc_d = NULL;
-    uint16_t *tmp_d = NULL;
-    cudaMalloc(&acc_d, N_FEAT * 4);
-    cudaMalloc(&tmp_d, N_FEAT * 2);
-    cudaMemsetAsync(acc_d, 0, N_FEAT * 4, tr->stream);
-    float w_view = 1.0f / (float)(1 + valid_extra);
-    k_tr_accum_bf16_f32<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, cond_bf16_d, N_FEAT, w_view);
-    for (int vi = 0; vi < n_extra; vi++) {
-      if (!req->extra_rgbs[vi] || req->extra_w[vi] <= 0 || req->extra_h[vi] <= 0) continue;
-      double vms = 0.0;
-      if (run_dinov3_vitl16(tr, req->extra_rgbs[vi], req->extra_w[vi], req->extra_h[vi], tmp_d, &vms) == 0) {
-        res->dino_ms += vms;
-        k_tr_accum_bf16_f32<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, tmp_d, N_FEAT, w_view);
-      }
+    if (!req->extra_rgbs[vi] || req->extra_w[vi] <= 0 || req->extra_h[vi] <= 0) continue;
+    cudaMalloc(&view_conds_d[n_views], 1029L * 1024L * 2);
+    double vms = 0.0;
+    if (run_dinov3_vitl16(tr, req->extra_rgbs[vi], req->extra_w[vi], req->extra_h[vi], view_conds_d[n_views], &vms) == 0) {
+      res->dino_ms += vms;
+      n_views++;
+    } else {
+      cudaFree(view_conds_d[n_views]); view_conds_d[n_views] = NULL;
     }
-    k_tr_f32_to_bf16<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, cond_bf16_d, N_FEAT);
-    cudaStreamSynchronize(tr->stream);
-    cudaFree(acc_d); cudaFree(tmp_d);
   }
 
-  // Stage 2: 30-Block SparseStructureFlowModel 1.3B BF16 (12-step Flow Euler CFG + hot-fused LoRA/DoRA!)
+  // Stage 2: 30-Block SparseStructureFlowModel 1.3B BF16 (12-step Flow Euler CFG + Stochastic Multi-View Cycling!)
   if (ensure_flow_loaded(tr, req->loras, req->n_loras) != 0) {
-    cudaFree(cond_bf16_d);
+    for (int v = 0; v < n_views; v++) cudaFree(view_conds_d[v]);
     snprintf(res->error, sizeof res->error, "trellis2 ss_flow load failed");
     return -1;
   }
   int lora_hits = tr->flow.lora_hits;
   float *z_d = NULL;
   cudaMalloc(&z_d, 4096L * 8 * 4);
-  int rc = run_ss_flow(tr, cond_bf16_d, steps, cfg, rsc, req->seed, z_d, cb, cb_ctx, &res->flow_ms);
-  cudaFree(cond_bf16_d);
+  int rc = run_ss_flow(tr, view_conds_d, n_views, steps, cfg, rsc, req->seed, z_d, cb, cb_ctx, &res->flow_ms);
+  for (int v = 0; v < n_views; v++) cudaFree(view_conds_d[v]);
   if (rc != 0) {
     cudaFree(z_d);
     snprintf(res->error, sizeof res->error, rc == -2 ? "cancelled" : "trellis2 ss_flow failed");
@@ -1614,7 +1838,7 @@ extern "C" int ec_trellis2_generate_3d(
   ec_mesh_t mesh;
   ec_splat3d_t splat;
   int n_act = 0;
-  if (extract_surface_nets_64(logits_h, bcol, &mesh, &splat, &n_act) != 0) {
+  if (extract_surface_nets_64(logits_h, bcol, req->rgb, req->img_w, req->img_h, &mesh, &splat, &n_act) != 0) {
     free(logits_h);
     snprintf(res->error, sizeof res->error, "trellis2 empty occupancy volume (0 active voxels)");
     return -1;

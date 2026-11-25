@@ -16,7 +16,7 @@ GENC=(-gencode arch=compute_80,code=sm_80
       -gencode arch=compute_90,code=sm_90
       -gencode arch=compute_120,code=[sm_120,compute_120])
 
-echo "=== Building 100% Native Eureka Creative Engine v8 (Multimodal VAE Encoders + Universal QLoRA + 8-Stem + Cowrie v2 SHA-NI) in $OUT ==="
+echo "=== Building 100% Native Eureka Creative Engine v16 (Z-Image-Turbo 6.15B + FLUX.2 Base/Klein + Wan 2.2 BT.709/RES + ACE-Step SFT/FP32 Master + TRELLIS.2 COLOR_0 PBR) in $OUT ==="
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_safetensors.c" -o "$OUT/obj/ec_safetensors.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_cowrie.c"      -o "$OUT/obj/ec_cowrie.o"
 "$CC" -std=c11 -O3 -Wall -Wextra -I"$SRC" -c "$SRC/ec_flow.c"        -o "$OUT/obj/ec_flow.o"
@@ -36,6 +36,7 @@ echo "=== Building 100% Native Eureka Creative Engine v8 (Multimodal VAE Encoder
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_models.cu"     -o "$OUT/obj/ec_models.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_lora.cu"       -o "$OUT/obj/ec_lora.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_flux2.cu"      -o "$OUT/obj/ec_flux2.o"
+"$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_zimage.cu"     -o "$OUT/obj/ec_zimage.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_acestep.cu"    -o "$OUT/obj/ec_acestep.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_trellis2.cu"   -o "$OUT/obj/ec_trellis2.o"
 "$NVCC" -O3 -std=c++17 "${GENC[@]}" -I"$SRC" -c "$SRC/ec_wan22.cu"      -o "$OUT/obj/ec_wan22.o"
@@ -60,6 +61,7 @@ COMMON_OBJS=(
   "$OUT/obj/ec_models.o"
   "$OUT/obj/ec_lora.o"
   "$OUT/obj/ec_flux2.o"
+  "$OUT/obj/ec_zimage.o"
   "$OUT/obj/ec_acestep.o"
   "$OUT/obj/ec_trellis2.o"
   "$OUT/obj/ec_wan22.o"

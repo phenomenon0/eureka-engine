@@ -349,6 +349,37 @@ __global__ void k_as_snake1d(
   y[idx] = v + inv_beta[c] * s * s;
 }
 
+// FP32 Im2Col for dilated 1D Conv (k=7, pad=3*dil) on chunk [t0 .. t0+chunk-1] of x[L, Cin]
+// Pure IEEE FP32 eliminates 7-bit-mantissa BF16 waveform phase smear & metallic hiss in Oobleck VAE!
+__global__ void k_as_im2col_1d_k7_f32(
+    const float *__restrict__ x, float *__restrict__ col_f32,
+    int L, int Cin, int dil, int t0, int chunk) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)chunk * 7 * Cin;
+  if (idx >= tot) return;
+  int row = (int)(idx / (7 * Cin));
+  int rem = (int)(idx % (7 * Cin));
+  int k = rem / Cin;
+  int ic = rem % Cin;
+  int t = t0 + row + (k - 3) * dil;
+  col_f32[idx] = (t >= 0 && t < L) ? x[(long)t * Cin + ic] : 0.0f;
+}
+
+// FP32 Input pairs for ConvTranspose1d (k=2*s, stride=s, pad=s/2) on chunk [q0 .. q0+q_chunk-1]
+__global__ void k_as_convt_pairs_f32(
+    const float *__restrict__ x, float *__restrict__ pairs_f32,
+    int L_in, int Cin, int q0, int q_chunk) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)q_chunk * (2 * Cin);
+  if (idx >= tot) return;
+  int row = (int)(idx / (2 * Cin));
+  int col = (int)(idx % (2 * Cin));
+  int q = q0 + row;
+  int t_in = (col < Cin) ? q : (q - 1);
+  int ic = (col < Cin) ? col : (col - Cin);
+  pairs_f32[idx] = (t_in >= 0 && t_in < L_in) ? x[(long)t_in * Cin + ic] : 0.0f;
+}
+
 // Im2Col for dilated 1D Conv (k=7, pad=3*dil) on chunk [t0 .. t0+chunk-1] of x[L, Cin]
 // Output: col_bf16[chunk, 7 * Cin] ordered as [k=0..6][ic=0..Cin-1]
 __global__ void k_as_im2col_1d_k7(
@@ -506,27 +537,27 @@ typedef struct {
 
 typedef struct {
   as_snake_t s1, s2;
-  uint16_t *c1_w; // [C, 7*C] BF16 (weight-norm folded, transposed to [Cout, K, Cin])
+  float    *c1_w; // [C, 7*C] FP32 (weight-norm folded, pure IEEE FP32 for phase-exact 48 kHz waveform!)
   float    *c1_b; // [C]
-  uint16_t *c2_w; // [C, C] BF16
+  float    *c2_w; // [C, C] FP32
   float    *c2_b; // [C]
 } as_oobleck_res_t;
 
 typedef struct {
   int in_c, out_c, stride;
   as_snake_t snake1;
-  uint16_t *conv_t_w; // [stride * out_c, 2 * in_c] BF16
+  float    *conv_t_w; // [stride * out_c, 2 * in_c] FP32
   float    *conv_t_b; // [stride * out_c] (bias tiled stride times!)
   as_oobleck_res_t res[3]; // dil = 1, 3, 9
 } as_oobleck_block_t;
 
 typedef struct {
   int loaded;
-  uint16_t *conv1_w; // [2048, 7*64] BF16
+  float    *conv1_w; // [2048, 7*64] FP32
   float    *conv1_b; // [2048]
   as_oobleck_block_t blocks[5];
   as_snake_t final_snake;
-  uint16_t *conv2_w; // [2, 7*128] BF16 (no bias)
+  float    *conv2_w; // [2, 7*128] FP32 (no bias)
 } as_vae_resident_t;
 
 struct ec_acestep {
@@ -535,6 +566,7 @@ struct ec_acestep {
   ec_bpe_t          *bpe;
   ec_safetensors_t       dit_st, vae_st, te_st, sil_st;
   int                dit_open, vae_open, te_open, sil_open;
+  char               loaded_dit_path[512];
   float             *silence_T64_h; // host [15000, 64] F32 (transposed from [1, 64, 15000])
   int                silence_frames;
   as_dit_resident_t  dit;
@@ -618,13 +650,26 @@ static void build_as_lora_sig(const ec_lora_spec_t *loras, int n_loras, char *ou
   }
 }
 
-static int ensure_dit_loaded(ec_acestep_t *as, const ec_lora_spec_t *loras, int n_loras) {
-  static char s_loaded_sig[1024] = {0};
+static int ensure_dit_loaded(ec_acestep_t *as, const char *ckpt_override, const ec_lora_spec_t *loras, int n_loras) {
+  static char s_loaded_sig[1536] = {0};
   static int  s_loaded_hits = 0;
-  char lsig[1024];
-  build_as_lora_sig(loras, n_loras, lsig, sizeof lsig);
+  const char *want_path = (ckpt_override && ckpt_override[0]) ? ckpt_override : as->paths.dit_path;
+  if (!as->loaded_dit_path[0]) snprintf(as->loaded_dit_path, sizeof as->loaded_dit_path, "%s", as->paths.dit_path);
+  char lsig[1536], ltmp[1024];
+  build_as_lora_sig(loras, n_loras, ltmp, sizeof ltmp);
+  snprintf(lsig, sizeof lsig, "%s||%s", want_path, ltmp);
   if (as->dit.loaded && strcmp(s_loaded_sig, lsig) == 0) return s_loaded_hits;
   if (as->dit.loaded) free_dit_resident(&as->dit);
+  if (strcmp(want_path, as->loaded_dit_path) != 0) {
+    ec_safetensors_t new_st;
+    char err[128] = {0};
+    if (ec_st_open(&new_st, want_path, err, sizeof err) == 0) {
+      if (as->dit_open) ec_st_close(&as->dit_st);
+      as->dit_st = new_st;
+      as->dit_open = 1;
+      snprintf(as->loaded_dit_path, sizeof as->loaded_dit_path, "%s", want_path);
+    }
+  }
   const ec_safetensors_t *st = &as->dit_st;
   as_dit_resident_t *d = &as->dit;
   ec_lora_apply_stats_t lstats = {};
@@ -738,8 +783,8 @@ static int load_snake(const ec_safetensors_t *st, const char *pfx, int C, as_sna
   return 0;
 }
 
-// Weight-norm fold Conv1d(Cout, Cin, K) -> upload BF16 transposed to [Cout, K * Cin] (row oc, col k*Cin + ic)
-static uint16_t *load_wn_conv1d_bf16(const ec_safetensors_t *st, const char *pfx, int Cout, int Cin, int K) {
+// Weight-norm fold Conv1d(Cout, Cin, K) -> upload FP32 transposed to [Cout, K * Cin] (exact 48 kHz waveform precision!)
+static float *load_wn_conv1d_f32(const ec_safetensors_t *st, const char *pfx, int Cout, int Cin, int K) {
   char kg[192], kv[192];
   snprintf(kg, sizeof kg, "%s.weight_g", pfx);
   snprintf(kv, sizeof kv, "%s.weight_v", pfx);
@@ -747,7 +792,7 @@ static uint16_t *load_wn_conv1d_bf16(const ec_safetensors_t *st, const char *pfx
   if (st_read_host_f32(st, kg, &g, NULL) != 0) return NULL;
   if (st_read_host_f32(st, kv, &v, NULL) != 0) { free(g); return NULL; }
 
-  uint16_t *w_t = (uint16_t *)malloc((size_t)Cout * K * Cin * 2);
+  float *w_t = (float *)malloc((size_t)Cout * K * Cin * 4);
   for (int oc = 0; oc < Cout; oc++) {
     double ss = 0.0;
     const float *vo = v + (long)oc * Cin * K;
@@ -755,10 +800,72 @@ static uint16_t *load_wn_conv1d_bf16(const ec_safetensors_t *st, const char *pfx
     double scale = (double)g[oc] / (sqrt(ss) + 1e-12);
     for (int ic = 0; ic < Cin; ic++) {
       for (int k = 0; k < K; k++) {
-        float wf = (float)((double)vo[(long)ic * K + k] * scale);
-        w_t[(long)oc * (K * Cin) + k * Cin + ic] = as_f32_to_bf16_host(wf);
+        w_t[(long)oc * (K * Cin) + k * Cin + ic] = (float)((double)vo[(long)ic * K + k] * scale);
       }
     }
+  }
+  free(g); free(v);
+  float *d = NULL;
+  cudaMalloc(&d, (size_t)Cout * K * Cin * 4);
+  cudaMemcpy(d, w_t, (size_t)Cout * K * Cin * 4, cudaMemcpyHostToDevice);
+  free(w_t);
+  return d;
+}
+
+// Weight-norm fold ConvTranspose1d(Cin, Cout, K=2*s) -> upload FP32 [s * Cout, 2 * Cin]
+static float *load_wn_convt1d_f32(const ec_safetensors_t *st, const char *pfx, int Cin, int Cout, int s) {
+  int K = 2 * s;
+  char kg[192], kv[192];
+  snprintf(kg, sizeof kg, "%s.weight_g", pfx);
+  snprintf(kv, sizeof kv, "%s.weight_v", pfx);
+  float *g = NULL, *v = NULL;
+  if (st_read_host_f32(st, kg, &g, NULL) != 0) return NULL;
+  if (st_read_host_f32(st, kv, &v, NULL) != 0) { free(g); return NULL; }
+
+  float *scale_ic = (float *)malloc((size_t)Cin * 4);
+  for (int ic = 0; ic < Cin; ic++) {
+    double ss = 0.0;
+    const float *vi = v + (long)ic * Cout * K;
+    for (int i = 0; i < Cout * K; i++) ss += (double)vi[i] * (double)vi[i];
+    scale_ic[ic] = (float)((double)g[ic] / (sqrt(ss) + 1e-12));
+  }
+
+  float *w_t = (float *)malloc((size_t)(s * Cout) * (2 * Cin) * 4);
+  for (int r = 0; r < s; r++) {
+    for (int oc = 0; oc < Cout; oc++) {
+      float *row = w_t + (long)(r * Cout + oc) * (2 * Cin);
+      for (int ic = 0; ic < Cin; ic++) {
+        const float *vic = v + ((long)ic * Cout + oc) * K;
+        row[ic]       = vic[r]     * scale_ic[ic];
+        row[Cin + ic] = vic[r + s] * scale_ic[ic];
+      }
+    }
+  }
+  free(scale_ic); free(g); free(v);
+  float *d = NULL;
+  cudaMalloc(&d, (size_t)(s * Cout) * (2 * Cin) * 4);
+  cudaMemcpy(d, w_t, (size_t)(s * Cout) * (2 * Cin) * 4, cudaMemcpyHostToDevice);
+  free(w_t);
+  return d;
+}
+
+// Keep BF16 weight-norm helper for Oobleck Encoder (streamed)
+static uint16_t *load_wn_conv1d_bf16(const ec_safetensors_t *st, const char *pfx, int Cout, int Cin, int K) {
+  char kg[192], kv[192];
+  snprintf(kg, sizeof kg, "%s.weight_g", pfx);
+  snprintf(kv, sizeof kv, "%s.weight_v", pfx);
+  float *g = NULL, *v = NULL;
+  if (st_read_host_f32(st, kg, &g, NULL) != 0) return NULL;
+  if (st_read_host_f32(st, kv, &v, NULL) != 0) { free(g); return NULL; }
+  uint16_t *w_t = (uint16_t *)malloc((size_t)Cout * K * Cin * 2);
+  for (int oc = 0; oc < Cout; oc++) {
+    double ss = 0.0;
+    const float *vo = v + (long)oc * Cin * K;
+    for (int i = 0; i < Cin * K; i++) ss += (double)vo[i] * (double)vo[i];
+    double scale = (double)g[oc] / (sqrt(ss) + 1e-12);
+    for (int ic = 0; ic < Cin; ic++)
+      for (int k = 0; k < K; k++)
+        w_t[(long)oc * (K * Cin) + k * Cin + ic] = as_f32_to_bf16_host((float)((double)vo[(long)ic * K + k] * scale));
   }
   free(g); free(v);
   uint16_t *d = NULL;
@@ -768,51 +875,12 @@ static uint16_t *load_wn_conv1d_bf16(const ec_safetensors_t *st, const char *pfx
   return d;
 }
 
-// Weight-norm fold ConvTranspose1d(Cin, Cout, K=2*s) -> upload BF16 [s * Cout, 2 * Cin]
-// For u = q*s + r (r=0..s-1), output y[u, oc] = sum_{ic} (x[q, ic] * W[ic, oc, r] + x[q-1, ic] * W[ic, oc, r+s])
-static uint16_t *load_wn_convt1d_bf16(const ec_safetensors_t *st, const char *pfx, int Cin, int Cout, int s) {
-  int K = 2 * s;
-  char kg[192], kv[192];
-  snprintf(kg, sizeof kg, "%s.weight_g", pfx);
-  snprintf(kv, sizeof kv, "%s.weight_v", pfx);
-  float *g = NULL, *v = NULL;
-  if (st_read_host_f32(st, kg, &g, NULL) != 0) return NULL;
-  if (st_read_host_f32(st, kv, &v, NULL) != 0) { free(g); return NULL; }
-
-  // Weight-norm dim=0 -> norm over (Cout * K) for each ic in 0..Cin-1
-  float *scale_ic = (float *)malloc((size_t)Cin * 4);
-  for (int ic = 0; ic < Cin; ic++) {
-    double ss = 0.0;
-    const float *vi = v + (long)ic * Cout * K;
-    for (int i = 0; i < Cout * K; i++) ss += (double)vi[i] * (double)vi[i];
-    scale_ic[ic] = (float)((double)g[ic] / (sqrt(ss) + 1e-12));
-  }
-
-  uint16_t *w_t = (uint16_t *)malloc((size_t)(s * Cout) * (2 * Cin) * 2);
-  for (int r = 0; r < s; r++) {
-    for (int oc = 0; oc < Cout; oc++) {
-      uint16_t *row = w_t + (long)(r * Cout + oc) * (2 * Cin);
-      for (int ic = 0; ic < Cin; ic++) {
-        const float *vic = v + ((long)ic * Cout + oc) * K;
-        row[ic]       = as_f32_to_bf16_host(vic[r]     * scale_ic[ic]);
-        row[Cin + ic] = as_f32_to_bf16_host(vic[r + s] * scale_ic[ic]);
-      }
-    }
-  }
-  free(scale_ic); free(g); free(v);
-  uint16_t *d = NULL;
-  cudaMalloc(&d, (size_t)(s * Cout) * (2 * Cin) * 2);
-  cudaMemcpy(d, w_t, (size_t)(s * Cout) * (2 * Cin) * 2, cudaMemcpyHostToDevice);
-  free(w_t);
-  return d;
-}
-
 static int ensure_vae_loaded(ec_acestep_t *as) {
   if (as->vae.loaded) return 0;
   const ec_safetensors_t *st = &as->vae_st;
   as_vae_resident_t *v = &as->vae;
 
-  v->conv1_w = load_wn_conv1d_bf16(st, "decoder.conv1", 2048, 64, 7);
+  v->conv1_w = load_wn_conv1d_f32(st, "decoder.conv1", 2048, 64, 7);
   v->conv1_b = st_upload_f32(st, "decoder.conv1.bias");
   if (!v->conv1_w || !v->conv1_b) return -1;
 
@@ -829,7 +897,7 @@ static int ensure_vae_loaded(ec_acestep_t *as) {
     if (load_snake(st, pfx, B->in_c, &B->snake1) != 0) { free_vae_resident(v); return -1; }
 
     snprintf(pfx, sizeof pfx, "decoder.block.%d.conv_t1", b);
-    B->conv_t_w = load_wn_convt1d_bf16(st, pfx, B->in_c, B->out_c, B->stride);
+    B->conv_t_w = load_wn_convt1d_f32(st, pfx, B->in_c, B->out_c, B->stride);
     snprintf(kb, sizeof kb, "%s.bias", pfx);
     float *bh = NULL;
     if (!B->conv_t_w || st_read_host_f32(st, kb, &bh, NULL) != 0) { free_vae_resident(v); return -1; }
@@ -846,13 +914,13 @@ static int ensure_vae_loaded(ec_acestep_t *as) {
       snprintf(pfx, sizeof pfx, "decoder.block.%d.res_unit%d.snake1", b, u + 1);
       if (load_snake(st, pfx, C, &R->s1) != 0) { free_vae_resident(v); return -1; }
       snprintf(pfx, sizeof pfx, "decoder.block.%d.res_unit%d.conv1", b, u + 1);
-      R->c1_w = load_wn_conv1d_bf16(st, pfx, C, C, 7);
+      R->c1_w = load_wn_conv1d_f32(st, pfx, C, C, 7);
       snprintf(kb, sizeof kb, "%s.bias", pfx);
       R->c1_b = st_upload_f32(st, kb);
       snprintf(pfx, sizeof pfx, "decoder.block.%d.res_unit%d.snake2", b, u + 1);
       if (load_snake(st, pfx, C, &R->s2) != 0) { free_vae_resident(v); return -1; }
       snprintf(pfx, sizeof pfx, "decoder.block.%d.res_unit%d.conv2", b, u + 1);
-      R->c2_w = load_wn_conv1d_bf16(st, pfx, C, C, 1);
+      R->c2_w = load_wn_conv1d_f32(st, pfx, C, C, 1);
       snprintf(kb, sizeof kb, "%s.bias", pfx);
       R->c2_b = st_upload_f32(st, kb);
       if (!R->c1_w || !R->c1_b || !R->c2_w || !R->c2_b) { free_vae_resident(v); return -1; }
@@ -860,7 +928,7 @@ static int ensure_vae_loaded(ec_acestep_t *as) {
   }
 
   if (load_snake(st, "decoder.snake1", 128, &v->final_snake) != 0) { free_vae_resident(v); return -1; }
-  v->conv2_w = load_wn_conv1d_bf16(st, "decoder.conv2", 2, 128, 7);
+  v->conv2_w = load_wn_conv1d_f32(st, "decoder.conv2", 2, 128, 7);
   if (!v->conv2_w) { free_vae_resident(v); return -1; }
 
   v->loaded = 1;
@@ -1073,7 +1141,8 @@ static int run_condition_encoder(
     ec_acestep_t *as,
     const uint16_t *text_bf16_d, int L_txt,
     const uint16_t *lyric_bf16_d, int L_lyr,
-    uint16_t *out_packed_bf16_d, // [L_lyr + 1 + L_txt, 2048] BF16
+    const float *src_lat_h, int T_src, // optional reference audio latent [T_src, 64] for Cover/Repaint/Extend timbre!
+    uint16_t *out_packed_bf16_d,       // [L_lyr + 1 + L_txt, 2048] BF16
     double *out_ms) {
   double t0 = as_now_ms();
   const int DIM = 2048;
@@ -1085,10 +1154,12 @@ static int run_condition_encoder(
     cudaFree(lyr_f32); return -1;
   }
 
-  // 2. Timbre encoder (4L on silence_latent[0..749, 0..63]) -> take row 0 [1, 2048]
-  int T_timbre = as->silence_frames < 750 ? as->silence_frames : 750;
+  // 2. Timbre encoder (4L): feed REAL source audio latent when provided (cover/repaint/extend), else silence_latent!
+  int use_src_timbre = (src_lat_h && T_src >= 4) ? 1 : 0;
+  int T_timbre = use_src_timbre ? (T_src < 750 ? T_src : 750) : (as->silence_frames < 750 ? as->silence_frames : 750);
+  const float *timbre_src = use_src_timbre ? src_lat_h : as->silence_T64_h;
   uint16_t *sil_bf16_h = (uint16_t *)malloc((size_t)T_timbre * 64 * 2);
-  for (int i = 0; i < T_timbre * 64; i++) sil_bf16_h[i] = as_f32_to_bf16_host(as->silence_T64_h[i]);
+  for (int i = 0; i < T_timbre * 64; i++) sil_bf16_h[i] = as_f32_to_bf16_host(timbre_src[i]);
   uint16_t *sil_bf16_d = NULL;
   cudaMalloc(&sil_bf16_d, (size_t)T_timbre * 64 * 2);
   cudaMemcpy(sil_bf16_d, sil_bf16_h, (size_t)T_timbre * 64 * 2, cudaMemcpyHostToDevice);
@@ -1168,6 +1239,7 @@ static float as_randn(uint64_t *rng) {
 static int run_acestep_dit(
     ec_acestep_t *as,
     const uint16_t *enc_packed_bf16_d, int L_enc,
+    const uint16_t *uncond_packed_bf16_d, int L_uncond, float cfg_scale,
     int T, int steps, float shift, uint32_t seed,
     const float *src_lat_h, int T_src, const char *audio_mode,
     float denoise, float repaint_start_sec, float repaint_end_sec,
@@ -1179,17 +1251,24 @@ static int run_acestep_dit(
   const int DIM = 2048, HQ = 16, HKV = 8, D = 128, FFN = 6144;
   int T_pad = (T + 1) & ~1;
   int T_p = T_pad / 2;
+  int use_cfg = (uncond_packed_bf16_d != NULL && L_uncond > 0 && cfg_scale > 1.05f) ? 1 : 0;
 
   static const float S1[8] = {1.0f, 0.875f, 0.75f, 0.625f, 0.5f, 0.375f, 0.25f, 0.125f};
   static const float S2[8] = {1.0f, 0.93333333f, 0.85714286f, 0.76923077f, 0.66666667f, 0.54545454f, 0.4f, 0.22222222f};
   static const float S3[8] = {1.0f, 0.95454545f, 0.9f, 0.83333333f, 0.75f, 0.64285714f, 0.5f, 0.3f};
-  const float *base_sched = (shift <= 1.5f) ? S1 : ((shift <= 2.5f) ? S2 : S3);
-  int n_steps = (steps >= 1 && steps <= 8) ? steps : 8;
-  float sched[8];
-  if (n_steps == 8) {
-    memcpy(sched, base_sched, sizeof sched);
+  int n_steps = (steps >= 1 && steps <= 64) ? steps : 8;
+  float sched[65];
+  if (n_steps == 8 && !use_cfg && (fabsf(shift - 1.0f) < 0.05f || fabsf(shift - 2.0f) < 0.05f || fabsf(shift - 3.0f) < 0.05f)) {
+    const float *base_sched = (shift <= 1.5f) ? S1 : ((shift <= 2.5f) ? S2 : S3);
+    memcpy(sched, base_sched, 8 * sizeof(float));
+    sched[8] = 0.0f;
   } else {
-    for (int i = 0; i < n_steps; i++) sched[i] = base_sched[(i * 8) / n_steps];
+    // Continuous shifted rectified-flow schedule: t(u) = shift * u / (1 + (shift - 1) * u) for arbitrary 1..64 steps!
+    for (int i = 0; i < n_steps; i++) {
+      float u = 1.0f - (float)i / (float)n_steps;
+      sched[i] = (shift * u) / (1.0f + (shift - 1.0f) * u);
+    }
+    sched[n_steps] = 0.0f;
   }
 
   int is_cover   = (src_lat_h && T_src > 0 && audio_mode && !strcmp(audio_mode, "cover"));
@@ -1207,15 +1286,21 @@ static int run_acestep_dit(
   if (rp_t1 <= rp_t0) rp_t1 = T;
   if (rp_t1 > T) rp_t1 = T;
 
-  // Project encoder_hidden_states ONCE through decoder.condition_embedder
-  uint16_t *cond_bf16_d = NULL;
+  // Project encoder_hidden_states ONCE through decoder.condition_embedder (pos + optional uncond for SFT CFG!)
+  uint16_t *cond_bf16_d = NULL, *ucond_bf16_d = NULL;
   cudaMalloc(&cond_bf16_d, (size_t)L_enc * DIM * 2);
   as_gemm(enc_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, cond_bf16_d, L_enc, DIM, DIM, as->stream);
+  if (use_cfg) {
+    cudaMalloc(&ucond_bf16_d, (size_t)L_uncond * DIM * 2);
+    as_gemm(uncond_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, ucond_bf16_d, L_uncond, DIM, DIM, as->stream);
+  }
 
   uint16_t *ck_cache[24] = {0}, *cv_cache[24] = {0};
+  uint16_t *uck_cache[24] = {0}, *ucv_cache[24] = {0};
+  int L_max_kv = (use_cfg && L_uncond > L_enc) ? L_uncond : L_enc;
   float *ck_tmp = NULL, *cv_tmp = NULL;
-  cudaMalloc(&ck_tmp, (size_t)L_enc * HKV * D * 4);
-  cudaMalloc(&cv_tmp, (size_t)L_enc * HKV * D * 4);
+  cudaMalloc(&ck_tmp, (size_t)L_max_kv * HKV * D * 4);
+  cudaMalloc(&cv_tmp, (size_t)L_max_kv * HKV * D * 4);
   for (int l = 0; l < 24; l++) {
     cudaMalloc(&ck_cache[l], (size_t)HKV * L_enc * D * 2);
     cudaMalloc(&cv_cache[l], (size_t)HKV * L_enc * D * 2);
@@ -1225,8 +1310,18 @@ static int run_acestep_dit(
     k_as_qk_norm_rope_bf16<<<(kv_warps + 7) / 8, 256, 0, as->stream>>>(
         NULL, ck_tmp, cv_tmp, NULL, d->layers[l].cross_k_norm,
         NULL, ck_cache[l], cv_cache[l], 0, L_enc, HQ, HKV, D, 1e6f, 1e-6f, 0);
+    if (use_cfg) {
+      cudaMalloc(&uck_cache[l], (size_t)HKV * L_uncond * D * 2);
+      cudaMalloc(&ucv_cache[l], (size_t)HKV * L_uncond * D * 2);
+      as_gemm(ucond_bf16_d, d->layers[l].cross_k, NULL, ck_tmp, NULL, L_uncond, HKV * D, DIM, as->stream);
+      as_gemm(ucond_bf16_d, d->layers[l].cross_v, NULL, cv_tmp, NULL, L_uncond, HKV * D, DIM, as->stream);
+      int ukv_warps = L_uncond * HKV;
+      k_as_qk_norm_rope_bf16<<<(ukv_warps + 7) / 8, 256, 0, as->stream>>>(
+          NULL, ck_tmp, cv_tmp, NULL, d->layers[l].cross_k_norm,
+          NULL, uck_cache[l], ucv_cache[l], 0, L_uncond, HQ, HKV, D, 1e6f, 1e-6f, 0);
+    }
   }
-  cudaFree(ck_tmp); cudaFree(cv_tmp); cudaFree(cond_bf16_d);
+  cudaFree(ck_tmp); cudaFree(cv_tmp); cudaFree(cond_bf16_d); cudaFree(ucond_bf16_d);
 
   float *temb_r_d = NULL, *tproj_r_d = NULL;
   float *temb_t_d = NULL, *tproj_t_d = NULL;
@@ -1268,10 +1363,11 @@ static int run_acestep_dit(
       }
     }
   }
-  float *ctx_d = NULL, *xt_d = NULL, *vt_d = NULL;
+  float *ctx_d = NULL, *xt_d = NULL, *vt_d = NULL, *vu_d = NULL;
   cudaMalloc(&ctx_d, (size_t)T * 128 * 4);
   cudaMalloc(&xt_d,  (size_t)T * 64 * 4);
   cudaMalloc(&vt_d,  (size_t)T_pad * 64 * 4);
+  if (use_cfg) cudaMalloc(&vu_d, (size_t)T_pad * 64 * 4);
   cudaMemcpyAsync(ctx_d, ctx_h, (size_t)T * 128 * 4, cudaMemcpyHostToDevice, as->stream);
   cudaMemcpyAsync(xt_d,  xt_h,  (size_t)T * 64 * 4,  cudaMemcpyHostToDevice, as->stream);
   free(ctx_h); free(xt_h);
@@ -1296,6 +1392,62 @@ static int run_acestep_dit(
   cudaMalloc(&mlp_bf16,      (size_t)T_p * FFN * 2);
 
   const float attn_scale = 1.0f / sqrtf((float)D);
+  auto eval_dit_pass = [&](uint16_t *const *ck, uint16_t *const *cv, int Lkv, float *out_v) {
+    k_as_pack_patch_in<<<((long)T_p * 384 + 255) / 256, 256, 0, as->stream>>>(
+        ctx_d, xt_d, patch_in_bf16, T, T_p);
+    as_gemm(patch_in_bf16, d->proj_in_w, d->proj_in_b, x_d, NULL, T_p, DIM, 384, as->stream);
+
+    for (int l = 0; l < 24; l++) {
+      const as_dit_layer_t *L = &d->layers[l];
+      k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(L->scale_shift, tproj_d, mod_d, 6 * DIM);
+      const float *shift_msa = mod_d + 0 * DIM;
+      const float *scale_msa = mod_d + 1 * DIM;
+      const float *gate_msa  = mod_d + 2 * DIM;
+      const float *c_shift   = mod_d + 3 * DIM;
+      const float *c_scale   = mod_d + 4 * DIM;
+      const float *c_gate    = mod_d + 5 * DIM;
+
+      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
+          x_d, L->self_norm_w, scale_msa, shift_msa, NULL, xn_bf16, T_p, DIM, 1e-6f);
+      as_gemm(xn_bf16, L->self_q, NULL, q_d, NULL, T_p, HQ * D,  DIM, as->stream);
+      as_gemm(xn_bf16, L->self_k, NULL, k_d, NULL, T_p, HKV * D, DIM, as->stream);
+      as_gemm(xn_bf16, L->self_v, NULL, v_d, NULL, T_p, HKV * D, DIM, as->stream);
+      int n_warps = T_p * (HQ + HKV);
+      k_as_qk_norm_rope_bf16<<<(n_warps + 7) / 8, 256, 0, as->stream>>>(
+          q_d, k_d, v_d, L->self_q_norm, L->self_k_norm, qr_b, kr_b, vr_b,
+          T_p, T_p, HQ, HKV, D, 1e6f, 1e-6f, 1);
+      int win = (l % 2 == 0) ? 128 : 0;
+      ec_ops_fa2_bf16(qr_b, kr_b, vr_b, NULL, ao_bf16, T_p, T_p, T_p, T_p, HQ, HKV, D, attn_scale, win, as->stream);
+      as_gemm(ao_bf16, L->self_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
+      k_as_add_gated<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, gate_msa, T_p, DIM);
+
+      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
+          x_d, L->cross_norm_w, NULL, NULL, NULL, xn_bf16, T_p, DIM, 1e-6f);
+      as_gemm(xn_bf16, L->cross_q, NULL, q_d, NULL, T_p, HQ * D, DIM, as->stream);
+      int q_warps = T_p * HQ;
+      k_as_qk_norm_rope_bf16<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
+          q_d, NULL, NULL, L->cross_q_norm, NULL, qr_b, NULL, NULL,
+          T_p, 0, HQ, HKV, D, 1e6f, 1e-6f, 0);
+      ec_ops_fa2_bf16(qr_b, ck[l], cv[l], NULL, ao_bf16, T_p, Lkv, T_p, Lkv, HQ, HKV, D, attn_scale, 0, as->stream);
+      as_gemm(ao_bf16, L->cross_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
+      k_as_add_inplace<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)T_p * DIM);
+
+      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
+          x_d, L->mlp_norm_w, c_scale, c_shift, NULL, xn_bf16, T_p, DIM, 1e-6f);
+      as_gemm(xn_bf16, L->mlp_gate, NULL, gate_d, NULL, T_p, FFN, DIM, as->stream);
+      as_gemm(xn_bf16, L->mlp_up,   NULL, up_d,   NULL, T_p, FFN, DIM, as->stream);
+      k_as_swiglu_pair_bf16<<<((long)T_p * FFN + 255) / 256, 256, 0, as->stream>>>(
+          gate_d, up_d, mlp_bf16, (long)T_p * FFN);
+      as_gemm(mlp_bf16, L->mlp_down, NULL, tmp_d, NULL, T_p, DIM, FFN, as->stream);
+      k_as_add_gated<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, c_gate, T_p, DIM);
+    }
+
+    k_as_add_out_mod<<<(2 * DIM + 255) / 256, 256, 0, as->stream>>>(d->scale_shift_out, temb_d, out_mod_d, DIM);
+    k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
+        x_d, d->norm_out_w, out_mod_d + DIM, out_mod_d, NULL, xn_bf16, T_p, DIM, 1e-6f);
+    as_gemm(xn_bf16, d->proj_out_w, d->proj_out_b2, out_v, NULL, T_p, 128, DIM, as->stream);
+  };
+
   int cancelled = 0;
   for (int step = s0; step < n_steps; step++) {
     if (cb && cb(step + 2, n_steps + 3, "acestep_dit_step", cb_ctx) != 0) {
@@ -1307,65 +1459,13 @@ static int run_acestep_dit(
     k_as_add_vec<<<(DIM + 255) / 256, 256, 0, as->stream>>>(temb_t_d, temb_r_d, temb_d, DIM);
     k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(tproj_t_d, tproj_r_d, tproj_d, 6 * DIM);
 
-    // Pack + proj_in
-    k_as_pack_patch_in<<<((long)T_p * 384 + 255) / 256, 256, 0, as->stream>>>(
-        ctx_d, xt_d, patch_in_bf16, T, T_p);
-    as_gemm(patch_in_bf16, d->proj_in_w, d->proj_in_b, x_d, NULL, T_p, DIM, 384, as->stream);
-
-    // 24 DiT Layers
-    for (int l = 0; l < 24; l++) {
-      const as_dit_layer_t *L = &d->layers[l];
-      k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(L->scale_shift, tproj_d, mod_d, 6 * DIM);
-      const float *shift_msa = mod_d + 0 * DIM;
-      const float *scale_msa = mod_d + 1 * DIM;
-      const float *gate_msa  = mod_d + 2 * DIM;
-      const float *c_shift   = mod_d + 3 * DIM;
-      const float *c_scale   = mod_d + 4 * DIM;
-      const float *c_gate    = mod_d + 5 * DIM;
-
-      // 1. Self-Attention (AdaLN -> GQA w/ RoPE -> TensorCore BF16 FA2 -> gated residual)
-      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-          x_d, L->self_norm_w, scale_msa, shift_msa, NULL, xn_bf16, T_p, DIM, 1e-6f);
-      as_gemm(xn_bf16, L->self_q, NULL, q_d, NULL, T_p, HQ * D,  DIM, as->stream);
-      as_gemm(xn_bf16, L->self_k, NULL, k_d, NULL, T_p, HKV * D, DIM, as->stream);
-      as_gemm(xn_bf16, L->self_v, NULL, v_d, NULL, T_p, HKV * D, DIM, as->stream);
-      int n_warps = T_p * (HQ + HKV);
-      k_as_qk_norm_rope_bf16<<<(n_warps + 7) / 8, 256, 0, as->stream>>>(
-          q_d, k_d, v_d, L->self_q_norm, L->self_k_norm, qr_b, kr_b, vr_b,
-          T_p, T_p, HQ, HKV, D, 1e6f, 1e-6f, 1);
-      int win = (l % 2 == 0) ? 128 : 0; // even: sliding W=128, odd: full
-      ec_ops_fa2_bf16(qr_b, kr_b, vr_b, NULL, ao_bf16, T_p, T_p, T_p, T_p, HQ, HKV, D, attn_scale, win, as->stream);
-      as_gemm(ao_bf16, L->self_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
-      k_as_add_gated<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, gate_msa, T_p, DIM);
-
-      // 2. Cross-Attention (RMSNorm -> TensorCore BF16 GQA FA2 against cached K/V)
-      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-          x_d, L->cross_norm_w, NULL, NULL, NULL, xn_bf16, T_p, DIM, 1e-6f);
-      as_gemm(xn_bf16, L->cross_q, NULL, q_d, NULL, T_p, HQ * D, DIM, as->stream);
-      int q_warps = T_p * HQ;
-      k_as_qk_norm_rope_bf16<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
-          q_d, NULL, NULL, L->cross_q_norm, NULL, qr_b, NULL, NULL,
-          T_p, 0, HQ, HKV, D, 1e6f, 1e-6f, 0);
-      ec_ops_fa2_bf16(qr_b, ck_cache[l], cv_cache[l], NULL, ao_bf16, T_p, L_enc, T_p, L_enc, HQ, HKV, D, attn_scale, 0, as->stream);
-      as_gemm(ao_bf16, L->cross_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
-      k_as_add_inplace<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)T_p * DIM);
-
-      // 3. SwiGLU MLP (AdaLN -> gate/up -> down -> gated residual)
-      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-          x_d, L->mlp_norm_w, c_scale, c_shift, NULL, xn_bf16, T_p, DIM, 1e-6f);
-      as_gemm(xn_bf16, L->mlp_gate, NULL, gate_d, NULL, T_p, FFN, DIM, as->stream);
-      as_gemm(xn_bf16, L->mlp_up,   NULL, up_d,   NULL, T_p, FFN, DIM, as->stream);
-      k_as_swiglu_pair_bf16<<<((long)T_p * FFN + 255) / 256, 256, 0, as->stream>>>(
-          gate_d, up_d, mlp_bf16, (long)T_p * FFN);
-      as_gemm(mlp_bf16, L->mlp_down, NULL, tmp_d, NULL, T_p, DIM, FFN, as->stream);
-      k_as_add_gated<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, c_gate, T_p, DIM);
+    eval_dit_pass(ck_cache, cv_cache, L_enc, vt_d);
+    // Official ACE-Step SFT CFG interval [0.0, 0.90]: release CFG in final 10% to keep cymbals & vocal air pristine!
+    float pct = (float)(step - s0) / (float)(n_steps - s0 > 0 ? n_steps - s0 : 1);
+    if (use_cfg && pct <= 0.90f) {
+      eval_dit_pass(uck_cache, ucv_cache, L_uncond, vu_d);
+      ec_ops_cfg_zerostar_vel(vt_d, vu_d, vt_d, (long)T * 64, cfg_scale, 0, as->stream);
     }
-
-    // Output Head: AdaLN + ConvTranspose1d(2048 -> 64, k=2, s=2) -> vt [T_pad, 64]
-    k_as_add_out_mod<<<(2 * DIM + 255) / 256, 256, 0, as->stream>>>(d->scale_shift_out, temb_d, out_mod_d, DIM);
-    k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-        x_d, d->norm_out_w, out_mod_d + DIM, out_mod_d, NULL, xn_bf16, T_p, DIM, 1e-6f);
-    as_gemm(xn_bf16, d->proj_out_w, d->proj_out_b2, vt_d, NULL, T_p, 128, DIM, as->stream);
 
     float dt = (step == n_steps - 1) ? t_cur : (t_cur - sched[step + 1]);
     k_as_ode_step<<<((long)T * 64 + 255) / 256, 256, 0, as->stream>>>(xt_d, vt_d, dt, (long)T * 64);
@@ -1376,11 +1476,14 @@ static int run_acestep_dit(
   }
   cudaStreamSynchronize(as->stream);
 
-  for (int l = 0; l < 24; l++) { cudaFree(ck_cache[l]); cudaFree(cv_cache[l]); }
+  for (int l = 0; l < 24; l++) {
+    cudaFree(ck_cache[l]); cudaFree(cv_cache[l]);
+    cudaFree(uck_cache[l]); cudaFree(ucv_cache[l]);
+  }
   cudaFree(temb_r_d); cudaFree(tproj_r_d); cudaFree(temb_t_d); cudaFree(tproj_t_d);
   cudaFree(temb_d); cudaFree(tproj_d); cudaFree(mod_d); cudaFree(out_mod_d);
   cudaFree(te_f_d); cudaFree(te_hf_d); cudaFree(te_hb_d);
-  cudaFree(ctx_d); cudaFree(xt_d); cudaFree(vt_d);
+  cudaFree(ctx_d); cudaFree(xt_d); cudaFree(vt_d); cudaFree(vu_d);
   cudaFree(patch_in_bf16); cudaFree(x_d); cudaFree(xn_bf16);
   cudaFree(q_d); cudaFree(k_d); cudaFree(v_d); cudaFree(qr_b); cudaFree(kr_b); cudaFree(vr_b);
   cudaFree(ao_bf16); cudaFree(tmp_d); cudaFree(gate_d); cudaFree(up_d); cudaFree(mlp_bf16);
@@ -1390,46 +1493,44 @@ static int run_acestep_dit(
 }
 
 // ===========================================================================
-// 11. Stage 4: Native CUDA AutoencoderOobleck 1D Stereo VAE Decoder
+// 11. Stage 4: Native CUDA AutoencoderOobleck 1D Stereo VAE Decoder — PURE IEEE FP32!
+//     (Eliminates 7-bit-mantissa BF16 stereo phase smear & metallic high-frequency hiss!)
 // ===========================================================================
-static void run_conv1d_k7_chunked(
+static void run_conv1d_k7_chunked_f32(
     ec_acestep_t *as, const float *x_d, float *y_d,
-    const uint16_t *w_bf16, const float *b_f32,
+    const float *w_f32, const float *b_f32,
     int L, int Cin, int Cout, int dil,
-    uint16_t *col_scratch, int max_chunk) {
+    float *col_scratch, int max_chunk) {
   for (int t0 = 0; t0 < L; t0 += max_chunk) {
     int ch = (L - t0 < max_chunk) ? (L - t0) : max_chunk;
     long n_col = (long)ch * 7 * Cin;
-    k_as_im2col_1d_k7<<<(n_col + 255) / 256, 256, 0, as->stream>>>(
+    k_as_im2col_1d_k7_f32<<<(n_col + 255) / 256, 256, 0, as->stream>>>(
         x_d, col_scratch, L, Cin, dil, t0, ch);
-    as_gemm(col_scratch, w_bf16, b_f32, y_d + (long)t0 * Cout, NULL, ch, Cout, 7 * Cin, as->stream);
+    ec_ops_gemm_f32(col_scratch, w_f32, b_f32, y_d + (long)t0 * Cout, ch, Cout, 7 * Cin, as->stream);
   }
 }
 
-static void run_conv1d_k1_chunked(
+static void run_conv1d_k1_chunked_f32(
     ec_acestep_t *as, const float *x_d, float *y_d,
-    const uint16_t *w_bf16, const float *b_f32,
-    int L, int Cin, int Cout,
-    uint16_t *bf16_scratch, int max_chunk) {
+    const float *w_f32, const float *b_f32,
+    int L, int Cin, int Cout, int max_chunk) {
   for (int t0 = 0; t0 < L; t0 += max_chunk) {
     int ch = (L - t0 < max_chunk) ? (L - t0) : max_chunk;
-    long n = (long)ch * Cin;
-    k_as_f32_to_bf16<<<(n + 255) / 256, 256, 0, as->stream>>>(x_d + (long)t0 * Cin, bf16_scratch, n);
-    as_gemm(bf16_scratch, w_bf16, b_f32, y_d + (long)t0 * Cout, NULL, ch, Cout, Cin, as->stream);
+    ec_ops_gemm_f32(x_d + (long)t0 * Cin, w_f32, b_f32, y_d + (long)t0 * Cout, ch, Cout, Cin, as->stream);
   }
 }
 
 static void run_oobleck_resunit(
     ec_acestep_t *as, float *x_d, float *buf_a, float *buf_b,
     const as_oobleck_res_t *R, int L, int C, int dil,
-    uint16_t *col_scratch, int max_chunk) {
+    float *col_scratch, int max_chunk) {
   long tot = (long)L * C;
   k_as_snake1d<<<(tot + 255) / 256, 256, 0, as->stream>>>(
       x_d, R->s1.exp_alpha, R->s1.inv_beta, buf_a, L, C);
-  run_conv1d_k7_chunked(as, buf_a, buf_b, R->c1_w, R->c1_b, L, C, C, dil, col_scratch, max_chunk);
+  run_conv1d_k7_chunked_f32(as, buf_a, buf_b, R->c1_w, R->c1_b, L, C, C, dil, col_scratch, max_chunk);
   k_as_snake1d<<<(tot + 255) / 256, 256, 0, as->stream>>>(
       buf_b, R->s2.exp_alpha, R->s2.inv_beta, buf_a, L, C);
-  run_conv1d_k1_chunked(as, buf_a, buf_b, R->c2_w, R->c2_b, L, C, C, col_scratch, max_chunk * 4);
+  run_conv1d_k1_chunked_f32(as, buf_a, buf_b, R->c2_w, R->c2_b, L, C, C, max_chunk * 4);
   k_as_add_inplace<<<(tot + 255) / 256, 256, 0, as->stream>>>(x_d, buf_b, tot);
 }
 
@@ -1440,16 +1541,16 @@ static int run_oobleck_vae_decode(
   double t0 = as_now_ms();
   const as_vae_resident_t *v = &as->vae;
 
-  // Scratch im2col buffer: 64 MB BF16 (handles any chunk cleanly!)
+  // Scratch im2col buffer: 128 MB FP32 (exact IEEE FP32 waveform synthesis!)
   const size_t COL_CAP_ELEMS = 32L * 1024 * 1024;
-  uint16_t *col_scratch = NULL;
-  if (cudaMalloc(&col_scratch, COL_CAP_ELEMS * 2) != cudaSuccess) return -1;
+  float *col_scratch = NULL;
+  if (cudaMalloc(&col_scratch, COL_CAP_ELEMS * 4) != cudaSuccess) return -1;
 
   // decoder.conv1: [T, 64] -> [T, 2048]
   float *cur_d = NULL;
   cudaMalloc(&cur_d, (size_t)T * 2048 * 4);
   int ch0 = (int)(COL_CAP_ELEMS / (7 * 64));
-  run_conv1d_k7_chunked(as, x0_d, cur_d, v->conv1_w, v->conv1_b, T, 64, 2048, 1, col_scratch, ch0);
+  run_conv1d_k7_chunked_f32(as, x0_d, cur_d, v->conv1_w, v->conv1_b, T, 64, 2048, 1, col_scratch, ch0);
 
   int L = T;
   const int dils[3] = {1, 3, 9};
@@ -1459,15 +1560,12 @@ static int run_oobleck_vae_decode(
     int s = B->stride;
     int Cin = B->in_c, Cout = B->out_c;
 
-    // 1. Snake1d in-place into buf_s
     float *buf_s = NULL;
     cudaMalloc(&buf_s, (size_t)L * Cin * 4);
     k_as_snake1d<<<((long)L * Cin + 255) / 256, 256, 0, as->stream>>>(
         cur_d, B->snake1.exp_alpha, B->snake1.inv_beta, buf_s, L, Cin);
     cudaFree(cur_d);
 
-    // 2. ConvTranspose1d(Cin -> Cout, k=2*s, stride=s, pad=s/2) -> [L_out, Cout]
-    // Allocate (L + 1) * s * Cout, compute chunked GEMMs, then slice starting at (s/2) * Cout!
     float *ct_full = NULL;
     cudaMalloc(&ct_full, (size_t)(L + 1) * s * Cout * 4);
     int q_max = (int)(COL_CAP_ELEMS / (2 * Cin));
@@ -1475,20 +1573,18 @@ static int run_oobleck_vae_decode(
     for (int q0 = 0; q0 < L + 1; q0 += q_max) {
       int qch = (L + 1 - q0 < q_max) ? (L + 1 - q0) : q_max;
       long n_p = (long)qch * 2 * Cin;
-      k_as_convt_pairs<<<(n_p + 255) / 256, 256, 0, as->stream>>>(buf_s, col_scratch, L, Cin, q0, qch);
-      as_gemm(col_scratch, B->conv_t_w, B->conv_t_b,
-              ct_full + (long)q0 * s * Cout, NULL, qch, s * Cout, 2 * Cin, as->stream);
+      k_as_convt_pairs_f32<<<(n_p + 255) / 256, 256, 0, as->stream>>>(buf_s, col_scratch, L, Cin, q0, qch);
+      ec_ops_gemm_f32(col_scratch, B->conv_t_w, B->conv_t_b,
+                      ct_full + (long)q0 * s * Cout, qch, s * Cout, 2 * Cin, as->stream);
     }
     cudaFree(buf_s);
 
-    // Copy contiguous valid slice [s/2 .. s/2 + L_out - 1] into next_d [L_out, Cout]
     float *next_d = NULL, *buf_a = NULL, *buf_b = NULL;
     cudaMalloc(&next_d, (size_t)L_out * Cout * 4);
     cudaMemcpyAsync(next_d, ct_full + (long)(s / 2) * Cout, (size_t)L_out * Cout * 4,
                     cudaMemcpyDeviceToDevice, as->stream);
     cudaFree(ct_full);
 
-    // 3. Three dilated Residual Units (dil = 1, 3, 9)
     cudaMalloc(&buf_a, (size_t)L_out * Cout * 4);
     cudaMalloc(&buf_b, (size_t)L_out * Cout * 4);
     int r_chunk = (int)(COL_CAP_ELEMS / (7 * Cout));
@@ -1512,7 +1608,7 @@ static int run_oobleck_vae_decode(
   cudaFree(cur_d);
 
   int fin_chunk = (int)(COL_CAP_ELEMS / (7 * 128));
-  run_conv1d_k7_chunked(as, sn_d, pcm_d, v->conv2_w, NULL, L, 128, 2, 1, col_scratch, fin_chunk);
+  run_conv1d_k7_chunked_f32(as, sn_d, pcm_d, v->conv2_w, NULL, L, 128, 2, 1, col_scratch, fin_chunk);
   cudaFree(sn_d);
   cudaFree(col_scratch);
 
@@ -1555,7 +1651,9 @@ static int run_oobleck_vae_encode(
 
   const size_t COL_CAP = 32L * 1024 * 1024;
   uint16_t *col = NULL;
+  float *col_f32 = NULL;
   if (cudaMalloc(&col, COL_CAP * 2) != cudaSuccess) return -1;
+  if (cudaMalloc(&col_f32, COL_CAP * 4) != cudaSuccess) { cudaFree(col); return -1; }
 
   float *pcm_d = NULL, *cur_d = NULL;
   cudaMalloc(&pcm_d, (size_t)L * 2 * 4);
@@ -1588,12 +1686,12 @@ static int run_oobleck_vae_encode(
     for (int u = 0; u < 3; u++) {
       as_oobleck_res_t R = {};
       snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.snake1", b, u + 1); load_snake(st, pfx, Cin, &R.s1);
-      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.conv1",  b, u + 1); R.c1_w = load_wn_conv1d_bf16(st, pfx, Cin, Cin, 7);
+      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.conv1",  b, u + 1); R.c1_w = load_wn_conv1d_f32(st, pfx, Cin, Cin, 7);
       snprintf(kb,  sizeof kb,  "%s.bias", pfx);                                R.c1_b = st_upload_f32(st, kb);
       snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.snake2", b, u + 1); load_snake(st, pfx, Cin, &R.s2);
-      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.conv2",  b, u + 1); R.c2_w = load_wn_conv1d_bf16(st, pfx, Cin, Cin, 1);
+      snprintf(pfx, sizeof pfx, "encoder.block.%d.res_unit%d.conv2",  b, u + 1); R.c2_w = load_wn_conv1d_f32(st, pfx, Cin, Cin, 1);
       snprintf(kb,  sizeof kb,  "%s.bias", pfx);                                R.c2_b = st_upload_f32(st, kb);
-      run_oobleck_resunit(as, cur_d, buf_a, buf_b, &R, L, Cin, dils[u], col, r_ch);
+      run_oobleck_resunit(as, cur_d, buf_a, buf_b, &R, L, Cin, dils[u], col_f32, r_ch);
       cudaStreamSynchronize(as->stream);
       free_snake(&R.s1); free_snake(&R.s2);
       cudaFree(R.c1_w); cudaFree(R.c1_b); cudaFree(R.c2_w); cudaFree(R.c2_b);
@@ -1634,7 +1732,7 @@ static int run_oobleck_vae_encode(
   k_as_slice_mu64<<<((long)L * 64 + 255) / 256, 256, 0, as->stream>>>(z128_d, z64_d, L);
   cudaMemcpyAsync(out_z64_h, z64_d, (size_t)L * 64 * 4, cudaMemcpyDeviceToHost, as->stream);
   cudaStreamSynchronize(as->stream);
-  cudaFree(sn_d); cudaFree(z128_d); cudaFree(z64_d); cudaFree(c2w); cudaFree(c2b); cudaFree(col);
+  cudaFree(sn_d); cudaFree(z128_d); cudaFree(z64_d); cudaFree(c2w); cudaFree(c2b); cudaFree(col); cudaFree(col_f32);
   if (out_T) *out_T = L;
   if (out_ms) *out_ms = as_now_ms() - t0;
   return 0;
@@ -1788,26 +1886,28 @@ extern "C" int ec_acestep_generate_wav(
   double t_all = as_now_ms();
 
   int bpm = (req->bpm >= 40 && req->bpm <= 240) ? req->bpm : 120;
-  float dur = (req->duration_sec >= 2.0f && req->duration_sec <= 120.0f) ? req->duration_sec : 10.0f;
-  int steps = (req->steps >= 1 && req->steps <= 8) ? req->steps : 8;
-  float shift = (req->shift >= 0.5f && req->shift <= 4.0f) ? req->shift : 3.0f;
+  float dur = (req->duration_sec >= 2.0f && req->duration_sec <= 120.0f) ? req->duration_sec : 20.0f;
+  const char *ckpt_use = (req->checkpoint_override && req->checkpoint_override[0]) ? req->checkpoint_override : as->paths.dit_path;
+  int is_sft_ckpt = (ckpt_use && (strstr(ckpt_use, "sft") != NULL || strstr(ckpt_use, "base") != NULL)) ? 1 : 0;
+  int steps = (req->steps >= 1 && req->steps <= 64) ? req->steps : (is_sft_ckpt ? 36 : 8);
+  float shift = (req->shift >= 0.5f && req->shift <= 5.0f) ? req->shift : 3.0f;
+  float cfg_scale = (req->cfg_scale > 1.05f) ? req->cfg_scale : (is_sft_ckpt ? 6.5f : 1.0f);
+  if (!is_sft_ckpt && steps <= 8) cfg_scale = 1.0f; // Turbo checkpoints are guidance-distilled!
   int T = (int)roundf(dur * 25.0f);
   if (T < 25) T = 25;
   int n_samples = T * 1920;
 
-  // Format exact SFT_GEN_PROMPT caption & lyrics strings (now including Key/Scale, Time Sig & Vocal Mode!)
-  const char *caption = (req->prompt && req->prompt[0]) ? req->prompt : "Warm cinematic instrumental synthwave";
+  // Format exact SFT_GEN_PROMPT caption & lyrics strings (clean instrumental tag — NEVER inject "no vocals"!)
+  const char *caption = (req->prompt && req->prompt[0]) ? req->prompt : "warm indie synth-pop, analog Juno-106 pads, tight Moog bass, crisp studio master, clean separation";
   const char *lyrics  = (req->lyrics && req->lyrics[0]) ? req->lyrics : "[Instrumental]";
   const char *vmode   = (req->vocal_mode && req->vocal_mode[0]) ? req->vocal_mode : "auto";
   if (!strcmp(vmode, "instrumental")) lyrics = "[Instrumental]";
-  const char *lang    = (lyrics && strcmp(lyrics, "[Instrumental]") != 0) ? "en" : "unknown";
+  const char *lang    = (lyrics && strcmp(lyrics, "[Instrumental]") != 0 && strcmp(lyrics, "[inst]") != 0) ? "en" : "unknown";
   const char *ks      = (req->key_scale && req->key_scale[0]) ? req->key_scale : "N/A";
   const char *tsig    = (req->time_sig && req->time_sig[0]) ? req->time_sig : "4";
   char cap_full[1536];
   if (strcmp(vmode, "auto") != 0 && strcmp(vmode, "instrumental") != 0) {
     snprintf(cap_full, sizeof cap_full, "%s, %s vocals", caption, vmode);
-  } else if (!strcmp(vmode, "instrumental")) {
-    snprintf(cap_full, sizeof cap_full, "%s, instrumental only, no vocals", caption);
   } else {
     snprintf(cap_full, sizeof cap_full, "%s", caption);
   }
@@ -1834,8 +1934,9 @@ extern "C" int ec_acestep_generate_wav(
     }
   }
 
-  int32_t text_ids[256], lyric_ids[1024];
-  int L_txt = ec_bpe_encode(as->bpe, cap_buf, text_ids, 256);
+  // Expanded to 1024 tokens so rich production tags NEVER silently truncate # Metas / BPM / duration / <|endoftext|>!
+  int32_t text_ids[1024], lyric_ids[1024];
+  int L_txt = ec_bpe_encode(as->bpe, cap_buf, text_ids, 1024);
   int L_lyr = ec_bpe_encode(as->bpe, lyr_buf, lyric_ids, 1024);
   if (L_txt <= 0 || L_lyr <= 0) {
     free(src_lat_h);
@@ -1854,12 +1955,22 @@ extern "C" int ec_acestep_generate_wav(
     return -1;
   }
 
-  // Stage 2: Condition Encoder (Text Proj + 8L Lyric + 4L Timbre)
+  // Stage 3a: Load DiT checkpoint FIRST so condition_encoder uses matching SFT/Turbo encoder weights!
+  int lora_hits = ensure_dit_loaded(as, ckpt_use, req->loras, req->n_loras);
+  if (lora_hits < 0) {
+    free(src_lat_h); cudaFree(text_bf16_d); cudaFree(lyric_bf16_d);
+    snprintf(res->error, sizeof res->error, "acestep dit weight load failed");
+    return -1;
+  }
+  res->lora_tensors_fused = lora_hits;
+
+  // Stage 2: Condition Encoder (Text Proj + 8L Lyric + 4L Timbre with real reference audio!)
   if (cb) cb(1, steps + 3, "acestep_cond_encode", cb_ctx);
   int L_enc = L_lyr + 1 + L_txt;
-  uint16_t *enc_packed_d = NULL;
+  uint16_t *enc_packed_d = NULL, *uncond_packed_d = NULL;
+  int L_uncond = 0;
   cudaMalloc(&enc_packed_d, (size_t)L_enc * 2048 * 2);
-  if (run_condition_encoder(as, text_bf16_d, L_txt, lyric_bf16_d, L_lyr, enc_packed_d, &res->cond_enc_ms) != 0) {
+  if (run_condition_encoder(as, text_bf16_d, L_txt, lyric_bf16_d, L_lyr, src_lat_h, T_src, enc_packed_d, &res->cond_enc_ms) != 0) {
     free(src_lat_h); cudaFree(text_bf16_d); cudaFree(lyric_bf16_d); cudaFree(enc_packed_d);
     snprintf(res->error, sizeof res->error, "condition encoder failed");
     return -1;
@@ -1867,31 +1978,66 @@ extern "C" int ec_acestep_generate_wav(
   cudaFree(text_bf16_d);
   cudaFree(lyric_bf16_d);
 
-  // Stage 3: Load & Run 24-Layer AceStepDiTModel (+ hot-fused LoRA/QLoRA/LoKr + Cover/Repaint/Extend!)
-  int lora_hits = ensure_dit_loaded(as, req->loras, req->n_loras);
-  if (lora_hits < 0) {
-    free(src_lat_h); cudaFree(enc_packed_d);
-    snprintf(res->error, sizeof res->error, "acestep dit weight load failed");
-    return -1;
+  // Optional Unconditional Conditioning for undistilled SFT/Base CFG (>1.05)!
+  if (cfg_scale > 1.05f) {
+    const ec_st_entry_t *null_e = ec_st_find(&as->dit_st, "null_condition_emb");
+    if (null_e && null_e->shape[null_e->rank - 1] == 2048) {
+      L_uncond = L_enc;
+      float *nh = NULL;
+      if (st_read_host_f32(&as->dit_st, "null_condition_emb", &nh, NULL) == 0 && nh) {
+        uint16_t *uh = (uint16_t *)malloc((size_t)L_uncond * 2048 * 2);
+        for (int t = 0; t < L_uncond; t++)
+          for (int c = 0; c < 2048; c++) uh[(long)t * 2048 + c] = as_f32_to_bf16_host(nh[c]);
+        free(nh);
+        cudaMalloc(&uncond_packed_d, (size_t)L_uncond * 2048 * 2);
+        cudaMemcpy(uncond_packed_d, uh, (size_t)L_uncond * 2048 * 2, cudaMemcpyHostToDevice);
+        free(uh);
+      }
+    }
+    if (!uncond_packed_d) {
+      // Fallback: encode empty caption + [Instrumental] unconditional prompt
+      int32_t ut_ids[128], ul_ids[64];
+      const char *ucap = "# Instruction\nFill the audio semantic mask based on the given conditions:\n\n# Caption\n\n\n# Metas\n- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n- duration: N/A\n<|endoftext|>\n";
+      const char *ulyr = "# Languages\nunknown\n\n# Lyric\n[Instrumental]<|endoftext|>";
+      int Lu_t = ec_bpe_encode(as->bpe, ucap, ut_ids, 128);
+      int Lu_l = ec_bpe_encode(as->bpe, ulyr, ul_ids, 64);
+      if (Lu_t > 0 && Lu_l > 0) {
+        uint16_t *ut_d = NULL, *ul_d = NULL;
+        cudaMalloc(&ut_d, (size_t)Lu_t * 1024 * 2);
+        cudaMalloc(&ul_d, (size_t)Lu_l * 1024 * 2);
+        double ums = 0.0;
+        if (run_qwen3_06b(as, ut_ids, Lu_t, ul_ids, Lu_l, ut_d, ul_d, &ums) == 0) {
+          L_uncond = Lu_l + 1 + Lu_t;
+          cudaMalloc(&uncond_packed_d, (size_t)L_uncond * 2048 * 2);
+          if (run_condition_encoder(as, ut_d, Lu_t, ul_d, Lu_l, NULL, 0, uncond_packed_d, &ums) != 0) {
+            cudaFree(uncond_packed_d); uncond_packed_d = NULL; L_uncond = 0;
+          }
+        }
+        cudaFree(ut_d); cudaFree(ul_d);
+      }
+    }
   }
-  res->lora_tensors_fused = lora_hits;
+
+  // Stage 3b: Run 24-Layer AceStepDiTModel (+ hot-fused LoRA/LoKr + SFT CFG-Zero*!)
   float *x0_d = NULL;
   cudaMalloc(&x0_d, (size_t)T * 64 * 4);
   const char *amode = (req->audio_mode && req->audio_mode[0]) ? req->audio_mode : (src_lat_h ? "cover" : "generate");
   float denoise = (req->denoise > 0.05f && req->denoise <= 1.0f) ? req->denoise : 0.65f;
-  int rc = run_acestep_dit(as, enc_packed_d, L_enc, T, steps, shift, req->seed,
+  int rc = run_acestep_dit(as, enc_packed_d, L_enc, uncond_packed_d, L_uncond, cfg_scale,
+                           T, steps, shift, req->seed,
                            src_lat_h, T_src, amode, denoise, req->repaint_start_sec, req->repaint_end_sec,
                            x0_d, cb, cb_ctx, &res->dit_ms);
   free(src_lat_h);
   cudaFree(enc_packed_d);
+  cudaFree(uncond_packed_d);
   if (rc != 0) {
     cudaFree(x0_d);
     snprintf(res->error, sizeof res->error, rc == -2 ? "cancelled" : "acestep dit denoising failed");
     return rc;
   }
 
-  // Stage 4: Load & Run AutoencoderOobleck 1D Stereo Audio VAE -> 48 kHz Stereo PCM
-  if (cb) cb(steps + 2, steps + 3, "acestep_oobleck_vae", cb_ctx);
+  // Stage 4: Load & Run Pure FP32 AutoencoderOobleck 1D Stereo Audio VAE -> 48 kHz Stereo PCM
+  if (cb) cb(steps + 2, steps + 3, "acestep_oobleck_vae_fp32", cb_ctx);
   if (ensure_vae_loaded(as) != 0) {
     cudaFree(x0_d);
     snprintf(res->error, sizeof res->error, "oobleck vae weight load failed");
@@ -1906,7 +2052,11 @@ extern "C" int ec_acestep_generate_wav(
   res->vae_ms += enc_ms;
   cudaFree(x0_d);
 
-  // Peak normalize softly only if peak > 0.99 (preserve genuine studio dynamics!), compute RMS/peak
+  // Stage 5 (v16): Native 48 kHz Studio Mastering DSP Chain (28Hz HPF, anti-mud EQ, air shelf, <120Hz bass mono, -13.5 LUFS, -1.0 dBTP True-Peak Limiter!)
+  if (!(getenv("EC_MUSIC_RAW") && atoi(getenv("EC_MUSIC_RAW")) != 0)) {
+    float master_lufs = -13.5f, master_tp = -1.0f;
+    ec_audio_master_studio(pcm_lr, n_samples, 48000, -13.5f, -1.0f, &master_lufs, &master_tp);
+  }
   float peak = 0.0f;
   double sum_sq = 0.0;
   for (long i = 0; i < (long)n_samples * 2; i++) {
@@ -1915,15 +2065,6 @@ extern "C" int ec_acestep_generate_wav(
     float a = fabsf(v);
     if (a > peak) peak = a;
     sum_sq += (double)v * (double)v;
-  }
-  if (peak > 0.99f) {
-    float gain = 0.98f / peak;
-    sum_sq = 0.0;
-    for (long i = 0; i < (long)n_samples * 2; i++) {
-      pcm_lr[i] *= gain;
-      sum_sq += (double)pcm_lr[i] * (double)pcm_lr[i];
-    }
-    peak = 0.98f;
   }
   double rms = sqrt(sum_sq / (double)((long)n_samples * 2) + 1e-12);
 

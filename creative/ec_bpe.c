@@ -423,53 +423,165 @@ static int bpe_encode_chunk(const ec_bpe_t *t, const char *s, size_t len, int32_
   return written;
 }
 
-static int is_ascii_letter(unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80; }
-static int is_ascii_digit(unsigned char c)  { return (c >= '0' && c <= '9'); }
-static int is_space_ch(unsigned char c)     { return c == ' ' || c == '\t'; }
+// Decode single UTF-8 codepoint at s[pos..len), advancing *next_pos
+static uint32_t bpe_utf8_next(const char *s, size_t len, size_t pos, size_t *next_pos) {
+  unsigned char c0 = (unsigned char)s[pos];
+  if (c0 < 0x80) { *next_pos = pos + 1; return c0; }
+  if ((c0 & 0xE0) == 0xC0 && pos + 1 < len) {
+    *next_pos = pos + 2;
+    return ((uint32_t)(c0 & 0x1F) << 6) | (uint32_t)((unsigned char)s[pos + 1] & 0x3F);
+  }
+  if ((c0 & 0xF0) == 0xE0 && pos + 2 < len) {
+    *next_pos = pos + 3;
+    return ((uint32_t)(c0 & 0x0F) << 12) |
+           ((uint32_t)((unsigned char)s[pos + 1] & 0x3F) << 6) |
+           (uint32_t)((unsigned char)s[pos + 2] & 0x3F);
+  }
+  if ((c0 & 0xF8) == 0xF0 && pos + 3 < len) {
+    *next_pos = pos + 4;
+    return ((uint32_t)(c0 & 0x07) << 18) |
+           ((uint32_t)((unsigned char)s[pos + 1] & 0x3F) << 12) |
+           ((uint32_t)((unsigned char)s[pos + 2] & 0x3F) << 6) |
+           (uint32_t)((unsigned char)s[pos + 3] & 0x3F);
+  }
+  *next_pos = pos + 1;
+  return c0;
+}
 
-// Qwen2/Qwen3 pre-tokenizer splitter (faithful ASCII + UTF-8 letter/digit/punct/newline segmentation)
+static int bpe_is_letter(uint32_t cp) {
+  if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return 1;
+  if (cp < 0x80) return 0;
+  // Latin-1 Supplement letters (exclude punctuation/symbols like ©, °, ×, ÷)
+  if ((cp >= 0x00C0 && cp <= 0x00D6) || (cp >= 0x00D8 && cp <= 0x00F6) || (cp >= 0x00F8 && cp <= 0x02AF)) return 1;
+  // Greek, Cyrillic, Armenian, Hebrew, Arabic, Devanagari, Thai, Hangul, Kana, CJK Ideographs
+  if (cp >= 0x0370 && cp <= 0x1FFF) return 1;
+  if (cp >= 0x3040 && cp <= 0x30FF) return 1;
+  if (cp >= 0x3400 && cp <= 0x9FFF) return 1;
+  if (cp >= 0xAC00 && cp <= 0xD7AF) return 1;
+  if (cp >= 0xF900 && cp <= 0xFAFF) return 1;
+  if (cp >= 0x20000 && cp <= 0x2FA1F) return 1;
+  return 0; // Punctuation (em-dash 0x2014, curly quotes 0x201C/D, CJK punct 0x3000..0x303F, fullwidth punct) -> NOT letter!
+}
+
+static int bpe_is_digit(uint32_t cp) {
+  return (cp >= '0' && cp <= '9') || (cp >= 0xFF10 && cp <= 0xFF19);
+}
+
+static int bpe_is_ws(uint32_t cp) {
+  return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' || cp == '\v' || cp == 0x00A0 || cp == 0x3000;
+}
+
+static int bpe_is_crlf(uint32_t cp) { return cp == '\r' || cp == '\n'; }
+
+// Exact Qwen2/Qwen3 pre-tokenizer regex:
+// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 static int encode_plain_segment(const ec_bpe_t *t, const char *s, size_t len, int32_t *out, int max_out) {
   int total = 0;
   size_t i = 0;
   while (i < len && total < max_out) {
-    size_t start = i;
-    unsigned char c = (unsigned char)s[i];
-    // Contractions: 's 't 're 've 'm 'll 'd (case-insensitive)
-    if (c == '\'' && i + 1 < len) {
+    size_t start = i, nxt = i;
+    uint32_t cp = bpe_utf8_next(s, len, i, &nxt);
+
+    // 1. Contractions: (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if (cp == '\'' && i + 1 < len) {
       char c1 = (char)tolower((unsigned char)s[i + 1]);
       char c2 = (i + 2 < len) ? (char)tolower((unsigned char)s[i + 2]) : 0;
       if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
         i += 2;
+        total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
+        continue;
       } else if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
         i += 3;
-      } else {
-        i++;
+        total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
+        continue;
       }
-    } else if (c == '\r' || c == '\n') {
-      while (i < len && (s[i] == '\r' || s[i] == '\n')) i++;
-    } else if (is_ascii_digit(c)) {
-      // Qwen3 splits digits individually (\p{N})!
-      i++;
-    } else if (is_ascii_letter(c)) {
-      while (i < len && is_ascii_letter((unsigned char)s[i])) i++;
-    } else if (is_space_ch(c)) {
-      // Leading single space attaches to following letters or punctuation (standard GPT-2 / Qwen3 rule)
-      if (i + 1 < len && is_ascii_letter((unsigned char)s[i + 1])) {
-        i++;
-        while (i < len && is_ascii_letter((unsigned char)s[i])) i++;
-      } else if (i + 1 < len && !is_space_ch((unsigned char)s[i + 1]) && s[i + 1] != '\r' && s[i + 1] != '\n' && !is_ascii_digit((unsigned char)s[i + 1])) {
-        i++;
-        while (i < len && !is_space_ch((unsigned char)s[i]) && !is_ascii_letter((unsigned char)s[i]) &&
-               !is_ascii_digit((unsigned char)s[i]) && s[i] != '\r' && s[i] != '\n') i++;
-      } else {
-        while (i < len && is_space_ch((unsigned char)s[i])) i++;
-      }
-    } else {
-      // Punctuation run
-      while (i < len && !is_space_ch((unsigned char)s[i]) && !is_ascii_letter((unsigned char)s[i]) &&
-             !is_ascii_digit((unsigned char)s[i]) && s[i] != '\r' && s[i] != '\n' && s[i] != '\'') i++;
-      if (i == start) i++;
     }
+
+    // 2. [^\r\n\p{L}\p{N}]?\p{L}+
+    if (bpe_is_letter(cp)) {
+      i = nxt;
+      while (i < len) {
+        size_t n2; uint32_t c2 = bpe_utf8_next(s, len, i, &n2);
+        if (!bpe_is_letter(c2)) break;
+        i = n2;
+      }
+      total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
+      continue;
+    }
+    if (!bpe_is_crlf(cp) && !bpe_is_digit(cp) && nxt < len) {
+      size_t n2; uint32_t c2 = bpe_utf8_next(s, len, nxt, &n2);
+      if (bpe_is_letter(c2)) {
+        i = n2;
+        while (i < len) {
+          size_t n3; uint32_t c3 = bpe_utf8_next(s, len, i, &n3);
+          if (!bpe_is_letter(c3)) break;
+          i = n3;
+        }
+        total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
+        continue;
+      }
+    }
+
+    // 3. \p{N} (single digit!)
+    if (bpe_is_digit(cp)) {
+      i = nxt;
+      total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
+      continue;
+    }
+
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
+    {
+      size_t p = i;
+      if (cp == ' ' && nxt < len) p = nxt;
+      if (p < len) {
+        size_t p2; uint32_t pc = bpe_utf8_next(s, len, p, &p2);
+        if (!bpe_is_ws(pc) && !bpe_is_letter(pc) && !bpe_is_digit(pc)) {
+          i = p2;
+          while (i < len) {
+            size_t n3; uint32_t c3 = bpe_utf8_next(s, len, i, &n3);
+            if (bpe_is_ws(c3) || bpe_is_letter(c3) || bpe_is_digit(c3)) break;
+            i = n3;
+          }
+          while (i < len && (s[i] == '\r' || s[i] == '\n')) i++;
+          total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
+          continue;
+        }
+      }
+    }
+
+    // 5. \s*[\r\n]+ | 6. \s+(?!\S) | 7. \s+
+    if (bpe_is_ws(cp)) {
+      size_t p = i;
+      size_t last_crlf_end = 0;
+      while (p < len) {
+        size_t n2; uint32_t c2 = bpe_utf8_next(s, len, p, &n2);
+        if (!bpe_is_ws(c2)) break;
+        if (bpe_is_crlf(c2)) last_crlf_end = n2;
+        p = n2;
+      }
+      if (last_crlf_end > start) {
+        i = last_crlf_end;
+      } else {
+        // \s+(?!\S): if followed by non-ws AND run has >1 whitespace char, leave the final space for next token!
+        if (p < len && p > nxt) {
+          // Back up one UTF-8 char (typically single ' ') before p
+          size_t prev_p = start, cur_p = start;
+          while (cur_p < p) {
+            prev_p = cur_p;
+            size_t n2; bpe_utf8_next(s, len, cur_p, &n2);
+            cur_p = n2;
+          }
+          i = (prev_p > start) ? prev_p : p;
+        } else {
+          i = p;
+        }
+      }
+      total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
+      continue;
+    }
+
+    // Fallback single codepoint
+    i = nxt;
     total += bpe_encode_chunk(t, s + start, i - start, out + total, max_out - total);
   }
   return total;
@@ -481,12 +593,12 @@ int ec_bpe_encode(const ec_bpe_t *t, const char *text, int32_t *out_ids, int max
   int total = 0;
   size_t pos = 0, seg_start = 0;
   while (pos < len && total < max_out) {
-    int matched = -1;
+    int matched = -1, best_len = 0;
     for (int s = 0; s < t->n_specials; s++) {
       int sl = t->specials[s].len;
-      if (pos + (size_t)sl <= len && memcmp(text + pos, t->specials[s].text, (size_t)sl) == 0) {
+      if (sl > best_len && pos + (size_t)sl <= len && memcmp(text + pos, t->specials[s].text, (size_t)sl) == 0) {
         matched = s;
-        break;
+        best_len = sl;
       }
     }
     if (matched >= 0) {

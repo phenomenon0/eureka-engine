@@ -444,8 +444,12 @@ static int apply_one_pair(
           free(ha); free(hb);
         }
         if (h1 && h2 && m1 * m2 == expected_out && n1 * n2 == expected_in) {
-          float alpha = read_alpha_or_default(st, prefixes[pi], alt, (float)rk);
-          float scale = strength * (alpha / (float)(rk > 0 ? rk : 1));
+          int is_full_lokr = (e2 && e2->rank == 2) ? 1 : 0;
+          float def_alpha = is_full_lokr ? 1.0f : (float)rk;
+          float alpha = read_alpha_or_default(st, prefixes[pi], alt, def_alpha);
+          // LyCORIS / Side-Step full-matrix LoKr uses scale = 1.0 (or alpha when <= 1), NOT alpha / min(m2, n2)!
+          float denom = (is_full_lokr && alpha <= 1.001f) ? 1.0f : (float)(rk > 0 ? rk : 1);
+          float scale = strength * (alpha / denom);
           float *d1, *d2;
           cudaMalloc(&d1, (size_t)m1 * n1 * 4);
           cudaMalloc(&d2, (size_t)m2 * n2 * 4);
@@ -590,6 +594,26 @@ extern "C" int ec_lora_fuse_onto_bf16(
         snprintf(dk, sizeof dk, "layers.%d.%s", bi, sub);
         hit += apply_one_pair(&st, dk, W_bf16_d, 0, out_dim, in_dim, stack[li].strength, stats, stream);
       }
+      // 2e. Tongyi-MAI Z-Image-Turbo S3-DiT ("layers.N.attention.qkv" <-> "layers.N.attention.to_{q,k,v}",
+      //     "layers.N.attention.out" <-> "layers.N.attention.to_out.0"; also context_refiner / noise_refiner!)
+      else {
+        char pfx[64] = {0};
+        if (sscanf(stem, "%63[^.].%d.%127s", pfx, &bi, sub) == 3 &&
+            (!strcmp(pfx, "layers") || !strcmp(pfx, "context_refiner") || !strcmp(pfx, "noise_refiner"))) {
+          char dk[192];
+          if (strcmp(sub, "attention.qkv") == 0 && out_dim == 3 * in_dim) {
+            snprintf(dk, sizeof dk, "%s.%d.attention.to_q", pfx, bi);
+            hit += apply_one_pair(&st, dk, W_bf16_d, 0, in_dim, in_dim, stack[li].strength, stats, stream);
+            snprintf(dk, sizeof dk, "%s.%d.attention.to_k", pfx, bi);
+            hit += apply_one_pair(&st, dk, W_bf16_d, in_dim, in_dim, in_dim, stack[li].strength, stats, stream);
+            snprintf(dk, sizeof dk, "%s.%d.attention.to_v", pfx, bi);
+            hit += apply_one_pair(&st, dk, W_bf16_d, 2 * in_dim, in_dim, in_dim, stack[li].strength, stats, stream);
+          } else if (strcmp(sub, "attention.out") == 0) {
+            snprintf(dk, sizeof dk, "%s.%d.attention.to_out.0", pfx, bi);
+            hit += apply_one_pair(&st, dk, W_bf16_d, 0, out_dim, in_dim, stack[li].strength, stats, stream);
+          }
+        }
+      }
     }
     total_hits += hit;
     ec_st_close(&st);
@@ -605,7 +629,7 @@ extern "C" int ec_lora_inspect_ex(
   char err[128] = {0};
   if (ec_st_open(&st, path, err, sizeof err) != 0) return -1;
   int pairs = 0, rank = 0;
-  int has_flux2 = 0, has_qwen = 0, has_wan = 0, has_flux1 = 0, has_acestep = 0, has_trellis = 0;
+  int has_flux2 = 0, has_zimage = 0, has_qwen = 0, has_wan = 0, has_flux1 = 0, has_acestep = 0, has_trellis = 0;
   int has_nf4 = 0, has_fp8 = 0, has_dora = 0, has_loha = 0, has_lokr = 0;
   for (uint32_t i = 0; i < st.n_tensors; i++) {
     const ec_st_entry_t *e = &st.entries[i];
@@ -625,6 +649,8 @@ extern "C" int ec_lora_inspect_ex(
 
     if (strstr(e->name, "to_qkv_mlp_proj") || strstr(e->name, "double_stream_modulation") ||
         (strstr(e->name, "double_blocks") && strstr(e->name, "img_attn.qkv"))) has_flux2 = 1;
+    if (strstr(e->name, "layers.") && (strstr(e->name, "attention.to_q") || strstr(e->name, "attention.qkv") ||
+        strstr(e->name, "adaLN_modulation"))) has_zimage = 1;
     if (strstr(e->name, "double_blocks") || strstr(e->name, "single_blocks")) has_flux1 = 1;
     if (strstr(e->name, "transformer_blocks") && strstr(e->name, "img_mod")) has_qwen = 1;
     if ((strstr(e->name, "self_attn") && strstr(e->name, "cross_attn") && strstr(e->name, "blocks.")) ||
@@ -637,7 +663,8 @@ extern "C" int ec_lora_inspect_ex(
   if (out_pairs) *out_pairs = pairs;
   if (out_rank) *out_rank = rank;
   if (arch_hint && arch_cap > 0) {
-    if (has_flux2)        snprintf(arch_hint, arch_cap, "flux2_lora");
+    if (has_zimage)       snprintf(arch_hint, arch_cap, "zimage_lora");
+    else if (has_flux2)   snprintf(arch_hint, arch_cap, "flux2_lora");
     else if (has_acestep) snprintf(arch_hint, arch_cap, "acestep_music_lora");
     else if (has_wan)     snprintf(arch_hint, arch_cap, "wan2_video_lora");
     else if (has_trellis) snprintf(arch_hint, arch_cap, "trellis2_3d_lora");

@@ -228,8 +228,9 @@ __global__ void k_qwen3_gqa_attn(
   float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int kpos = 0; kpos <= qpos; kpos++) {
-    // Attend to all valid tokens up to qpos (and self if pad token)
-    if (mask[kpos] == 0 && kpos != qpos) continue;
+    // Official HF/Diffusers right-padded causal attention: pad keys (mask==0) are strictly masked
+    // even when kpos==qpos so ~470 right-pad tokens never create self-attention spikes across 27 layers!
+    if (mask[kpos] == 0) continue;
     const float *kv = kbase + (long)kpos * D;
     float dot = 0.0f;
     #pragma unroll
@@ -342,6 +343,60 @@ __global__ void k_flux2_pack_qkv_rope(
     ko[d1] = __float2half_rn(fmaxf(-65000.0f, fminf(65000.0f, rk1)));
     vo[d0] = __float2half_rn(fmaxf(-65000.0f, fminf(65000.0f, vs[d0])));
     vo[d1] = __float2half_rn(fmaxf(-65000.0f, fminf(65000.0f, vs[d1])));
+  }
+}
+
+// Native BF16 QKV + QK-RMSNorm + 4D RoPE packer for Exact Tier (`ec_ops_fa2_bf16` — ZERO FP16 clamping!)
+__global__ void k_flux2_pack_qkv_rope_bf16(
+    const float *__restrict__ qkv, int row_stride,
+    const float *__restrict__ q_norm_w, const float *__restrict__ k_norm_w,
+    const float *__restrict__ rope_cos, const float *__restrict__ rope_sin,
+    uint16_t *__restrict__ Q_out, uint16_t *__restrict__ K_out, uint16_t *__restrict__ V_out,
+    int n_tok, int tok_off, int n_pad, int H, int D, float eps) {
+  long pair = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  int lane = threadIdx.x & 31;
+  if (pair >= (long)n_tok * H) return;
+  int h = (int)(pair % H);
+  int t = (int)(pair / H);
+  int E = H * D;
+  const float *base = qkv + (long)t * row_stride;
+  const float *qs = base + h * D;
+  const float *ks = base + E + h * D;
+  const float *vs = base + 2 * E + h * D;
+
+  float sq = 0.0f, sk = 0.0f;
+  for (int d = lane; d < D; d += 32) {
+    float qv = qs[d], kv = ks[d];
+    sq += qv * qv; sk += kv * kv;
+  }
+  sq = warp_sum_dev(sq); sk = warp_sum_dev(sk);
+  float inv_q = rsqrtf(sq / (float)D + eps);
+  float inv_k = rsqrtf(sk / (float)D + eps);
+
+  int gtok = tok_off + t;
+  const float *rc = rope_cos + (long)gtok * (D >> 1);
+  const float *rs = rope_sin + (long)gtok * (D >> 1);
+
+  long out_base = ((long)h * n_pad + gtok) * D;
+  uint16_t *qo = Q_out + out_base;
+  uint16_t *ko = K_out + out_base;
+  uint16_t *vo = V_out + out_base;
+
+  for (int p = lane; p < (D >> 1); p += 32) {
+    int d0 = 2 * p, d1 = d0 + 1;
+    float q0 = qs[d0] * inv_q * q_norm_w[d0];
+    float q1 = qs[d1] * inv_q * q_norm_w[d1];
+    float k0 = ks[d0] * inv_k * k_norm_w[d0];
+    float k1 = ks[d1] * inv_k * k_norm_w[d1];
+    float cs = rc[p], sn = rs[p];
+    float rq0 = q0 * cs - q1 * sn, rq1 = q0 * sn + q1 * cs;
+    float rk0 = k0 * cs - k1 * sn, rk1 = k0 * sn + k1 * cs;
+    qo[d0] = f32_to_bf16_dev(rq0);
+    qo[d1] = f32_to_bf16_dev(rq1);
+    ko[d0] = f32_to_bf16_dev(rk0);
+    ko[d1] = f32_to_bf16_dev(rk1);
+    vo[d0] = f32_to_bf16_dev(vs[d0]);
+    vo[d1] = f32_to_bf16_dev(vs[d1]);
   }
 }
 
@@ -1281,11 +1336,11 @@ static int run_qwen3_text_encoder(
     return 0;
   }
 
-  // Persistent cross-restart Cowrie v2 SHA-NI StatePage lookup (7.86 MB -> ~2.1 ms instead of ~1.2 s!)
+  // Persistent cross-restart Cowrie v2 SHA-NI StatePage lookup (v2 namespace: exact Qwen3 pad-mask + BPE regex!)
   if (prompt && fx->te_sha[0] && ec_cowrie_available()) {
     if (!fx->cached_prompt_bf16) fx->cached_prompt_bf16 = (uint16_t *)malloc(emb_elems * 2);
     if (fx->cached_prompt_bf16 &&
-        ec_cowrie_sp_load("flux2_qwen3", fx->te_sha, prompt, strlen(prompt),
+        ec_cowrie_sp_load("flux2_qwen3_v2", fx->te_sha, prompt, strlen(prompt),
                           EC_COWRIE_KV_BF16, fx->cached_prompt_bf16, emb_elems * 2) == 0) {
       snprintf(fx->cached_prompt, sizeof fx->cached_prompt, "%s", prompt);
       fx->has_cached_prompt = 1;
@@ -1439,7 +1494,7 @@ static int run_qwen3_text_encoder(
     snprintf(fx->cached_prompt, sizeof fx->cached_prompt, "%s", prompt);
     fx->has_cached_prompt = 1;
     if (fx->te_sha[0] && ec_cowrie_available()) {
-      ec_cowrie_sp_save("flux2_qwen3", fx->te_sha, prompt, strlen(prompt),
+      ec_cowrie_sp_save("flux2_qwen3_v2", fx->te_sha, prompt, strlen(prompt),
                         (uint32_t)L, EC_COWRIE_KV_BF16, fx->cached_prompt_bf16, emb_elems * 2);
     }
   }
@@ -1460,12 +1515,16 @@ static int run_qwen3_text_encoder(
 static double compute_empirical_mu(int image_seq_len, int num_steps) {
   const double a1 = 8.73809524e-05, b1 = 1.89833333;
   const double a2 = 0.00016927,     b2 = 0.45666666;
-  if (image_seq_len > 4300) return a2 * image_seq_len + b2;
-  double m200 = a2 * image_seq_len + b2;
-  double m10  = a1 * image_seq_len + b1;
+  // Smooth continuity above L=4300 for low-step schedules (eliminates the sudden 2.29->1.18 cliff at 1088px-1536px!)
+  int L_eff = (image_seq_len > 4300 && num_steps <= 12) ? 4300 : image_seq_len;
+  if (L_eff > 4300) return a2 * L_eff + b2;
+  double m200 = a2 * L_eff + b2;
+  double m10  = a1 * L_eff + b1;
   double a = (m200 - m10) / 190.0;
   double b = m200 - 200.0 * a;
-  return a * num_steps + b;
+  double mu = a * num_steps + b;
+  if (image_seq_len > 4300 && num_steps <= 12) mu += a2 * (double)(image_seq_len - 4300);
+  return mu;
 }
 
 static uint64_t sm64(uint64_t *s) {
@@ -1515,7 +1574,7 @@ static int run_flux2_dit(
 
   // Shifted sigmas schedule (with FLUX.2 empirical mu-shifted SDEdit starting at t_lin = denoise for unmasked Img2Img!)
   int s0 = 0;
-  float sigmas[64];
+  float sigmas[72];
   if (z0_init_d && !mask_p_d && denoise > 0.01f && denoise < 0.99f) {
     if (steps < 6) steps = 6;
     double mu = compute_empirical_mu(N_img, steps);
@@ -1564,8 +1623,8 @@ static int run_flux2_dit(
   need_arena += align256((size_t)N_tot * (E + F) * 2);   // cat_bf
   need_arena += align256((size_t)N_tot * E * 4) * 2;     // attn_out, proj_out
   need_arena += align256(lin1_bytes);                    // lin1_out (aliased with qkv_img/qkv_txt & mlp_2f!)
-  need_arena += align256((size_t)N_img * 128 * 4) * (use_cfg ? 2 : 1); // v_pred (+ v_neg)
-  need_arena += align256((size_t)H * N_pad * D * 2) * 3; // Q_h, K_h, V_h
+  need_arena += align256((size_t)N_img * 128 * 4) * (use_cfg ? 3 : 2); // v_pred, old_x0 (+ v_neg)
+  need_arena += align256((size_t)H * N_pad * D * 2) * 3; // Q_h, K_h, V_h (BF16 in Exact, F16 in Sage-I8)
   need_arena += align256((size_t)N_tot * (E + F));       // act_q8
   need_arena += align256((size_t)N_tot * ((E + F) / 64) * 4); // act_sc
   if (use_sage) {
@@ -1612,10 +1671,14 @@ static int run_flux2_dit(
   float *qkv_txt     = (float *)((uint8_t *)lin1_out + align256((size_t)N_img * 3 * E * 4));
   float *mlp_2f      = lin1_out;
   float *v_pred      = (float *)carve((size_t)N_img * 128 * 4);
+  float *old_x0      = (float *)carve((size_t)N_img * 128 * 4);
   float *v_neg       = use_cfg ? (float *)carve((size_t)N_img * 128 * 4) : NULL;
   __half *Q_h        = (__half *)carve((size_t)H * N_pad * D * 2);
   __half *K_h        = (__half *)carve((size_t)H * N_pad * D * 2);
   __half *V_h        = (__half *)carve((size_t)H * N_pad * D * 2);
+  uint16_t *Q_bf     = (uint16_t *)Q_h;
+  uint16_t *K_bf     = (uint16_t *)K_h;
+  uint16_t *V_bf     = (uint16_t *)V_h;
   int8_t *act_q8     = (int8_t *)carve((size_t)N_tot * (E + F));
   float  *act_sc     = (float *)carve((size_t)N_tot * ((E + F) / 64) * 4);
   int8_t *sage_q_i8  = use_sage ? (int8_t *)carve((size_t)H * N_pad * D) : NULL;
@@ -1664,7 +1727,19 @@ static int run_flux2_dit(
       ec_launch_sage_attn_i8(Q_h, K_h, V_h, sage_q_i8, sage_k_i8, sage_q_sc, sage_k_sc,
                              attn_out, NULL, N_tot, N_tot, N_pad, N_pad, H, D, attn_scale, 0, s);
     } else {
-      ec_launch_fa2_f16(Q_h, K_h, V_h, attn_out, NULL, N_tot, N_tot, N_pad, N_pad, H, D, attn_scale, 0, s);
+      // Pure native BF16 TensorCore FlashAttention-2 (zero FP16 [-65000,65000] clamping!)
+      ec_ops_fa2_bf16(Q_bf, K_bf, V_bf, attn_out, NULL, N_tot, N_tot, N_pad, N_pad, H, H, D, attn_scale, 0, s);
+    }
+  };
+
+  auto pack_qkv_fx = [&](const float *qkv_src, int stride, const float *qn, const float *kn, int n_tok, int tok_off) {
+    int warps = n_tok * H;
+    if (use_sage) {
+      k_flux2_pack_qkv_rope<<<(warps + 7) / 8, 256, 0, s>>>(
+          qkv_src, stride, qn, kn, rope_cos, rope_sin, Q_h, K_h, V_h, n_tok, tok_off, N_pad, H, D, 1e-6f);
+    } else {
+      k_flux2_pack_qkv_rope_bf16<<<(warps + 7) / 8, 256, 0, s>>>(
+          qkv_src, stride, qn, kn, rope_cos, rope_sin, Q_bf, K_bf, V_bf, n_tok, tok_off, N_pad, H, D, 1e-6f);
     }
   };
 
@@ -1679,11 +1754,8 @@ static int run_flux2_dit(
       k_adaln_bf16<<<N_txt, 256, 0, s>>>(txt_d, mod_txt_v, mod_txt_v + E, norm_txt_bf, N_txt, E, 1e-6f);
       gemm_fx(norm_bf,     w->img_qkv, qkv_img, N_img, 3 * E, E);
       gemm_fx(norm_txt_bf, w->txt_qkv, qkv_txt, N_txt, 3 * E, E);
-      int w_txt = N_txt * H, w_img = N_img * H;
-      k_flux2_pack_qkv_rope<<<(w_txt + 7) / 8, 256, 0, s>>>(
-          qkv_txt, 3 * E, w->txt_qn, w->txt_kn, rope_cos, rope_sin, Q_h, K_h, V_h, N_txt, 0, N_pad, H, D, 1e-6f);
-      k_flux2_pack_qkv_rope<<<(w_img + 7) / 8, 256, 0, s>>>(
-          qkv_img, 3 * E, w->img_qn, w->img_kn, rope_cos, rope_sin, Q_h, K_h, V_h, N_img, N_txt, N_pad, H, D, 1e-6f);
+      pack_qkv_fx(qkv_txt, 3 * E, w->txt_qn, w->txt_kn, N_txt, 0);
+      pack_qkv_fx(qkv_img, 3 * E, w->img_qn, w->img_kn, N_img, N_txt);
       attn_fx();
       k_f32_to_bf16<<<((long)N_txt * E + 255) / 256, 256, 0, s>>>(attn_out, norm_txt_bf, (long)N_txt * E);
       k_f32_to_bf16<<<((long)N_img * E + 255) / 256, 256, 0, s>>>(attn_out + (long)N_txt * E, norm_bf, (long)N_img * E);
@@ -1706,13 +1778,11 @@ static int run_flux2_dit(
     cudaMemcpyAsync(h_cat, txt_d, (size_t)N_txt * E * 4, cudaMemcpyDeviceToDevice, s);
     cudaMemcpyAsync(h_cat + (size_t)N_txt * E, img_d, (size_t)N_img * E * 4, cudaMemcpyDeviceToDevice, s);
 
-    int w_tot = N_tot * H;
     for (int b = 0; b < 20; b++) {
       const fx_single_w_t *w = &d->sng[b];
       k_adaln_bf16<<<N_tot, 256, 0, s>>>(h_cat, mod_sng_v, mod_sng_v + E, norm_bf, N_tot, E, 1e-6f);
       gemm_fx(norm_bf, w->lin1, lin1_out, N_tot, 3 * E + 2 * F, E);
-      k_flux2_pack_qkv_rope<<<(w_tot + 7) / 8, 256, 0, s>>>(
-          lin1_out, 3 * E + 2 * F, w->qn, w->kn, rope_cos, rope_sin, Q_h, K_h, V_h, N_tot, 0, N_pad, H, D, 1e-6f);
+      pack_qkv_fx(lin1_out, 3 * E + 2 * F, w->qn, w->kn, N_tot, 0);
       attn_fx();
       if (w->lin2.q8 && w->lin2.sc) {
         const long tot_thr = (long)N_tot * ((E + F) >> 6) * 16;
@@ -1730,17 +1800,34 @@ static int run_flux2_dit(
     gemm_bf16(norm_bf, d->final_lin, NULL, out_v, NULL, N_img, 128, E, s);
   };
 
+  // v16 Solver Intelligence:
+  // - Distilled 4-step runs stay on exact Flux2 Euler (trained straight trajectory)
+  // - Multi-step Base runs (>= 12 steps) engage exact RES-Multistep + CFG-Zero* + subtle Lying Sigma micro-detail!
+  int use_res_ms = (steps >= 10 && !z0_init_d && !(getenv("EC_SOLVER_EULER") && atoi(getenv("EC_SOLVER_EULER")) != 0)) ? 1 : 0;
+  float lying_sigma = 0.0f;
+  const char *env_ls = getenv("EC_LYING_SIGMA");
+  if (env_ls) lying_sigma = strtof(env_ls, NULL);
+  else if (steps >= 12 && !z0_init_d) lying_sigma = -0.025f;
+
+  float h_prev = 0.0f;
+  int has_prev = 0;
+  int cancelled = 0;
   for (int step = s0; step < steps; step++) {
-    if (cb && cb(step, steps, "flux2_dit", cb_ctx) != 0) break;
+    if (cb && cb(step, steps, "flux2_dit", cb_ctx) != 0) { cancelled = 1; break; }
 
     float sigma = sigmas[step];
     float sigma_next = sigmas[step + 1];
     float dt = sigma_next - sigma;
+    float sigma_model = sigma;
+    if (lying_sigma != 0.0f && step >= 1 && step < steps - 1) {
+      float pct = (float)step / (float)steps;
+      if (pct >= 0.15f && pct <= 0.78f) sigma_model = sigma * (1.0f + lying_sigma);
+    }
 
     float t_h[256];
     for (int i = 0; i < 128; i++) {
       double freq = exp(-log(10000.0) * (double)i / 128.0);
-      double arg = (double)sigma * 1000.0 * freq;
+      double arg = (double)sigma_model * 1000.0 * freq;
       t_h[i] = (float)cos(arg); t_h[128 + i] = (float)sin(arg);
     }
     cudaMemcpyAsync(temb_256, t_h, sizeof t_h, cudaMemcpyHostToDevice, s);
@@ -1756,7 +1843,16 @@ static int run_flux2_dit(
     eval_mmdit_pass(prompt_embeds_bf16, v_pred);
     if (use_cfg) {
       eval_mmdit_pass(neg_embeds_bf16, v_neg);
-      ec_launch_flow_cfg_euler(out_latents_gpu_f32, v_pred, v_neg, out_latents_gpu_f32, N_img * 128, dt, cfg_scale, s);
+      // CFG-Zero* optimal scalar projection (kills high-CFG burn & waxy skin on Base 4B!)
+      int zero_init = (step == s0 && steps >= 16) ? 1 : 0;
+      ec_ops_cfg_zerostar_vel(v_pred, v_neg, v_pred, (long)N_img * 128, cfg_scale, zero_init, s);
+    }
+    if (use_res_ms) {
+      ec_ops_res_multistep_step(out_latents_gpu_f32, v_pred, old_x0, (long)N_img * 128, sigma, sigma_next, h_prev, has_prev, s);
+      if (sigma > 1e-5f && sigma_next > 1e-5f) {
+        h_prev = (float)log((double)sigma / (double)sigma_next);
+        has_prev = 1;
+      }
     } else {
       ec_launch_flow_cfg_euler(out_latents_gpu_f32, v_pred, NULL, out_latents_gpu_f32, N_img * 128, dt, 1.0f, s);
     }
@@ -1768,6 +1864,7 @@ static int run_flux2_dit(
     }
   }
   cudaStreamSynchronize(s);
+  if (cancelled) return -2;
 
   // Trim > 512 MB DiT arena only when < 13.6 GB VRAM remains free (standalone keeps 14.3 GB free = 100% hot; Chat co-residency frees +1.1 GB -> ~14.0 GB free!)
   if (fx->dit_arena && fx->dit_arena_cap > (512ULL << 20)) {
@@ -2668,39 +2765,35 @@ extern "C" int ec_flux2_generate_rgb(
   int H = req->height > 0 ? ((req->height + 15) & ~15) : 512;
   if (W < 256) W = 256; if (W > 1536) W = 1536;
   if (H < 256) H = 256; if (H > 1536) H = 1536;
-  int steps = (req->steps > 0 && req->steps <= 50) ? req->steps : 4;
+  int steps = (req->steps > 0 && req->steps <= 64) ? req->steps : 4;
   const char *ckpt = (req->checkpoint_override && req->checkpoint_override[0])
                      ? req->checkpoint_override : fx->paths.checkpoint_path;
+  // Detect undistilled FLUX.2-klein-base checkpoint vs 4-step guidance-distilled klein checkpoint!
+  int is_base_ckpt = (ckpt && (strstr(ckpt, "base") != NULL || strstr(ckpt, "BASE") != NULL)) ? 1 : 0;
 
   // 1. Text Encode (Qwen3-4B layers 0..26) + optional negative prompt for CFG > 1.05
   if (cb) cb(0, steps + 2, "qwen3_text_encode", cb_ctx);
   char enriched_prompt[1536];
   const char *eff_prompt = (req->prompt && req->prompt[0]) ? req->prompt : "";
   if (req->init_rgb) {
-    // If user supplies an edit verb ("make it better", "enhance", "upscale", "fix") or empty prompt on Img2Img,
-    // enrich with concrete optical quality cues so pure flow-matching T2I enhances structure instead of hallucinating!
+    // Clean anti-slop Img2Img edit-verb handler: strip typo/verb-only stubs ("MAKE IT BETER", "enhance", "upscale")
+    // instead of prepending them verbatim + SD1.5 buzzwords!
     size_t plen = strlen(eff_prompt);
-    int is_edit_verb = (plen == 0 || plen < 22);
-    if (!is_edit_verb) {
+    int is_edit_verb = (plen == 0);
+    if (!is_edit_verb && plen < 32) {
       char low[128] = {0};
       for (size_t i = 0; i < plen && i + 1 < sizeof low; i++) {
         char c = eff_prompt[i];
         low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
       }
       if (strstr(low, "make it") || strstr(low, "enhance") || strstr(low, "improve") ||
-          strstr(low, "upscale") || strstr(low, "sharpen") || strstr(low, "fix")) {
+          strstr(low, "upscale") || strstr(low, "sharpen") || strstr(low, "fix") || strstr(low, "better") || strstr(low, "beter")) {
         is_edit_verb = 1;
       }
     }
     if (is_edit_verb) {
-      if (plen > 0) {
-        snprintf(enriched_prompt, sizeof enriched_prompt,
-                 "%s, masterpiece photorealistic 35mm cinema still, ultra-detailed natural textures, dramatic volumetric lighting, crisp micro-contrast, razor-sharp focus",
-                 eff_prompt);
-      } else {
-        snprintf(enriched_prompt, sizeof enriched_prompt,
-                 "Masterpiece photorealistic 35mm cinema still, ultra-detailed natural textures, dramatic volumetric lighting, crisp micro-contrast, razor-sharp focus");
-      }
+      snprintf(enriched_prompt, sizeof enriched_prompt,
+               "Crisp optical micro-detail, natural skin pores and authentic material weave, balanced tonal contrast, subtle 35mm film grain, preserving exact subject, composition, and natural lighting");
       eff_prompt = enriched_prompt;
     }
   }
@@ -2711,10 +2804,20 @@ extern "C" int ec_flux2_generate_rgb(
     snprintf(res->error, sizeof res->error, "qwen3 text encoder failed");
     return -1;
   }
-  const char *eff_neg = (req->neg_prompt && req->neg_prompt[0])
-                        ? req->neg_prompt
-                        : "blurry, low quality, out of focus, distorted anatomy, oversaturated, plastic skin, watermark, text, artifacts";
-  float cfg = (req->cfg_scale > 1.05f) ? req->cfg_scale : 1.0f;
+  // Exact Diffusers unconditional prompt is "" (NOT SD1.5 tag soup!), plus distilled CFG safety guard!
+  const char *eff_neg = (req->neg_prompt && req->neg_prompt[0]) ? req->neg_prompt : "";
+  float cfg = (req->cfg_scale > 1.05f) ? req->cfg_scale : (is_base_ckpt ? 3.5f : 1.0f);
+  if (!is_base_ckpt) {
+    // Distilled FLUX.2-klein-4B is guidance-distilled (CFG=1.0) & 4-step distilled: protect against accidental frying!
+    if (cfg > 1.05f && !(getenv("EC_ALLOW_DISTILLED_CFG") && atoi(getenv("EC_ALLOW_DISTILLED_CFG")) != 0)) {
+      cfg = 1.0f;
+    }
+    if (steps > 8 && !(getenv("EC_ALLOW_DISTILLED_CFG") && atoi(getenv("EC_ALLOW_DISTILLED_CFG")) != 0)) {
+      steps = 4;
+    }
+  } else {
+    if (steps < 12) steps = 28;
+  }
   if (cfg > 1.05f) {
     double neg_ms = 0.0;
     cudaMalloc(&neg_emb_d, 512L * 7680L * 2);
@@ -2727,7 +2830,7 @@ extern "C" int ec_flux2_generate_rgb(
 
   // 2. Ensure FLUX.2 DiT checkpoint + LoRA/QLoRA stack is resident on GPU (Q8_G64 fast default vs BF16+FA2 oracle!)
   //    (If an imported workflow overrides checkpoint with an incompatible arch like SDXL/9B-Quanto, fall back cleanly!)
-  int want_exact = (req->tier == EC_TIER_EXACT || (getenv("EC_EXACT") && atoi(getenv("EC_EXACT")) != 0)) ? 1 : 0;
+  int want_exact = (req->tier == EC_TIER_EXACT || is_base_ckpt || (getenv("EC_EXACT") && atoi(getenv("EC_EXACT")) != 0)) ? 1 : 0;
   if (cb) cb(1, steps + 2, "load_dit_and_loras", cb_ctx);
   if (ensure_dit_loaded(fx, ckpt, req->loras, req->n_loras, want_exact, res->error, sizeof res->error) != 0) {
     if (ckpt != fx->paths.checkpoint_path && strcmp(ckpt, fx->paths.checkpoint_path) != 0 &&
@@ -2744,9 +2847,9 @@ extern "C" int ec_flux2_generate_rgb(
   int H_p = H / 16, W_p = W / 16;
   float *z0_init_d = NULL, *mask_p_d = NULL;
   double enc_ms = 0.0;
-  float denoise = (req->denoise > 0.01f && req->denoise <= 1.0f) ? req->denoise : (req->init_rgb ? 0.48f : 1.0f);
+  float denoise = (req->denoise > 0.01f && req->denoise <= 1.0f) ? req->denoise : (req->init_rgb ? 0.42f : 1.0f);
   if (req->init_rgb && req->init_w > 0 && req->init_h > 0) {
-    uint8_t *resized = ec_rgb_resize_bilinear(req->init_rgb, req->init_w, req->init_h, W, H);
+    uint8_t *resized = ec_rgb_resize_lanczos3(req->init_rgb, req->init_w, req->init_h, W, H);
     if (resized) {
       cudaMalloc(&z0_init_d, (size_t)H_p * W_p * 128 * 4);
       if (run_flux2_vae_encode(fx, resized, H, W, z0_init_d, &enc_ms) != 0) {
@@ -2780,11 +2883,12 @@ extern "C" int ec_flux2_generate_rgb(
   // 3. Denoise latents [H/16 * W/16, 128]
   float *latents_d = NULL;
   cudaMalloc(&latents_d, (size_t)H_p * W_p * 128 * 4);
-  if (run_flux2_dit(fx, prompt_emb_d, neg_emb_d, H_p, W_p, steps, cfg, req->seed,
-                    z0_init_d, mask_p_d, denoise, latents_d, cb, cb_ctx, &res->dit_ms) != 0) {
+  int dit_rc = run_flux2_dit(fx, prompt_emb_d, neg_emb_d, H_p, W_p, steps, cfg, req->seed,
+                             z0_init_d, mask_p_d, denoise, latents_d, cb, cb_ctx, &res->dit_ms);
+  if (dit_rc != 0) {
     cudaFree(prompt_emb_d); cudaFree(neg_emb_d); cudaFree(z0_init_d); cudaFree(mask_p_d); cudaFree(latents_d);
-    snprintf(res->error, sizeof res->error, "flux2 dit denoising failed");
-    return -1;
+    snprintf(res->error, sizeof res->error, dit_rc == -2 ? "cancelled" : "flux2 dit denoising failed");
+    return dit_rc;
   }
   cudaFree(z0_init_d); cudaFree(mask_p_d);
 
@@ -2799,12 +2903,28 @@ extern "C" int ec_flux2_generate_rgb(
   res->vae_ms += enc_ms;
   cudaFree(latents_d);
 
-  // 4b. Optional 2x Native Tile Detail Upscale (2x2 overlapping tiles via VAE Encode -> 0.42 denoise -> VAE Decode!)
-  if (req->tile_upscale && W <= 768 && H <= 768) {
-    int UW = W * 2, UH = H * 2;
-    uint8_t *up_base = ec_rgb_resize_bilinear(rgb, W, H, UW, UH);
+  // 4b. v16 2-Pass Pixel-Space HiRes Detail Refine (up to 1280px input -> 1.5x/2x Lanczos3 + neutral micro-detail prompt + denoise=0.26!)
+  if (req->tile_upscale && W <= 1280 && H <= 1280) {
+    float scale_f = (W <= 768 && H <= 768) ? 2.0f : 1.5f;
+    int UW = (((int)(W * scale_f) + 15) & ~15);
+    int UH = (((int)(H * scale_f) + 15) & ~15);
+    uint8_t *up_base = ec_rgb_resize_lanczos3(rgb, W, H, UW, UH);
     if (up_base) {
-      int TW = ((W + 64 + 15) & ~15), TH = ((H + 64 + 15) & ~15);
+      // Encode a neutral micro-detail prompt so tile refinement never duplicates faces/text across quadrants!
+      uint16_t *tile_emb_d = NULL;
+      double t_enc_ms = 0.0;
+      const char *neutral_detail = "Razor-sharp natural optical micro-detail, authentic skin pores, fine fabric weave, subtle organic 35mm film grain, preserving exact subject, typography, lighting, and composition";
+      if (cudaMalloc(&tile_emb_d, 512L * 7680L * 2) == cudaSuccess &&
+          run_qwen3_text_encoder(fx, neutral_detail, tile_emb_d, &t_enc_ms) == 0) {
+        res->text_enc_ms += t_enc_ms;
+      } else {
+        cudaFree(tile_emb_d); tile_emb_d = NULL;
+      }
+      const uint16_t *use_tile_emb = tile_emb_d ? tile_emb_d : prompt_emb_d;
+
+      int TW = ((UW / 2 + 96 + 15) & ~15);
+      int TH = ((UH / 2 + 96 + 15) & ~15);
+      if (TW > 1024) TW = 1024; if (TH > 1024) TH = 1024;
       if (TW > UW) TW = UW; if (TH > UH) TH = UH;
       int T_hp = TH / 16, T_wp = TW / 16;
       float *acc = (float *)calloc((size_t)UW * UH * 3, sizeof(float));
@@ -2815,6 +2935,8 @@ extern "C" int ec_flux2_generate_rgb(
       cudaMalloc(&tz0, (size_t)T_hp * T_wp * 128 * 4);
       cudaMalloc(&tlat, (size_t)T_hp * T_wp * 128 * 4);
       int oxs[2] = { 0, UW - TW }, oys[2] = { 0, UH - TH };
+      int tile_steps = is_base_ckpt ? 12 : 4;
+      float tile_cfg = is_base_ckpt ? 3.2f : 1.0f;
       for (int ty = 0; ty < 2; ty++) {
         for (int tx = 0; tx < 2; tx++) {
           int x0 = oxs[tx], y0 = oys[ty];
@@ -2822,15 +2944,17 @@ extern "C" int ec_flux2_generate_rgb(
             memcpy(tile_in + (size_t)y * TW * 3, up_base + ((size_t)(y0 + y) * UW + x0) * 3, (size_t)TW * 3);
           double e_ms = 0, d_ms = 0, v_ms = 0;
           if (run_flux2_vae_encode(fx, tile_in, TH, TW, tz0, &e_ms) == 0 &&
-              run_flux2_dit(fx, prompt_emb_d, NULL, T_hp, T_wp, steps, 1.0f, req->seed + ty * 2 + tx + 11,
-                            tz0, NULL, 0.42f, tlat, NULL, NULL, &d_ms) == 0 &&
+              run_flux2_dit(fx, use_tile_emb, is_base_ckpt ? neg_emb_d : NULL, T_hp, T_wp, tile_steps, tile_cfg,
+                            req->seed + ty * 2 + tx + 11, tz0, NULL, 0.26f, tlat, NULL, NULL, &d_ms) == 0 &&
               run_flux2_vae_decode(fx, tlat, T_hp, T_wp, tile_out, &v_ms) == 0) {
             res->dit_ms += d_ms; res->vae_ms += e_ms + v_ms;
             for (int y = 0; y < TH; y++) {
-              float wy = fminf(1.0f, fminf((float)(y + 1), (float)(TH - y)) / 32.0f);
+              float wy = fminf(1.0f, fminf((float)(y + 1), (float)(TH - y)) / 64.0f);
+              wy = wy * wy * (3.0f - 2.0f * wy); // smoothstep cosine-like feather!
               for (int x = 0; x < TW; x++) {
-                float wx = fminf(1.0f, fminf((float)(x + 1), (float)(TW - x)) / 32.0f);
-                float ww = fmaxf(0.02f, wx * wy);
+                float wx = fminf(1.0f, fminf((float)(x + 1), (float)(TW - x)) / 64.0f);
+                wx = wx * wx * (3.0f - 2.0f * wx);
+                float ww = fmaxf(0.01f, wx * wy);
                 size_t gi = (size_t)(y0 + y) * UW + (x0 + x);
                 size_t li = (size_t)y * TW + x;
                 acc[gi * 3 + 0] += tile_out[li * 3 + 0] * ww;
@@ -2842,6 +2966,7 @@ extern "C" int ec_flux2_generate_rgb(
           }
         }
       }
+      cudaFree(tile_emb_d);
       cudaFree(tz0); cudaFree(tlat);
       free(tile_in); free(tile_out); free(up_base);
       uint8_t *final_up = (uint8_t *)malloc((size_t)UW * UH * 3);

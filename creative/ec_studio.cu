@@ -20,12 +20,14 @@
 #include "ec_trellis2.h"
 #include "ec_vram_pool.h"
 #include "ec_wan22.h"
+#include "ec_zimage.h"
 #include <cuda_fp16.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -55,22 +57,25 @@ struct ec_studio {
   ec_storage_vault_t  vault;
   ec_recipe_lib_t     recipes;
   ec_flux2_t         *flux2;
+  ec_zimage_t        *zimage;
   ec_acestep_t       *acestep;
   ec_trellis2_t      *trellis2;
   ec_wan22_t         *wan22;
   char                dag_model_sha[65];
+  uint64_t            artifact_seq;
   int                 active_engine_mask;
   int                 initialized;
 };
 
-// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2, 0=ALL).
+// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2, 5=Z-Image, 0=ALL).
 // Lightweight mmap handles & tokenizers stay open so switching modalities incurs zero file re-parsing!
 static void studio_evict_other_engines_locked(ec_studio_t *st, int keep_id) {
   if (keep_id != 1 && st->flux2)    ec_flux2_unload_vram(st->flux2);
   if (keep_id != 2 && st->acestep)  ec_acestep_unload_vram(st->acestep);
   if (keep_id != 3 && st->trellis2) ec_trellis2_unload_vram(st->trellis2);
   if (keep_id != 4 && st->wan22)    ec_wan22_unload_vram(st->wan22);
-  st->active_engine_mask = (keep_id >= 1 && keep_id <= 4) ? (1 << (keep_id - 1)) : 0;
+  if (keep_id != 5 && st->zimage)   ec_zimage_unload_vram(st->zimage);
+  st->active_engine_mask = (keep_id >= 1 && keep_id <= 5) ? (1 << (keep_id - 1)) : 0;
 }
 
 extern "C" int ec_studio_unload_all_vram(ec_studio_t *st, double *out_ms, double *out_free_mb) {
@@ -108,6 +113,26 @@ static void studio_try_init_all_engines_locked(ec_studio_t *st) {
       snprintf(p.tokenizer_path,    sizeof p.tokenizer_path,    "%s", tok->path);
       if (st->flux2) { ec_flux2_destroy(st->flux2); st->flux2 = NULL; }
       st->flux2 = ec_flux2_create(&p);
+    }
+  }
+
+  // 1b. Photoreal Image: Tongyi-MAI Z-Image-Turbo (6.15B S3-DiT + FLUX.1 16ch VAE + shared Qwen3-4B!)
+  if (!st->zimage || !ec_zimage_is_ready(st->zimage)) {
+    const ec_storage_asset_t *dit = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "z_image_turbo");
+    const ec_storage_asset_t *vae = ec_storage_find(&st->vault, EC_ASSET_VAE, "flux1_ae");
+    if (!vae) vae = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "flux1_ae");
+    const ec_storage_asset_t *te  = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen_3_4b");
+    if (!te) te = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "qwen3_4b");
+    const ec_storage_asset_t *tok = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "qwen3_tokenizer");
+    if (!tok) tok = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "tokenizer");
+    if (dit && vae && te && tok) {
+      ec_zimage_paths_t zp = {};
+      snprintf(zp.dit_path,          sizeof zp.dit_path,          "%s", dit->path);
+      snprintf(zp.vae_path,          sizeof zp.vae_path,          "%s", vae->path);
+      snprintf(zp.text_encoder_path, sizeof zp.text_encoder_path, "%s", te->path);
+      snprintf(zp.tokenizer_path,    sizeof zp.tokenizer_path,    "%s", tok->path);
+      if (st->zimage) { ec_zimage_destroy(st->zimage); st->zimage = NULL; }
+      st->zimage = ec_zimage_create(&zp);
     }
   }
 
@@ -191,6 +216,32 @@ static uint64_t hash_prompt_seed(const char *prompt, uint32_t seed) {
     }
   }
   return h;
+}
+
+static uint64_t hash_mix_str(uint64_t h, const char *s) {
+  if (!s || !s[0]) return h;
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    h ^= (uint64_t)*p;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+static uint32_t next_artifact_hash32(ec_studio_t *st, uint64_t h) {
+  uint64_t seq = __sync_add_and_fetch(&st->artifact_seq, 1ULL);
+  h ^= seq * 0xBF58476D1CE4E5B9ULL;
+  h ^= (uint64_t)time(NULL) * 0x94D049BB133111EBULL;
+  h ^= h >> 30;
+  h *= 0xBF58476D1CE4E5B9ULL;
+  h ^= h >> 27;
+  return (uint32_t)(h ^ (h >> 32));
+}
+
+static int ci_substr(const char *hay, const char *needle) {
+  if (!hay || !needle || !*needle) return 0;
+  size_t nl = strlen(needle);
+  for (const char *p = hay; *p; p++) if (strncasecmp(p, needle, nl) == 0) return 1;
+  return 0;
 }
 
 static float prng_next(uint64_t *s) {
@@ -290,6 +341,7 @@ extern "C" void ec_studio_destroy(ec_studio_t *st) {
   if (st->initialized) {
     pthread_mutex_lock(&st->gpu_mu);
     if (st->flux2)    { ec_flux2_destroy(st->flux2);       st->flux2 = NULL; }
+    if (st->zimage)   { ec_zimage_destroy(st->zimage);     st->zimage = NULL; }
     if (st->acestep)  { ec_acestep_destroy(st->acestep);   st->acestep = NULL; }
     if (st->trellis2) { ec_trellis2_destroy(st->trellis2); st->trellis2 = NULL; }
     if (st->wan22)    { ec_wan22_destroy(st->wan22);       st->wan22 = NULL; }
@@ -326,6 +378,7 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
   out->engines_resident_mask = st->active_engine_mask;
   out->models_discovered = st->registry.n_models;
   out->photoreal_ready = (st->flux2    && ec_flux2_is_ready(st->flux2))       ? 1 : 0;
+  out->zimage_ready    = (st->zimage   && ec_zimage_is_ready(st->zimage))     ? 1 : 0;
   out->acestep_ready   = (st->acestep  && ec_acestep_is_ready(st->acestep))   ? 1 : 0;
   out->trellis2_ready  = (st->trellis2 && ec_trellis2_is_ready(st->trellis2)) ? 1 : 0;
   out->wan22_ready     = (st->wan22    && ec_wan22_is_ready(st->wan22))       ? 1 : 0;
@@ -396,6 +449,57 @@ extern "C" int ec_studio_gen_image_v8(
   memset(res, 0, sizeof *res);
   if (!st || !st->initialized || !req) return -1;
 
+  // Route Tongyi-MAI Z-Image-Turbo (6.15B S3-DiT) when explicitly selected and no Img2Img/Inpaint input!
+  int want_zimage = (req->photoreal && st->zimage && ec_zimage_is_ready(st->zimage) &&
+                     req->checkpoint_query &&
+                     (ci_substr(req->checkpoint_query, "z_image") || ci_substr(req->checkpoint_query, "zimage")) &&
+                     !(req->init_image_path && req->init_image_path[0]) &&
+                     !(req->mask_image_path && req->mask_image_path[0]));
+  if (want_zimage) {
+    ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
+    int nl = resolve_lora_stack(st, req->loras, req->n_loras, lstack);
+    int W = (req->width  >= 512) ? req->width  : 1024;
+    int H = (req->height >= 512) ? req->height : 1024;
+    if (req->tile_upscale) {
+      W = (W * 3) / 2; H = (H * 3) / 2;
+      if (W > 1536) W = 1536; if (H > 1536) H = 1536;
+    }
+    ec_zimage_req_t zreq = {};
+    zreq.prompt = req->prompt;
+    zreq.seed = req->seed;
+    zreq.width = W; zreq.height = H;
+    zreq.steps = (req->steps >= 4 && req->steps <= 20) ? req->steps : 8;
+    zreq.shift = 3.0f;
+    zreq.loras = nl > 0 ? lstack : NULL;
+    zreq.n_loras = nl;
+    zreq.tile_upscale = req->tile_upscale;
+
+    uint64_t h = hash_prompt_seed(req->prompt, req->seed);
+    h = hash_mix_str(h, req->checkpoint_query);
+    for (int i = 0; i < nl; i++) h = hash_mix_str(h, lstack[i].path);
+    h ^= ((uint64_t)W << 32) ^ ((uint64_t)H << 16) ^ (uint64_t)zreq.steps;
+    uint32_t tag32 = next_artifact_hash32(st, h);
+    snprintf(res->file_main, sizeof res->file_main, "%s/zimage_%u_%08x.png", st->artifact_dir, req->seed, tag32);
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_zimage_res_t zres = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 5);
+    int rc = ec_zimage_generate_png(st->zimage, &zreq, res->file_main, cb ? fx_progress_bridge : NULL, &bridge, &zres);
+    pthread_mutex_unlock(&st->gpu_mu);
+    if (rc == -2) { res->cancelled = 1; return 0; }
+    if (rc == 0 && zres.ok) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "z_image_turbo_6b");
+      snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "%s", zres.checkpoint_used);
+      res->width = zres.width; res->height = zres.height;
+      res->steps_run = zres.steps_run; res->lora_tensors_fused = zres.lora_tensors_fused;
+      res->text_enc_ms = zres.text_enc_ms; res->dit_ms = zres.dit_ms;
+      res->vae_ms = zres.vae_ms; res->gpu_ms = zres.total_ms;
+      return 0;
+    }
+    return -1;
+  }
+
   if (req->photoreal && st->flux2 && ec_flux2_is_ready(st->flux2)) {
     char ckpt_path[512] = {0};
     if (req->checkpoint_query && req->checkpoint_query[0]) {
@@ -405,8 +509,8 @@ extern "C" int ec_studio_gen_image_v8(
     ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
     int nl = resolve_lora_stack(st, req->loras, req->n_loras, lstack);
 
-    int W = (req->width  >= 256) ? req->width  : 512;
-    int H = (req->height >= 256) ? req->height : 512;
+    int W = (req->width  >= 256) ? req->width  : 1024;
+    int H = (req->height >= 256) ? req->height : 1024;
     uint8_t *init_rgb = NULL;
     int init_w = 0, init_h = 0;
     float *mask_gray = NULL;
@@ -434,7 +538,7 @@ extern "C" int ec_studio_gen_image_v8(
     freq.seed = req->seed;
     freq.width = W;
     freq.height = H;
-    freq.steps = (req->steps >= 1 && req->steps <= 50) ? req->steps : 4;
+    freq.steps = (req->steps >= 1 && req->steps <= 64) ? req->steps : 4;
     freq.cfg_scale = req->cfg_scale;
     freq.checkpoint_override = ckpt_path[0] ? ckpt_path : NULL;
     freq.loras = nl > 0 ? lstack : NULL;
@@ -448,11 +552,16 @@ extern "C" int ec_studio_gen_image_v8(
     freq.tier = req->tier;
 
     uint64_t tag = hash_prompt_seed(req->prompt, req->seed);
+    tag = hash_mix_str(tag, ckpt_path);
+    tag = hash_mix_str(tag, req->neg_prompt);
+    for (int i = 0; i < nl; i++) tag = hash_mix_str(tag, lstack[i].path);
+    tag ^= ((uint64_t)W << 32) ^ ((uint64_t)H << 16) ^ ((uint64_t)freq.steps << 8) ^ (uint64_t)(int)(req->cfg_scale * 100.0f);
     if (init_rgb) tag ^= 0x12101210ULL;
     if (mask_gray) tag ^= 0xA1B2C3D4ULL;
     if (req->tile_upscale) tag ^= 0x20002000ULL;
-    snprintf(res->file_main, sizeof res->file_main, "%s/flux2_%u_%04x.png",
-             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+    uint32_t tag32 = next_artifact_hash32(st, tag);
+    snprintf(res->file_main, sizeof res->file_main, "%s/flux2_%u_%08x.png",
+             st->artifact_dir, req->seed, tag32);
 
     fx_cb_bridge_t bridge = { cb, cb_ctx };
     ec_flux2_res_t fres = {};
@@ -461,9 +570,11 @@ extern "C" int ec_studio_gen_image_v8(
     int rc = ec_flux2_generate_png(st->flux2, &freq, res->file_main, cb ? fx_progress_bridge : NULL, &bridge, &fres);
     pthread_mutex_unlock(&st->gpu_mu);
     free(init_rgb); free(mask_gray);
+    if (rc == -2) { res->cancelled = 1; return 0; }
     if (rc == 0 && fres.ok) {
+      int is_base = ci_substr(fres.checkpoint_used, "base");
       snprintf(res->engine_mode, sizeof res->engine_mode, "%s",
-               has_outpaint ? "flux2_outpaint" : (mask_gray ? "flux2_inpaint" : (init_rgb ? "flux2_img2img" : "flux2_photoreal")));
+               has_outpaint ? "flux2_outpaint" : (mask_gray ? "flux2_inpaint" : (init_rgb ? "flux2_img2img" : (is_base ? "flux2_base_4b" : "flux2_photoreal"))));
       snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "%s", fres.checkpoint_used);
       res->width = fres.width; res->height = fres.height;
       res->steps_run = fres.steps_run; res->lora_tensors_fused = fres.lora_tensors_fused;
@@ -498,35 +609,51 @@ extern "C" int ec_studio_gen_3d_v8(
     }
 
     uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ ((uint64_t)n_loaded * 0x9E3779B9ULL);
-    snprintf(res->file_main, sizeof res->file_main, "%s/trellis2_%u_%04x.glb",
-             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
-    snprintf(res->file_aux, sizeof res->file_aux, "%s/trellis2_%u_%04x.ply",
-             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+    uint32_t tag32 = next_artifact_hash32(st, tag);
+    snprintf(res->file_main, sizeof res->file_main, "%s/trellis2_%u_%08x.glb",
+             st->artifact_dir, req->seed, tag32);
+    snprintf(res->file_aux, sizeof res->file_aux, "%s/trellis2_%u_%08x.ply",
+             st->artifact_dir, req->seed, tag32);
 
     fx_cb_bridge_t bridge = { cb, cb_ctx };
     double ref_ms = 0.0;
-    if (n_loaded == 0 && st->flux2 && ec_flux2_is_ready(st->flux2)) {
+    if (n_loaded == 0 && ((st->zimage && ec_zimage_is_ready(st->zimage)) || (st->flux2 && ec_flux2_is_ready(st->flux2)))) {
       char hero_prompt[1536], ref_png[256];
+      // v16 Studio 3D Reference Standard: 1024x1024 Telephoto 3/4 Softbox floating cutout on flat shadowless neutral gray!
       snprintf(hero_prompt, sizeof hero_prompt,
-          "Isolated centered 3D studio product render of %s, single object floating centered on pure solid matte black background, even neutral softbox studio lighting, full object visible in frame, no room, no table, no background clutter",
+          "Single isolated 3D turntable product cutout of %s, three-quarter front-elevated view, 100mm telephoto lens with zero distortion, full object floating cleanly centered with 18%% empty margin on all four sides, even shadowless neutral softbox lighting, flat solid uniform neutral medium-gray #888888 void background with zero gradient and zero cast shadows, crisp true material albedo, no studio wall, no table, no floor, no horizon, no props, no text",
           (req->prompt && req->prompt[0]) ? req->prompt : "sculptural matte-white porcelain teapot with bamboo handle");
-      snprintf(ref_png, sizeof ref_png, "%s/trellis2_%u_%04x_ref.png",
-               st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
-      ec_flux2_req_t freq = {};
-      freq.prompt = hero_prompt; freq.seed = req->seed; freq.width = 512; freq.height = 512; freq.steps = 4;
-      ec_flux2_res_t fres = {};
-      pthread_mutex_lock(&st->gpu_mu);
-      studio_evict_other_engines_locked(st, 1);
-      int rc_ref = ec_flux2_generate_rgb(st->flux2, &freq, &views[0], ref_png,
-                                         cb ? tr_ref_progress_bridge : NULL, &bridge, &fres);
-      ec_flux2_unload_vram(st->flux2);
-      pthread_mutex_unlock(&st->gpu_mu);
+      snprintf(ref_png, sizeof ref_png, "%s/trellis2_%u_%08x_ref.png",
+               st->artifact_dir, req->seed, tag32);
+      int rc_ref = -1;
+      if (st->zimage && ec_zimage_is_ready(st->zimage)) {
+        ec_zimage_req_t zreq = {};
+        zreq.prompt = hero_prompt; zreq.seed = req->seed; zreq.width = 1024; zreq.height = 1024; zreq.steps = 8; zreq.shift = 3.0f;
+        ec_zimage_res_t zres = {};
+        pthread_mutex_lock(&st->gpu_mu);
+        studio_evict_other_engines_locked(st, 5);
+        rc_ref = ec_zimage_generate_rgb(st->zimage, &zreq, &views[0], ref_png,
+                                        cb ? tr_ref_progress_bridge : NULL, &bridge, &zres);
+        ec_zimage_unload_vram(st->zimage);
+        pthread_mutex_unlock(&st->gpu_mu);
+        if (rc_ref == 0 && views[0]) { vw[0] = zres.width; vh[0] = zres.height; n_loaded = 1; ref_ms = zres.total_ms; }
+      } else {
+        ec_flux2_req_t freq = {};
+        freq.prompt = hero_prompt; freq.seed = req->seed; freq.width = 1024; freq.height = 1024; freq.steps = 4; freq.tier = EC_TIER_EXACT;
+        ec_flux2_res_t fres = {};
+        pthread_mutex_lock(&st->gpu_mu);
+        studio_evict_other_engines_locked(st, 1);
+        rc_ref = ec_flux2_generate_rgb(st->flux2, &freq, &views[0], ref_png,
+                                       cb ? tr_ref_progress_bridge : NULL, &bridge, &fres);
+        ec_flux2_unload_vram(st->flux2);
+        pthread_mutex_unlock(&st->gpu_mu);
+        if (rc_ref == 0 && views[0]) { vw[0] = fres.width; vh[0] = fres.height; n_loaded = 1; ref_ms = fres.total_ms; }
+      }
       if (rc_ref != 0 || !views[0]) {
         free(views[0]);
         if (rc_ref == -2) { res->cancelled = 1; return 0; }
         return -1;
       }
-      vw[0] = fres.width; vh[0] = fres.height; n_loaded = 1; ref_ms = fres.total_ms;
     }
 
     if (n_loaded > 0) {
@@ -579,9 +706,18 @@ extern "C" int ec_studio_gen_music_v8(
   if (!st || !st->initialized || !req) return -1;
 
   if (req->full_model && st->acestep && ec_acestep_is_ready(st->acestep)) {
+    char ckpt_path[512] = {0};
+    if (req->checkpoint_query && req->checkpoint_query[0]) {
+      const ec_storage_asset_t *a = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, req->checkpoint_query);
+      snprintf(ckpt_path, sizeof ckpt_path, "%s", a ? a->path : req->checkpoint_query);
+    }
+    int is_sft = ci_substr(ckpt_path, "sft") || (req->checkpoint_query && ci_substr(req->checkpoint_query, "sft"));
     uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ ((uint64_t)req->stem_mode << 12);
-    snprintf(res->file_main, sizeof res->file_main, "%s/acestep_%u_%04x_master.wav",
-             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+    tag = hash_mix_str(tag, ckpt_path);
+    tag = hash_mix_str(tag, req->lyrics);
+    uint32_t tag32 = next_artifact_hash32(st, tag);
+    snprintf(res->file_main, sizeof res->file_main, "%s/acestep_%u_%08x_master.wav",
+             st->artifact_dir, req->seed, tag32);
 
     float *src_pcm = NULL; int src_samples = 0;
     char apath[512] = {0};
@@ -596,9 +732,11 @@ extern "C" int ec_studio_gen_music_v8(
     areq.lyrics = (req->lyrics && req->lyrics[0]) ? req->lyrics : "";
     areq.seed = req->seed;
     areq.bpm = (req->bpm >= 40 && req->bpm <= 240) ? req->bpm : 120;
-    areq.duration_sec = (req->duration_sec >= 4.0f && req->duration_sec <= 120.0f) ? req->duration_sec : 10.0f;
-    areq.steps = (req->steps >= 1 && req->steps <= 8) ? req->steps : 8;
-    areq.shift = (req->shift >= 0.5f && req->shift <= 4.0f) ? req->shift : 3.0f;
+    areq.duration_sec = (req->duration_sec >= 4.0f && req->duration_sec <= 120.0f) ? req->duration_sec : 20.0f;
+    areq.steps = (req->steps >= 1 && req->steps <= 64) ? req->steps : (is_sft ? 32 : 8);
+    areq.shift = (req->shift >= 0.5f && req->shift <= 6.0f) ? req->shift : 3.0f;
+    areq.cfg_scale = req->cfg_scale;
+    areq.checkpoint_override = ckpt_path[0] ? ckpt_path : NULL;
     areq.key_scale = req->key_scale;
     areq.time_sig = req->time_sig;
     areq.vocal_mode = req->vocal_mode;
@@ -623,7 +761,8 @@ extern "C" int ec_studio_gen_music_v8(
 
     if (rc == -2) { res->cancelled = 1; return 0; }
     if (rc == 0 && ares.ok) {
-      snprintf(res->engine_mode, sizeof res->engine_mode, "acestep_1.5_turbo");
+      snprintf(res->engine_mode, sizeof res->engine_mode, "%s", is_sft ? "acestep_1.5_sft" : "acestep_1.5_turbo");
+      snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "%s", ckpt_path[0] ? ckpt_path : "acestep_v15_turbo_bf16.safetensors");
       res->sample_rate = ares.sample_rate;
       res->frames = ares.num_samples;
       res->steps_run = ares.steps_run;
@@ -673,16 +812,16 @@ extern "C" int ec_studio_gen_video_v8(
   if (!st || !st->initialized || !req) return -1;
 
   if (req->full_model && st->wan22 && ec_wan22_is_ready(st->wan22)) {
-    int W = (req->width  >= 320) ? ((req->width  + 31) & ~31) : 832;
+    int W = (req->width  >= 320) ? ((req->width  + 31) & ~31) : 1280;
     if (W > 1280) W = 1280;
-    int H = (req->height >= 320) ? ((req->height + 31) & ~31) : 480;
+    int H = (req->height >= 320) ? ((req->height + 31) & ~31) : 704;
     if (H > 1024) H = 1024;
-    int req_f = (req->n_frames >= 5) ? req->n_frames : 17;
+    int req_f = (req->n_frames >= 5) ? req->n_frames : 49;
     int F_lat = (req_f - 1) / 4 + 1;
-    if (F_lat < 2) F_lat = 2; if (F_lat > 21) F_lat = 21;
+    if (F_lat < 2) F_lat = 2; if (F_lat > 31) F_lat = 31;
     int actual_f = 1 + 4 * (F_lat - 1);
-    int afps = (req->fps >= 8 && req->fps <= 60) ? req->fps : 16;
-    int asteps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 20;
+    int afps = (req->fps >= 8 && req->fps <= 60) ? req->fps : 24;
+    int asteps = (req->steps >= 4 && req->steps <= 50) ? req->steps : 30;
 
     char wav_path[256] = {0};
     double audio_ms = 0.0;
@@ -699,7 +838,8 @@ extern "C" int ec_studio_gen_video_v8(
     }
 
     uint8_t *start_rgb = NULL, *end_rgb = NULL;
-    int sw = 0, sh = 0, ew = 0, eh = 0;
+    int sw = 0, sh = 0, ew = 0, eh = 0, used_hero_i2v = 0;
+    double hero_ms = 0.0;
     char spath[512] = {0}, epath[512] = {0};
     if (req->start_frame_path && resolve_studio_media_path(st, req->start_frame_path, spath, sizeof spath) == 0) {
       ec_load_image_rgb(spath, &start_rgb, &sw, &sh);
@@ -707,16 +847,55 @@ extern "C" int ec_studio_gen_video_v8(
     if (req->end_frame_path && resolve_studio_media_path(st, req->end_frame_path, epath, sizeof epath) == 0) {
       ec_load_image_rgb(epath, &end_rgb, &ew, &eh);
     }
+    // Optional v16 Hero-Keyframe -> Wan 2.2 I2V Cinema Mode: synthesize ultra-sharp photoreal opening frame first!
+    const char *env_hero = getenv("EC_VIDEO_HERO_I2V");
+    int want_hero = (!start_rgb && (req->hero_keyframe_i2v || (env_hero && env_hero[0] == '1')));
+    if (want_hero && ((st->zimage && ec_zimage_is_ready(st->zimage)) || (st->flux2 && ec_flux2_is_ready(st->flux2)))) {
+      if (cb && cb(0, asteps + 4, 0, "hero_keyframe_gen", cb_ctx) != 0) { res->cancelled = 1; return 0; }
+      const char *hp = (req->prompt && req->prompt[0]) ? req->prompt : "35mm cinema still frame, natural lighting";
+      int rc_h = -1;
+      if (st->zimage && ec_zimage_is_ready(st->zimage)) {
+        ec_zimage_req_t zreq = {};
+        // Z-Image S3-DiT is trained at ~1 MP (e.g. 1280x720 or 1024x576); generate hero keyframe at >=1024 long edge
+        // matching the target video aspect ratio, then Lanczos-3 downsample crisply into Wan 2.2 I2V!
+        int zw = W, zh = H;
+        if (zw < 1024 && zh < 1024) {
+          if (zw >= zh) { zh = ((H * 1024 / W + 15) & ~15); zw = 1024; }
+          else          { zw = ((W * 1024 / H + 15) & ~15); zh = 1024; }
+        }
+        if (zw < 512) zw = 512; if (zh < 512) zh = 512;
+        zreq.prompt = hp; zreq.seed = req->seed; zreq.width = zw; zreq.height = zh; zreq.steps = 8; zreq.shift = 3.0f;
+        ec_zimage_res_t zres = {};
+        pthread_mutex_lock(&st->gpu_mu);
+        studio_evict_other_engines_locked(st, 5);
+        rc_h = ec_zimage_generate_rgb(st->zimage, &zreq, &start_rgb, NULL, NULL, NULL, &zres);
+        ec_zimage_unload_vram(st->zimage);
+        pthread_mutex_unlock(&st->gpu_mu);
+        if (rc_h == 0 && start_rgb) { sw = zres.width; sh = zres.height; hero_ms = zres.total_ms; used_hero_i2v = 1; }
+      } else {
+        ec_flux2_req_t freq = {};
+        freq.prompt = hp; freq.seed = req->seed; freq.width = W; freq.height = H; freq.steps = 4; freq.tier = EC_TIER_EXACT;
+        ec_flux2_res_t fres = {};
+        pthread_mutex_lock(&st->gpu_mu);
+        studio_evict_other_engines_locked(st, 1);
+        rc_h = ec_flux2_generate_rgb(st->flux2, &freq, &start_rgb, NULL, NULL, NULL, &fres);
+        ec_flux2_unload_vram(st->flux2);
+        pthread_mutex_unlock(&st->gpu_mu);
+        if (rc_h == 0 && start_rgb) { sw = fres.width; sh = fres.height; hero_ms = fres.total_ms; used_hero_i2v = 1; }
+      }
+    }
     ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
     int nl = resolve_lora_stack(st, req->loras, req->n_loras, lstack);
 
     uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ (start_rgb ? 0x1111ULL : 0ULL) ^ (end_rgb ? 0x2222ULL : 0ULL);
-    snprintf(res->file_mp4, sizeof res->file_mp4, "%s/wan22_%u_%04x%s.mp4",
-             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu), req->with_audio ? "_av" : "");
-    snprintf(res->file_aux, sizeof res->file_aux, "%s/wan22_%u_%04x_kf0.png",
-             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
-    snprintf(res->file_last, sizeof res->file_last, "%s/wan22_%u_%04x_last.png",
-             st->artifact_dir, req->seed, (unsigned)(tag & 0xFFFFu));
+    tag ^= ((uint64_t)W << 32) ^ ((uint64_t)H << 16) ^ (uint64_t)actual_f;
+    uint32_t tag32 = next_artifact_hash32(st, tag);
+    snprintf(res->file_mp4, sizeof res->file_mp4, "%s/wan22_%u_%08x%s.mp4",
+             st->artifact_dir, req->seed, tag32, req->with_audio ? "_av" : "");
+    snprintf(res->file_aux, sizeof res->file_aux, "%s/wan22_%u_%08x_kf0.png",
+             st->artifact_dir, req->seed, tag32);
+    snprintf(res->file_last, sizeof res->file_last, "%s/wan22_%u_%08x_last.png",
+             st->artifact_dir, req->seed, tag32);
     snprintf(res->file_main, sizeof res->file_main, "%s", res->file_mp4);
 
     ec_wan22_req_t wreq = {};
@@ -725,8 +904,8 @@ extern "C" int ec_studio_gen_video_v8(
     wreq.seed = req->seed;
     wreq.width = W; wreq.height = H; wreq.num_frames = actual_f;
     wreq.fps = afps; wreq.steps = asteps;
-    wreq.cfg_scale = (req->cfg_scale > 0.0f) ? req->cfg_scale : 5.0f;
-    wreq.shift = req->shift; // 0 -> ec_wan22 picks 5.0f for base Wan 2.2 TI2V-5B or 3.0f for Turbo LoRA!
+    wreq.cfg_scale = (req->cfg_scale > 0.0f) ? req->cfg_scale : 4.0f;
+    wreq.shift = req->shift; // 0 -> ec_wan22 picks 5.0f cleanly!
     wreq.start_rgb = start_rgb; wreq.start_w = sw; wreq.start_h = sh;
     wreq.end_rgb = end_rgb; wreq.end_w = ew; wreq.end_h = eh;
     wreq.denoise = req->denoise;
@@ -747,13 +926,13 @@ extern "C" int ec_studio_gen_video_v8(
     if (rc == -2) { res->cancelled = 1; return 0; }
     if (rc == 0 && wres.ok) {
       snprintf(res->engine_mode, sizeof res->engine_mode, "%s",
-               (start_rgb && end_rgb) ? "wan2.2_flf2v" : (start_rgb ? "wan2.2_i2v" : "wan2.2_ti2v_5b"));
+               used_hero_i2v ? "wan2.2_hero_i2v" : ((start_rgb && end_rgb) ? "wan2.2_flf2v" : (start_rgb ? "wan2.2_i2v" : "wan2.2_ti2v_5b")));
       snprintf(res->encoder_used, sizeof res->encoder_used, "%s", wres.encoder_used);
       res->width = wres.width; res->height = wres.height; res->frames = wres.num_frames;
       res->steps_run = wres.steps_run;
       res->lora_tensors_fused = wres.lora_tensors_fused;
-      res->text_enc_ms = wres.text_enc_ms; res->dit_ms = wres.dit_ms;
-      res->vae_ms = wres.vae_ms; res->gpu_ms = wres.total_ms + audio_ms;
+      res->text_enc_ms = wres.text_enc_ms + hero_ms; res->dit_ms = wres.dit_ms;
+      res->vae_ms = wres.vae_ms; res->gpu_ms = wres.total_ms + audio_ms + hero_ms;
       res->fps = (double)wres.num_frames / ((wres.total_ms > 1.0 ? wres.total_ms : 1.0) * 1e-3);
       return 0;
     }
@@ -770,65 +949,18 @@ extern "C" int ec_studio_gen_image_ex(
     const char *checkpoint_query,
     const ec_studio_lora_t *loras, int n_loras,
     ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
-  memset(res, 0, sizeof *res);
-  if (!st || !st->initialized) return -1;
-
-  if (photoreal && st->flux2 && ec_flux2_is_ready(st->flux2)) {
-    char ckpt_path[512] = {0};
-    if (checkpoint_query && checkpoint_query[0]) {
-      const ec_storage_asset_t *a = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, checkpoint_query);
-      if (a) snprintf(ckpt_path, sizeof ckpt_path, "%s", a->path);
-      else snprintf(ckpt_path, sizeof ckpt_path, "%s", checkpoint_query);
-    }
-
-    ec_lora_spec_t lstack[EC_LORA_MAX_STACK];
-    int nl = 0;
-    for (int i = 0; i < n_loras && nl < EC_LORA_MAX_STACK; i++) {
-      if (!loras[i].path[0]) continue;
-      const ec_storage_asset_t *la = ec_storage_find(&st->vault, EC_ASSET_LORA, loras[i].path);
-      snprintf(lstack[nl].path, sizeof lstack[nl].path, "%s", la ? la->path : loras[i].path);
-      lstack[nl].strength = loras[i].strength;
-      nl++;
-    }
-
-    ec_flux2_req_t freq = {};
-    freq.prompt = prompt;
-    freq.seed = seed;
-    freq.width = (width >= 256) ? width : 512;
-    freq.height = (height >= 256) ? height : 512;
-    freq.steps = (steps >= 1 && steps <= 50) ? steps : 4;
-    freq.checkpoint_override = ckpt_path[0] ? ckpt_path : NULL;
-    freq.loras = nl > 0 ? lstack : NULL;
-    freq.n_loras = nl;
-
-    uint64_t tag = hash_prompt_seed(prompt, seed);
-    snprintf(res->file_main, sizeof res->file_main, "%s/flux2_%u_%04x.png",
-             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
-
-    fx_cb_bridge_t bridge = { cb, cb_ctx };
-    ec_flux2_res_t fres = {};
-    pthread_mutex_lock(&st->gpu_mu);
-    studio_evict_other_engines_locked(st, 1);
-    int rc = ec_flux2_generate_png(st->flux2, &freq, res->file_main, cb ? fx_progress_bridge : NULL, &bridge, &fres);
-    pthread_mutex_unlock(&st->gpu_mu);
-    if (rc == 0 && fres.ok) {
-      snprintf(res->engine_mode, sizeof res->engine_mode, "flux2_photoreal");
-      snprintf(res->checkpoint_used, sizeof res->checkpoint_used, "%s", fres.checkpoint_used);
-      res->width = fres.width;
-      res->height = fres.height;
-      res->steps_run = fres.steps_run;
-      res->lora_tensors_fused = fres.lora_tensors_fused;
-      res->text_enc_ms = fres.text_enc_ms;
-      res->dit_ms = fres.dit_ms;
-      res->vae_ms = fres.vae_ms;
-      res->gpu_ms = fres.total_ms;
-      return 0;
-    }
-    return -1;
-  }
-
-  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
-  return ec_studio_gen_image(st, prompt, seed, width, height, steps, tier, cb, cb_ctx, res);
+  ec_studio_image_v8_t req = {};
+  req.prompt = prompt;
+  req.seed = seed;
+  req.width = width;
+  req.height = height;
+  req.steps = steps;
+  req.tier = tier;
+  req.photoreal = photoreal;
+  req.checkpoint_query = checkpoint_query;
+  req.loras = loras;
+  req.n_loras = n_loras;
+  return ec_studio_gen_image_v8(st, &req, cb, cb_ctx, res);
 }
 
 // ===========================================================================
@@ -964,83 +1096,16 @@ static int tr_flow_progress_bridge(int step, int total, const char *stage, void 
 extern "C" int ec_studio_gen_3d_ex(
     ec_studio_t *st, const char *prompt, uint32_t seed, int grid_res,
     ec_tier_t tier, int full_model, ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
-  memset(res, 0, sizeof *res);
-  if (!st || !st->initialized) return -1;
-
-  if (full_model && st->trellis2 && ec_trellis2_is_ready(st->trellis2) &&
-      st->flux2 && ec_flux2_is_ready(st->flux2)) {
-    uint64_t tag = hash_prompt_seed(prompt, seed);
-    char hero_prompt[1536];
-    snprintf(hero_prompt, sizeof hero_prompt,
-        "Isolated centered 3D studio product render of %s, single object floating centered on pure solid matte black background, even neutral softbox studio lighting, full object visible in frame, no room, no table, no background clutter",
-        (prompt && prompt[0]) ? prompt : "sculptural matte-white porcelain teapot with bamboo handle");
-
-    char ref_png[256];
-    snprintf(ref_png, sizeof ref_png, "%s/trellis2_%u_%04x_ref.png",
-             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
-    snprintf(res->file_main, sizeof res->file_main, "%s/trellis2_%u_%04x.glb",
-             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
-    snprintf(res->file_aux, sizeof res->file_aux, "%s/trellis2_%u_%04x.ply",
-             st->artifact_dir, seed, (unsigned)(tag & 0xFFFFu));
-
-    ec_flux2_req_t freq = {};
-    freq.prompt = hero_prompt;
-    freq.seed = seed;
-    freq.width = 512;
-    freq.height = 512;
-    freq.steps = 4;
-
-    fx_cb_bridge_t bridge = { cb, cb_ctx };
-    uint8_t *ref_rgb = NULL;
-    ec_flux2_res_t fres = {};
-    ec_trellis2_res_t tres = {};
-
-    pthread_mutex_lock(&st->gpu_mu);
-    studio_evict_other_engines_locked(st, 1);
-    int rc_ref = ec_flux2_generate_rgb(st->flux2, &freq, &ref_rgb, ref_png,
-                                       cb ? tr_ref_progress_bridge : NULL, &bridge, &fres);
-    // Evict FLUX.2 immediately so TRELLIS.2 DINOv3 + 30-block Flow + 3D Conv Decoder run with ample VRAM!
-    ec_flux2_unload_vram(st->flux2);
-    if (rc_ref != 0 || !ref_rgb) {
-      pthread_mutex_unlock(&st->gpu_mu);
-      if (ref_rgb) free(ref_rgb);
-      if (rc_ref == -2) { res->cancelled = 1; return 0; }
-      return -1;
-    }
-
-    ec_trellis2_req_t treq = {};
-    treq.rgb = ref_rgb;
-    treq.img_w = fres.width;
-    treq.img_h = fres.height;
-    treq.seed = seed;
-    treq.steps = 12;
-    treq.cfg_scale = 7.5f;
-    treq.rescale_t = 5.0f;
-
-    int rc_3d = ec_trellis2_generate_3d(st->trellis2, &treq, res->file_main, res->file_aux,
-                                        cb ? tr_flow_progress_bridge : NULL, &bridge, &tres);
-    pthread_mutex_unlock(&st->gpu_mu);
-    free(ref_rgb);
-
-    if (rc_3d == -2) { res->cancelled = 1; return 0; }
-    if (rc_3d == 0 && tres.ok) {
-      snprintf(res->engine_mode, sizeof res->engine_mode, "trellis2_1.3b");
-      res->n_verts = tres.n_verts;
-      res->n_tris = tres.n_tris;
-      res->n_splats = tres.n_splats;
-      res->steps_run = tres.steps_run;
-      res->text_enc_ms = fres.total_ms;
-      res->dit_ms = tres.dino_ms + tres.flow_ms;
-      res->vae_ms = tres.dec_ms + tres.mesh_ms;
-      res->gpu_ms = fres.total_ms + tres.total_ms;
-      return 0;
-    }
-    return -1;
-  }
-
-  int rc = ec_studio_gen_3d(st, prompt, seed, grid_res, tier, cb, cb_ctx, res);
-  snprintf(res->engine_mode, sizeof res->engine_mode, "dit_smoke");
-  return rc;
+  ec_studio_3d_v8_t req = {};
+  req.prompt = prompt;
+  req.seed = seed;
+  req.grid_res = grid_res;
+  req.steps = 12;
+  req.cfg_scale = 7.5f;
+  req.rescale_t = 5.0f;
+  req.tier = tier;
+  req.full_model = full_model;
+  return ec_studio_gen_3d_v8(st, &req, cb, cb_ctx, res);
 }
 
 extern "C" int ec_studio_gen_3d(
@@ -1563,7 +1628,7 @@ typedef struct {
   char vocal_mode[24];
   char audio_mode[24];
   float denoise, repaint_start, repaint_end;
-  int  stem_mode, tile_upscale, isolate_fg;
+  int  stem_mode, stem_mode_set, tile_upscale, isolate_fg;
   char engine_mode[32];
   double gpu_ms;
 } ec_node_val_t;
@@ -1641,7 +1706,7 @@ static void flow_merge_val(ec_node_val_t *dst, const ec_node_val_t *src) {
   if (src->denoise > 0.0f && dst->denoise <= 0.0f) dst->denoise = src->denoise;
   if (src->repaint_start > 0.0f && dst->repaint_start <= 0.0f) dst->repaint_start = src->repaint_start;
   if (src->repaint_end > 0.0f && dst->repaint_end <= 0.0f) dst->repaint_end = src->repaint_end;
-  if (src->stem_mode > 0 && dst->stem_mode <= 0) dst->stem_mode = src->stem_mode;
+  if (src->stem_mode_set && !dst->stem_mode_set) { dst->stem_mode = src->stem_mode; dst->stem_mode_set = 1; }
   if (src->tile_upscale && !dst->tile_upscale) dst->tile_upscale = src->tile_upscale;
   if (src->isolate_fg && !dst->isolate_fg) dst->isolate_fg = src->isolate_fg;
   for (int i = 0; i < 8; i++) {
@@ -1847,8 +1912,9 @@ static int studio_dag_cb(
     const ec_flow_input_t *in_vm = ec_flow_get_input(nd, "vocal_mode");
     if (in_vm && in_vm->kind == EC_VAL_STRING && in_vm->str_val[0]) snprintf(val->vocal_mode, sizeof val->vocal_mode, "%s", in_vm->str_val);
     const ec_flow_input_t *in_sm = ec_flow_get_input(nd, "stem_mode");
-    if (in_sm && in_sm->kind == EC_VAL_NUMBER) val->stem_mode = (int)in_sm->num_val;
+    if (in_sm && in_sm->kind == EC_VAL_NUMBER) { val->stem_mode = (int)in_sm->num_val; val->stem_mode_set = 1; }
     else if (in_sm && in_sm->kind == EC_VAL_STRING) {
+      val->stem_mode_set = 1;
       if (!strcmp(in_sm->str_val, "8stem") || !strcmp(in_sm->str_val, "8")) val->stem_mode = 8;
       else if (!strcmp(in_sm->str_val, "4stem") || !strcmp(in_sm->str_val, "4")) val->stem_mode = 4;
       else if (!strcmp(in_sm->str_val, "2stem") || !strcmp(in_sm->str_val, "2")) val->stem_mode = 2;
@@ -1890,9 +1956,11 @@ static int studio_dag_cb(
       ec_studio_music_v8_t mq = {};
       mq.prompt = prompt; mq.lyrics = val->lyrics; mq.seed = seed;
       mq.bpm = (val->bpm >= 40 && val->bpm <= 240) ? val->bpm : 124;
-      mq.duration_sec = (val->duration_sec >= 2.0f && val->duration_sec <= 120.0f) ? val->duration_sec : 10.0f;
-      mq.steps = (val->steps >= 1 && val->steps <= 8) ? val->steps : 8;
-      mq.stem_mode = val->stem_mode > 0 ? val->stem_mode : 4;
+      mq.duration_sec = (val->duration_sec >= 2.0f && val->duration_sec <= 120.0f) ? val->duration_sec : 20.0f;
+      mq.steps = (val->steps >= 1 && val->steps <= 64) ? val->steps : 8;
+      mq.cfg_scale = val->cfg;
+      mq.checkpoint_query = val->checkpoint[0] ? val->checkpoint : NULL;
+      mq.stem_mode = val->stem_mode_set ? val->stem_mode : 4;
       mq.key_scale = val->key_scale[0] ? val->key_scale : NULL;
       mq.vocal_mode = val->vocal_mode[0] ? val->vocal_mode : NULL;
       mq.audio_mode = val->audio_mode[0] ? val->audio_mode : NULL;
@@ -1957,11 +2025,11 @@ static int studio_dag_cb(
     } else {
       ec_studio_image_v8_t iq = {};
       iq.prompt = prompt; iq.neg_prompt = val->neg_prompt[0] ? val->neg_prompt : NULL; iq.seed = seed;
-      iq.width = val->width >= 256 ? val->width : 512;
-      iq.height = val->height >= 256 ? val->height : 512;
-      iq.steps = (val->steps >= 1 && val->steps <= 28) ? val->steps : 4;
+      iq.width = val->width >= 256 ? val->width : 1024;
+      iq.height = val->height >= 256 ? val->height : 1024;
+      iq.steps = (val->steps >= 1 && val->steps <= 64) ? val->steps : 4;
       iq.cfg_scale = val->cfg;
-      iq.tier = EC_TIER_FAST;
+      iq.tier = EC_TIER_EXACT;
       iq.photoreal = (in_fm && in_fm->kind == EC_VAL_NUMBER) ? (int)in_fm->num_val : ((iq.width >= 512 && fc->st->flux2) ? 1 : 0);
       iq.checkpoint_query = val->checkpoint[0] ? val->checkpoint : NULL;
       iq.loras = val->n_loras > 0 ? val->loras : NULL; iq.n_loras = val->n_loras;
@@ -2343,7 +2411,7 @@ extern "C" int ec_studio_flow_object_info_json(ec_studio_t *st, char *buf, size_
 
   // Build live dropdown arrays for checkpoints & LoRAs from Multi-Drive Storage Vault
   char ckpt_opts[8192], lora_opts[4096];
-  int cp = snprintf(ckpt_opts, sizeof ckpt_opts, "[\"flux2_klein_4b_bf16.safetensors\",\"acestep_v15_turbo_bf16.safetensors\",\"trellis2_ss_flow_1.3b_bf16.safetensors\",\"wan2.2_ti2v_5b_fp16.safetensors\"");
+  int cp = snprintf(ckpt_opts, sizeof ckpt_opts, "[\"z_image_turbo_bf16.safetensors\",\"flux2_klein_4b_bf16.safetensors\",\"flux2_klein_base_4b_bf16.safetensors\",\"acestep_v15_sft_bf16.safetensors\",\"acestep_v15_turbo_bf16.safetensors\",\"trellis2_ss_flow_1.3b_bf16.safetensors\",\"wan2.2_ti2v_5b_fp16.safetensors\"");
   int lp = snprintf(lora_opts, sizeof lora_opts, "[\"None\"");
   pthread_mutex_lock(&st->gpu_mu);
   for (int i = 0; i < st->vault.n_assets; i++) {
@@ -2383,7 +2451,7 @@ extern "C" int ec_studio_flow_object_info_json(ec_studio_t *st, char *buf, size_
       "\"EmptyLatentImage\":{\"category\":\"latent\",\"title\":\"Empty Latent Image\",\"outputs\":[\"LATENT\"],\"inputs\":{\"width\":{\"type\":\"INT\",\"default\":512,\"min\":256,\"max\":1536,\"step\":64},\"height\":{\"type\":\"INT\",\"default\":512,\"min\":256,\"max\":1536,\"step\":64}}},"
       "\"EmptyAceStepLatentAudio\":{\"category\":\"audio\",\"title\":\"Empty ACE-Step Latent Audio\",\"outputs\":[\"LATENT\"],\"inputs\":{\"seconds\":{\"type\":\"FLOAT\",\"default\":10,\"min\":2,\"max\":30,\"step\":1}}},"
       "\"Wan22ImageToVideoLatent\":{\"category\":\"video\",\"title\":\"Wan 2.2 TI2V Latent\",\"outputs\":[\"LATENT\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"width\":{\"type\":\"INT\",\"default\":832,\"min\":480,\"max\":1280,\"step\":32},\"height\":{\"type\":\"INT\",\"default\":480,\"min\":480,\"max\":1024,\"step\":32},\"length\":{\"type\":\"INT\",\"default\":17,\"min\":17,\"max\":81,\"step\":4}}},"
-      "\"KSampler\":{\"category\":\"sampling\",\"title\":\"KSampler (Native CUDA PTX)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"model\":{\"type\":\"MODEL\"},\"positive\":{\"type\":\"CONDITIONING\"},\"negative\":{\"type\":\"CONDITIONING\"},\"latent_image\":{\"type\":\"LATENT\"},\"seed\":{\"type\":\"INT\",\"default\":1042,\"min\":0,\"max\":9999999},\"steps\":{\"type\":\"INT\",\"default\":4,\"min\":1,\"max\":36},\"cfg\":{\"type\":\"FLOAT\",\"default\":3.5,\"min\":1,\"max\":12,\"step\":0.5},\"full_model\":{\"type\":\"BOOL\",\"default\":true}}},"
+      "\"KSampler\":{\"category\":\"sampling\",\"title\":\"KSampler (Native CUDA PTX)\",\"outputs\":[\"LATENT\"],\"inputs\":{\"model\":{\"type\":\"MODEL\"},\"positive\":{\"type\":\"CONDITIONING\"},\"negative\":{\"type\":\"CONDITIONING\"},\"latent_image\":{\"type\":\"LATENT\"},\"seed\":{\"type\":\"INT\",\"default\":1042,\"min\":0,\"max\":9999999},\"steps\":{\"type\":\"INT\",\"default\":4,\"min\":1,\"max\":64},\"cfg\":{\"type\":\"FLOAT\",\"default\":1.0,\"min\":1,\"max\":12,\"step\":0.5},\"full_model\":{\"type\":\"BOOL\",\"default\":true}}},"
       "\"VAEDecode\":{\"category\":\"decoders\",\"title\":\"VAE Decode (Image)\",\"outputs\":[\"IMAGE\"],\"inputs\":{\"samples\":{\"type\":\"LATENT\"},\"vae\":{\"type\":\"VAE\"}}},"
       "\"VAEDecodeAudio\":{\"category\":\"audio\",\"title\":\"Oobleck 48kHz Audio Decode\",\"outputs\":[\"AUDIO\"],\"inputs\":{\"samples\":{\"type\":\"LATENT\"}}},"
       "\"ImageColorGrade\":{\"category\":\"image_fx\",\"title\":\"Film Color Grade (Pure C11)\",\"outputs\":[\"IMAGE\"],\"inputs\":{\"image\":{\"type\":\"IMAGE\"},\"contrast\":{\"type\":\"FLOAT\",\"default\":1.08,\"min\":0.4,\"max\":2.0,\"step\":0.02},\"warmth\":{\"type\":\"FLOAT\",\"default\":0.15,\"min\":-1,\"max\":1,\"step\":0.05},\"saturation\":{\"type\":\"FLOAT\",\"default\":1.12,\"min\":0,\"max\":2.0,\"step\":0.05},\"vignette\":{\"type\":\"FLOAT\",\"default\":0.25,\"min\":0,\"max\":1,\"step\":0.05},\"sharpen\":{\"type\":\"FLOAT\",\"default\":0.30,\"min\":0,\"max\":1.5,\"step\":0.05}}},"
@@ -2767,16 +2835,51 @@ extern "C" int ec_studio_loras_json(ec_studio_t *st, char *buf, size_t cap) {
   return n;
 }
 
-static int is_compatible_flux2_klein4b_ckpt(const char *path) {
+static int inspect_supported_ckpt(
+    const char *path, const char *name,
+    const char **out_family, const char **out_mod, const char **out_variant,
+    int *out_rec_steps, float *out_rec_cfg, int *out_supports_neg) {
   if (!path || !path[0]) return 0;
   ec_safetensors_t st;
   char err[128] = {0};
   if (ec_st_open(&st, path, err, sizeof err) != 0) return 0;
+  int ok = 0;
   const ec_st_entry_t *qkv = ec_st_find(&st, "double_blocks.0.img_attn.qkv.weight");
   const ec_st_entry_t *s19 = ec_st_find(&st, "single_blocks.19.linear1.weight");
-  int ok = (qkv && s19 && qkv->rank == 2 && qkv->shape[0] == 9216 && qkv->shape[1] == 3072 &&
-            s19->rank == 2 && s19->shape[0] == 27648 && s19->shape[1] == 3072 &&
-            (qkv->dtype == EC_DTYPE_BF16 || qkv->dtype == EC_DTYPE_F16 || qkv->dtype == EC_DTYPE_F32)) ? 1 : 0;
+  if (qkv && s19 && qkv->rank == 2 && qkv->shape[0] == 9216 && qkv->shape[1] == 3072 &&
+      s19->rank == 2 && s19->shape[0] == 27648 && s19->shape[1] == 3072 &&
+      (qkv->dtype == EC_DTYPE_BF16 || qkv->dtype == EC_DTYPE_F16 || qkv->dtype == EC_DTYPE_F32)) {
+    int is_base = ci_substr(name, "base");
+    *out_family = "flux2"; *out_mod = "image";
+    *out_variant = is_base ? "base" : "distilled";
+    *out_rec_steps = is_base ? 28 : 4;
+    *out_rec_cfg = is_base ? 4.0f : 1.0f;
+    *out_supports_neg = is_base ? 1 : 0;
+    ok = 1;
+  } else {
+    const ec_st_entry_t *zi_qkv = ec_st_find(&st, "layers.0.attention.qkv.weight");
+    const ec_st_entry_t *zi_cap = ec_st_find(&st, "cap_embedder.1.weight");
+    if (zi_qkv && zi_cap && zi_qkv->rank == 2 && zi_qkv->shape[0] == 11520 && zi_qkv->shape[1] == 3840) {
+      int is_base = ci_substr(name, "base");
+      *out_family = "zimage"; *out_mod = "image";
+      *out_variant = is_base ? "base" : "turbo";
+      *out_rec_steps = is_base ? 30 : 8;
+      *out_rec_cfg = is_base ? 4.0f : 1.0f;
+      *out_supports_neg = is_base ? 1 : 0;
+      ok = 1;
+    } else {
+      const ec_st_entry_t *as_q = ec_st_find(&st, "decoder.layers.0.self_attn.q_proj.weight");
+      if (as_q && as_q->rank == 2 && as_q->shape[0] == 2048 && as_q->shape[1] == 2048) {
+        int is_sft = ci_substr(name, "sft") || (ec_st_find(&st, "null_condition_emb") != NULL && !ci_substr(name, "turbo"));
+        *out_family = "acestep"; *out_mod = "music";
+        *out_variant = is_sft ? "sft" : "turbo";
+        *out_rec_steps = is_sft ? 32 : 8;
+        *out_rec_cfg = is_sft ? 3.5f : 1.0f;
+        *out_supports_neg = 0;
+        ok = 1;
+      }
+    }
+  }
   ec_st_close(&st);
   return ok;
 }
@@ -2786,15 +2889,28 @@ extern "C" int ec_studio_checkpoints_json(ec_studio_t *st, char *buf, size_t cap
   pthread_mutex_lock(&st->gpu_mu);
   int n = snprintf(buf, cap, "{\"checkpoints\":[");
   int cnt = 0;
-  for (int i = 0; i < st->vault.n_assets && (size_t)n < cap - 320; i++) {
+  char seen_ids[64][128];
+  int n_seen = 0;
+  for (int i = 0; i < st->vault.n_assets && (size_t)n < cap - 420; i++) {
     const ec_storage_asset_t *a = &st->vault.assets[i];
     if (a->kind != EC_ASSET_CHECKPOINT) continue;
-    if (!is_compatible_flux2_klein4b_ckpt(a->path)) continue;
+    int dup = 0;
+    for (int j = 0; j < n_seen; j++) {
+      if (!strcmp(seen_ids[j], a->id)) { dup = 1; break; }
+    }
+    if (dup) continue;
+    const char *fam = "", *mod = "", *var = "";
+    int rec_steps = 4, supports_neg = 0;
+    float rec_cfg = 1.0f;
+    if (!inspect_supported_ckpt(a->path, a->name, &fam, &mod, &var, &rec_steps, &rec_cfg, &supports_neg)) continue;
+    if (n_seen < 64) snprintf(seen_ids[n_seen++], sizeof seen_ids[0], "%s", a->id);
     n += snprintf(buf + n, cap - (size_t)n,
         "%s{\"id\":\"%s\",\"name\":\"%s\",\"path\":\"%s\",\"root\":\"%s\","
-        "\"bytes\":%llu,\"is_network\":%s}",
+        "\"bytes\":%llu,\"is_network\":%s,\"family\":\"%s\",\"modality\":\"%s\","
+        "\"variant\":\"%s\",\"rec_steps\":%d,\"rec_cfg\":%.1f,\"supports_neg\":%s}",
         cnt ? "," : "", a->id, a->name, a->path, a->root_label,
-        (unsigned long long)a->bytes, a->is_network ? "true" : "false");
+        (unsigned long long)a->bytes, a->is_network ? "true" : "false",
+        fam, mod, var, rec_steps, rec_cfg, supports_neg ? "true" : "false");
     cnt++;
   }
   n += snprintf(buf + n, cap - (size_t)n, "],\"count\":%d}", cnt);

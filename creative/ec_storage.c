@@ -168,7 +168,7 @@ int ec_storage_remove_root(ec_storage_vault_t *v, const char *path) {
 static ec_asset_kind_t classify_asset(const char *fullpath, const char *fname, uint64_t bytes) {
   if (ci_contains(fname, "tokenizer") && ci_contains(fname, ".json")) return EC_ASSET_TOKENIZER;
   if (ci_contains(fullpath, "/loras/") || ci_contains(fname, "lora") || ci_contains(fname, "lightning")) return EC_ASSET_LORA;
-  if (ci_contains(fullpath, "/vae/") || ci_contains(fname, "vae") || strcasecmp(fname, "ae.safetensors") == 0) return EC_ASSET_VAE;
+  if (ci_contains(fullpath, "/vae/") || ci_contains(fname, "vae") || ci_contains(fname, "_ae.") || strcasecmp(fname, "ae.safetensors") == 0) return EC_ASSET_VAE;
   if (ci_contains(fullpath, "/text_encoders/") || ci_contains(fullpath, "/clip/") ||
       ci_contains(fname, "qwen_3_") || ci_contains(fname, "qwen3_") ||
       ci_contains(fname, "qwen_2.5") || ci_contains(fname, "umt5") || ci_contains(fname, "t5xxl")) {

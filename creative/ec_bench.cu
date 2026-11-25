@@ -998,7 +998,7 @@ static int studio_node_exec(
     float pos[] = { 0,1,0,  1,0,0,  0,0,1, -1,0,0,  0,0,-1,  0,-1,0 };
     float nrm[] = { 0,1,0,  1,0,0,  0,0,1, -1,0,0,  0,0,-1,  0,-1,0 };
     uint32_t idx3[] = { 0,2,1, 0,3,2, 0,4,3, 0,1,4, 5,1,2, 5,2,3, 5,3,4, 5,4,1 };
-    ec_mesh_t m = { pos, nrm, nullptr, idx3, 6, 8, {0.85f, 0.42f, 0.18f, 1.0f}, 0.25f, 0.35f };
+    ec_mesh_t m = { pos, nrm, nullptr, nullptr, idx3, 6, 8, {0.85f, 0.42f, 0.18f, 1.0f}, 0.25f, 0.35f };
     snprintf(path, sizeof path, "%s/studio_asset.glb", ctx->art_dir);
     if (ec_export_glb(path, &m) != 0) return -1;
 

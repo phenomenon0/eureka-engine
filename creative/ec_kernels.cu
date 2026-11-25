@@ -1147,6 +1147,56 @@ __global__ void __launch_bounds__(256) k_sage_attn_i8_d128_bm128(
   }
 }
 
+// Step 1a (v16 Real SageAttention): Compute per-head per-channel K mean [H, D] to eliminate DC outliers!
+// Mathematically softmax(Q (K - mu)^T) == softmax(Q K^T), recovering ~2-3 bits of INT8 attention precision!
+__global__ void k_sage_k_mean(
+    const __half *__restrict__ K, float *__restrict__ k_mean,
+    int n_kv, int n_kv_pad, int n_heads, int D) {
+  const int h = blockIdx.x;
+  const int d = threadIdx.x;
+  if (h >= n_heads || d >= D) return;
+  const __half *kh = K + (long)h * n_kv_pad * D;
+  float sum = 0.0f;
+  for (int t = 0; t < n_kv; t++) sum += __half2float(kh[(long)t * D + d]);
+  k_mean[(long)h * D + d] = (n_kv > 0) ? (sum / (float)n_kv) : 0.0f;
+}
+
+// Step 1b: Quantize each K row [H, n_kv_pad, D] with K-smoothing (K - k_mean[h, d]) -> INT8 + per-row scale
+__global__ void k_quant_rows_i8_ksmooth(
+    const __half *__restrict__ src, const float *__restrict__ k_mean,
+    int8_t *__restrict__ dst, float *__restrict__ sc,
+    int n_kv, int n_kv_pad, int n_heads, int D) {
+  const long row = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const long total_rows = (long)n_heads * n_kv_pad;
+  if (row >= total_rows) return;
+  const int h = (int)(row / n_kv_pad);
+  const int t = (int)(row % n_kv_pad);
+  const __half *sr = src + row * D;
+  const float  *km = k_mean + (long)h * D;
+  int8_t *dr = dst + row * D;
+
+  if (t >= n_kv) {
+    if (lane == 0) sc[row] = 0.0f;
+    for (int d = lane; d < D; d += 32) dr[d] = 0;
+    return;
+  }
+  float amax = 0.0f;
+  for (int d = lane; d < D; d += 32) {
+    amax = fmaxf(amax, fabsf(__half2float(sr[d]) - km[d]));
+  }
+  amax = warp_reduce_max(amax);
+  const float s = (amax > 1e-8f) ? (amax / 127.0f) : 1.0f;
+  const float inv = (amax > 1e-8f) ? (127.0f / amax) : 0.0f;
+  if (lane == 0) sc[row] = s;
+  for (int d = lane; d < D; d += 32) {
+    int q = __float2int_rn((__half2float(sr[d]) - km[d]) * inv);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+    dr[d] = (int8_t)q;
+  }
+}
+
 extern "C" int ec_launch_sage_attn_i8(
     const __half *Q, const __half *K, const __half *V,
     int8_t *q_i8, int8_t *k_i8, float *q_sc, float *k_sc,
@@ -1158,7 +1208,21 @@ extern "C" int ec_launch_sage_attn_i8(
   const int rows_q = n_heads * n_q_pad;
   const int rows_k = n_heads * n_kv_pad;
   k_quant_rows_i8<<<(rows_q + 7) / 8, 256, 0, stream>>>(Q, q_i8, q_sc, rows_q, head_dim);
-  k_quant_rows_i8<<<(rows_k + 7) / 8, 256, 0, stream>>>(K, k_i8, k_sc, rows_k, head_dim);
+  // Real SageAttention K-smoothing: reuse tiny static device scratch [H, D] (<= 64 KB)
+  static float *s_kmean = nullptr;
+  static int s_kmean_cap = 0;
+  int need_km = n_heads * head_dim;
+  if (need_km > s_kmean_cap) {
+    if (s_kmean) cudaFree(s_kmean);
+    if (cudaMalloc(&s_kmean, (size_t)need_km * sizeof(float)) == cudaSuccess) s_kmean_cap = need_km;
+    else { s_kmean = nullptr; s_kmean_cap = 0; }
+  }
+  if (s_kmean && block_causal_size <= 0 && head_dim <= 256) {
+    k_sage_k_mean<<<n_heads, head_dim, 0, stream>>>(K, s_kmean, n_kv, n_kv_pad, n_heads, head_dim);
+    k_quant_rows_i8_ksmooth<<<(rows_k + 7) / 8, 256, 0, stream>>>(K, s_kmean, k_i8, k_sc, n_kv, n_kv_pad, n_heads, head_dim);
+  } else {
+    k_quant_rows_i8<<<(rows_k + 7) / 8, 256, 0, stream>>>(K, k_i8, k_sc, rows_k, head_dim);
+  }
 
   if (head_dim == 64) {
     dim3 grd((n_q + 63) / 64, n_heads);
