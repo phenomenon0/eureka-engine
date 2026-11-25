@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include "ec_hal.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -78,6 +78,19 @@ int ec_ops_conv2d_3x3_nhwc_bf16(
     const float *bias, const float *res_f32,
     float *Y_f32, uint16_t *Y_bf16,
     int H, int W, int Cin, int Cout, cudaStream_t stream);
+
+// 5. Shared GPU RMSNorm & LayerNorm (+ optional affine weight/bias + optional AdaLN scale/shift -> F32 and/or BF16):
+int ec_ops_rmsnorm_adaln(
+    const float *x, const float *w,
+    const float *scale, const float *shift,
+    float *y_f32, uint16_t *y_bf16,
+    int rows, int dim, float eps, cudaStream_t stream);
+
+int ec_ops_layernorm_adaln(
+    const float *x, const float *w, const float *b,
+    const float *scale, const float *shift,
+    float *y_f32, uint16_t *y_bf16,
+    int rows, int dim, float eps, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

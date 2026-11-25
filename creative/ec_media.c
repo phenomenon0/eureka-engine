@@ -832,7 +832,13 @@ int ec_load_image_rgb(const char *path, uint8_t **out_rgb, int *out_w, int *out_
     static void *g_libz = NULL;
     static zlib_uncompress_fn g_uncomp = NULL;
     if (!g_libz) {
+#ifdef __APPLE__
+      g_libz = dlopen("libz.1.dylib", RTLD_LAZY);
+      if (!g_libz) g_libz = dlopen("/usr/lib/libz.1.dylib", RTLD_LAZY);
+#else
       g_libz = dlopen("libz.so.1", RTLD_LAZY);
+      if (!g_libz) g_libz = dlopen("libz.so", RTLD_LAZY);
+#endif
       if (g_libz) g_uncomp = (zlib_uncompress_fn)dlsym(g_libz, "uncompress");
     }
     if (g_uncomp) {

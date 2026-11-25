@@ -15,8 +15,8 @@
 #include "ec_media.h"
 #include "ec_ops.h"
 #include "ec_safetensors.h"
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "ec_hal.h"
+#include "backends/ec_model_kernels_portable.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,11 +51,13 @@ static inline uint16_t as_f32_to_bf16_host(float f) {
 static __device__ __forceinline__ float as_silu(float x) {
   return x / (1.0f + expf(-x));
 }
+#ifdef __CUDACC__
 static __device__ __forceinline__ float as_warp_sum(float v) {
   #pragma unroll
   for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
   return v;
 }
+#endif
 // ===========================================================================
 // 1. Unified High-Throughput BF16 TensorCore GEMM (via shared ec_ops.cu)
 // ===========================================================================
@@ -89,6 +91,7 @@ __global__ void k_as_swiglu_pair_bf16(const float *gate, const float *up, uint16
 }
 
 // Qwen3RMSNorm -> optional AdaLN: (rmsnorm(x, w) * (1 + scale) + shift) -> BF16
+#ifdef __CUDACC__
 __global__ void k_as_rmsnorm_adaln(
     const float *__restrict__ x, const float *__restrict__ w,
     const float *__restrict__ scale, const float *__restrict__ shift,
@@ -119,8 +122,10 @@ __global__ void k_as_rmsnorm_adaln(
     if (yb) yb[c] = as_f32_to_bf16(v);
   }
 }
+#endif
 
 // QK-RMSNorm + Split-Half 1D RoPE + Transpose [L, H, D] -> [H, L, D] BF16 (direct TensorCore FA2 input!)
+#ifdef __CUDACC__
 __global__ void k_as_qk_norm_rope_bf16(
     const float *__restrict__ q_in, const float *__restrict__ k_in, const float *__restrict__ v_in,
     const float *__restrict__ q_norm_w, const float *__restrict__ k_norm_w,
@@ -181,9 +186,11 @@ __global__ void k_as_qk_norm_rope_bf16(
     }
   }
 }
+#endif
 
 // QK-RMSNorm + Split-Half 1D RoPE + Transpose [L, H, D] -> [H, L, D]
 // apply_rope=0 skips RoPE (for cross-attention K/V & Q).
+#ifdef __CUDACC__
 __global__ void k_as_qk_norm_rope(
     const float *__restrict__ q_in, const float *__restrict__ k_in, const float *__restrict__ v_in,
     const float *__restrict__ q_norm_w, const float *__restrict__ k_norm_w,
@@ -244,11 +251,13 @@ __global__ void k_as_qk_norm_rope(
     }
   }
 }
+#endif
 
 // Unified F32 Flash-style GQA Attention (D=128, 1 warp per (qpos, hq)):
 //   mode=0: causal (k <= q)
 //   mode=1: bidirectional full (0 <= k < Lkv)
 //   mode=2: bidirectional sliding window (|q - k| <= window)
+#ifdef __CUDACC__
 __global__ void k_as_gqa_attn(
     const float *__restrict__ Q, const float *__restrict__ K, const float *__restrict__ V,
     uint16_t *__restrict__ O_bf16,
@@ -306,6 +315,7 @@ __global__ void k_as_gqa_attn(
     out[lane + i * 32] = as_f32_to_bf16(acc[i] * inv_l);
   }
 }
+#endif
 
 // Pack [ctx[T, 128], xt[T, 64]] -> patchified BF16 [T_p, 384] (zero-padded if T is odd)
 __global__ void k_as_pack_patch_in(
@@ -430,6 +440,16 @@ static uint16_t *st_upload_bf16(const ec_safetensors_t *st, const char *name) {
     return NULL;
   }
   return d;
+}
+
+// Read-only zero-copy safetensors mmap bind on Apple Silicon Unified Memory; falls back to st_upload_bf16 elsewhere
+static uint16_t *st_upload_bf16_ro(const ec_safetensors_t *st, const char *name) {
+  const ec_st_entry_t *t = ec_st_find(st, name);
+  if (t && t->dtype == EC_DTYPE_BF16) {
+    void *mapped = ec_hal_mmap_bind(ec_st_ptr(st, t), t->nbytes);
+    if (mapped) return (uint16_t *)mapped;
+  }
+  return st_upload_bf16(st, name);
 }
 
 static float *st_upload_f32(const ec_safetensors_t *st, const char *name) {
@@ -930,35 +950,32 @@ static int run_qwen3_06b(
     snprintf(key, sizeof key, "layers.%d.post_attention_layernorm.weight", l); float *ln2 = st_upload_f32(st, key);
     snprintf(key, sizeof key, "layers.%d.self_attn.q_norm.weight", l);         float *qn  = st_upload_f32(st, key);
     snprintf(key, sizeof key, "layers.%d.self_attn.k_norm.weight", l);         float *kn  = st_upload_f32(st, key);
-    snprintf(key, sizeof key, "layers.%d.self_attn.q_proj.weight", l);         uint16_t *wq = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "layers.%d.self_attn.k_proj.weight", l);         uint16_t *wk = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "layers.%d.self_attn.v_proj.weight", l);         uint16_t *wv = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "layers.%d.self_attn.o_proj.weight", l);         uint16_t *wo = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "layers.%d.mlp.gate_proj.weight", l);            uint16_t *wg = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "layers.%d.mlp.up_proj.weight", l);              uint16_t *wu = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "layers.%d.mlp.down_proj.weight", l);            uint16_t *wd = st_upload_bf16(st, key);
+    snprintf(key, sizeof key, "layers.%d.self_attn.q_proj.weight", l);         uint16_t *wq = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "layers.%d.self_attn.k_proj.weight", l);         uint16_t *wk = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "layers.%d.self_attn.v_proj.weight", l);         uint16_t *wv = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "layers.%d.self_attn.o_proj.weight", l);         uint16_t *wo = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "layers.%d.mlp.gate_proj.weight", l);            uint16_t *wg = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "layers.%d.mlp.up_proj.weight", l);              uint16_t *wu = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "layers.%d.mlp.down_proj.weight", l);            uint16_t *wd = st_upload_bf16_ro(st, key);
 
-    k_as_rmsnorm_adaln<<<L_txt, 256, 0, as->stream>>>(x_d, ln1, NULL, NULL, NULL, xn_bf16, L_txt, DIM, 1e-6f);
+    EC_DISPATCH_PORT(k_as_rmsnorm_adaln, L_txt, 256, 0, as->stream, x_d, ln1, NULL, NULL, NULL, xn_bf16, L_txt, DIM, 1e-6f);
     as_gemm(xn_bf16, wq, NULL, q_d, NULL, L_txt, HQ * D,  DIM, as->stream);
     as_gemm(xn_bf16, wk, NULL, k_d, NULL, L_txt, HKV * D, DIM, as->stream);
     as_gemm(xn_bf16, wv, NULL, v_d, NULL, L_txt, HKV * D, DIM, as->stream);
 
     int n_warps = L_txt * (HQ + HKV);
-    k_as_qk_norm_rope<<<(n_warps + 7) / 8, 256, 0, as->stream>>>(
-        q_d, k_d, v_d, qn, kn, qr_d, kr_d, vr_d, L_txt, L_txt, HQ, HKV, D, 1e6f, 1e-6f, 1);
+    EC_DISPATCH_PORT(k_as_qk_norm_rope, (n_warps + 7) / 8, 256, 0, as->stream, q_d, k_d, v_d, qn, kn, qr_d, kr_d, vr_d, L_txt, L_txt, HQ, HKV, D, 1e6f, 1e-6f, 1);
     int q_warps = L_txt * HQ;
-    k_as_gqa_attn<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
-        qr_d, kr_d, vr_d, ao_bf16, L_txt, L_txt, HQ, HKV, D, 1.0f / sqrtf((float)D), 0, 0);
+    EC_DISPATCH_PORT(k_as_gqa_attn, (q_warps + 7) / 8, 256, 0, as->stream, qr_d, kr_d, vr_d, ao_bf16, L_txt, L_txt, HQ, HKV, D, 1.0f / sqrtf((float)D), 0, 0);
     as_gemm(ao_bf16, wo, NULL, tmp_d, NULL, L_txt, DIM, HQ * D, as->stream);
-    k_as_add_inplace<<<((long)L_txt * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)L_txt * DIM);
+    EC_LAUNCH_1D(k_as_add_inplace, ((long)L_txt * DIM + 255) / 256, 256, as->stream, x_d, tmp_d, (long)L_txt * DIM);
 
-    k_as_rmsnorm_adaln<<<L_txt, 256, 0, as->stream>>>(x_d, ln2, NULL, NULL, NULL, xn_bf16, L_txt, DIM, 1e-6f);
+    EC_DISPATCH_PORT(k_as_rmsnorm_adaln, L_txt, 256, 0, as->stream, x_d, ln2, NULL, NULL, NULL, xn_bf16, L_txt, DIM, 1e-6f);
     as_gemm(xn_bf16, wg, NULL, gate_d, NULL, L_txt, FFN, DIM, as->stream);
     as_gemm(xn_bf16, wu, NULL, up_d,   NULL, L_txt, FFN, DIM, as->stream);
-    k_as_swiglu_pair_bf16<<<((long)L_txt * FFN + 255) / 256, 256, 0, as->stream>>>(
-        gate_d, up_d, mlp_bf16, (long)L_txt * FFN);
+    EC_LAUNCH_1D(k_as_swiglu_pair_bf16, ((long)L_txt * FFN + 255) / 256, 256, as->stream, gate_d, up_d, mlp_bf16, (long)L_txt * FFN);
     as_gemm(mlp_bf16, wd, NULL, tmp_d, NULL, L_txt, DIM, FFN, as->stream);
-    k_as_add_inplace<<<((long)L_txt * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)L_txt * DIM);
+    EC_LAUNCH_1D(k_as_add_inplace, ((long)L_txt * DIM + 255) / 256, 256, as->stream, x_d, tmp_d, (long)L_txt * DIM);
 
     cudaStreamSynchronize(as->stream);
     cudaFree(ln1); cudaFree(ln2); cudaFree(qn); cudaFree(kn);
@@ -967,7 +984,7 @@ static int run_qwen3_06b(
   }
 
   float *norm_w = st_upload_f32(st, "norm.weight");
-  k_as_rmsnorm_adaln<<<L_txt, 256, 0, as->stream>>>(x_d, norm_w, NULL, NULL, NULL, out_text_bf16_d, L_txt, DIM, 1e-6f);
+  EC_DISPATCH_PORT(k_as_rmsnorm_adaln, L_txt, 256, 0, as->stream, x_d, norm_w, NULL, NULL, NULL, out_text_bf16_d, L_txt, DIM, 1e-6f);
   cudaStreamSynchronize(as->stream);
 
   cudaFree(norm_w);
@@ -990,7 +1007,7 @@ static int run_encoder_stack(
   const int DIM = 2048, HQ = 16, HKV = 8, D = 128, FFN = 6144;
   char key[192];
 
-  snprintf(key, sizeof key, "%s.embed_tokens.weight", prefix); uint16_t *ew = st_upload_bf16(st, key);
+  snprintf(key, sizeof key, "%s.embed_tokens.weight", prefix); uint16_t *ew = st_upload_bf16_ro(st, key);
   snprintf(key, sizeof key, "%s.embed_tokens.bias", prefix);   float    *eb = st_upload_f32(st, key);
   if (!ew || !eb) { cudaFree(ew); cudaFree(eb); return -1; }
 
@@ -1020,36 +1037,33 @@ static int run_encoder_stack(
     snprintf(key, sizeof key, "%s.layers.%d.post_attention_layernorm.weight", prefix, l); float *ln2 = st_upload_f32(st, key);
     snprintf(key, sizeof key, "%s.layers.%d.self_attn.q_norm.weight", prefix, l);         float *qn  = st_upload_f32(st, key);
     snprintf(key, sizeof key, "%s.layers.%d.self_attn.k_norm.weight", prefix, l);         float *kn  = st_upload_f32(st, key);
-    snprintf(key, sizeof key, "%s.layers.%d.self_attn.q_proj.weight", prefix, l);         uint16_t *wq = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "%s.layers.%d.self_attn.k_proj.weight", prefix, l);         uint16_t *wk = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "%s.layers.%d.self_attn.v_proj.weight", prefix, l);         uint16_t *wv = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "%s.layers.%d.self_attn.o_proj.weight", prefix, l);         uint16_t *wo = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "%s.layers.%d.mlp.gate_proj.weight", prefix, l);            uint16_t *wg = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "%s.layers.%d.mlp.up_proj.weight", prefix, l);              uint16_t *wu = st_upload_bf16(st, key);
-    snprintf(key, sizeof key, "%s.layers.%d.mlp.down_proj.weight", prefix, l);            uint16_t *wd = st_upload_bf16(st, key);
+    snprintf(key, sizeof key, "%s.layers.%d.self_attn.q_proj.weight", prefix, l);         uint16_t *wq = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "%s.layers.%d.self_attn.k_proj.weight", prefix, l);         uint16_t *wk = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "%s.layers.%d.self_attn.v_proj.weight", prefix, l);         uint16_t *wv = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "%s.layers.%d.self_attn.o_proj.weight", prefix, l);         uint16_t *wo = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "%s.layers.%d.mlp.gate_proj.weight", prefix, l);            uint16_t *wg = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "%s.layers.%d.mlp.up_proj.weight", prefix, l);              uint16_t *wu = st_upload_bf16_ro(st, key);
+    snprintf(key, sizeof key, "%s.layers.%d.mlp.down_proj.weight", prefix, l);            uint16_t *wd = st_upload_bf16_ro(st, key);
 
-    k_as_rmsnorm_adaln<<<L, 256, 0, as->stream>>>(x_d, ln1, NULL, NULL, NULL, xn_bf16, L, DIM, 1e-6f);
+    EC_DISPATCH_PORT(k_as_rmsnorm_adaln, L, 256, 0, as->stream, x_d, ln1, NULL, NULL, NULL, xn_bf16, L, DIM, 1e-6f);
     as_gemm(xn_bf16, wq, NULL, q_d, NULL, L, HQ * D,  DIM, as->stream);
     as_gemm(xn_bf16, wk, NULL, k_d, NULL, L, HKV * D, DIM, as->stream);
     as_gemm(xn_bf16, wv, NULL, v_d, NULL, L, HKV * D, DIM, as->stream);
 
     int n_warps = L * (HQ + HKV);
-    k_as_qk_norm_rope<<<(n_warps + 7) / 8, 256, 0, as->stream>>>(
-        q_d, k_d, v_d, qn, kn, qr_d, kr_d, vr_d, L, L, HQ, HKV, D, 1e6f, 1e-6f, 1);
+    EC_DISPATCH_PORT(k_as_qk_norm_rope, (n_warps + 7) / 8, 256, 0, as->stream, q_d, k_d, v_d, qn, kn, qr_d, kr_d, vr_d, L, L, HQ, HKV, D, 1e6f, 1e-6f, 1);
     int q_warps = L * HQ;
     int mode = (l % 2 == 0) ? 2 : 1; // even: sliding window 128, odd: full bidirectional
-    k_as_gqa_attn<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
-        qr_d, kr_d, vr_d, ao_bf16, L, L, HQ, HKV, D, 1.0f / sqrtf((float)D), mode, 128);
+    EC_DISPATCH_PORT(k_as_gqa_attn, (q_warps + 7) / 8, 256, 0, as->stream, qr_d, kr_d, vr_d, ao_bf16, L, L, HQ, HKV, D, 1.0f / sqrtf((float)D), mode, 128);
     as_gemm(ao_bf16, wo, NULL, tmp_d, NULL, L, DIM, HQ * D, as->stream);
-    k_as_add_inplace<<<((long)L * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)L * DIM);
+    EC_LAUNCH_1D(k_as_add_inplace, ((long)L * DIM + 255) / 256, 256, as->stream, x_d, tmp_d, (long)L * DIM);
 
-    k_as_rmsnorm_adaln<<<L, 256, 0, as->stream>>>(x_d, ln2, NULL, NULL, NULL, xn_bf16, L, DIM, 1e-6f);
+    EC_DISPATCH_PORT(k_as_rmsnorm_adaln, L, 256, 0, as->stream, x_d, ln2, NULL, NULL, NULL, xn_bf16, L, DIM, 1e-6f);
     as_gemm(xn_bf16, wg, NULL, gate_d, NULL, L, FFN, DIM, as->stream);
     as_gemm(xn_bf16, wu, NULL, up_d,   NULL, L, FFN, DIM, as->stream);
-    k_as_swiglu_pair_bf16<<<((long)L * FFN + 255) / 256, 256, 0, as->stream>>>(
-        gate_d, up_d, mlp_bf16, (long)L * FFN);
+    EC_LAUNCH_1D(k_as_swiglu_pair_bf16, ((long)L * FFN + 255) / 256, 256, as->stream, gate_d, up_d, mlp_bf16, (long)L * FFN);
     as_gemm(mlp_bf16, wd, NULL, tmp_d, NULL, L, DIM, FFN, as->stream);
-    k_as_add_inplace<<<((long)L * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)L * DIM);
+    EC_LAUNCH_1D(k_as_add_inplace, ((long)L * DIM + 255) / 256, 256, as->stream, x_d, tmp_d, (long)L * DIM);
 
     cudaStreamSynchronize(as->stream);
     cudaFree(ln1); cudaFree(ln2); cudaFree(qn); cudaFree(kn);
@@ -1059,7 +1073,7 @@ static int run_encoder_stack(
 
   snprintf(key, sizeof key, "%s.norm.weight", prefix);
   float *nw = st_upload_f32(st, key);
-  k_as_rmsnorm_adaln<<<L, 256, 0, as->stream>>>(x_d, nw, NULL, NULL, out_f32, NULL, L, DIM, 1e-6f);
+  EC_DISPATCH_PORT(k_as_rmsnorm_adaln, L, 256, 0, as->stream, x_d, nw, NULL, NULL, out_f32, NULL, L, DIM, 1e-6f);
   cudaStreamSynchronize(as->stream);
 
   cudaFree(nw);
@@ -1107,12 +1121,9 @@ static int run_condition_encoder(
   as_gemm(text_bf16_d, tp_w, NULL, txt_f32, NULL, L_txt, DIM, 1024, as->stream);
 
   // 4. Pack in exact order: [lyric_enc, timbre_enc[0], text_proj] -> BF16
-  k_as_f32_to_bf16<<<((long)L_lyr * DIM + 255) / 256, 256, 0, as->stream>>>(
-      lyr_f32, out_packed_bf16_d, (long)L_lyr * DIM);
-  k_as_f32_to_bf16<<<(DIM + 255) / 256, 256, 0, as->stream>>>(
-      timbre_f32, out_packed_bf16_d + (long)L_lyr * DIM, DIM);
-  k_as_f32_to_bf16<<<((long)L_txt * DIM + 255) / 256, 256, 0, as->stream>>>(
-      txt_f32, out_packed_bf16_d + (long)(L_lyr + 1) * DIM, (long)L_txt * DIM);
+  EC_LAUNCH_1D(k_as_f32_to_bf16, ((long)L_lyr * DIM + 255) / 256, 256, as->stream, lyr_f32, out_packed_bf16_d, (long)L_lyr * DIM);
+  EC_LAUNCH_1D(k_as_f32_to_bf16, (DIM + 255) / 256, 256, as->stream, timbre_f32, out_packed_bf16_d + (long)L_lyr * DIM, DIM);
+  EC_LAUNCH_1D(k_as_f32_to_bf16, ((long)L_txt * DIM + 255) / 256, 256, as->stream, txt_f32, out_packed_bf16_d + (long)(L_lyr + 1) * DIM, (long)L_txt * DIM);
 
   cudaStreamSynchronize(as->stream);
   cudaFree(tp_w); cudaFree(lyr_f32); cudaFree(timbre_f32); cudaFree(txt_f32);
@@ -1222,8 +1233,7 @@ static int run_acestep_dit(
     as_gemm(cond_bf16_d, d->layers[l].cross_k, NULL, ck_tmp, NULL, L_enc, HKV * D, DIM, as->stream);
     as_gemm(cond_bf16_d, d->layers[l].cross_v, NULL, cv_tmp, NULL, L_enc, HKV * D, DIM, as->stream);
     int kv_warps = L_enc * HKV;
-    k_as_qk_norm_rope_bf16<<<(kv_warps + 7) / 8, 256, 0, as->stream>>>(
-        NULL, ck_tmp, cv_tmp, NULL, d->layers[l].cross_k_norm,
+    EC_DISPATCH_PORT(k_as_qk_norm_rope_bf16, (kv_warps + 7) / 8, 256, 0, as->stream, NULL, ck_tmp, cv_tmp, NULL, d->layers[l].cross_k_norm,
         NULL, ck_cache[l], cv_cache[l], 0, L_enc, HQ, HKV, D, 1e6f, 1e-6f, 0);
   }
   cudaFree(ck_tmp); cudaFree(cv_tmp); cudaFree(cond_bf16_d);
@@ -1304,18 +1314,17 @@ static int run_acestep_dit(
     }
     float t_cur = sched[step];
     compute_time_embed_gpu(as, &d->time_embed, t_cur, te_f_d, te_hf_d, te_hb_d, temb_t_d, tproj_t_d);
-    k_as_add_vec<<<(DIM + 255) / 256, 256, 0, as->stream>>>(temb_t_d, temb_r_d, temb_d, DIM);
-    k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(tproj_t_d, tproj_r_d, tproj_d, 6 * DIM);
+    EC_LAUNCH_1D(k_as_add_vec, (DIM + 255) / 256, 256, as->stream, temb_t_d, temb_r_d, temb_d, DIM);
+    EC_LAUNCH_1D(k_as_add_vec, (6 * DIM + 255) / 256, 256, as->stream, tproj_t_d, tproj_r_d, tproj_d, 6 * DIM);
 
     // Pack + proj_in
-    k_as_pack_patch_in<<<((long)T_p * 384 + 255) / 256, 256, 0, as->stream>>>(
-        ctx_d, xt_d, patch_in_bf16, T, T_p);
+    EC_LAUNCH_1D(k_as_pack_patch_in, ((long)T_p * 384 + 255) / 256, 256, as->stream, ctx_d, xt_d, patch_in_bf16, T, T_p);
     as_gemm(patch_in_bf16, d->proj_in_w, d->proj_in_b, x_d, NULL, T_p, DIM, 384, as->stream);
 
     // 24 DiT Layers
     for (int l = 0; l < 24; l++) {
       const as_dit_layer_t *L = &d->layers[l];
-      k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(L->scale_shift, tproj_d, mod_d, 6 * DIM);
+      EC_LAUNCH_1D(k_as_add_vec, (6 * DIM + 255) / 256, 256, as->stream, L->scale_shift, tproj_d, mod_d, 6 * DIM);
       const float *shift_msa = mod_d + 0 * DIM;
       const float *scale_msa = mod_d + 1 * DIM;
       const float *gate_msa  = mod_d + 2 * DIM;
@@ -1324,51 +1333,44 @@ static int run_acestep_dit(
       const float *c_gate    = mod_d + 5 * DIM;
 
       // 1. Self-Attention (AdaLN -> GQA w/ RoPE -> TensorCore BF16 FA2 -> gated residual)
-      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-          x_d, L->self_norm_w, scale_msa, shift_msa, NULL, xn_bf16, T_p, DIM, 1e-6f);
+      EC_DISPATCH_PORT(k_as_rmsnorm_adaln, T_p, 256, 0, as->stream, x_d, L->self_norm_w, scale_msa, shift_msa, NULL, xn_bf16, T_p, DIM, 1e-6f);
       as_gemm(xn_bf16, L->self_q, NULL, q_d, NULL, T_p, HQ * D,  DIM, as->stream);
       as_gemm(xn_bf16, L->self_k, NULL, k_d, NULL, T_p, HKV * D, DIM, as->stream);
       as_gemm(xn_bf16, L->self_v, NULL, v_d, NULL, T_p, HKV * D, DIM, as->stream);
       int n_warps = T_p * (HQ + HKV);
-      k_as_qk_norm_rope_bf16<<<(n_warps + 7) / 8, 256, 0, as->stream>>>(
-          q_d, k_d, v_d, L->self_q_norm, L->self_k_norm, qr_b, kr_b, vr_b,
+      EC_DISPATCH_PORT(k_as_qk_norm_rope_bf16, (n_warps + 7) / 8, 256, 0, as->stream, q_d, k_d, v_d, L->self_q_norm, L->self_k_norm, qr_b, kr_b, vr_b,
           T_p, T_p, HQ, HKV, D, 1e6f, 1e-6f, 1);
       int win = (l % 2 == 0) ? 128 : 0; // even: sliding W=128, odd: full
       ec_ops_fa2_bf16(qr_b, kr_b, vr_b, NULL, ao_bf16, T_p, T_p, T_p, T_p, HQ, HKV, D, attn_scale, win, as->stream);
       as_gemm(ao_bf16, L->self_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
-      k_as_add_gated<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, gate_msa, T_p, DIM);
+      EC_LAUNCH_1D(k_as_add_gated, ((long)T_p * DIM + 255) / 256, 256, as->stream, x_d, tmp_d, gate_msa, T_p, DIM);
 
       // 2. Cross-Attention (RMSNorm -> TensorCore BF16 GQA FA2 against cached K/V)
-      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-          x_d, L->cross_norm_w, NULL, NULL, NULL, xn_bf16, T_p, DIM, 1e-6f);
+      EC_DISPATCH_PORT(k_as_rmsnorm_adaln, T_p, 256, 0, as->stream, x_d, L->cross_norm_w, NULL, NULL, NULL, xn_bf16, T_p, DIM, 1e-6f);
       as_gemm(xn_bf16, L->cross_q, NULL, q_d, NULL, T_p, HQ * D, DIM, as->stream);
       int q_warps = T_p * HQ;
-      k_as_qk_norm_rope_bf16<<<(q_warps + 7) / 8, 256, 0, as->stream>>>(
-          q_d, NULL, NULL, L->cross_q_norm, NULL, qr_b, NULL, NULL,
+      EC_DISPATCH_PORT(k_as_qk_norm_rope_bf16, (q_warps + 7) / 8, 256, 0, as->stream, q_d, NULL, NULL, L->cross_q_norm, NULL, qr_b, NULL, NULL,
           T_p, 0, HQ, HKV, D, 1e6f, 1e-6f, 0);
       ec_ops_fa2_bf16(qr_b, ck_cache[l], cv_cache[l], NULL, ao_bf16, T_p, L_enc, T_p, L_enc, HQ, HKV, D, attn_scale, 0, as->stream);
       as_gemm(ao_bf16, L->cross_o, NULL, tmp_d, NULL, T_p, DIM, HQ * D, as->stream);
-      k_as_add_inplace<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, (long)T_p * DIM);
+      EC_LAUNCH_1D(k_as_add_inplace, ((long)T_p * DIM + 255) / 256, 256, as->stream, x_d, tmp_d, (long)T_p * DIM);
 
       // 3. SwiGLU MLP (AdaLN -> gate/up -> down -> gated residual)
-      k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-          x_d, L->mlp_norm_w, c_scale, c_shift, NULL, xn_bf16, T_p, DIM, 1e-6f);
+      EC_DISPATCH_PORT(k_as_rmsnorm_adaln, T_p, 256, 0, as->stream, x_d, L->mlp_norm_w, c_scale, c_shift, NULL, xn_bf16, T_p, DIM, 1e-6f);
       as_gemm(xn_bf16, L->mlp_gate, NULL, gate_d, NULL, T_p, FFN, DIM, as->stream);
       as_gemm(xn_bf16, L->mlp_up,   NULL, up_d,   NULL, T_p, FFN, DIM, as->stream);
-      k_as_swiglu_pair_bf16<<<((long)T_p * FFN + 255) / 256, 256, 0, as->stream>>>(
-          gate_d, up_d, mlp_bf16, (long)T_p * FFN);
+      EC_LAUNCH_1D(k_as_swiglu_pair_bf16, ((long)T_p * FFN + 255) / 256, 256, as->stream, gate_d, up_d, mlp_bf16, (long)T_p * FFN);
       as_gemm(mlp_bf16, L->mlp_down, NULL, tmp_d, NULL, T_p, DIM, FFN, as->stream);
-      k_as_add_gated<<<((long)T_p * DIM + 255) / 256, 256, 0, as->stream>>>(x_d, tmp_d, c_gate, T_p, DIM);
+      EC_LAUNCH_1D(k_as_add_gated, ((long)T_p * DIM + 255) / 256, 256, as->stream, x_d, tmp_d, c_gate, T_p, DIM);
     }
 
     // Output Head: AdaLN + ConvTranspose1d(2048 -> 64, k=2, s=2) -> vt [T_pad, 64]
-    k_as_add_out_mod<<<(2 * DIM + 255) / 256, 256, 0, as->stream>>>(d->scale_shift_out, temb_d, out_mod_d, DIM);
-    k_as_rmsnorm_adaln<<<T_p, 256, 0, as->stream>>>(
-        x_d, d->norm_out_w, out_mod_d + DIM, out_mod_d, NULL, xn_bf16, T_p, DIM, 1e-6f);
+    EC_LAUNCH_1D(k_as_add_out_mod, (2 * DIM + 255) / 256, 256, as->stream, d->scale_shift_out, temb_d, out_mod_d, DIM);
+    EC_DISPATCH_PORT(k_as_rmsnorm_adaln, T_p, 256, 0, as->stream, x_d, d->norm_out_w, out_mod_d + DIM, out_mod_d, NULL, xn_bf16, T_p, DIM, 1e-6f);
     as_gemm(xn_bf16, d->proj_out_w, d->proj_out_b2, vt_d, NULL, T_p, 128, DIM, as->stream);
 
     float dt = (step == n_steps - 1) ? t_cur : (t_cur - sched[step + 1]);
-    k_as_ode_step<<<((long)T * 64 + 255) / 256, 256, 0, as->stream>>>(xt_d, vt_d, dt, (long)T * 64);
+    EC_LAUNCH_1D(k_as_ode_step, ((long)T * 64 + 255) / 256, 256, as->stream, xt_d, vt_d, dt, (long)T * 64);
   }
 
   if (!cancelled) {
@@ -1400,8 +1402,7 @@ static void run_conv1d_k7_chunked(
   for (int t0 = 0; t0 < L; t0 += max_chunk) {
     int ch = (L - t0 < max_chunk) ? (L - t0) : max_chunk;
     long n_col = (long)ch * 7 * Cin;
-    k_as_im2col_1d_k7<<<(n_col + 255) / 256, 256, 0, as->stream>>>(
-        x_d, col_scratch, L, Cin, dil, t0, ch);
+    EC_LAUNCH_1D(k_as_im2col_1d_k7, (n_col + 255) / 256, 256, as->stream, x_d, col_scratch, L, Cin, dil, t0, ch);
     as_gemm(col_scratch, w_bf16, b_f32, y_d + (long)t0 * Cout, NULL, ch, Cout, 7 * Cin, as->stream);
   }
 }
@@ -1414,7 +1415,7 @@ static void run_conv1d_k1_chunked(
   for (int t0 = 0; t0 < L; t0 += max_chunk) {
     int ch = (L - t0 < max_chunk) ? (L - t0) : max_chunk;
     long n = (long)ch * Cin;
-    k_as_f32_to_bf16<<<(n + 255) / 256, 256, 0, as->stream>>>(x_d + (long)t0 * Cin, bf16_scratch, n);
+    EC_LAUNCH_1D(k_as_f32_to_bf16, (n + 255) / 256, 256, as->stream, x_d + (long)t0 * Cin, bf16_scratch, n);
     as_gemm(bf16_scratch, w_bf16, b_f32, y_d + (long)t0 * Cout, NULL, ch, Cout, Cin, as->stream);
   }
 }
@@ -1424,13 +1425,11 @@ static void run_oobleck_resunit(
     const as_oobleck_res_t *R, int L, int C, int dil,
     uint16_t *col_scratch, int max_chunk) {
   long tot = (long)L * C;
-  k_as_snake1d<<<(tot + 255) / 256, 256, 0, as->stream>>>(
-      x_d, R->s1.exp_alpha, R->s1.inv_beta, buf_a, L, C);
+  EC_LAUNCH_1D(k_as_snake1d, (tot + 255) / 256, 256, as->stream, x_d, R->s1.exp_alpha, R->s1.inv_beta, buf_a, L, C);
   run_conv1d_k7_chunked(as, buf_a, buf_b, R->c1_w, R->c1_b, L, C, C, dil, col_scratch, max_chunk);
-  k_as_snake1d<<<(tot + 255) / 256, 256, 0, as->stream>>>(
-      buf_b, R->s2.exp_alpha, R->s2.inv_beta, buf_a, L, C);
+  EC_LAUNCH_1D(k_as_snake1d, (tot + 255) / 256, 256, as->stream, buf_b, R->s2.exp_alpha, R->s2.inv_beta, buf_a, L, C);
   run_conv1d_k1_chunked(as, buf_a, buf_b, R->c2_w, R->c2_b, L, C, C, col_scratch, max_chunk * 4);
-  k_as_add_inplace<<<(tot + 255) / 256, 256, 0, as->stream>>>(x_d, buf_b, tot);
+  EC_LAUNCH_1D(k_as_add_inplace, (tot + 255) / 256, 256, as->stream, x_d, buf_b, tot);
 }
 
 static int run_oobleck_vae_decode(
@@ -1462,8 +1461,7 @@ static int run_oobleck_vae_decode(
     // 1. Snake1d in-place into buf_s
     float *buf_s = NULL;
     cudaMalloc(&buf_s, (size_t)L * Cin * 4);
-    k_as_snake1d<<<((long)L * Cin + 255) / 256, 256, 0, as->stream>>>(
-        cur_d, B->snake1.exp_alpha, B->snake1.inv_beta, buf_s, L, Cin);
+    EC_LAUNCH_1D(k_as_snake1d, ((long)L * Cin + 255) / 256, 256, as->stream, cur_d, B->snake1.exp_alpha, B->snake1.inv_beta, buf_s, L, Cin);
     cudaFree(cur_d);
 
     // 2. ConvTranspose1d(Cin -> Cout, k=2*s, stride=s, pad=s/2) -> [L_out, Cout]
@@ -1475,7 +1473,7 @@ static int run_oobleck_vae_decode(
     for (int q0 = 0; q0 < L + 1; q0 += q_max) {
       int qch = (L + 1 - q0 < q_max) ? (L + 1 - q0) : q_max;
       long n_p = (long)qch * 2 * Cin;
-      k_as_convt_pairs<<<(n_p + 255) / 256, 256, 0, as->stream>>>(buf_s, col_scratch, L, Cin, q0, qch);
+      EC_LAUNCH_1D(k_as_convt_pairs, (n_p + 255) / 256, 256, as->stream, buf_s, col_scratch, L, Cin, q0, qch);
       as_gemm(col_scratch, B->conv_t_w, B->conv_t_b,
               ct_full + (long)q0 * s * Cout, NULL, qch, s * Cout, 2 * Cin, as->stream);
     }
@@ -1507,8 +1505,7 @@ static int run_oobleck_vae_decode(
   float *sn_d = NULL, *pcm_d = NULL;
   cudaMalloc(&sn_d,  (size_t)L * 128 * 4);
   cudaMalloc(&pcm_d, (size_t)L * 2 * 4);
-  k_as_snake1d<<<((long)L * 128 + 255) / 256, 256, 0, as->stream>>>(
-      cur_d, v->final_snake.exp_alpha, v->final_snake.inv_beta, sn_d, L, 128);
+  EC_LAUNCH_1D(k_as_snake1d, ((long)L * 128 + 255) / 256, 256, as->stream, cur_d, v->final_snake.exp_alpha, v->final_snake.inv_beta, sn_d, L, 128);
   cudaFree(cur_d);
 
   int fin_chunk = (int)(COL_CAP_ELEMS / (7 * 128));
@@ -1538,8 +1535,7 @@ static void run_conv1d_strided_chunked(
   for (int q0 = 0; q0 < L_out; q0 += max_ch) {
     int ch = (L_out - q0 < max_ch) ? (L_out - q0) : max_ch;
     long n_col = (long)ch * K * Cin;
-    k_as_im2col_1d_strided<<<(n_col + 255) / 256, 256, 0, as->stream>>>(
-        x_d, col_scratch, L_in, Cin, K, stride, pad, q0, ch);
+    EC_LAUNCH_1D(k_as_im2col_1d_strided, (n_col + 255) / 256, 256, as->stream, x_d, col_scratch, L_in, Cin, K, stride, pad, q0, ch);
     as_gemm(col_scratch, w_bf16, b_f32, y_d + (long)q0 * Cout, NULL, ch, Cout, K * Cin, as->stream);
   }
 }
@@ -1603,7 +1599,7 @@ static int run_oobleck_vae_encode(
     // snake1 -> strided conv1 (k=2*s, stride=s, pad=s/2)
     as_snake_t sn = {};
     snprintf(pfx, sizeof pfx, "encoder.block.%d.snake1", b); load_snake(st, pfx, Cin, &sn);
-    k_as_snake1d<<<((long)L * Cin + 255) / 256, 256, 0, as->stream>>>(cur_d, sn.exp_alpha, sn.inv_beta, buf_a, L, Cin);
+    EC_LAUNCH_1D(k_as_snake1d, ((long)L * Cin + 255) / 256, 256, as->stream, cur_d, sn.exp_alpha, sn.inv_beta, buf_a, L, Cin);
     cudaFree(cur_d); free_snake(&sn);
 
     int L_out = L / s;
@@ -1626,12 +1622,12 @@ static int run_oobleck_vae_encode(
   cudaMalloc(&sn_d,   (size_t)L * 2048 * 4);
   cudaMalloc(&z128_d, (size_t)L * 128 * 4);
   cudaMalloc(&z64_d,  (size_t)L * 64 * 4);
-  k_as_snake1d<<<((long)L * 2048 + 255) / 256, 256, 0, as->stream>>>(cur_d, fsn.exp_alpha, fsn.inv_beta, sn_d, L, 2048);
+  EC_LAUNCH_1D(k_as_snake1d, ((long)L * 2048 + 255) / 256, 256, as->stream, cur_d, fsn.exp_alpha, fsn.inv_beta, sn_d, L, 2048);
   cudaFree(cur_d); free_snake(&fsn);
   uint16_t *c2w = load_wn_conv1d_bf16(st, "encoder.conv2", 128, 2048, 3);
   float    *c2b = st_upload_f32(st, "encoder.conv2.bias");
   run_conv1d_strided_chunked(as, sn_d, z128_d, c2w, c2b, L, L, 2048, 128, 3, 1, 1, col, COL_CAP);
-  k_as_slice_mu64<<<((long)L * 64 + 255) / 256, 256, 0, as->stream>>>(z128_d, z64_d, L);
+  EC_LAUNCH_1D(k_as_slice_mu64, ((long)L * 64 + 255) / 256, 256, as->stream, z128_d, z64_d, L);
   cudaMemcpyAsync(out_z64_h, z64_d, (size_t)L * 64 * 4, cudaMemcpyDeviceToHost, as->stream);
   cudaStreamSynchronize(as->stream);
   cudaFree(sn_d); cudaFree(z128_d); cudaFree(z64_d); cudaFree(c2w); cudaFree(c2b); cudaFree(col);

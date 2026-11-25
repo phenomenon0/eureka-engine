@@ -33,6 +33,17 @@ static int has_nvenc(void) {
   return cached;
 }
 
+static int has_videotoolbox(void) {
+#ifdef __APPLE__
+  static int cached = -1;
+  if (cached >= 0) return cached;
+  cached = probe_encoder_works("h264_videotoolbox");
+  return cached;
+#else
+  return 0;
+#endif
+}
+
 static const char *select_video_codec(int prefer_nvenc) {
   const char *want = getenv("EC_VIDEO_CODEC");
   if (want && want[0]) {
@@ -43,13 +54,24 @@ static const char *select_video_codec(int prefer_nvenc) {
       static int svt = -1;
       if (svt < 0) svt = probe_encoder_works("libsvtav1");
       if (svt) return "libsvtav1";
-    } else if (!strcmp(want, "hevc") || !strcmp(want, "hevc_nvenc")) {
+    } else if (!strcmp(want, "hevc") || !strcmp(want, "hevc_nvenc") || !strcmp(want, "hevc_videotoolbox")) {
+#ifdef __APPLE__
+      static int vt_hevc = -1;
+      if (vt_hevc < 0) vt_hevc = probe_encoder_works("hevc_videotoolbox");
+      if (vt_hevc) return "hevc_videotoolbox";
+#endif
       static int hevc_hw = -1;
       if (hevc_hw < 0) hevc_hw = probe_encoder_works("hevc_nvenc");
       if (hevc_hw) return "hevc_nvenc";
+    } else if (!strcmp(want, "h264_videotoolbox") || !strcmp(want, "h264_amf") || !strcmp(want, "h264_qsv")) {
+      if (probe_encoder_works(want)) return want;
     }
   }
-  return (prefer_nvenc && has_nvenc()) ? "h264_nvenc" : "libx264";
+  if (prefer_nvenc) {
+    if (has_videotoolbox()) return "h264_videotoolbox";
+    if (has_nvenc()) return "h264_nvenc";
+  }
+  return "libx264";
 }
 
 static ec_mp4_writer_t *spawn_ffmpeg(
@@ -98,6 +120,9 @@ static ec_mp4_writer_t *spawn_ffmpeg(
       argv[ac++] = "-aq-strength"; argv[ac++] = "8";
       argv[ac++] = "-temporal-aq"; argv[ac++] = "1";
       argv[ac++] = "-rc-lookahead";argv[ac++] = "12";
+    } else if (!strcmp(vcodec, "h264_videotoolbox") || !strcmp(vcodec, "hevc_videotoolbox")) {
+      // Apple Silicon Media Engine hardware encoder (M1/M2/M3/M4)
+      argv[ac++] = "-q:v"; argv[ac++] = "72";
     } else if (!strcmp(vcodec, "libsvtav1")) {
       argv[ac++] = "-preset"; argv[ac++] = "8";
       argv[ac++] = "-crf";    argv[ac++] = "24";

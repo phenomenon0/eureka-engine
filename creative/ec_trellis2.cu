@@ -13,9 +13,8 @@
 #include "ec_media.h"
 #include "ec_ops.h"
 #include "ec_safetensors.h"
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "ec_hal.h"
+#include "backends/ec_model_kernels_portable.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,11 +78,13 @@ static __device__ __forceinline__ float tr_gelu_tanh(float x) {
   float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
   return 0.5f * x * (1.0f + tanhf(c));
 }
+#ifdef __CUDACC__
 static __device__ __forceinline__ float tr_warp_sum(float v) {
   #pragma unroll
   for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
   return v;
 }
+#endif
 // ===========================================================================
 // 1. Unified High-Throughput BF16 TensorCore GEMM (via shared ec_ops.cu)
 // ===========================================================================
@@ -128,6 +129,7 @@ __global__ void k_tr_silu_f32(const float *src, float *dst, long n) {
 }
 
 // Unified LayerNorm (optional affine w/b, optional AdaLN scale/shift, optional SiLU)
+#ifdef __CUDACC__
 __global__ void k_tr_layernorm(
     const float *__restrict__ x,
     const float *__restrict__ w, const float *__restrict__ b,
@@ -169,6 +171,7 @@ __global__ void k_tr_layernorm(
     if (yb) yb[c] = tr_f32_to_bf16(v);
   }
 }
+#endif
 
 // ===========================================================================
 // 3. DINOv3-ViT-L/16 Attention Kernels (H=16, D=64, 2D RoPE -> BF16 for TensorCore FA2!)
@@ -220,6 +223,7 @@ __global__ void k_dino_unpack_rope(
 // 4. TRELLIS.2 SparseStructureFlowModel Kernels (3D RoPE, MultiHeadRMSNorm -> BF16 FA2)
 // ===========================================================================
 // Self-attn unpack qkv[N, 3, H, 128] -> Q, K, V [H, N, 128] BF16 + MultiHeadRMSNorm + 3D RoPE
+#ifdef __CUDACC__
 __global__ void k_ss_self_qkv_rope(
     const float *__restrict__ qkv,
     const float *__restrict__ q_gamma, const float *__restrict__ k_gamma,
@@ -282,8 +286,10 @@ __global__ void k_ss_self_qkv_rope(
     vo[d1] = tr_f32_to_bf16(vs[d1]);
   }
 }
+#endif
 
 // Cross-attn Q norm & transpose [Lq, H, 128] -> [H, Lq, 128] BF16
+#ifdef __CUDACC__
 __global__ void k_ss_cross_q_norm(
     const float *__restrict__ q_in, const float *__restrict__ q_gamma,
     uint16_t *__restrict__ Q, int Lq, int H) {
@@ -302,8 +308,10 @@ __global__ void k_ss_cross_q_norm(
     qo[d] = tr_f32_to_bf16(qs[d] * inv * qg[d]);
   }
 }
+#endif
 
 // Cross-attn KV unpack [Lkv, 2, H, 128] -> K, V [H, Lkv, 128] BF16 + k_rms_norm
+#ifdef __CUDACC__
 __global__ void k_ss_cross_kv_norm(
     const float *__restrict__ kv_in, const float *__restrict__ k_gamma,
     uint16_t *__restrict__ K, uint16_t *__restrict__ V, int Lkv, int H) {
@@ -325,6 +333,7 @@ __global__ void k_ss_cross_kv_norm(
     vo[d] = tr_f32_to_bf16(vs[d]);
   }
 }
+#endif
 
 // ===========================================================================
 // 5. SparseStructureDecoder 3D Conv & PixelShuffle3D Kernels (Layout: [R, R, R, C])
@@ -435,6 +444,16 @@ static uint16_t *tr_upload_bf16(const ec_safetensors_t *st, const char *name) {
     free(b);
   }
   return d;
+}
+
+// Read-only zero-copy safetensors mmap bind on Apple Silicon Unified Memory; falls back to tr_upload_bf16 elsewhere
+static uint16_t *tr_upload_bf16_ro(const ec_safetensors_t *st, const char *name) {
+  const ec_st_entry_t *e = ec_st_find(st, name);
+  if (e && e->dtype == EC_DTYPE_BF16) {
+    void *mapped = ec_hal_mmap_bind(ec_st_ptr(st, e), e->nbytes);
+    if (mapped) return (uint16_t *)mapped;
+  }
+  return tr_upload_bf16(st, name);
 }
 
 // Transpose Conv3d weight [Cout, Cin, 3, 3, 3] -> [Cout, 27 * Cin] BF16 (row oc, col k*Cin + ic)
@@ -790,7 +809,7 @@ static int run_dinov3_vitl16(
   }
   free(img_norm);
 
-  uint16_t *patches_d = NULL, *pw_d = tr_upload_bf16(st, "patch_embed.proj.weight");
+  uint16_t *patches_d = NULL, *pw_d = tr_upload_bf16_ro(st, "patch_embed.proj.weight");
   float *pb_d = tr_upload_f32(st, "patch_embed.proj.bias");
   float *cls_d = tr_upload_f32(st, "cls_token");
   float *reg_d = tr_upload_f32(st, "reg_token");
@@ -824,31 +843,31 @@ static int run_dinov3_vitl16(
   for (int l = 0; l < 24; l++) {
     snprintf(k, sizeof k, "blocks.%d.norm1.weight", l);     float *n1w   = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.norm1.bias", l);       float *n1b   = tr_upload_f32(st, k);
-    snprintf(k, sizeof k, "blocks.%d.attn.qkv.weight", l);  uint16_t *qkv_w = tr_upload_bf16(st, k);
-    snprintf(k, sizeof k, "blocks.%d.attn.proj.weight", l); uint16_t *pr_w  = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.attn.qkv.weight", l);  uint16_t *qkv_w = tr_upload_bf16_ro(st, k);
+    snprintf(k, sizeof k, "blocks.%d.attn.proj.weight", l); uint16_t *pr_w  = tr_upload_bf16_ro(st, k);
     snprintf(k, sizeof k, "blocks.%d.attn.proj.bias", l);   float *pr_b  = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.gamma_1", l);          float *g1    = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.norm2.weight", l);     float *n2w   = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.norm2.bias", l);       float *n2b   = tr_upload_f32(st, k);
-    snprintf(k, sizeof k, "blocks.%d.mlp.fc1.weight", l);   uint16_t *fc1w = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.mlp.fc1.weight", l);   uint16_t *fc1w = tr_upload_bf16_ro(st, k);
     snprintf(k, sizeof k, "blocks.%d.mlp.fc1.bias", l);     float *fc1b  = tr_upload_f32(st, k);
-    snprintf(k, sizeof k, "blocks.%d.mlp.fc2.weight", l);   uint16_t *fc2w = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.mlp.fc2.weight", l);   uint16_t *fc2w = tr_upload_bf16_ro(st, k);
     snprintf(k, sizeof k, "blocks.%d.mlp.fc2.bias", l);     float *fc2b  = tr_upload_f32(st, k);
     snprintf(k, sizeof k, "blocks.%d.gamma_2", l);          float *g2    = tr_upload_f32(st, k);
 
-    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(x_d, n1w, n1b, NULL, NULL, NULL, xn_bf16, N, DIM, 1e-5f, 0);
+    EC_DISPATCH_PORT(k_tr_layernorm, N, 256, 0, tr->stream, x_d, n1w, n1b, NULL, NULL, NULL, xn_bf16, N, DIM, 1e-5f, 0);
     tr_gemm(xn_bf16, qkv_w, NULL, qkv_d, NULL, N, 3 * DIM, DIM, tr->stream);
     int nw = N * H;
-    k_dino_unpack_rope<<<(nw + 7) / 8, 256, 0, tr->stream>>>(qkv_d, Q_d, K_d, V_d, N, H, D, 5, G);
+    EC_LAUNCH_1D(k_dino_unpack_rope, (nw + 7) / 8, 256, tr->stream, qkv_d, Q_d, K_d, V_d, N, H, D, 5, G);
     ec_ops_fa2_bf16(Q_d, K_d, V_d, NULL, ao_bf16, N, N, N, N, H, H, D, 1.0f / sqrtf((float)D), 0, tr->stream);
     tr_gemm(ao_bf16, pr_w, pr_b, tmp_d, NULL, N, DIM, DIM, tr->stream);
-    k_tr_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(x_d, tmp_d, g1, N, DIM);
+    EC_LAUNCH_1D(k_tr_add_scaled, ((long)N * DIM + 255) / 256, 256, tr->stream, x_d, tmp_d, g1, N, DIM);
 
-    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(x_d, n2w, n2b, NULL, NULL, NULL, xn_bf16, N, DIM, 1e-5f, 0);
+    EC_DISPATCH_PORT(k_tr_layernorm, N, 256, 0, tr->stream, x_d, n2w, n2b, NULL, NULL, NULL, xn_bf16, N, DIM, 1e-5f, 0);
     tr_gemm(xn_bf16, fc1w, fc1b, fc1_d, NULL, N, FFN, DIM, tr->stream);
-    k_tr_gelu_erf_bf16<<<((long)N * FFN + 255) / 256, 256, 0, tr->stream>>>(fc1_d, mlp_bf16, (long)N * FFN);
+    EC_LAUNCH_1D(k_tr_gelu_erf_bf16, ((long)N * FFN + 255) / 256, 256, tr->stream, fc1_d, mlp_bf16, (long)N * FFN);
     tr_gemm(mlp_bf16, fc2w, fc2b, tmp_d, NULL, N, DIM, FFN, tr->stream);
-    k_tr_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(x_d, tmp_d, g2, N, DIM);
+    EC_LAUNCH_1D(k_tr_add_scaled, ((long)N * DIM + 255) / 256, 256, tr->stream, x_d, tmp_d, g2, N, DIM);
 
     cudaStreamSynchronize(tr->stream);
     cudaFree(n1w); cudaFree(n1b); cudaFree(qkv_w); cudaFree(pr_w); cudaFree(pr_b); cudaFree(g1);
@@ -856,7 +875,7 @@ static int run_dinov3_vitl16(
   }
 
   // Exact TRELLIS.2 DinoV3FeatureExtractor output: affine-free F.layer_norm(hidden_states, [1024], eps=1e-5)
-  k_tr_layernorm<<<N, 256, 0, tr->stream>>>(x_d, NULL, NULL, NULL, NULL, NULL, out_cond_bf16_d, N, DIM, 1e-5f, 0);
+  EC_DISPATCH_PORT(k_tr_layernorm, N, 256, 0, tr->stream, x_d, NULL, NULL, NULL, NULL, NULL, out_cond_bf16_d, N, DIM, 1e-5f, 0);
   cudaStreamSynchronize(tr->stream);
 
   // Persist 16 KB SHA-NI Cowrie StatePage for DINOv3 vision conditioning across restarts & rerolls
@@ -925,14 +944,14 @@ static void ss_flow_forward(
   const float scale = 1.0f / sqrtf(128.0f);
 
   compute_ss_t_mod(tr, t_val, W, W->mod_d);
-  k_tr_f32_to_bf16<<<(N * 8 + 255) / 256, 256, 0, tr->stream>>>(xt_d, W->x8_bf16, N * 8);
+  EC_LAUNCH_1D(k_tr_f32_to_bf16, (N * 8 + 255) / 256, 256, tr->stream, xt_d, W->x8_bf16, N * 8);
   tr_gemm(W->x8_bf16, f->in_w, f->in_b, W->x_d, NULL, N, DIM, 8, tr->stream);
 
   int nw_sa = N * H;
 
   for (int l = 0; l < 30; l++) {
     const tr_ss_block_t *B = &f->blocks[l];
-    k_tr_add_vec<<<(9216 + 255) / 256, 256, 0, tr->stream>>>(B->modulation, W->mod_d, W->mod_blk_d, 9216);
+    EC_LAUNCH_1D(k_tr_add_vec, (9216 + 255) / 256, 256, tr->stream, B->modulation, W->mod_d, W->mod_blk_d, 9216);
     const float *shift_msa = W->mod_blk_d + 0 * DIM;
     const float *scale_msa = W->mod_blk_d + 1 * DIM;
     const float *gate_msa  = W->mod_blk_d + 2 * DIM;
@@ -941,35 +960,31 @@ static void ss_flow_forward(
     const float *gate_mlp  = W->mod_blk_d + 5 * DIM;
 
     // 1. Self-Attention (AdaLN -> to_qkv -> MultiHeadRMSNorm + 3D RoPE -> TensorCore BF16 FA2 -> gated residual)
-    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(
-        W->x_d, NULL, NULL, scale_msa, shift_msa, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
+    EC_DISPATCH_PORT(k_tr_layernorm, N, 256, 0, tr->stream, W->x_d, NULL, NULL, scale_msa, shift_msa, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
     tr_gemm(W->xn_bf16, B->sa_qkv_w, B->sa_qkv_b, W->qkv_d, NULL, N, 3 * DIM, DIM, tr->stream);
-    k_ss_self_qkv_rope<<<(nw_sa + 7) / 8, 256, 0, tr->stream>>>(
-        W->qkv_d, B->sa_qn, B->sa_kn, W->Q_b, W->K_b, W->V_b, N, H, 16);
+    EC_DISPATCH_PORT(k_ss_self_qkv_rope, (nw_sa + 7) / 8, 256, 0, tr->stream, W->qkv_d, B->sa_qn, B->sa_kn, W->Q_b, W->K_b, W->V_b, N, H, 16);
     ec_ops_fa2_bf16(W->Q_b, W->K_b, W->V_b, NULL, W->ao_bf16, N, N, N, N, H, H, 128, scale, 0, tr->stream);
     tr_gemm(W->ao_bf16, B->sa_out_w, B->sa_out_b, W->tmp_d, NULL, N, DIM, DIM, tr->stream);
-    k_tr_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(W->x_d, W->tmp_d, gate_msa, N, DIM);
+    EC_LAUNCH_1D(k_tr_add_scaled, ((long)N * DIM + 255) / 256, 256, tr->stream, W->x_d, W->tmp_d, gate_msa, N, DIM);
 
     // 2. Cross-Attention (affine norm2 -> to_q + MultiHeadRMSNorm -> TensorCore BF16 FA2 -> residual)
-    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(
-        W->x_d, B->norm2_w, B->norm2_b, NULL, NULL, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
+    EC_DISPATCH_PORT(k_tr_layernorm, N, 256, 0, tr->stream, W->x_d, B->norm2_w, B->norm2_b, NULL, NULL, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
     tr_gemm(W->xn_bf16, B->ca_q_w, B->ca_q_b, W->qkv_d, NULL, N, DIM, DIM, tr->stream);
-    k_ss_cross_q_norm<<<(nw_sa + 7) / 8, 256, 0, tr->stream>>>(W->qkv_d, B->ca_qn, W->Q_b, N, H);
+    EC_DISPATCH_PORT(k_ss_cross_q_norm, (nw_sa + 7) / 8, 256, 0, tr->stream, W->qkv_d, B->ca_qn, W->Q_b, N, H);
     ec_ops_fa2_bf16(W->Q_b, ck_cache[l], cv_cache[l], NULL, W->ao_bf16, N, Lkv, N, Lkv, H, H, 128, scale, 0, tr->stream);
     tr_gemm(W->ao_bf16, B->ca_out_w, B->ca_out_b, W->tmp_d, NULL, N, DIM, DIM, tr->stream);
-    k_tr_add_inplace<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(W->x_d, W->tmp_d, (long)N * DIM);
+    EC_LAUNCH_1D(k_tr_add_inplace, ((long)N * DIM + 255) / 256, 256, tr->stream, W->x_d, W->tmp_d, (long)N * DIM);
 
     // 3. MLP (AdaLN -> 1536->8192 GELU(tanh) -> 8192->1536 -> gated residual)
-    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(
-        W->x_d, NULL, NULL, scale_mlp, shift_mlp, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
+    EC_DISPATCH_PORT(k_tr_layernorm, N, 256, 0, tr->stream, W->x_d, NULL, NULL, scale_mlp, shift_mlp, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
     tr_gemm(W->xn_bf16, B->mlp0_w, B->mlp0_b, W->fc0_d, NULL, N, FFN, DIM, tr->stream);
-    k_tr_gelu_tanh_bf16<<<((long)N * FFN + 255) / 256, 256, 0, tr->stream>>>(W->fc0_d, W->mlp_bf16, (long)N * FFN);
+    EC_LAUNCH_1D(k_tr_gelu_tanh_bf16, ((long)N * FFN + 255) / 256, 256, tr->stream, W->fc0_d, W->mlp_bf16, (long)N * FFN);
     tr_gemm(W->mlp_bf16, B->mlp2_w, B->mlp2_b, W->tmp_d, NULL, N, DIM, FFN, tr->stream);
-    k_tr_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(W->x_d, W->tmp_d, gate_mlp, N, DIM);
+    EC_LAUNCH_1D(k_tr_add_scaled, ((long)N * DIM + 255) / 256, 256, tr->stream, W->x_d, W->tmp_d, gate_mlp, N, DIM);
   }
 
   // Output Layer: F.layer_norm(no affine, eps=1e-5) -> out_layer (1536 -> 8)
-  k_tr_layernorm<<<N, 256, 0, tr->stream>>>(W->x_d, NULL, NULL, NULL, NULL, NULL, W->xn_bf16, N, DIM, 1e-5f, 0);
+  EC_DISPATCH_PORT(k_tr_layernorm, N, 256, 0, tr->stream, W->x_d, NULL, NULL, NULL, NULL, NULL, W->xn_bf16, N, DIM, 1e-5f, 0);
   tr_gemm(W->xn_bf16, f->out_w, f->out_b, out_v_d, NULL, N, 8, DIM, tr->stream);
 }
 
@@ -1000,9 +1015,9 @@ static int run_ss_flow(
     cudaMalloc(&ck_neg[l], (size_t)Lkv * DIM * 2);
     cudaMalloc(&cv_neg[l], (size_t)Lkv * DIM * 2);
     tr_gemm(cond_bf16_d, B->ca_kv_w, B->ca_kv_b, kv_tmp, NULL, Lkv, 2 * DIM, 1024, tr->stream);
-    k_ss_cross_kv_norm<<<(nw_kv + 7) / 8, 256, 0, tr->stream>>>(kv_tmp, B->ca_kn, ck_pos[l], cv_pos[l], Lkv, H);
+    EC_DISPATCH_PORT(k_ss_cross_kv_norm, (nw_kv + 7) / 8, 256, 0, tr->stream, kv_tmp, B->ca_kn, ck_pos[l], cv_pos[l], Lkv, H);
     tr_gemm(neg_bf16_d, B->ca_kv_w, B->ca_kv_b, kv_tmp, NULL, Lkv, 2 * DIM, 1024, tr->stream);
-    k_ss_cross_kv_norm<<<(nw_kv + 7) / 8, 256, 0, tr->stream>>>(kv_tmp, B->ca_kn, ck_neg[l], cv_neg[l], Lkv, H);
+    EC_DISPATCH_PORT(k_ss_cross_kv_norm, (nw_kv + 7) / 8, 256, 0, tr->stream, kv_tmp, B->ca_kn, ck_neg[l], cv_neg[l], Lkv, H);
   }
   cudaFree(kv_tmp);
   cudaFree(neg_bf16_d);
@@ -1094,7 +1109,7 @@ static void run_conv3d_k3(
   for (int v0 = 0; v0 < V; v0 += max_chunk) {
     int ch = (V - v0 < max_chunk) ? (V - v0) : max_chunk;
     long n = (long)ch * 27 * Cin;
-    k_tr_im2col_3d_k3<<<(n + 255) / 256, 256, 0, tr->stream>>>(x_d, col_scratch, R, Cin, v0, ch);
+    EC_LAUNCH_1D(k_tr_im2col_3d_k3, (n + 255) / 256, 256, tr->stream, x_d, col_scratch, R, Cin, v0, ch);
     tr_gemm(col_scratch, w_bf16, b_f32, y_d + (long)v0 * Cout, NULL, ch, Cout, 27 * Cin, tr->stream);
   }
 }
@@ -1103,11 +1118,11 @@ static void run_res3d(
     ec_trellis2_t *tr, float *x_d, float *buf_a, float *buf_b,
     const tr_res3d_t *r, int R, int C, uint16_t *col_scratch, size_t col_cap_elems) {
   int V = R * R * R;
-  k_tr_layernorm<<<V, 256, 0, tr->stream>>>(x_d, r->n1_w, r->n1_b, NULL, NULL, buf_a, NULL, V, C, 1e-5f, 1);
+  EC_DISPATCH_PORT(k_tr_layernorm, V, 256, 0, tr->stream, x_d, r->n1_w, r->n1_b, NULL, NULL, buf_a, NULL, V, C, 1e-5f, 1);
   run_conv3d_k3(tr, buf_a, buf_b, r->c1_w, r->c1_b, R, C, C, col_scratch, col_cap_elems);
-  k_tr_layernorm<<<V, 256, 0, tr->stream>>>(buf_b, r->n2_w, r->n2_b, NULL, NULL, buf_a, NULL, V, C, 1e-5f, 1);
+  EC_DISPATCH_PORT(k_tr_layernorm, V, 256, 0, tr->stream, buf_b, r->n2_w, r->n2_b, NULL, NULL, buf_a, NULL, V, C, 1e-5f, 1);
   run_conv3d_k3(tr, buf_a, buf_b, r->c2_w, r->c2_b, R, C, C, col_scratch, col_cap_elems);
-  k_tr_add_inplace<<<((long)V * C + 255) / 256, 256, 0, tr->stream>>>(x_d, buf_b, (long)V * C);
+  EC_LAUNCH_1D(k_tr_add_inplace, ((long)V * C + 255) / 256, 256, tr->stream, x_d, buf_b, (long)V * C);
 }
 
 static int run_ss_decoder(
@@ -1139,7 +1154,7 @@ static int run_ss_decoder(
 
   float *x32 = NULL, *a32 = NULL, *b32 = NULL, *up32 = NULL;
   cudaMalloc(&x32, 32768L * 128 * 4);
-  k_tr_pixel_shuffle_3d<<<(32768L * 128 + 255) / 256, 256, 0, tr->stream>>>(up16, x32, 16, 128);
+  EC_LAUNCH_1D(k_tr_pixel_shuffle_3d, (32768L * 128 + 255) / 256, 256, tr->stream, up16, x32, 16, 128);
   cudaFree(up16);
 
   cudaMalloc(&a32, 32768L * 128 * 4);
@@ -1155,7 +1170,7 @@ static int run_ss_decoder(
 
   float *x64 = NULL, *a64 = NULL, *b64 = NULL, *out64 = NULL;
   cudaMalloc(&x64, 262144L * 32 * 4);
-  k_tr_pixel_shuffle_3d<<<(262144L * 32 + 255) / 256, 256, 0, tr->stream>>>(up32, x64, 32, 32);
+  EC_LAUNCH_1D(k_tr_pixel_shuffle_3d, (262144L * 32 + 255) / 256, 256, tr->stream, up32, x64, 32, 32);
   cudaFree(up32);
 
   cudaMalloc(&a64, 262144L * 32 * 4);
@@ -1166,7 +1181,7 @@ static int run_ss_decoder(
 
   // Out Layer: ChannelLayerNorm32(32) -> SiLU -> Conv3d(32 -> 1)
   cudaMalloc(&out64, 262144L * 4);
-  k_tr_layernorm<<<262144, 64, 0, tr->stream>>>(x64, d->out_nw, d->out_nb, NULL, NULL, a64, NULL, 262144, 32, 1e-5f, 1);
+  EC_DISPATCH_PORT(k_tr_layernorm, 262144, 64, 0, tr->stream, x64, d->out_nw, d->out_nb, NULL, NULL, a64, NULL, 262144, 32, 1e-5f, 1);
   cudaFree(x64);
   run_conv3d_k3(tr, a64, out64, d->out_w, d->out_b, 64, 32, 1, col, COL_CAP);
   cudaFree(a64);
@@ -1562,16 +1577,16 @@ extern "C" int ec_trellis2_generate_3d(
     cudaMalloc(&tmp_d, N_FEAT * 2);
     cudaMemsetAsync(acc_d, 0, N_FEAT * 4, tr->stream);
     float w_view = 1.0f / (float)(1 + valid_extra);
-    k_tr_accum_bf16_f32<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, cond_bf16_d, N_FEAT, w_view);
+    EC_LAUNCH_1D(k_tr_accum_bf16_f32, (int)((N_FEAT + 255) / 256), 256, tr->stream, acc_d, cond_bf16_d, N_FEAT, w_view);
     for (int vi = 0; vi < n_extra; vi++) {
       if (!req->extra_rgbs[vi] || req->extra_w[vi] <= 0 || req->extra_h[vi] <= 0) continue;
       double vms = 0.0;
       if (run_dinov3_vitl16(tr, req->extra_rgbs[vi], req->extra_w[vi], req->extra_h[vi], tmp_d, &vms) == 0) {
         res->dino_ms += vms;
-        k_tr_accum_bf16_f32<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, tmp_d, N_FEAT, w_view);
+        EC_LAUNCH_1D(k_tr_accum_bf16_f32, (int)((N_FEAT + 255) / 256), 256, tr->stream, acc_d, tmp_d, N_FEAT, w_view);
       }
     }
-    k_tr_f32_to_bf16<<<(int)((N_FEAT + 255) / 256), 256, 0, tr->stream>>>(acc_d, cond_bf16_d, N_FEAT);
+    EC_LAUNCH_1D(k_tr_f32_to_bf16, (int)((N_FEAT + 255) / 256), 256, tr->stream, acc_d, cond_bf16_d, N_FEAT);
     cudaStreamSynchronize(tr->stream);
     cudaFree(acc_d); cudaFree(tmp_d);
   }

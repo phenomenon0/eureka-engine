@@ -4,8 +4,7 @@
 
 #include "ec_lora.h"
 #include "ec_safetensors.h"
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include "ec_hal.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +55,7 @@ __global__ void k_lora_fuse_bf16(
 
 // DoRA (Weight-Decomposed Low-Rank Adaptation, ICML 2024):
 // After W' = W + scale * (B @ A), rescale each row i by mag[i] / ||W'_i||_2!
+#ifdef __CUDACC__
 __global__ void k_dora_rescale_rows_bf16(
     uint16_t *__restrict__ W_bf16, int row_off, int out_sub, int in_dim,
     const float *__restrict__ mag_f32) {
@@ -83,6 +83,26 @@ __global__ void k_dora_rescale_rows_bf16(
     row[c] = dev_f32_to_bf16(v * ratio);
   }
 }
+#else
+static void host_dora_rescale_rows_bf16(
+    uint16_t *W_bf16, int row_off, int out_sub, int in_dim, const float *mag_f32, cudaStream_t s) {
+  ec_hal_stream_sync(s);
+  #pragma omp parallel for schedule(static)
+  for (int r = 0; r < out_sub; r++) {
+    uint16_t *row = W_bf16 + (long)(row_off + r) * in_dim;
+    float ss = 0.0f;
+    for (int c = 0; c < in_dim; c++) {
+      float v = __uint_as_float(((uint32_t)row[c]) << 16);
+      ss += v * v;
+    }
+    float ratio = mag_f32[r] * rsqrtf(ss + 1e-12f);
+    for (int c = 0; c < in_dim; c++) {
+      float v = __uint_as_float(((uint32_t)row[c]) << 16);
+      row[c] = dev_f32_to_bf16(v * ratio);
+    }
+  }
+}
+#endif
 
 // LoHa (Hadamard Product Low-Rank Adaptation, LyCORIS):
 // W += scale * ((W1a @ W1b) * (W2a @ W2b))
@@ -341,12 +361,16 @@ static int apply_one_pair(
       cudaMemcpyAsync(Ad, Ah, na * sizeof(float), cudaMemcpyHostToDevice, stream);
       cudaMemcpyAsync(Bd, Bh, nb * sizeof(float), cudaMemcpyHostToDevice, stream);
       long total = (long)out_d * in_d;
-      k_lora_fuse_bf16<<<(int)((total + 255) / 256), 256, 0, stream>>>(
+      EC_LAUNCH_1D(k_lora_fuse_bf16, (int)((total + 255) / 256), 256, stream,
           W_bf16_d, row_off, out_d, in_d, rank, Bd, Ad, scale);
       if (Mh) {
         cudaMalloc(&Md, (size_t)out_d * sizeof(float));
         cudaMemcpyAsync(Md, Mh, (size_t)out_d * sizeof(float), cudaMemcpyHostToDevice, stream);
+#ifdef __CUDACC__
         k_dora_rescale_rows_bf16<<<out_d, 256, 0, stream>>>(W_bf16_d, row_off, out_d, in_d, Md);
+#else
+        host_dora_rescale_rows_bf16(W_bf16_d, row_off, out_d, in_d, Md, stream);
+#endif
       }
       cudaStreamSynchronize(stream);
       cudaFree(Ad); cudaFree(Bd); cudaFree(Md);
@@ -391,7 +415,7 @@ static int apply_one_pair(
             cudaMemcpyAsync(d2a, h2a, n2a * 4, cudaMemcpyHostToDevice, stream);
             cudaMemcpyAsync(d2b, h2b, n2b * 4, cudaMemcpyHostToDevice, stream);
             long total = (long)expected_out * expected_in;
-            k_loha_fuse_bf16<<<(int)((total + 255) / 256), 256, 0, stream>>>(
+            EC_LAUNCH_1D(k_loha_fuse_bf16, (int)((total + 255) / 256), 256, stream,
                 W_bf16_d, row_off, expected_out, expected_in, r1, r2, d1a, d1b, d2a, d2b, scale);
             cudaStreamSynchronize(stream);
             cudaFree(d1a); cudaFree(d1b); cudaFree(d2a); cudaFree(d2b);
@@ -452,7 +476,7 @@ static int apply_one_pair(
           cudaMemcpyAsync(d1, h1, (size_t)m1 * n1 * 4, cudaMemcpyHostToDevice, stream);
           cudaMemcpyAsync(d2, h2, (size_t)m2 * n2 * 4, cudaMemcpyHostToDevice, stream);
           long total = (long)expected_out * expected_in;
-          k_lokr_fuse_bf16<<<(int)((total + 255) / 256), 256, 0, stream>>>(
+          EC_LAUNCH_1D(k_lokr_fuse_bf16, (int)((total + 255) / 256), 256, stream,
               W_bf16_d, row_off, expected_out, expected_in, d1, m1, n1, d2, m2, n2, scale);
           cudaStreamSynchronize(stream);
           cudaFree(d1); cudaFree(d2);

@@ -53,6 +53,7 @@ void ec_dit_ws_free(ec_dit_ws_t *ws) {
   if (!ws) return;
   if (ws->graph_exec) cudaGraphExecDestroy(ws->graph_exec);
   if (ws->graph) cudaGraphDestroy(ws->graph);
+  free(ws->cap_blocks);
   void *ptrs[] = {
     ws->norm_f32, ws->norm_f16, ws->qkv_f32, ws->q_h, ws->k_h, ws->v_h,
     ws->q_i8, ws->k_i8, ws->q_sc, ws->k_sc, ws->attn_f32, ws->attn_f16,
@@ -150,9 +151,24 @@ int ec_dit_capture_graph(
     ec_dit_ws_t *ws, float *x_d, const int32_t *coords_d, ec_tier_t tier, cudaStream_t stream) {
   if (ws->graph_exec) { cudaGraphExecDestroy(ws->graph_exec); ws->graph_exec = nullptr; }
   if (ws->graph)      { cudaGraphDestroy(ws->graph);          ws->graph = nullptr; }
+  free(ws->cap_blocks); ws->cap_blocks = nullptr;
   ws->graph_valid = 0;
 
-  EC_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+  cudaError_t cap_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+  if (cap_err == cudaErrorNotSupported) {
+    ws->cap_cfg = *cfg;
+    ws->cap_n_blocks = n_blocks;
+    ws->cap_blocks = (ec_dit_block_w_t *)malloc((size_t)n_blocks * sizeof(ec_dit_block_w_t));
+    if (!ws->cap_blocks) return -1;
+    memcpy(ws->cap_blocks, blocks, (size_t)n_blocks * sizeof(ec_dit_block_w_t));
+    ws->cap_x_d = x_d;
+    ws->cap_coords_d = coords_d;
+    ws->cap_tier = tier;
+    ws->graph_valid = 2;
+    return 0;
+  }
+  if (cap_err != cudaSuccess) return -1;
+
   for (int32_t b = 0; b < n_blocks; b++) {
     if (ec_dit_block_forward(cfg, &blocks[b], ws, x_d, coords_d, tier, stream) != 0) {
       cudaGraph_t tmp = nullptr;
@@ -168,7 +184,16 @@ int ec_dit_capture_graph(
 }
 
 int ec_dit_replay_graph(ec_dit_ws_t *ws, cudaStream_t stream) {
-  if (!ws || !ws->graph_valid || !ws->graph_exec) return -1;
+  if (!ws || !ws->graph_valid) return -1;
+  if (ws->graph_valid == 2) {
+    for (int32_t b = 0; b < ws->cap_n_blocks; b++) {
+      if (ec_dit_block_forward(&ws->cap_cfg, &ws->cap_blocks[b], ws,
+                               ws->cap_x_d, ws->cap_coords_d, ws->cap_tier, stream) != 0)
+        return -1;
+    }
+    return 0;
+  }
+  if (!ws->graph_exec) return -1;
   return cudaGraphLaunch(ws->graph_exec, stream) == cudaSuccess ? 0 : -1;
 }
 

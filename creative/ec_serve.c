@@ -696,7 +696,7 @@ static void *client_thread(void *arg) {
 
   if (!strcmp(method, "GET") && (!strcmp(path, "/v1/creative/health") || !strcmp(path, "/v1/creative/status"))) {
     snprintf(resp, RESP_CAP,
-        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v8\","
+        "{\"status\":\"ok\",\"engine\":\"eureka-creative-native-v16\",\"backend\":\"%s\","
         "\"ownership\":\"100%% eureka engine (zero cuBLAS, zero ggml, zero Python)\","
         "\"parallel\":true,\"auth_enabled\":%s,\"photoreal_ready\":%s,"
         "\"acestep_ready\":%s,\"trellis2_ready\":%s,\"wan22_ready\":%s,"
@@ -709,6 +709,7 @@ static void *client_thread(void *arg) {
         "\"models_discovered\":%d,\"storage_roots\":%d,\"loras_discovered\":%d,"
         "\"checkpoints_discovered\":%d,\"recipes_count\":%d,"
         "\"modalities\":[\"flux2_photoreal\",\"flux2_img2img\",\"flux2_inpaint_outpaint\",\"flux2_tile_upscale_2x\",\"acestep_1.5_music\",\"acestep_8stem_repaint_extend\",\"trellis2_3d\",\"trellis2_photo_multiview\",\"wan2.2_video\",\"wan2.2_i2v_flf2v\",\"qlora_nf4_fp8_dora_loha_lokr\",\"lora_delta_hotswap_8ms\",\"vae_arena_slab\",\"vram_lease_broker\",\"image\",\"3d_glb_splat\",\"music_stems\",\"video_nvenc_mp4\",\"video_av_ltx\",\"realtime_video_shm\",\"comfyui_dag\",\"comfyui_import\",\"lora_stack\",\"network_storage\",\"prompt_recipes\",\"async_jobs_sse\",\"cowrie_v2_shani\",\"cowrie_statepages\",\"cowrie_trust_membrane\",\"cowrie_lenses\"]}",
+        info.backend[0] ? info.backend : "cuda",
         g_api_key[0] ? "true" : "false",
         info.photoreal_ready ? "true" : "false",
         info.acestep_ready   ? "true" : "false",

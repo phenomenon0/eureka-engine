@@ -17,8 +17,8 @@
 #include "ec_ops.h"
 #include "ec_safetensors.h"
 #include "ec_unigram.h"
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "ec_hal.h"
+#include "backends/ec_model_kernels_portable.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,11 +102,13 @@ static __device__ __forceinline__ float wn_gelu_tanh(float x) {
   float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
   return 0.5f * x * (1.0f + tanhf(c));
 }
+#ifdef __CUDACC__
 static __device__ __forceinline__ float wn_warp_sum(float v) {
   #pragma unroll
   for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
   return v;
 }
+#endif
 // ===========================================================================
 // 1. Unified High-Throughput BF16 TensorCore GEMM (via shared ec_ops.cu)
 // ===========================================================================
@@ -157,6 +159,7 @@ __global__ void k_wn_fp8_to_bf16_scaled(
 }
 
 // RMSNorm: y = x * rsqrt(mean(x^2) + eps) * w  (optionally + SiLU for VAE!)
+#ifdef __CUDACC__
 __global__ void k_wn_rmsnorm(
     const float *__restrict__ x, const float *__restrict__ w,
     float *__restrict__ y_f32, uint16_t *__restrict__ y_bf16,
@@ -186,8 +189,10 @@ __global__ void k_wn_rmsnorm(
     if (yb) yb[c] = wn_f32_to_bf16(v);
   }
 }
+#endif
 
 // LayerNorm (optional affine w/b, optional AdaLN scale/shift) -> BF16
+#ifdef __CUDACC__
 __global__ void k_wn_layernorm(
     const float *__restrict__ x,
     const float *__restrict__ w, const float *__restrict__ b,
@@ -225,6 +230,7 @@ __global__ void k_wn_layernorm(
     yb[c] = wn_f32_to_bf16(v);
   }
 }
+#endif
 
 // ===========================================================================
 // 3. UMT5-XXL Attention Kernel (H=64, D=64, NO 1/sqrt(D) scaling, Per-Block Relative Bias!)
@@ -246,6 +252,7 @@ __device__ __forceinline__ int t5_rel_bucket(int rel_pos) {
   return bucket;
 }
 
+#ifdef __CUDACC__
 __global__ void k_wn_t5_attn_d64(
     const float *__restrict__ Q, const float *__restrict__ K, const float *__restrict__ V,
     const float *__restrict__ rel_bias, // [32, 64]
@@ -276,6 +283,7 @@ __global__ void k_wn_t5_attn_d64(
   out[lane]      = wn_f32_to_bf16(a0 * inv);
   out[lane + 32] = wn_f32_to_bf16(a1 * inv);
 }
+#endif
 
 // ===========================================================================
 // 4. WanModel 3D RoPE, Patchify/Unpatchify & Shared-Mem FlashAttention (D=128)
@@ -324,6 +332,7 @@ __global__ void k_wn_unpatchify(
 
 // Fused Self-Attention QKV WanRMSNorm(3072) + 3D RoPE ([22,21,21]) + Transpose [N, 3*3072] -> [24, N, 128] BF16
 // Replaces 2 separate RMSNorms + 3 separate transposes with 1 single bandwidth-fused kernel!
+#ifdef __CUDACC__
 __global__ void k_wn_sa_qkv_norm_rope_bf16(
     const float *__restrict__ qkv,   // [N, 3 * DIM] where DIM = 3072 = 24 * 128
     const float *__restrict__ nq_w,  // [DIM]
@@ -396,6 +405,7 @@ __global__ void k_wn_sa_qkv_norm_rope_bf16(
     vr_b[out_off + d1] = wn_f32_to_bf16(vs[c1]);
   }
 }
+#endif
 
 // Transpose [L, H, 128] F32 -> [H, L, 128] BF16 (for cross-attention Q and cached K/V!)
 __global__ void k_wn_transpose_bf16(
@@ -540,6 +550,7 @@ __global__ void k_wn_dupup3d(
 }
 
 // Single-head spatial self-attention for VAE middle.1 (C=1024, [H*W, 3072] qkv -> [H*W, 1024] BF16)
+#ifdef __CUDACC__
 __global__ void k_wn_vae_attn_1h(
     const float *__restrict__ qkv, uint16_t *__restrict__ out_bf16, int HW, int C) {
   int qpos = blockIdx.x;
@@ -600,6 +611,7 @@ __global__ void k_wn_vae_attn_1h(
     out[c] = wn_f32_to_bf16(acc * inv_l);
   }
 }
+#endif
 
 // Unpatchify(patch_size=2): [T, H, W, 12] -> RGB24 [T, 2H, 2W, 3]
 // Matches wan22_vae.py line 309: (c r q) -> (h q)(w r) => channel index = (c*2 + r)*2 + q
@@ -753,7 +765,7 @@ static uint16_t *wn_upload_bf16(const ec_safetensors_t *st, const char *name, cu
     __half *tmp = NULL;
     if (cudaMalloc(&tmp, n * 2) != cudaSuccess) { cudaFree(d); return NULL; }
     cudaMemcpyAsync(tmp, ec_st_ptr(st, e), n * 2, cudaMemcpyHostToDevice, stream);
-    k_wn_f16_to_bf16<<<(n + 255) / 256, 256, 0, stream>>>(tmp, d, (long)n);
+    EC_LAUNCH_1D(k_wn_f16_to_bf16, (n + 255) / 256, 256, stream, tmp, d, (long)n);
     cudaStreamSynchronize(stream);
     cudaFree(tmp);
   } else {
@@ -782,7 +794,7 @@ static uint16_t *wn_upload_fp8_bf16(
   if (cudaMalloc(&raw_d, n) != cudaSuccess) return NULL;
   if (cudaMalloc(&out_d, n * 2) != cudaSuccess) { cudaFree(raw_d); return NULL; }
   cudaMemcpyAsync(raw_d, ec_st_ptr(st, ew), n, cudaMemcpyHostToDevice, stream);
-  k_wn_fp8_to_bf16_scaled<<<(n + 255) / 256, 256, 0, stream>>>(raw_d, lut_d, scale, out_d, (long)n);
+  EC_LAUNCH_1D(k_wn_fp8_to_bf16_scaled, (n + 255) / 256, 256, stream, raw_d, lut_d, scale, out_d, (long)n);
   cudaStreamSynchronize(stream);
   cudaFree(raw_d);
   return out_d;
@@ -1226,14 +1238,14 @@ static int run_umt5_xxl(
     snprintf(ks, sizeof ks, "encoder.block.%d.layer.0.SelfAttention.o.scale_weight", l);
     uint16_t *wo = wn_upload_fp8_bf16(st, kw, ks, lut_d, w->stream);
 
-    k_wn_rmsnorm<<<L, 256, 0, w->stream>>>(x_d, ln0, NULL, xn_bf16, L, DIM, 1e-6f, 0);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, L, 256, 0, w->stream, x_d, ln0, NULL, xn_bf16, L, DIM, 1e-6f, 0);
     wn_gemm(xn_bf16, wq, NULL, q_d, NULL, L, DIM, DIM, w->stream);
     wn_gemm(xn_bf16, wk, NULL, k_d, NULL, L, DIM, DIM, w->stream);
     wn_gemm(xn_bf16, wv, NULL, v_d, NULL, L, DIM, DIM, w->stream);
     int nw = L * H;
-    k_wn_t5_attn_d64<<<(nw + 7) / 8, 256, 0, w->stream>>>(q_d, k_d, v_d, rb, ao_bf16, L, H);
+    EC_DISPATCH_PORT(k_wn_t5_attn_d64, (nw + 7) / 8, 256, 0, w->stream, q_d, k_d, v_d, rb, ao_bf16, L, H);
     wn_gemm(ao_bf16, wo, NULL, tmp_d, NULL, L, DIM, DIM, w->stream);
-    k_wn_add_inplace<<<((long)L * DIM + 255) / 256, 256, 0, w->stream>>>(x_d, tmp_d, (long)L * DIM);
+    EC_LAUNCH_1D(k_wn_add_inplace, ((long)L * DIM + 255) / 256, 256, w->stream, x_d, tmp_d, (long)L * DIM);
     cudaStreamSynchronize(w->stream);
     cudaFree(ln0); cudaFree(rb); cudaFree(wq); cudaFree(wk); cudaFree(wv); cudaFree(wo);
 
@@ -1249,19 +1261,19 @@ static int run_umt5_xxl(
     snprintf(ks, sizeof ks, "encoder.block.%d.layer.1.DenseReluDense.wo.scale_weight", l);
     uint16_t *wd = wn_upload_fp8_bf16(st, kw, ks, lut_d, w->stream);
 
-    k_wn_rmsnorm<<<L, 256, 0, w->stream>>>(x_d, ln1, NULL, xn_bf16, L, DIM, 1e-6f, 0);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, L, 256, 0, w->stream, x_d, ln1, NULL, xn_bf16, L, DIM, 1e-6f, 0);
     wn_gemm(xn_bf16, w0, NULL, w0_d, NULL, L, FFN, DIM, w->stream);
     wn_gemm(xn_bf16, w1, NULL, w1_d, NULL, L, FFN, DIM, w->stream);
-    k_wn_t5_geglu_bf16<<<((long)L * FFN + 255) / 256, 256, 0, w->stream>>>(w0_d, w1_d, mlp_bf16, (long)L * FFN);
+    EC_LAUNCH_1D(k_wn_t5_geglu_bf16, ((long)L * FFN + 255) / 256, 256, w->stream, w0_d, w1_d, mlp_bf16, (long)L * FFN);
     wn_gemm(mlp_bf16, wd, NULL, tmp_d, NULL, L, DIM, FFN, w->stream);
-    k_wn_add_inplace<<<((long)L * DIM + 255) / 256, 256, 0, w->stream>>>(x_d, tmp_d, (long)L * DIM);
+    EC_LAUNCH_1D(k_wn_add_inplace, ((long)L * DIM + 255) / 256, 256, w->stream, x_d, tmp_d, (long)L * DIM);
     cudaStreamSynchronize(w->stream);
     cudaFree(ln1); cudaFree(w0); cudaFree(w1); cudaFree(wd);
   }
 
   float *fnorm = wn_upload_f32(st, "encoder.final_layer_norm.weight");
   cudaMemsetAsync(out_512_bf16_d, 0, 512L * DIM * 2, w->stream);
-  k_wn_rmsnorm<<<L, 256, 0, w->stream>>>(x_d, fnorm, NULL, out_512_bf16_d, L, DIM, 1e-6f, 0);
+  EC_DISPATCH_PORT(k_wn_rmsnorm, L, 256, 0, w->stream, x_d, fnorm, NULL, out_512_bf16_d, L, DIM, 1e-6f, 0);
   cudaStreamSynchronize(w->stream);
 
   // Store host copy in 4-slot UMT5-XXL prompt cache + persist Cowrie SHA-NI StatePage across restarts!
@@ -1343,7 +1355,7 @@ static void wan_dit_forward(
     // Official Wan 2.2 TI2V-5B mask2 conditioning: clean anchored frames receive timestep t = 0.0f!
     compute_wan_time(w, 0.0f, W, W->e_z_d, W->e0_z_d);
   }
-  k_wn_patchify<<<((long)N * 192 + 255) / 256, 256, 0, w->stream>>>(xt_d, W->patch_bf16, F, Hp, Wp);
+  EC_LAUNCH_1D(k_wn_patchify, ((long)N * 192 + 255) / 256, 256, w->stream, xt_d, W->patch_bf16, F, Hp, Wp);
   wn_gemm(W->patch_bf16, d->patch_w, d->patch_b, W->x_d, NULL, N, DIM, 192, w->stream);
 
   int nw = N * H;
@@ -1353,19 +1365,17 @@ static void wan_dit_forward(
 
   auto run_adaln_ln = [&](const float *sc_main, const float *sh_main, const float *sc_zero, const float *sh_zero) {
     if (!has_pin) {
-      k_wn_layernorm<<<N, 256, 0, w->stream>>>(W->x_d, NULL, NULL, sc_main, sh_main, W->xn_bf16, N, DIM, 1e-6f);
+      EC_DISPATCH_PORT(k_wn_layernorm, N, 256, 0, w->stream, W->x_d, NULL, NULL, sc_main, sh_main, W->xn_bf16, N, DIM, 1e-6f);
     } else {
       if (pin_first) {
-        k_wn_layernorm<<<n_tok_f, 256, 0, w->stream>>>(W->x_d, NULL, NULL, sc_zero, sh_zero, W->xn_bf16, n_tok_f, DIM, 1e-6f);
+        EC_DISPATCH_PORT(k_wn_layernorm, n_tok_f, 256, 0, w->stream, W->x_d, NULL, NULL, sc_zero, sh_zero, W->xn_bf16, n_tok_f, DIM, 1e-6f);
       }
       if (mid_rows > 0) {
-        k_wn_layernorm<<<mid_rows, 256, 0, w->stream>>>(
-            W->x_d + (long)mid_start * DIM, NULL, NULL, sc_main, sh_main,
+        EC_DISPATCH_PORT(k_wn_layernorm, mid_rows, 256, 0, w->stream, W->x_d + (long)mid_start * DIM, NULL, NULL, sc_main, sh_main,
             W->xn_bf16 + (long)mid_start * DIM, mid_rows, DIM, 1e-6f);
       }
       if (pin_last) {
-        k_wn_layernorm<<<n_tok_f, 256, 0, w->stream>>>(
-            W->x_d + (long)(N - n_tok_f) * DIM, NULL, NULL, sc_zero, sh_zero,
+        EC_DISPATCH_PORT(k_wn_layernorm, n_tok_f, 256, 0, w->stream, W->x_d + (long)(N - n_tok_f) * DIM, NULL, NULL, sc_zero, sh_zero,
             W->xn_bf16 + (long)(N - n_tok_f) * DIM, n_tok_f, DIM, 1e-6f);
       }
     }
@@ -1373,28 +1383,26 @@ static void wan_dit_forward(
 
   auto run_gated_add = [&](const float *g_main, const float *g_zero) {
     if (!has_pin) {
-      k_wn_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, g_main, N, DIM);
+      EC_LAUNCH_1D(k_wn_add_scaled, ((long)N * DIM + 255) / 256, 256, w->stream, W->x_d, W->tmp_d, g_main, N, DIM);
     } else {
       if (pin_first) {
-        k_wn_add_scaled<<<((long)n_tok_f * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, g_zero, n_tok_f, DIM);
+        EC_LAUNCH_1D(k_wn_add_scaled, ((long)n_tok_f * DIM + 255) / 256, 256, w->stream, W->x_d, W->tmp_d, g_zero, n_tok_f, DIM);
       }
       if (mid_rows > 0) {
-        k_wn_add_scaled<<<((long)mid_rows * DIM + 255) / 256, 256, 0, w->stream>>>(
-            W->x_d + (long)mid_start * DIM, W->tmp_d + (long)mid_start * DIM, g_main, mid_rows, DIM);
+        EC_LAUNCH_1D(k_wn_add_scaled, ((long)mid_rows * DIM + 255) / 256, 256, w->stream, W->x_d + (long)mid_start * DIM, W->tmp_d + (long)mid_start * DIM, g_main, mid_rows, DIM);
       }
       if (pin_last) {
         long off = (long)(N - n_tok_f) * DIM;
-        k_wn_add_scaled<<<((long)n_tok_f * DIM + 255) / 256, 256, 0, w->stream>>>(
-            W->x_d + off, W->tmp_d + off, g_zero, n_tok_f, DIM);
+        EC_LAUNCH_1D(k_wn_add_scaled, ((long)n_tok_f * DIM + 255) / 256, 256, w->stream, W->x_d + off, W->tmp_d + off, g_zero, n_tok_f, DIM);
       }
     }
   };
 
   for (int l = 0; l < 30; l++) {
     const wn_dit_blk_t *B = &d->blocks[l];
-    k_wn_add_vec<<<(18432 + 255) / 256, 256, 0, w->stream>>>(B->mod, W->e0_d, W->mod_d, 18432);
+    EC_LAUNCH_1D(k_wn_add_vec, (18432 + 255) / 256, 256, w->stream, B->mod, W->e0_d, W->mod_d, 18432);
     if (has_pin) {
-      k_wn_add_vec<<<(18432 + 255) / 256, 256, 0, w->stream>>>(B->mod, W->e0_z_d, W->mod_z_d, 18432);
+      EC_LAUNCH_1D(k_wn_add_vec, (18432 + 255) / 256, 256, w->stream, B->mod, W->e0_z_d, W->mod_z_d, 18432);
     }
     const float *m0 = W->mod_d + 0 * DIM, *m1 = W->mod_d + 1 * DIM, *m2 = W->mod_d + 2 * DIM;
     const float *m3 = W->mod_d + 3 * DIM, *m4 = W->mod_d + 4 * DIM, *m5 = W->mod_d + 5 * DIM;
@@ -1404,37 +1412,36 @@ static void wan_dit_forward(
     // 1. Self-Attention: LN + AdaLN -> 1 Fused QKV GEMM -> 1 Fused WanRMSNorm+3DRoPE+BF16 -> TensorCore BF16 FA2!
     run_adaln_ln(m1, m0, z1, z0);
     wn_gemm(W->xn_bf16, B->sa_qkv_w, B->sa_qkv_b, W->qkv_d, NULL, N, 3 * DIM, DIM, w->stream);
-    k_wn_sa_qkv_norm_rope_bf16<<<N, 256, 0, w->stream>>>(
-        W->qkv_d, B->sa_nq, B->sa_nk, W->qr_b, W->kr_b, W->vr_b, N, F, Hp, Wp);
+    EC_DISPATCH_PORT(k_wn_sa_qkv_norm_rope_bf16, N, 256, 0, w->stream, W->qkv_d, B->sa_nq, B->sa_nk, W->qr_b, W->kr_b, W->vr_b, N, F, Hp, Wp);
     ec_ops_fa2_bf16(W->qr_b, W->kr_b, W->vr_b, NULL, W->ao_bf16, N, N, N, N, H, H, 128, scale, 0, w->stream);
     wn_gemm(W->ao_bf16, B->sa_o_w, B->sa_o_b, W->tmp_d, NULL, N, DIM, DIM, w->stream);
     run_gated_add(m2, z2);
 
     // 2. Cross-Attention: affine norm3 -> q + WanRMSNorm(3072) -> TensorCore BF16 FA2 against cached KV -> residual
-    k_wn_layernorm<<<N, 256, 0, w->stream>>>(W->x_d, B->norm3_w, B->norm3_b, NULL, NULL, W->xn_bf16, N, DIM, 1e-6f);
+    EC_DISPATCH_PORT(k_wn_layernorm, N, 256, 0, w->stream, W->x_d, B->norm3_w, B->norm3_b, NULL, NULL, W->xn_bf16, N, DIM, 1e-6f);
     wn_gemm(W->xn_bf16, B->ca_q_w, B->ca_q_b, W->qkv_d, NULL, N, DIM, DIM, w->stream);
-    k_wn_rmsnorm<<<N, 256, 0, w->stream>>>(W->qkv_d, B->ca_nq, W->qkv_d, NULL, N, DIM, 1e-6f, 0);
-    k_wn_transpose_bf16<<<(nw + 7) / 8, 256, 0, w->stream>>>(W->qkv_d, W->qr_b, N, H);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, N, 256, 0, w->stream, W->qkv_d, B->ca_nq, W->qkv_d, NULL, N, DIM, 1e-6f, 0);
+    EC_LAUNCH_1D(k_wn_transpose_bf16, (nw + 7) / 8, 256, w->stream, W->qkv_d, W->qr_b, N, H);
     ec_ops_fa2_bf16(W->qr_b, ck_cache[l], cv_cache[l], NULL, W->ao_bf16, N, Lctx, N, Lctx, H, H, 128, scale, 0, w->stream);
     wn_gemm(W->ao_bf16, B->ca_o_w, B->ca_o_b, W->tmp_d, NULL, N, DIM, DIM, w->stream);
-    k_wn_add_inplace<<<((long)N * DIM + 255) / 256, 256, 0, w->stream>>>(W->x_d, W->tmp_d, (long)N * DIM);
+    EC_LAUNCH_1D(k_wn_add_inplace, ((long)N * DIM + 255) / 256, 256, w->stream, W->x_d, W->tmp_d, (long)N * DIM);
 
     // 3. FFN: LN(no affine) + AdaLN -> 3072->14336 GELU(tanh) -> 14336->3072 -> gated residual
     run_adaln_ln(m4, m3, z4, z3);
     wn_gemm(W->xn_bf16, B->ffn0_w, B->ffn0_b, W->ffn_d, NULL, N, FFN, DIM, w->stream);
-    k_wn_gelu_tanh_bf16<<<((long)N * FFN + 255) / 256, 256, 0, w->stream>>>(W->ffn_d, W->ffn_bf16, (long)N * FFN);
+    EC_LAUNCH_1D(k_wn_gelu_tanh_bf16, ((long)N * FFN + 255) / 256, 256, w->stream, W->ffn_d, W->ffn_bf16, (long)N * FFN);
     wn_gemm(W->ffn_bf16, B->ffn2_w, B->ffn2_b, W->tmp_d, NULL, N, DIM, FFN, w->stream);
     run_gated_add(m5, z5);
   }
 
   // Head + Unpatchify
-  k_wn_add_head_mod<<<(2 * DIM + 255) / 256, 256, 0, w->stream>>>(d->head_mod, W->e_d, W->hmod_d, DIM);
+  EC_LAUNCH_1D(k_wn_add_head_mod, (2 * DIM + 255) / 256, 256, w->stream, d->head_mod, W->e_d, W->hmod_d, DIM);
   if (has_pin) {
-    k_wn_add_head_mod<<<(2 * DIM + 255) / 256, 256, 0, w->stream>>>(d->head_mod, W->e_z_d, W->hmod_z_d, DIM);
+    EC_LAUNCH_1D(k_wn_add_head_mod, (2 * DIM + 255) / 256, 256, w->stream, d->head_mod, W->e_z_d, W->hmod_z_d, DIM);
   }
   run_adaln_ln(W->hmod_d + DIM, W->hmod_d, W->hmod_z_d + DIM, W->hmod_z_d);
   wn_gemm(W->xn_bf16, d->head_w, d->head_b, W->head_d, NULL, N, 192, DIM, w->stream);
-  k_wn_unpatchify<<<((long)N * 192 + 255) / 256, 256, 0, w->stream>>>(W->head_d, out_v_d, F, Hp, Wp);
+  EC_LAUNCH_1D(k_wn_unpatchify, ((long)N * 192 + 255) / 256, 256, w->stream, W->head_d, out_v_d, F, Hp, Wp);
 }
 
 static int run_wan_dit(
@@ -1458,11 +1465,11 @@ static int run_wan_dit(
   cudaMalloc(&ctx_neg_b, (size_t)Lctx * DIM * 2);
 
   wn_gemm(t5_pos_bf16, d->txt0_w, d->txt0_b, t_mid, NULL, Lctx, DIM, 4096, w->stream);
-  k_wn_gelu_tanh_bf16<<<((long)Lctx * DIM + 255) / 256, 256, 0, w->stream>>>(t_mid, t_mid_b, (long)Lctx * DIM);
+  EC_LAUNCH_1D(k_wn_gelu_tanh_bf16, ((long)Lctx * DIM + 255) / 256, 256, w->stream, t_mid, t_mid_b, (long)Lctx * DIM);
   wn_gemm(t_mid_b, d->txt2_w, d->txt2_b, NULL, ctx_pos_b, Lctx, DIM, DIM, w->stream);
 
   wn_gemm(t5_neg_bf16, d->txt0_w, d->txt0_b, t_mid, NULL, Lctx, DIM, 4096, w->stream);
-  k_wn_gelu_tanh_bf16<<<((long)Lctx * DIM + 255) / 256, 256, 0, w->stream>>>(t_mid, t_mid_b, (long)Lctx * DIM);
+  EC_LAUNCH_1D(k_wn_gelu_tanh_bf16, ((long)Lctx * DIM + 255) / 256, 256, w->stream, t_mid, t_mid_b, (long)Lctx * DIM);
   wn_gemm(t_mid_b, d->txt2_w, d->txt2_b, NULL, ctx_neg_b, Lctx, DIM, DIM, w->stream);
   cudaFree(t_mid); cudaFree(t_mid_b);
 
@@ -1479,16 +1486,16 @@ static int run_wan_dit(
     cudaMalloc(&cv_neg[l], (size_t)Lctx * DIM * 2);
 
     wn_gemm(ctx_pos_b, B->ca_k_w, B->ca_k_b, kv_tmp, NULL, Lctx, DIM, DIM, w->stream);
-    k_wn_rmsnorm<<<Lctx, 256, 0, w->stream>>>(kv_tmp, B->ca_nk, kv_tmp, NULL, Lctx, DIM, 1e-6f, 0);
-    k_wn_transpose_bf16<<<(nw_c + 7) / 8, 256, 0, w->stream>>>(kv_tmp, ck_pos[l], Lctx, H);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, Lctx, 256, 0, w->stream, kv_tmp, B->ca_nk, kv_tmp, NULL, Lctx, DIM, 1e-6f, 0);
+    EC_LAUNCH_1D(k_wn_transpose_bf16, (nw_c + 7) / 8, 256, w->stream, kv_tmp, ck_pos[l], Lctx, H);
     wn_gemm(ctx_pos_b, B->ca_v_w, B->ca_v_b, kv_tmp, NULL, Lctx, DIM, DIM, w->stream);
-    k_wn_transpose_bf16<<<(nw_c + 7) / 8, 256, 0, w->stream>>>(kv_tmp, cv_pos[l], Lctx, H);
+    EC_LAUNCH_1D(k_wn_transpose_bf16, (nw_c + 7) / 8, 256, w->stream, kv_tmp, cv_pos[l], Lctx, H);
 
     wn_gemm(ctx_neg_b, B->ca_k_w, B->ca_k_b, kv_tmp, NULL, Lctx, DIM, DIM, w->stream);
-    k_wn_rmsnorm<<<Lctx, 256, 0, w->stream>>>(kv_tmp, B->ca_nk, kv_tmp, NULL, Lctx, DIM, 1e-6f, 0);
-    k_wn_transpose_bf16<<<(nw_c + 7) / 8, 256, 0, w->stream>>>(kv_tmp, ck_neg[l], Lctx, H);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, Lctx, 256, 0, w->stream, kv_tmp, B->ca_nk, kv_tmp, NULL, Lctx, DIM, 1e-6f, 0);
+    EC_LAUNCH_1D(k_wn_transpose_bf16, (nw_c + 7) / 8, 256, w->stream, kv_tmp, ck_neg[l], Lctx, H);
     wn_gemm(ctx_neg_b, B->ca_v_w, B->ca_v_b, kv_tmp, NULL, Lctx, DIM, DIM, w->stream);
-    k_wn_transpose_bf16<<<(nw_c + 7) / 8, 256, 0, w->stream>>>(kv_tmp, cv_neg[l], Lctx, H);
+    EC_LAUNCH_1D(k_wn_transpose_bf16, (nw_c + 7) / 8, 256, w->stream, kv_tmp, cv_neg[l], Lctx, H);
   }
   cudaFree(kv_tmp); cudaFree(ctx_pos_b); cudaFree(ctx_neg_b);
 
@@ -1683,7 +1690,7 @@ static void vae_causal_conv3d(
   for (long p0 = 0; p0 < total_p; p0 += max_ch) {
     int ch = (total_p - p0 < max_ch) ? (int)(total_p - p0) : max_ch;
     long n = (long)ch * 27 * Cin;
-    k_wn_im2col_c3d<<<(n + 255) / 256, 256, 0, w->stream>>>(x_pad, col_scratch, T, H, W, Cin, p0, ch);
+    EC_LAUNCH_1D(k_wn_im2col_c3d, (n + 255) / 256, 256, w->stream, x_pad, col_scratch, T, H, W, Cin, p0, ch);
     wn_gemm(col_scratch, w_bf16, b_f32, y_d + p0 * Cout, NULL, ch, Cout, 27 * Cin, w->stream);
   }
   cudaFree(x_pad);
@@ -1697,7 +1704,7 @@ static void vae_conv1x1(
   if (max_ch < 256) max_ch = 256;
   for (long p0 = 0; p0 < total_p; p0 += max_ch) {
     int ch = (total_p - p0 < max_ch) ? (int)(total_p - p0) : max_ch;
-    k_wn_f32_to_bf16<<<((long)ch * Cin + 255) / 256, 256, 0, w->stream>>>(x_d + p0 * Cin, col_scratch, (long)ch * Cin);
+    EC_LAUNCH_1D(k_wn_f32_to_bf16, ((long)ch * Cin + 255) / 256, 256, w->stream, x_d + p0 * Cin, col_scratch, (long)ch * Cin);
     wn_gemm(col_scratch, w_bf16, b_f32, y_d + p0 * Cout, NULL, ch, Cout, Cin, w->stream);
   }
 }
@@ -1712,7 +1719,7 @@ static void vae_conv2d_k3(
   for (long p0 = 0; p0 < total_p; p0 += max_ch) {
     int ch = (total_p - p0 < max_ch) ? (int)(total_p - p0) : max_ch;
     long n = (long)ch * 9 * C;
-    k_wn_im2col_2d_k3<<<(n + 255) / 256, 256, 0, w->stream>>>(x_d, col_scratch, T, H, W, C, p0, ch);
+    EC_LAUNCH_1D(k_wn_im2col_2d_k3, (n + 255) / 256, 256, w->stream, x_d, col_scratch, T, H, W, C, p0, ch);
     wn_gemm(col_scratch, w_bf16, b_f32, y_d + p0 * C, NULL, ch, C, 9 * C, w->stream);
   }
 }
@@ -1732,13 +1739,13 @@ static float *vae_run_resblk(
     h_d = x_d;
   }
 
-  k_wn_rmsnorm<<<total_p, 256, 0, w->stream>>>(x_d, R->g0, a_d, NULL, (int)total_p, R->in_c, 1e-12f, 1);
+  EC_DISPATCH_PORT(k_wn_rmsnorm, total_p, 256, 0, w->stream, x_d, R->g0, a_d, NULL, (int)total_p, R->in_c, 1e-12f, 1);
   vae_causal_conv3d(w, a_d, b_d, R->w2, R->b2, T, H, W, R->in_c, R->out_c, &caches[(*cidx)++], col_scratch, col_cap);
   cudaFree(a_d);
   cudaMalloc(&a_d, (size_t)total_p * R->out_c * 4);
-  k_wn_rmsnorm<<<total_p, 256, 0, w->stream>>>(b_d, R->g3, a_d, NULL, (int)total_p, R->out_c, 1e-12f, 1);
+  EC_DISPATCH_PORT(k_wn_rmsnorm, total_p, 256, 0, w->stream, b_d, R->g3, a_d, NULL, (int)total_p, R->out_c, 1e-12f, 1);
   vae_causal_conv3d(w, a_d, b_d, R->w6, R->b6, T, H, W, R->out_c, R->out_c, &caches[(*cidx)++], col_scratch, col_cap);
-  k_wn_add_inplace<<<(total_p * R->out_c + 255) / 256, 256, 0, w->stream>>>(h_d, b_d, total_p * R->out_c);
+  EC_LAUNCH_1D(k_wn_add_inplace, (total_p * R->out_c + 255) / 256, 256, w->stream, h_d, b_d, total_p * R->out_c);
   cudaFree(a_d); cudaFree(b_d);
   if (R->has_sc) cudaFree(x_d);
   return h_d;
@@ -1761,7 +1768,7 @@ static int run_wan_vae_decode(
   cudaMemcpyAsync(mean_d, WAN22_LATENT_MEAN, 48 * 4, cudaMemcpyHostToDevice, w->stream);
   cudaMemcpyAsync(std_d,  WAN22_LATENT_STD,  48 * 4, cudaMemcpyHostToDevice, w->stream);
   long z_pix = (long)F_lat * H_lat * W_lat;
-  k_wn_denorm_latent<<<(z_pix * 48 + 255) / 256, 256, 0, w->stream>>>(z_d, mean_d, std_d, z_pix);
+  EC_LAUNCH_1D(k_wn_denorm_latent, (z_pix * 48 + 255) / 256, 256, w->stream, z_d, mean_d, std_d, z_pix);
   cudaFree(mean_d); cudaFree(std_d);
 
   cudaMalloc(&z_c2, (size_t)z_pix * 48 * 4);
@@ -1799,12 +1806,12 @@ static int run_wan_vae_decode(
       cudaMalloc(&qkv_d,  (size_t)HW * 3072 * 4);
       cudaMalloc(&ao_b,   (size_t)HW * 1024 * 2);
       cudaMalloc(&pr_d,   (size_t)HW * 1024 * 4);
-      k_wn_rmsnorm<<<HW, 256, 0, w->stream>>>(cur, v->attn_g, norm_d, NULL, HW, 1024, 1e-12f, 0);
+      EC_DISPATCH_PORT(k_wn_rmsnorm, HW, 256, 0, w->stream, cur, v->attn_g, norm_d, NULL, HW, 1024, 1e-12f, 0);
       vae_conv1x1(w, norm_d, qkv_d, v->attn_qkv_w, v->attn_qkv_b, HW, 1024, 3072, col, COL_CAP);
       size_t smem_bytes = (size_t)(HW + 32) * 4;
-      k_wn_vae_attn_1h<<<HW, 256, smem_bytes, w->stream>>>(qkv_d, ao_b, HW, 1024);
+      EC_DISPATCH_PORT(k_wn_vae_attn_1h, HW, 256, smem_bytes, w->stream, qkv_d, ao_b, HW, 1024);
       wn_gemm(ao_b, v->attn_pr_w, v->attn_pr_b, pr_d, NULL, HW, 1024, 1024, w->stream);
-      k_wn_add_inplace<<<((long)HW * 1024 + 255) / 256, 256, 0, w->stream>>>(cur, pr_d, (long)HW * 1024);
+      EC_LAUNCH_1D(k_wn_add_inplace, ((long)HW * 1024 + 255) / 256, 256, w->stream, cur, pr_d, (long)HW * 1024);
       cudaFree(norm_d); cudaFree(qkv_d); cudaFree(ao_b); cudaFree(pr_d);
     }
 
@@ -1868,14 +1875,14 @@ static int run_wan_vae_decode(
             if (max_ch < 64) max_ch = 64;
             for (long p0 = 0; p0 < total_p; p0 += max_ch) {
               int ch = (total_p - p0 < max_ch) ? (int)(total_p - p0) : max_ch;
-              k_wn_im2col_t3<<<((long)ch * 3 * C + 255) / 256, 256, 0, w->stream>>>(x_pad, col, T, H, W, C, p0, ch);
+              EC_LAUNCH_1D(k_wn_im2col_t3, ((long)ch * 3 * C + 255) / 256, 256, w->stream, x_pad, col, T, H, W, C, p0, ch);
               wn_gemm(col, U->tm_w, U->tm_b, tc_out + p0 * (2 * C), NULL, ch, 2 * C, 3 * C, w->stream);
             }
             cudaFree(x_pad);
             cudaFree(cur);
 
             cudaMalloc(&unshuf, (size_t)(2 * T) * H * W * C * 4);
-            k_wn_time_unshuffle<<<((long)(2 * T) * H * W * C + 255) / 256, 256, 0, w->stream>>>(tc_out, unshuf, T, H, W, C);
+            EC_LAUNCH_1D(k_wn_time_unshuffle, ((long)(2 * T) * H * W * C + 255) / 256, 256, w->stream, tc_out, unshuf, T, H, W, C);
             cudaFree(tc_out);
             cur = unshuf;
             T *= 2;
@@ -1886,7 +1893,7 @@ static int run_wan_vae_decode(
         float *up2d = NULL, *sp_out = NULL;
         cudaMalloc(&up2d,   (size_t)T * (2 * H) * (2 * W) * C * 4);
         cudaMalloc(&sp_out, (size_t)T * (2 * H) * (2 * W) * C * 4);
-        k_wn_upsample2d_nearest<<<((long)T * 4 * H * W * C + 255) / 256, 256, 0, w->stream>>>(cur, up2d, T, H, W, C);
+        EC_LAUNCH_1D(k_wn_upsample2d_nearest, ((long)T * 4 * H * W * C + 255) / 256, 256, w->stream, cur, up2d, T, H, W, C);
         cudaFree(cur);
         H *= 2; W *= 2;
         vae_conv2d_k3(w, up2d, sp_out, U->sp_w, U->sp_b, T, H, W, C, col, COL_CAP);
@@ -1895,10 +1902,9 @@ static int run_wan_vae_decode(
         // Add DupUp3D shortcut!
         float *sc_up = NULL;
         cudaMalloc(&sc_up, (size_t)T * H * W * C * 4);
-        k_wn_dupup3d<<<((long)T * H * W * C + 255) / 256, 256, 0, w->stream>>>(
-            x_in_copy, sc_up, T_in, H_in, W_in, U->in_c, C, U->t_up_flag ? 2 : 1, first_chunk);
+        EC_LAUNCH_1D(k_wn_dupup3d, ((long)T * H * W * C + 255) / 256, 256, w->stream, x_in_copy, sc_up, T_in, H_in, W_in, U->in_c, C, U->t_up_flag ? 2 : 1, first_chunk);
         cudaFree(x_in_copy);
-        k_wn_add_inplace<<<((long)T * H * W * C + 255) / 256, 256, 0, w->stream>>>(sp_out, sc_up, (long)T * H * W * C);
+        EC_LAUNCH_1D(k_wn_add_inplace, ((long)T * H * W * C + 255) / 256, 256, w->stream, sp_out, sc_up, (long)T * H * W * C);
         cudaFree(sc_up);
         cur = sp_out;
       }
@@ -1909,14 +1915,14 @@ static int run_wan_vae_decode(
     float *hnorm = NULL, *out12 = NULL;
     cudaMalloc(&hnorm, (size_t)tot_p * 256 * 4);
     cudaMalloc(&out12, (size_t)tot_p * 12 * 4);
-    k_wn_rmsnorm<<<tot_p, 256, 0, w->stream>>>(cur, v->head_g, hnorm, NULL, (int)tot_p, 256, 1e-12f, 1);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, tot_p, 256, 0, w->stream, cur, v->head_g, hnorm, NULL, (int)tot_p, 256, 1e-12f, 1);
     cudaFree(cur);
     vae_causal_conv3d(w, hnorm, out12, v->head_w, v->head_b, T, H, W, 256, 12, &caches[cidx++], col, COL_CAP);
     cudaFree(hnorm);
 
     uint8_t *rgb_d = NULL;
     cudaMalloc(&rgb_d, (size_t)T * rgb_frame_bytes);
-    k_wn_unpatchify_rgb24<<<((long)T * rgb_frame_bytes + 255) / 256, 256, 0, w->stream>>>(out12, rgb_d, T, H, W);
+    EC_LAUNCH_1D(k_wn_unpatchify_rgb24, ((long)T * rgb_frame_bytes + 255) / 256, 256, w->stream, out12, rgb_d, T, H, W);
     cudaFree(out12);
 
     cudaMemcpyAsync(out_rgb24_h + (long)out_frame_cursor * rgb_frame_bytes, rgb_d,
@@ -1961,7 +1967,7 @@ static float *vae_enc_run_resblk_streamed(
   float *a_d = NULL, *b_d = NULL;
   cudaMalloc(&a_d, (size_t)total_p * Cin * 4);
   cudaMalloc(&b_d, (size_t)total_p * Cout * 4);
-  k_wn_rmsnorm<<<total_p, 256, 0, w->stream>>>(x_d, g0, a_d, NULL, (int)total_p, Cin, 1e-12f, 1);
+  EC_DISPATCH_PORT(k_wn_rmsnorm, total_p, 256, 0, w->stream, x_d, g0, a_d, NULL, (int)total_p, Cin, 1e-12f, 1);
   vae_causal_conv3d(w, a_d, b_d, w2, b2, 1, H, W, Cin, Cout, &c0, col, col_cap);
   cudaStreamSynchronize(w->stream);
   cudaFree(g0); cudaFree(w2); cudaFree(b2); cudaFree(a_d); cudaFree(c0.frames_d);
@@ -1971,9 +1977,9 @@ static float *vae_enc_run_resblk_streamed(
   snprintf(k, sizeof k, "%s.residual.6.weight", pfx); uint16_t *w6 = wn_upload_conv_k_bf16(st, k, Cout, Cout, 27);
   snprintf(k, sizeof k, "%s.residual.6.bias", pfx);   float    *b6 = wn_upload_f32(st, k);
   cudaMalloc(&a_d, (size_t)total_p * Cout * 4);
-  k_wn_rmsnorm<<<total_p, 256, 0, w->stream>>>(b_d, g3, a_d, NULL, (int)total_p, Cout, 1e-12f, 1);
+  EC_DISPATCH_PORT(k_wn_rmsnorm, total_p, 256, 0, w->stream, b_d, g3, a_d, NULL, (int)total_p, Cout, 1e-12f, 1);
   vae_causal_conv3d(w, a_d, b_d, w6, b6, 1, H, W, Cout, Cout, &c1, col, col_cap);
-  k_wn_add_inplace<<<(total_p * Cout + 255) / 256, 256, 0, w->stream>>>(h_d, b_d, total_p * Cout);
+  EC_LAUNCH_1D(k_wn_add_inplace, (total_p * Cout + 255) / 256, 256, w->stream, h_d, b_d, total_p * Cout);
   cudaStreamSynchronize(w->stream);
   cudaFree(g3); cudaFree(w6); cudaFree(b6); cudaFree(a_d); cudaFree(b_d); cudaFree(c1.frames_d);
   return h_d;
@@ -1995,7 +2001,7 @@ static int run_wan_vae_encode_frame(
   cudaMalloc(&rgb_d, (size_t)img_H * img_W * 3);
   cudaMemcpyAsync(rgb_d, rgb_hwc, (size_t)img_H * img_W * 3, cudaMemcpyHostToDevice, w->stream);
   cudaMalloc(&in12_d, (size_t)H * W * 12 * 4);
-  k_wn_patchify_rgb24<<<((long)H * W * 12 + 255) / 256, 256, 0, w->stream>>>(rgb_d, in12_d, 1, H, W);
+  EC_LAUNCH_1D(k_wn_patchify_rgb24, ((long)H * W * 12 + 255) / 256, 256, w->stream, rgb_d, in12_d, 1, H, W);
   cudaFree(rgb_d);
 
   // encoder.conv1: 12 -> 160 (CausalConv3d T=1)
@@ -2038,15 +2044,15 @@ static int run_wan_vae_encode_frame(
       int max_ch = (int)(COL_CAP / (size_t)(9 * Cout)); if (max_ch < 64) max_ch = 64;
       for (long p0 = 0; p0 < total_p; p0 += max_ch) {
         int ch = (total_p - p0 < max_ch) ? (int)(total_p - p0) : max_ch;
-        k_wn_im2col_2d_s2<<<((long)ch * 9 * Cout + 255) / 256, 256, 0, w->stream>>>(cur, col, 1, H, W, nH, nW, Cout, p0, ch);
+        EC_LAUNCH_1D(k_wn_im2col_2d_s2, ((long)ch * 9 * Cout + 255) / 256, 256, w->stream, cur, col, 1, H, W, nH, nW, Cout, p0, ch);
         wn_gemm(col, dw, db, dn_out + p0 * Cout, NULL, ch, Cout, 9 * Cout, w->stream);
       }
       cudaFree(cur); cudaFree(dw); cudaFree(db);
       // Add AvgDown3D shortcut (T=1 spatial 2x2 average + channel fold)
       cudaMalloc(&sc_dn, (size_t)nH * nW * Cout * 4);
-      k_wn_avgdown2d<<<((long)nH * nW * Cout + 255) / 256, 256, 0, w->stream>>>(x_in_copy, sc_dn, H_in, W_in, Cin, Cout);
+      EC_LAUNCH_1D(k_wn_avgdown2d, ((long)nH * nW * Cout + 255) / 256, 256, w->stream, x_in_copy, sc_dn, H_in, W_in, Cin, Cout);
       cudaFree(x_in_copy);
-      k_wn_add_inplace<<<((long)nH * nW * Cout + 255) / 256, 256, 0, w->stream>>>(dn_out, sc_dn, (long)nH * nW * Cout);
+      EC_LAUNCH_1D(k_wn_add_inplace, ((long)nH * nW * Cout + 255) / 256, 256, w->stream, dn_out, sc_dn, (long)nH * nW * Cout);
       cudaStreamSynchronize(w->stream);
       cudaFree(sc_dn);
       cur = dn_out; H = nH; W = nW;
@@ -2065,11 +2071,11 @@ static int run_wan_vae_encode_frame(
     float *norm_d = NULL, *qkv_d = NULL, *pr_d = NULL; uint16_t *ao_b = NULL;
     cudaMalloc(&norm_d, (size_t)HW * 640 * 4); cudaMalloc(&qkv_d, (size_t)HW * 1920 * 4);
     cudaMalloc(&ao_b, (size_t)HW * 640 * 2);   cudaMalloc(&pr_d, (size_t)HW * 640 * 4);
-    k_wn_rmsnorm<<<HW, 256, 0, w->stream>>>(cur, ag, norm_d, NULL, HW, 640, 1e-12f, 0);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, HW, 256, 0, w->stream, cur, ag, norm_d, NULL, HW, 640, 1e-12f, 0);
     vae_conv1x1(w, norm_d, qkv_d, aqw, aqb, HW, 640, 1920, col, COL_CAP);
-    k_wn_vae_attn_1h<<<HW, 256, (size_t)(HW + 32) * 4, w->stream>>>(qkv_d, ao_b, HW, 640);
+    EC_DISPATCH_PORT(k_wn_vae_attn_1h, HW, 256, (size_t)(HW + 32) * 4, w->stream, qkv_d, ao_b, HW, 640);
     wn_gemm(ao_b, apw, apb, pr_d, NULL, HW, 640, 640, w->stream);
-    k_wn_add_inplace<<<((long)HW * 640 + 255) / 256, 256, 0, w->stream>>>(cur, pr_d, (long)HW * 640);
+    EC_LAUNCH_1D(k_wn_add_inplace, ((long)HW * 640 + 255) / 256, 256, w->stream, cur, pr_d, (long)HW * 640);
     cudaStreamSynchronize(w->stream);
     cudaFree(ag); cudaFree(aqw); cudaFree(aqb); cudaFree(apw); cudaFree(apb);
     cudaFree(norm_d); cudaFree(qkv_d); cudaFree(ao_b); cudaFree(pr_d);
@@ -2089,14 +2095,14 @@ static int run_wan_vae_encode_frame(
     cudaMalloc(&hnorm, (size_t)HW * 640 * 4);
     cudaMalloc(&z96,   (size_t)HW * 96 * 4);
     cudaMalloc(&q96,   (size_t)HW * 96 * 4);
-    k_wn_rmsnorm<<<HW, 256, 0, w->stream>>>(cur, hg, hnorm, NULL, (int)HW, 640, 1e-12f, 1);
+    EC_DISPATCH_PORT(k_wn_rmsnorm, HW, 256, 0, w->stream, cur, hg, hnorm, NULL, (int)HW, 640, 1e-12f, 1);
     cudaFree(cur);
     vae_causal_conv3d(w, hnorm, z96, hw, hb, 1, H, W, 640, 96, &cslot, col, COL_CAP);
     vae_conv1x1(w, z96, q96, c1w, c1b, HW, 96, 96, col, COL_CAP);
     cudaMalloc(&mean_d, 48 * 4); cudaMalloc(&std_d, 48 * 4);
     cudaMemcpyAsync(mean_d, WAN22_LATENT_MEAN, 48 * 4, cudaMemcpyHostToDevice, w->stream);
     cudaMemcpyAsync(std_d,  WAN22_LATENT_STD,  48 * 4, cudaMemcpyHostToDevice, w->stream);
-    k_wn_norm_latent_mu<<<(HW * 48 + 255) / 256, 256, 0, w->stream>>>(q96, out_z_d, mean_d, std_d, HW);
+    EC_LAUNCH_1D(k_wn_norm_latent_mu, (HW * 48 + 255) / 256, 256, w->stream, q96, out_z_d, mean_d, std_d, HW);
     cudaStreamSynchronize(w->stream);
     cudaFree(hg); cudaFree(hw); cudaFree(hb); cudaFree(c1w); cudaFree(c1b);
     cudaFree(cslot.frames_d); cudaFree(hnorm); cudaFree(z96); cudaFree(q96);

@@ -4,10 +4,9 @@
 
 #pragma once
 
+#include "ec_hal.h"
 #include "ec_kernels.cuh"
 #include "ec_types.h"
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,10 +75,16 @@ typedef struct {
   __half *lora_f16;   // [N, max_lora_rank]
   float  *mag_stats;  // [2] GPU L1 stats
 
-  // Captured CUDA Graph for replay
-  cudaGraph_t     graph;
-  cudaGraphExec_t graph_exec;
-  int             graph_valid;
+  // Captured CUDA Graph for replay (plus portable replay bindings when stream capture is unsupported)
+  cudaGraph_t        graph;
+  cudaGraphExec_t    graph_exec;
+  int                graph_valid;
+  ec_dit_cfg_t       cap_cfg;
+  ec_dit_block_w_t  *cap_blocks;
+  int32_t            cap_n_blocks;
+  float             *cap_x_d;
+  const int32_t     *cap_coords_d;
+  ec_tier_t          cap_tier;
 } ec_dit_ws_t;
 
 int  ec_dit_ws_alloc(ec_dit_ws_t *ws, const ec_dit_cfg_t *cfg, int32_t n_tokens, int32_t max_lora_rank);

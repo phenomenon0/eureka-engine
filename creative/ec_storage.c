@@ -38,6 +38,11 @@ static void detect_mount_info(const char *path, char *fs_out, size_t fs_cap, int
       ci_contains(path, "/nfs/")  || ci_contains(path, "/net/")) {
     *is_net = 1;
   }
+#ifdef __APPLE__
+  if (strncmp(path, "/Volumes/", 9) == 0) {
+    snprintf(fs_out, fs_cap, "volume");
+  }
+#endif
   FILE *fp = fopen("/proc/mounts", "r");
   if (!fp) return;
   char line[1024];

@@ -25,6 +25,7 @@ typedef struct {
 typedef struct {
   char   artifact_dir[256];
   char   models_dir[256];
+  char   backend[16]; // "cuda", "metal", or "vulkan"
   char   gpu_name[128];
   int    sm_major, sm_minor;
   double vram_total_gb;

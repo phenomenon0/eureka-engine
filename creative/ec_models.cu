@@ -7,8 +7,7 @@
 #include "ec_dit.h"
 #include "ec_kernels.cuh"
 #include "ec_kernels_v2.cuh"
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "ec_hal.h"
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>

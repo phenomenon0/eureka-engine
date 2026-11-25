@@ -1296,3 +1296,99 @@ extern "C" int ec_ops_conv2d_3x3_nhwc_bf16(
       X_nhwc, W_ohwi, bias, res_f32, Y_f32, Y_bf16, H, W, Cin, Cout);
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+__global__ void k_ops_rmsnorm_adaln(
+    const float *__restrict__ x, const float *__restrict__ w,
+    const float *__restrict__ scale, const float *__restrict__ shift,
+    float *__restrict__ y_f32, uint16_t *__restrict__ y_bf16,
+    int rows, int dim, float eps) {
+  int r = blockIdx.x;
+  if (r >= rows) return;
+  const float *xr = x + (long)r * dim;
+  float ss = 0.0f;
+  for (int c = threadIdx.x; c < dim; c += blockDim.x) { float v = xr[c]; ss += v * v; }
+  __shared__ float sm[32];
+  for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+  if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = ss;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float t = (threadIdx.x < (blockDim.x >> 5)) ? sm[threadIdx.x] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) t += __shfl_xor_sync(0xffffffffu, t, off);
+    if (threadIdx.x == 0) sm[0] = rsqrtf(t / (float)dim + eps);
+  }
+  __syncthreads();
+  float inv = sm[0];
+  float *yf = y_f32 ? (y_f32 + (long)r * dim) : NULL;
+  uint16_t *yb = y_bf16 ? (y_bf16 + (long)r * dim) : NULL;
+  for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+    float v = xr[c] * inv * (w ? w[c] : 1.0f);
+    if (scale) v = v * (1.0f + scale[c]);
+    if (shift) v += shift[c];
+    if (yf) yf[c] = v;
+    if (yb) yb[c] = ops_f32_to_bf16(v);
+  }
+}
+
+__global__ void k_ops_layernorm_adaln(
+    const float *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b,
+    const float *__restrict__ scale, const float *__restrict__ shift,
+    float *__restrict__ y_f32, uint16_t *__restrict__ y_bf16,
+    int rows, int dim, float eps) {
+  int r = blockIdx.x;
+  if (r >= rows) return;
+  const float *xr = x + (long)r * dim;
+  float s1 = 0.0f, s2 = 0.0f;
+  for (int c = threadIdx.x; c < dim; c += blockDim.x) { float v = xr[c]; s1 += v; s2 += v * v; }
+  __shared__ float sm1[32], sm2[32];
+  for (int off = 16; off > 0; off >>= 1) {
+    s1 += __shfl_xor_sync(0xffffffffu, s1, off);
+    s2 += __shfl_xor_sync(0xffffffffu, s2, off);
+  }
+  if ((threadIdx.x & 31) == 0) { sm1[threadIdx.x >> 5] = s1; sm2[threadIdx.x >> 5] = s2; }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    int nw = blockDim.x >> 5;
+    float a = (threadIdx.x < nw) ? sm1[threadIdx.x] : 0.0f;
+    float q = (threadIdx.x < nw) ? sm2[threadIdx.x] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      a += __shfl_xor_sync(0xffffffffu, a, off);
+      q += __shfl_xor_sync(0xffffffffu, q, off);
+    }
+    if (threadIdx.x == 0) {
+      float mean = a / (float)dim;
+      float var = q / (float)dim - mean * mean;
+      if (var < 0.0f) var = 0.0f;
+      sm1[0] = mean;
+      sm2[0] = rsqrtf(var + eps);
+    }
+  }
+  __syncthreads();
+  float mean = sm1[0], inv = sm2[0];
+  float *yf = y_f32 ? (y_f32 + (long)r * dim) : NULL;
+  uint16_t *yb = y_bf16 ? (y_bf16 + (long)r * dim) : NULL;
+  for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+    float v = (xr[c] - mean) * inv;
+    if (w) v *= w[c];
+    if (b) v += b[c];
+    if (scale) v = v * (1.0f + scale[c]);
+    if (shift) v += shift[c];
+    if (yf) yf[c] = v;
+    if (yb) yb[c] = ops_f32_to_bf16(v);
+  }
+}
+
+extern "C" int ec_ops_rmsnorm_adaln(
+    const float *x, const float *w, const float *scale, const float *shift,
+    float *y_f32, uint16_t *y_bf16, int rows, int dim, float eps, cudaStream_t stream) {
+  if (!x || rows <= 0 || dim <= 0) return -1;
+  k_ops_rmsnorm_adaln<<<rows, 256, 0, stream>>>(x, w, scale, shift, y_f32, y_bf16, rows, dim, eps);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+extern "C" int ec_ops_layernorm_adaln(
+    const float *x, const float *w, const float *b, const float *scale, const float *shift,
+    float *y_f32, uint16_t *y_bf16, int rows, int dim, float eps, cudaStream_t stream) {
+  if (!x || rows <= 0 || dim <= 0) return -1;
+  k_ops_layernorm_adaln<<<rows, 256, 0, stream>>>(x, w, b, scale, shift, y_f32, y_bf16, rows, dim, eps);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

@@ -20,7 +20,7 @@
 #include "ec_trellis2.h"
 #include "ec_vram_pool.h"
 #include "ec_wan22.h"
-#include <cuda_fp16.h>
+#include "ec_hal.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -313,6 +313,7 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
   if (!st) return;
   snprintf(out->artifact_dir, sizeof out->artifact_dir, "%s", st->artifact_dir);
   snprintf(out->models_dir, sizeof out->models_dir, "%s", st->models_dir);
+  snprintf(out->backend, sizeof out->backend, "%s", ec_hal_backend_name());
   snprintf(out->gpu_name, sizeof out->gpu_name, "%s", st->gpu_name);
   out->sm_major = st->sm_major;
   out->sm_minor = st->sm_minor;

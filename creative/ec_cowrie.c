@@ -109,13 +109,21 @@ static void cw_load_once(void) {
   }
 
   const char *env_lib = getenv("COWRIE_LIB");
-  const char *cands[5];
+  const char *cands[16];
   int nc = 0;
   if (env_lib && env_lib[0]) cands[nc++] = env_lib;
+#ifdef __APPLE__
+  cands[nc++] = "@executable_path/libcowrie_core.dylib";
+  cands[nc++] = "@executable_path/../lib/libcowrie_core.dylib";
+  cands[nc++] = "/tmp/cowrie-cargo-target/release/libcowrie_core.dylib";
+  cands[nc++] = "/usr/local/lib/libcowrie_core.dylib";
+  cands[nc++] = "libcowrie_core.dylib";
+#else
   cands[nc++] = "/tmp/cowrie-cargo-target/release/libcowrie_core.so";
   cands[nc++] = "/home/omen/.local/lib/libcowrie_core.so";
   cands[nc++] = "/usr/local/lib/libcowrie_core.so";
   cands[nc++] = "libcowrie_core.so";
+#endif
 
   void *h = NULL;
   for (int i = 0; i < nc && !h; i++) {

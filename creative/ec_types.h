@@ -51,9 +51,10 @@ typedef enum {
 // ---------------------------------------------------------------------------
 
 typedef enum {
-  EC_DEV_CPU  = 0,
-  EC_DEV_CUDA = 1,
-  EC_DEV_METAL = 2,
+  EC_DEV_CPU    = 0,
+  EC_DEV_CUDA   = 1,
+  EC_DEV_METAL  = 2,
+  EC_DEV_VULKAN = 3,
 } ec_device_t;
 
 typedef struct {

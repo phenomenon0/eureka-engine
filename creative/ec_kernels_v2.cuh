@@ -6,10 +6,9 @@
 
 #pragma once
 
+#include "ec_hal.h"
 #include "ec_kernels.cuh"
 #include "ec_types.h"
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C" {

@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include "ec_hal.h"
 #include <stddef.h>
 #include <stdint.h>
 
