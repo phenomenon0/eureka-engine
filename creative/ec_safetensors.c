@@ -157,7 +157,7 @@ int ec_st_open(ec_safetensors_t *st, const char *path, char *err, size_t err_cap
   if (c.p < c.end && *c.p == '}') return 0;
 
   while (c.p < c.end) {
-    char key[128];
+    char key[160];
     if (parse_str(&c, key, sizeof key)) { ec_st_close(st); set_err(err, err_cap, "st: bad key"); return -1; }
     skip_ws(&c);
     if (c.p >= c.end || *c.p != ':') { ec_st_close(st); set_err(err, err_cap, "st: expected colon"); return -1; }

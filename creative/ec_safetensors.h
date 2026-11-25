@@ -11,10 +11,10 @@
 extern "C" {
 #endif
 
-#define EC_ST_MAX_TENSORS 4096
+#define EC_ST_MAX_TENSORS 16384
 
 typedef struct {
-  char       name[128];
+  char       name[160];
   ec_dtype_t dtype;
   int32_t    rank;
   int64_t    shape[5];

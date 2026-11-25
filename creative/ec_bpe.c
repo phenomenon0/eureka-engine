@@ -147,7 +147,7 @@ static int32_t merge_get(const ec_bpe_t *t, const char *a, size_t la, const char
   char key[512];
   if (la + 1 + lb >= sizeof key) return -1;
   memcpy(key, a, la);
-  key[la] = ' ';
+  key[la] = '\x1F';
   memcpy(key + la + 1, b, lb);
   size_t n = la + 1 + lb;
   uint32_t idx = (uint32_t)(fnv1a_bytes(key, n) & t->merge_mask);
@@ -225,7 +225,7 @@ ec_bpe_t *ec_bpe_load(const char *path) {
   fseek(fp, 0, SEEK_END);
   long sz = ftell(fp);
   fseek(fp, 0, SEEK_SET);
-  if (sz <= 0 || sz > 64 * 1024 * 1024) { fclose(fp); return NULL; }
+  if (sz <= 0 || sz > 96 * 1024 * 1024) { fclose(fp); return NULL; }
   char *js = (char *)malloc((size_t)sz + 1);
   if (!js || fread(js, 1, (size_t)sz, fp) != (size_t)sz) { free(js); fclose(fp); return NULL; }
   js[sz] = '\0';
@@ -234,13 +234,13 @@ ec_bpe_t *ec_bpe_load(const char *path) {
   ec_bpe_t *t = (ec_bpe_t *)calloc(1, sizeof *t);
   init_gpt2_byte_table(t);
   t->pad_id = 151643;
-  // 524,288 slots for vocab (~152k entries -> load 0.29) and merges (~151k entries)
-  uint32_t vcap = 1U << 19;
+  // Scale open-addressing hash tables for large tokenizers (e.g. Gemma-3: 262K vocab, 515K merges!)
+  uint32_t vcap = (sz > 16 * 1024 * 1024) ? (1U << 20) : (1U << 19);
   t->vocab_mask = vcap - 1;
   t->vocab_tab = (ec_vocab_slot_t *)malloc(vcap * sizeof(ec_vocab_slot_t));
   for (uint32_t i = 0; i < vcap; i++) t->vocab_tab[i].id = -1;
 
-  uint32_t mcap = 1U << 19;
+  uint32_t mcap = (sz > 16 * 1024 * 1024) ? (1U << 21) : (1U << 19);
   t->merge_mask = mcap - 1;
   t->merge_tab = (ec_merge_slot_t *)malloc(mcap * sizeof(ec_merge_slot_t));
   for (uint32_t i = 0; i < mcap; i++) t->merge_tab[i].rank = -1;
@@ -325,6 +325,8 @@ ec_bpe_t *ec_bpe_load(const char *path) {
         if (*mg == ',') { mg++; continue; }
         if (*mg == '"') {
           if (parse_json_str(&mg, comb, sizeof comb, &l1) != 0) break;
+          char *sp = (char *)memchr(comb, ' ', l1);
+          if (sp) *sp = '\x1F';
           merge_put(t, comb, l1, rank++);
         } else if (*mg == '[') {
           mg = skip_ws(mg + 1);
@@ -336,7 +338,7 @@ ec_bpe_t *ec_bpe_load(const char *path) {
           if (*mg == ']') mg++;
           if (l1 + 1 + l2 < sizeof comb) {
             memcpy(comb, s1, l1);
-            comb[l1] = ' ';
+            comb[l1] = '\x1F';
             memcpy(comb + l1 + 1, s2, l2);
             comb[l1 + 1 + l2] = '\0';
             merge_put(t, comb, l1 + 1 + l2, rank++);
@@ -638,4 +640,106 @@ int ec_bpe_encode_flux2_qwen3(
     }
   }
   return n;
+}
+
+// Gemma-3 SentencePiece BPE encoder (Replace ' ' -> '▁' U+2581, raw UTF-8 + <0xXX> fallback, prepend <bos>=2)
+int ec_bpe_encode_gemma3(
+    const ec_bpe_t *tok, const char *prompt,
+    int32_t *out_ids, int max_out) {
+  if (!tok || !out_ids || max_out <= 1) return -1;
+  int written = 0;
+  int32_t bos_id = vocab_get(tok, "<bos>", 5);
+  out_ids[written++] = (bos_id >= 0) ? bos_id : 2;
+  if (!prompt || !prompt[0]) return written;
+
+  // Normalize: replace every ASCII space ' ' with UTF-8 '▁' (\xE2\x96\x81)
+  size_t plen = strlen(prompt);
+  size_t ncap = plen * 3 + 8;
+  char *norm = (char *)malloc(ncap);
+  if (!norm) return -1;
+  size_t nlen = 0;
+  for (size_t i = 0; i < plen; i++) {
+    if (prompt[i] == ' ') {
+      norm[nlen++] = '\xE2'; norm[nlen++] = '\x96'; norm[nlen++] = '\x81';
+    } else {
+      norm[nlen++] = prompt[i];
+    }
+  }
+  norm[nlen] = '\0';
+
+  // Split into UTF-8 codepoint symbols (with <0xXX> byte fallback for unknown chars)
+  enum { MAX_GSYMS = 2048 };
+  char **syms = (char **)malloc(MAX_GSYMS * sizeof(char *));
+  size_t *slens = (size_t *)malloc(MAX_GSYMS * sizeof(size_t));
+  size_t arena_cap = nlen * 8 + 65536;
+  char *arena = (char *)malloc(arena_cap);
+  if (!syms || !slens || !arena) { free(norm); free(syms); free(slens); free(arena); return -1; }
+  size_t arena_used = 0;
+  int n = 0;
+  size_t pos = 0;
+  while (pos < nlen && n < MAX_GSYMS) {
+    size_t nxt = pos;
+    bpe_utf8_next(norm, nlen, pos, &nxt);
+    size_t clen = nxt - pos;
+    if (vocab_get(tok, norm + pos, clen) >= 0) {
+      if (arena_used + clen + 1 > arena_cap) break;
+      syms[n] = arena + arena_used;
+      memcpy(syms[n], norm + pos, clen);
+      syms[n][clen] = '\0';
+      slens[n] = clen;
+      arena_used += clen + 1;
+      n++;
+    } else {
+      // Byte fallback: <0xXX>
+      for (size_t b = 0; b < clen && n < MAX_GSYMS; b++) {
+        char bf[8];
+        snprintf(bf, sizeof bf, "<0x%02X>", (unsigned char)norm[pos + b]);
+        if (arena_used + 7 > arena_cap) break;
+        syms[n] = arena + arena_used;
+        memcpy(syms[n], bf, 7);
+        slens[n] = 6;
+        arena_used += 7;
+        n++;
+      }
+    }
+    pos = nxt;
+  }
+
+  // Standard greedy lowest-rank BPE merge loop
+  while (n > 1) {
+    int best_i = -1;
+    int32_t best_rank = 0x7fffffff;
+    for (int i = 0; i + 1 < n; i++) {
+      int32_t r = merge_get(tok, syms[i], slens[i], syms[i + 1], slens[i + 1]);
+      if (r >= 0 && r < best_rank) {
+        best_rank = r;
+        best_i = i;
+      }
+    }
+    if (best_i < 0) break;
+    size_t nl = slens[best_i] + slens[best_i + 1];
+    if (arena_used + nl + 1 > arena_cap) break;
+    char *merged = arena + arena_used;
+    memcpy(merged, syms[best_i], slens[best_i]);
+    memcpy(merged + slens[best_i], syms[best_i + 1], slens[best_i + 1]);
+    merged[nl] = '\0';
+    arena_used += nl + 1;
+    syms[best_i] = merged;
+    slens[best_i] = nl;
+    for (int j = best_i + 1; j + 1 < n; j++) {
+      syms[j] = syms[j + 1];
+      slens[j] = slens[j + 1];
+    }
+    n--;
+  }
+
+  int32_t unk_id = vocab_get(tok, "<unk>", 5);
+  if (unk_id < 0) unk_id = 3;
+  for (int i = 0; i < n && written < max_out; i++) {
+    int32_t id = vocab_get(tok, syms[i], slens[i]);
+    out_ids[written++] = (id >= 0) ? id : unk_id;
+  }
+
+  free(norm); free(syms); free(slens); free(arena);
+  return written;
 }

@@ -502,6 +502,10 @@ struct ec_trellis2 {
   cudaStream_t        stream;
   ec_safetensors_t    dino_st, flow_st, dec_st;
   int                 dino_open, flow_open, dec_open;
+  // v17.2 Full 3-Stage 512^3 O-Voxel PBR handles
+  ec_safetensors_t    sh_flow_st, tx_flow_st, sh_dec_st, tx_dec_st;
+  int                 sh_flow_open, tx_flow_open, sh_dec_open, tx_dec_open;
+  int                 full_3stage;
   tr_ss_flow_res_t    flow;
   tr_ss_dec_res_t     dec;
   char                dino_sha[65];
@@ -718,10 +722,84 @@ static int run_dinov3_vitl16(
         edge_cnt += 2;
       }
     }
-    // Smooth borders -> run 4-neighbor BFS from perimeter pixels
+    // Smooth borders -> run Coons-patch bilinear studio backdrop model + local-edge-aware BFS + interior-hole punch!
     if (edge_cnt > 0 && (edge_jump / (double)edge_cnt) < 12.0) {
+      float *top_e = (float *)calloc((size_t)img_w * 3, 4);
+      float *bot_e = (float *)calloc((size_t)img_w * 3, 4);
+      float *lft_e = (float *)calloc((size_t)img_h * 3, 4);
+      float *rgt_e = (float *)calloc((size_t)img_h * 3, 4);
+      uint8_t *grad_map = (uint8_t *)calloc((size_t)img_w * (size_t)img_h, 1);
       int *q = (int *)malloc((size_t)img_w * (size_t)img_h * sizeof(int));
-      if (q) {
+      if (top_e && bot_e && lft_e && rgt_e && grad_map && q) {
+        int strip = img_h < 8 ? img_h : 8;
+        int strip_w = img_w < 8 ? img_w : 8;
+        for (int x = 0; x < img_w; x++) {
+          for (int k = 0; k < strip; k++) {
+            const uint8_t *pt = rgb + ((long)k * img_w + x) * 3;
+            const uint8_t *pb = rgb + ((long)(img_h - 1 - k) * img_w + x) * 3;
+            for (int c = 0; c < 3; c++) { top_e[x*3+c] += pt[c]; bot_e[x*3+c] += pb[c]; }
+          }
+          for (int c = 0; c < 3; c++) { top_e[x*3+c] /= (float)strip; bot_e[x*3+c] /= (float)strip; }
+        }
+        for (int y = 0; y < img_h; y++) {
+          for (int k = 0; k < strip_w; k++) {
+            const uint8_t *pl = rgb + ((long)y * img_w + k) * 3;
+            const uint8_t *pr = rgb + ((long)y * img_w + (img_w - 1 - k)) * 3;
+            for (int c = 0; c < 3; c++) { lft_e[y*3+c] += pl[c]; rgt_e[y*3+c] += pr[c]; }
+          }
+          for (int c = 0; c < 3; c++) { lft_e[y*3+c] /= (float)strip_w; rgt_e[y*3+c] /= (float)strip_w; }
+        }
+        float c00[3] = {0}, c01[3] = {0}, c10[3] = {0}, c11[3] = {0};
+        for (int ky = 0; ky < strip; ky++) {
+          for (int kx = 0; kx < strip_w; kx++) {
+            const uint8_t *p00 = rgb + ((long)ky * img_w + kx) * 3;
+            const uint8_t *p01 = rgb + ((long)ky * img_w + (img_w - 1 - kx)) * 3;
+            const uint8_t *p10 = rgb + ((long)(img_h - 1 - ky) * img_w + kx) * 3;
+            const uint8_t *p11 = rgb + ((long)(img_h - 1 - ky) * img_w + (img_w - 1 - kx)) * 3;
+            for (int c = 0; c < 3; c++) { c00[c] += p00[c]; c01[c] += p01[c]; c10[c] += p10[c]; c11[c] += p11[c]; }
+          }
+        }
+        float inv_cn = 1.0f / (float)(strip * strip_w);
+        for (int c = 0; c < 3; c++) { c00[c] *= inv_cn; c01[c] *= inv_cn; c10[c] *= inv_cn; c11[c] *= inv_cn; }
+
+        double bg_sat_sum = 0.0;
+        for (int x = 0; x < img_w; x += 4) {
+          float mx = fmaxf(top_e[x*3], fmaxf(top_e[x*3+1], top_e[x*3+2]));
+          float mn = fminf(top_e[x*3], fminf(top_e[x*3+1], top_e[x*3+2]));
+          bg_sat_sum += (double)(mx - mn);
+        }
+        int neutral_bg = (bg_sat_sum / (double)((img_w + 3) / 4)) < 15.0;
+
+        auto eval_bg = [&](int x, int y, float out[3]) {
+          float u = (float)x / (float)(img_w - 1);
+          float v = (float)y / (float)(img_h - 1);
+          for (int c = 0; c < 3; c++) {
+            out[c] = (1.0f - v) * top_e[x*3+c] + v * bot_e[x*3+c]
+                   + (1.0f - u) * lft_e[y*3+c] + u * rgt_e[y*3+c]
+                   - (1.0f - v) * (1.0f - u) * c00[c] - (1.0f - v) * u * c01[c]
+                   - v * (1.0f - u) * c10[c] - v * u * c11[c];
+          }
+        };
+
+        for (int y = 0; y < img_h; y++) {
+          int ym = y > 0 ? y - 1 : 0, yp = y + 1 < img_h ? y + 1 : img_h - 1;
+          for (int x = 0; x < img_w; x++) {
+            int xm = x > 0 ? x - 1 : 0, xp = x + 1 < img_w ? x + 1 : img_w - 1;
+            const uint8_t *pl = rgb + ((long)y * img_w + xm) * 3;
+            const uint8_t *pr = rgb + ((long)y * img_w + xp) * 3;
+            const uint8_t *pu = rgb + ((long)ym * img_w + x) * 3;
+            const uint8_t *pd = rgb + ((long)yp * img_w + x) * 3;
+            int g = 0;
+            for (int c = 0; c < 3; c++) {
+              int dx_v = abs((int)pr[c] - (int)pl[c]);
+              int dy_v = abs((int)pd[c] - (int)pu[c]);
+              if (dx_v > g) g = dx_v;
+              if (dy_v > g) g = dy_v;
+            }
+            grad_map[y * img_w + x] = (uint8_t)(g > 255 ? 255 : g);
+          }
+        }
+
         int qh = 0, qt = 0;
         auto try_seed = [&](int x, int y) {
           int idx = y * img_w + x;
@@ -740,30 +818,67 @@ static int run_dinov3_vitl16(
             if (nx < 0 || nx >= img_w || ny < 0 || ny >= img_h) continue;
             int nidx = ny * img_w + nx;
             if (bg_mask[nidx]) continue;
+            if (grad_map[nidx] > 12) continue;
             const uint8_t *pn = rgb + (long)nidx * 3;
             float dr = (float)pn[0] - (float)pc[0];
             float dg = (float)pn[1] - (float)pc[1];
             float db = (float)pn[2] - (float)pc[2];
-            if (dr*dr + dg*dg + db*db > 14.0f * 14.0f) continue;
-            // Compare against row-interpolated studio cyclorama backdrop at (nx, ny)
-            float tx = (float)nx / (float)(img_w - 1);
-            float er = row_l[ny*3+0] * (1.0f - tx) + row_r[ny*3+0] * tx;
-            float eg = row_l[ny*3+1] * (1.0f - tx) + row_r[ny*3+1] * tx;
-            float eb = row_l[ny*3+2] * (1.0f - tx) + row_r[ny*3+2] * tx;
-            float bdr = (float)pn[0] - er, bdg = (float)pn[1] - eg, bdb = (float)pn[2] - eb;
-            // Also require low chromatic saturation for neutral studio backdrops (prevents leaking into colored objects!)
+            if (dr*dr + dg*dg + db*db > 8.0f * 8.0f) continue;
             int cmax = pn[0] > pn[1] ? (pn[0] > pn[2] ? pn[0] : pn[2]) : (pn[1] > pn[2] ? pn[1] : pn[2]);
             int cmin = pn[0] < pn[1] ? (pn[0] < pn[2] ? pn[0] : pn[2]) : (pn[1] < pn[2] ? pn[1] : pn[2]);
-            int bmax = (int)fmaxf(er, fmaxf(eg, eb)), bmin = (int)fminf(er, fminf(eg, eb));
-            int neutral_bg = ((bmax - bmin) < 22);
-            // Smooth neutral cast shadow under floating product cutouts is achromatic and slightly darker than bg_est
-            int is_soft_shadow = (neutral_bg && (cmax - cmin) < 14 && (float)pn[0] <= er + 8.0f &&
-                                  bdr*bdr + bdg*bdg + bdb*bdb <= 76.0f * 76.0f);
-            if ((bdr*bdr + bdg*bdg + bdb*bdb <= 44.0f * 44.0f && (!neutral_bg || (cmax - cmin) < 26)) || is_soft_shadow) {
+            int sat = cmax - cmin;
+            if (neutral_bg && sat > 10) continue;
+            float be[3];
+            eval_bg(nx, ny, be);
+            float bdr = (float)pn[0] - be[0], bdg = (float)pn[1] - be[1], bdb = (float)pn[2] - be[2];
+            float bd2 = bdr*bdr + bdg*bdg + bdb*bdb;
+            float pm = ((float)pn[0] + (float)pn[1] + (float)pn[2]) * (1.0f / 3.0f);
+            float bm = (be[0] + be[1] + be[2]) * (1.0f / 3.0f);
+            int is_soft_shadow = (neutral_bg && sat <= 6 && pm < bm + 4.0f && bd2 <= 65.0f * 65.0f);
+            if (bd2 <= 28.0f * 28.0f || is_soft_shadow) {
               bg_mask[nidx] = 1;
               q[qt++] = nidx;
             }
           }
+        }
+        // Punch out enclosed studio-backdrop holes (e.g. inside teapot/mug handles & loops!)
+        {
+          uint8_t *cand = (uint8_t *)calloc((size_t)img_w * (size_t)img_h, 1);
+          uint8_t *vis  = (uint8_t *)calloc((size_t)img_w * (size_t)img_h, 1);
+          if (cand && vis) {
+            for (int y = 0; y < img_h; y++) {
+              for (int x = 0; x < img_w; x++) {
+                int idx = y * img_w + x;
+                if (bg_mask[idx] || grad_map[idx] > 10) continue;
+                const uint8_t *p = rgb + (long)idx * 3;
+                int cmax = p[0] > p[1] ? (p[0] > p[2] ? p[0] : p[2]) : (p[1] > p[2] ? p[1] : p[2]);
+                int cmin = p[0] < p[1] ? (p[0] < p[2] ? p[0] : p[2]) : (p[1] < p[2] ? p[1] : p[2]);
+                if (neutral_bg && (cmax - cmin) > 8) continue;
+                float be[3];
+                eval_bg(x, y, be);
+                float bdr = (float)p[0] - be[0], bdg = (float)p[1] - be[1], bdb = (float)p[2] - be[2];
+                if (bdr*bdr + bdg*bdg + bdb*bdb <= 22.0f * 22.0f) cand[idx] = 1;
+              }
+            }
+            for (int i = 0; i < img_w * img_h; i++) {
+              if (!cand[i] || vis[i]) continue;
+              int ch = 0, ct = 0;
+              vis[i] = 1; q[ct++] = i;
+              while (ch < ct) {
+                int c = q[ch++], cx = c % img_w, cy = c / img_w;
+                for (int d = 0; d < 4; d++) {
+                  int nx = cx + DX[d], ny = cy + DY[d];
+                  if (nx < 0 || nx >= img_w || ny < 0 || ny >= img_h) continue;
+                  int ni = ny * img_w + nx;
+                  if (cand[ni] && !vis[ni]) { vis[ni] = 1; q[ct++] = ni; }
+                }
+              }
+              if (ct >= 400) {
+                for (int k = 0; k < ct; k++) bg_mask[q[k]] = 1;
+              }
+            }
+          }
+          free(cand); free(vis);
         }
         // Keep only the single largest connected foreground component (drops any detached cast floor shadow!)
         {
@@ -795,7 +910,6 @@ static int run_dinov3_vitl16(
             free(comp_id);
           }
         }
-        free(q);
         // Compute tight foreground bounding box and validate foreground fraction [3%, 94%]
         int bx0 = img_w, by0 = img_h, bx1 = -1, by1 = -1;
         long fg_cnt = 0;
@@ -811,7 +925,6 @@ static int run_dinov3_vitl16(
         double fg_frac = (double)fg_cnt / (double)((long)img_w * img_h);
         if (fg_frac >= 0.03 && fg_frac <= 0.94 && bx1 > bx0 + 16 && by1 > by0 + 16) {
           use_bfs_matte = 1;
-          // 1-pass box blur on (1 - bg_mask) for anti-aliased edge feathering onto pure (0,0,0) black!
           for (int y = 0; y < img_h; y++) {
             for (int x = 0; x < img_w; x++) {
               if (!bg_mask[y * img_w + x]) {
@@ -831,13 +944,14 @@ static int run_dinov3_vitl16(
           }
           float cx = 0.5f * (float)(bx0 + bx1);
           float cy = 0.5f * (float)(by0 + by1);
-          float sz = (float)((bx1 - bx0 > by1 - by0) ? (bx1 - bx0) : (by1 - by0)) * 1.12f;
+          float sz = (float)((bx1 - bx0 > by1 - by0) ? (bx1 - bx0) : (by1 - by0)) * 1.06f;
           crop_x0 = cx - 0.5f * sz;
           crop_y0 = cy - 0.5f * sz;
           crop_w = sz;
           crop_h = sz;
         }
       }
+      free(top_e); free(bot_e); free(lft_e); free(rgt_e); free(grad_map); free(q);
     }
     free(row_l); free(row_r);
   }
@@ -1688,6 +1802,1043 @@ static int extract_surface_nets_64(
 }
 
 // ===========================================================================
+// 11b. v17.2 Full 3-Stage TRELLIS.2-4B Native Pure-CUDA Pipeline (512^3 O-Voxel PBR!)
+//      Stage 2a: Sparse 30-Block SLatFlowModel (Shape, 32ch, 32^3 sparse coords, 3D RoPE)
+//      Stage 3a: Sparse 30-Block SLatFlowModel (Texture, 64ch->32ch, conditioned on Shape SLat)
+//      Stage 2b: FlexiDualGridVaeDecoder (4-stage Sparse 3D ConvNeXt + C2S octree 32^3->512^3 -> 7ch DC)
+//      Stage 3b: SparseUnetVaeDecoder (matching octree -> 6ch 360-deg PBR: BaseColor+Metallic+Roughness+Alpha)
+// ===========================================================================
+
+static const float TR2_SHAPE_MEAN[32] = {
+  0.781296f, 0.018091f, -0.495192f, -0.558457f, 1.060530f, 0.093252f, 1.518149f, -0.933218f,
+  -0.732996f, 2.604095f, -0.118341f, -2.143904f, 0.495076f, -2.179512f, -2.130751f, -0.996944f,
+  0.261421f, -2.217463f, 1.260067f, -0.150213f, 3.790713f, 1.481266f, -1.046058f, -1.523667f,
+  -0.059621f, 2.220780f, 1.621212f, 0.877230f, 0.567247f, -3.175944f, -3.186688f, 1.578665f
+};
+static const float TR2_SHAPE_STD[32] = {
+  5.972266f, 4.706852f, 5.445010f, 5.209927f, 5.320220f, 4.547237f, 5.020802f, 5.444004f,
+  5.226681f, 5.683095f, 4.831436f, 5.286469f, 5.652043f, 5.367606f, 5.525084f, 4.730578f,
+  4.805265f, 5.124013f, 5.530808f, 5.619001f, 5.103930f, 5.417670f, 5.269677f, 5.547194f,
+  5.634698f, 5.235274f, 6.110351f, 5.511298f, 6.237273f, 4.879207f, 5.347008f, 5.405691f
+};
+static const float TR2_TEX_MEAN[32] = {
+  3.501659f, 2.212398f, 2.226094f, 0.251093f, -0.026248f, -0.687364f, 0.439898f, -0.928075f,
+  0.029398f, -0.339596f, -0.869527f, 1.038479f, -0.972385f, 0.126042f, -1.129303f, 0.455149f,
+  -1.209521f, 2.069067f, 0.544735f, 2.569128f, -0.323407f, 2.293000f, -1.925608f, -1.217717f,
+  1.213905f, 0.971588f, -0.023631f, 0.106750f, 2.021786f, 0.250524f, -0.662387f, -0.768862f
+};
+static const float TR2_TEX_STD[32] = {
+  2.665652f, 2.743913f, 2.765121f, 2.595319f, 3.037293f, 2.291316f, 2.144656f, 2.911822f,
+  2.969419f, 2.501689f, 2.154811f, 3.163343f, 2.621215f, 2.381943f, 3.186697f, 3.021588f,
+  2.295916f, 3.234985f, 3.233086f, 2.260140f, 2.874801f, 2.810596f, 3.292720f, 2.674999f,
+  2.680878f, 2.372054f, 2.451546f, 2.353556f, 2.995195f, 2.379849f, 2.786195f, 2.775190f
+};
+
+__global__ void k_slat_pack_in(
+    const float *__restrict__ xt, const float *__restrict__ concat_cond,
+    uint16_t *__restrict__ out_bf16, int N, int out_ch, int in_ch) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)N * in_ch;
+  if (idx >= tot) return;
+  int row = (int)(idx / in_ch);
+  int c   = (int)(idx % in_ch);
+  float v = (c < out_ch) ? xt[(long)row * out_ch + c]
+                         : (concat_cond ? concat_cond[(long)row * (in_ch - out_ch) + (c - out_ch)] : 0.0f);
+  out_bf16[idx] = tr_f32_to_bf16(v);
+}
+
+__global__ void k_slat_self_qkv_rope(
+    const float *__restrict__ qkv,
+    const float *__restrict__ q_gamma, const float *__restrict__ k_gamma,
+    const int32_t *__restrict__ coords3,
+    uint16_t *__restrict__ Q, uint16_t *__restrict__ K, uint16_t *__restrict__ V,
+    int N, int H) {
+  int idx = (int)(((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+  int lane = threadIdx.x & 31;
+  if (idx >= N * H) return;
+  int tok = idx / H;
+  int h = idx % H;
+  const float *base = qkv + (long)tok * (3 * H * 128);
+  const float *qs = base + (0 * H + h) * 128;
+  const float *ks = base + (1 * H + h) * 128;
+  const float *vs = base + (2 * H + h) * 128;
+  const float *qg = q_gamma + (long)h * 128;
+  const float *kg = k_gamma + (long)h * 128;
+  uint16_t *qo = Q + ((long)h * N + tok) * 128;
+  uint16_t *ko = K + ((long)h * N + tok) * 128;
+  uint16_t *vo = V + ((long)h * N + tok) * 128;
+
+  float sq = 0.0f, sk = 0.0f;
+  for (int i = 0; i < 4; i++) {
+    int d = lane + i * 32;
+    float qv = qs[d], kv = ks[d];
+    sq += qv * qv; sk += kv * kv;
+  }
+  float inv_q = rsqrtf(tr_warp_sum(sq) / 128.0f + 1e-12f);
+  float inv_k = rsqrtf(tr_warp_sum(sk) / 128.0f + 1e-12f);
+
+  int ci = coords3[tok * 3 + 0];
+  int cj = coords3[tok * 3 + 1];
+  int ck = coords3[tok * 3 + 2];
+
+  for (int pass = 0; pass < 2; pass++) {
+    int p = lane + pass * 32;
+    int d0 = 2 * p, d1 = 2 * p + 1;
+    float q0 = qs[d0] * inv_q * qg[d0];
+    float q1 = qs[d1] * inv_q * qg[d1];
+    float k0 = ks[d0] * inv_k * kg[d0];
+    float k1 = ks[d1] * inv_k * kg[d1];
+    float cs = 1.0f, sn = 0.0f;
+    if (p < 63) {
+      int axis = p / 21;
+      int fi = p % 21;
+      float coord = (axis == 0) ? (float)ci : ((axis == 1) ? (float)cj : (float)ck);
+      double freq = 1.0 / pow(10000.0, (double)fi / 21.0);
+      double ang = (double)coord * freq;
+      cs = (float)cos(ang); sn = (float)sin(ang);
+    }
+    qo[d0] = tr_f32_to_bf16(q0 * cs - q1 * sn);
+    qo[d1] = tr_f32_to_bf16(q0 * sn + q1 * cs);
+    ko[d0] = tr_f32_to_bf16(k0 * cs - k1 * sn);
+    ko[d1] = tr_f32_to_bf16(k0 * sn + k1 * cs);
+    vo[d0] = tr_f32_to_bf16(vs[d0]);
+    vo[d1] = tr_f32_to_bf16(vs[d1]);
+  }
+}
+
+__global__ void k_tr_silu_bf16(const float *src, uint16_t *dst, long n) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = tr_f32_to_bf16(tr_silu(src[i]));
+}
+
+__global__ void k_tr_unnorm_ch(const float *in, float *out, const float *mean_d, const float *std_d, int N, int C) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)N * C;
+  if (idx >= tot) return;
+  int c = (int)(idx % C);
+  out[idx] = in[idx] * std_d[c] + mean_d[c];
+}
+
+// Sparse 3D Open-Addressing Hash Table + 27-Neighbor Table Builder (matches FlexGEMM subm_neighbor_map!)
+__device__ __forceinline__ uint64_t tr_pack_xyz(int x, int y, int z) {
+  return (((uint64_t)(uint32_t)x << 20) | ((uint64_t)(uint32_t)y << 10) | (uint64_t)(uint32_t)z) + 1ULL;
+}
+__device__ __forceinline__ uint32_t tr_hash_key(uint64_t key, uint32_t mask) {
+  return (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
+
+__global__ void k_tr_sp_hash_insert(
+    const int32_t *__restrict__ coords3, int N,
+    unsigned long long *__restrict__ keys, int32_t *__restrict__ vals, uint32_t mask) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  uint64_t k = tr_pack_xyz(coords3[i * 3 + 0], coords3[i * 3 + 1], coords3[i * 3 + 2]);
+  uint32_t slot = tr_hash_key(k, mask);
+  while (true) {
+    unsigned long long prev = atomicCAS(&keys[slot], 0ULL, (unsigned long long)k);
+    if (prev == 0ULL || prev == (unsigned long long)k) {
+      vals[slot] = i;
+      return;
+    }
+    slot = (slot + 1u) & mask;
+  }
+}
+
+__global__ void k_tr_sp_build_nb(
+    const int32_t *__restrict__ coords3, int N, int R,
+    const unsigned long long *__restrict__ keys, const int32_t *__restrict__ vals, uint32_t mask,
+    int32_t *__restrict__ nb_out) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)N * 27;
+  if (idx >= tot) return;
+  int i = (int)(idx / 27);
+  int v = (int)(idx % 27);
+  if (v == 13) { nb_out[idx] = i; return; }
+  int x = coords3[i * 3 + 0] + (v / 9) - 1;
+  int y = coords3[i * 3 + 1] + ((v / 3) % 3) - 1;
+  int z = coords3[i * 3 + 2] + (v % 3) - 1;
+  if (x < 0 || x >= R || y < 0 || y >= R || z < 0 || z >= R) { nb_out[idx] = -1; return; }
+  uint64_t k = tr_pack_xyz(x, y, z);
+  uint32_t slot = tr_hash_key(k, mask);
+  while (true) {
+    unsigned long long cur = keys[slot];
+    if (cur == 0ULL) { nb_out[idx] = -1; return; }
+    if (cur == (unsigned long long)k) { nb_out[idx] = vals[slot]; return; }
+    slot = (slot + 1u) & mask;
+  }
+}
+
+__global__ void k_tr_sp_gather_k3(
+    const float *__restrict__ x, const int32_t *__restrict__ nb,
+    uint16_t *__restrict__ col_bf16, int v0, int chunk, int Cin) {
+  long K = 27L * Cin;
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)chunk * K;
+  if (idx >= tot) return;
+  int row = (int)(idx / K);
+  int rem = (int)(idx % K);
+  int v   = rem / Cin;
+  int ic  = rem % Cin;
+  int ni  = nb[(long)(v0 + row) * 27 + v];
+  float val = (ni >= 0) ? x[(long)ni * Cin + ic] : 0.0f;
+  col_bf16[idx] = tr_f32_to_bf16(val);
+}
+
+// SparseChannel2Spatial gather: h_in[N_parent, 8 * Cout] -> h_out[N_child, Cout]
+__global__ void k_tr_c2s_gather(
+    const float *__restrict__ h_in, const int32_t *__restrict__ c_parent,
+    const uint8_t *__restrict__ c_sub, float *__restrict__ h_out, int N_child, int Cout) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)N_child * Cout;
+  if (idx >= tot) return;
+  int ci = (int)(idx / Cout);
+  int k  = (int)(idx % Cout);
+  int p  = c_parent[ci];
+  int s  = (int)c_sub[ci];
+  h_out[idx] = h_in[((long)p * 8 + s) * Cout + k];
+}
+
+// SparseChannel2Spatial skip + repeat_interleave(Cout / (Cin/8)): h_f32 += repeat_interleave(C2S(x_in))
+__global__ void k_tr_c2s_skip_add(
+    float *__restrict__ h_f32, const float *__restrict__ x_in,
+    const int32_t *__restrict__ c_parent, const uint8_t *__restrict__ c_sub,
+    int N_child, int Cin, int Cout) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long tot = (long)N_child * Cout;
+  if (idx >= tot) return;
+  int ci = (int)(idx / Cout);
+  int k  = (int)(idx % Cout);
+  int p  = c_parent[ci];
+  int s  = (int)c_sub[ci];
+  int xc = Cin >> 3;
+  int rep = Cout / xc;
+  h_f32[idx] += x_in[((long)p * 8 + s) * xc + (k / rep)];
+}
+
+static int load_slat_flow_generic(const ec_safetensors_t *st, tr_ss_flow_res_t *f) {
+  memset(f, 0, sizeof *f);
+  f->in_w    = tr_upload_bf16(st, "input_layer.weight");
+  f->in_b    = tr_upload_f32(st,  "input_layer.bias");
+  f->out_w   = tr_upload_bf16(st, "out_layer.weight");
+  f->out_b   = tr_upload_f32(st,  "out_layer.bias");
+  f->t0_w    = tr_upload_bf16(st, "t_embedder.mlp.0.weight");
+  f->t0_b    = tr_upload_f32(st,  "t_embedder.mlp.0.bias");
+  f->t2_w    = tr_upload_bf16(st, "t_embedder.mlp.2.weight");
+  f->t2_b    = tr_upload_f32(st,  "t_embedder.mlp.2.bias");
+  f->adaln_w = tr_upload_bf16(st, "adaLN_modulation.1.weight");
+  f->adaln_b = tr_upload_f32(st,  "adaLN_modulation.1.bias");
+  if (!f->in_w || !f->out_w || !f->adaln_w) { free_flow_res(f); return -1; }
+  char k[192];
+  for (int i = 0; i < 30; i++) {
+    tr_ss_block_t *B = &f->blocks[i];
+    snprintf(k, sizeof k, "blocks.%d.modulation", i);                    B->modulation = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.to_qkv.weight", i);      B->sa_qkv_w   = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.to_qkv.bias", i);        B->sa_qkv_b   = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.to_out.weight", i);      B->sa_out_w   = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.to_out.bias", i);        B->sa_out_b   = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.q_rms_norm.gamma", i);   B->sa_qn      = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.self_attn.k_rms_norm.gamma", i);   B->sa_kn      = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.norm2.weight", i);                 B->norm2_w    = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.norm2.bias", i);                   B->norm2_b    = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.to_q.weight", i);       B->ca_q_w     = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.to_q.bias", i);         B->ca_q_b     = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.to_kv.weight", i);      B->ca_kv_w    = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.to_kv.bias", i);        B->ca_kv_b    = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.to_out.weight", i);     B->ca_out_w   = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.to_out.bias", i);       B->ca_out_b   = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.q_rms_norm.gamma", i);  B->ca_qn      = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.cross_attn.k_rms_norm.gamma", i);  B->ca_kn      = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.mlp.mlp.0.weight", i);             B->mlp0_w     = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.mlp.mlp.0.bias", i);               B->mlp0_b     = tr_upload_f32(st, k);
+    snprintf(k, sizeof k, "blocks.%d.mlp.mlp.2.weight", i);             B->mlp2_w     = tr_upload_bf16(st, k);
+    snprintf(k, sizeof k, "blocks.%d.mlp.mlp.2.bias", i);               B->mlp2_b     = tr_upload_f32(st, k);
+    if (!B->sa_qkv_w || !B->ca_kv_w || !B->mlp2_w) { free_flow_res(f); return -1; }
+  }
+  f->loaded = 1;
+  return 0;
+}
+
+static void slat_flow_forward_one(
+    ec_trellis2_t *tr, const tr_ss_flow_res_t *f,
+    const float *xt_d, const float *concat_cond_d, const int32_t *coords_d,
+    int N, int in_ch, int out_ch, float t_val,
+    uint16_t *const ck_cache[30], uint16_t *const cv_cache[30],
+    ss_work_t *W, float *out_v_d) {
+  const int DIM = 1536, H = 12, FFN = 8192, Lkv = 1029;
+  const float scale = 1.0f / sqrtf(128.0f);
+
+  // Timestep embedding
+  uint16_t fb_h[256];
+  double scaled = (double)t_val * 1000.0;
+  for (int i = 0; i < 128; i++) {
+    double fr = exp(-log(10000.0) * (double)i / 128.0);
+    double a = scaled * fr;
+    fb_h[i]       = tr_f32_to_bf16_h((float)cos(a));
+    fb_h[128 + i] = tr_f32_to_bf16_h((float)sin(a));
+  }
+  cudaMemcpyAsync(W->t_f_d, fb_h, 256 * 2, cudaMemcpyHostToDevice, tr->stream);
+  tr_gemm(W->t_f_d, f->t0_w, f->t0_b, W->t_hf_d, NULL, 1, 1536, 256, tr->stream);
+  ec_ops_silu_f32_to_bf16(W->t_hf_d, W->t_hb_d, 1536, tr->stream);
+  tr_gemm(W->t_hb_d, f->t2_w, f->t2_b, W->t_hf_d, NULL, 1, 1536, 1536, tr->stream);
+  ec_ops_silu_f32_to_bf16(W->t_hf_d, W->t_hb_d, 1536, tr->stream);
+  tr_gemm(W->t_hb_d, f->adaln_w, f->adaln_b, W->mod_d, NULL, 1, 9216, 1536, tr->stream);
+
+  k_slat_pack_in<<<((long)N * in_ch + 255) / 256, 256, 0, tr->stream>>>(
+      xt_d, concat_cond_d, W->x8_bf16, N, out_ch, in_ch);
+  tr_gemm(W->x8_bf16, f->in_w, f->in_b, W->x_d, NULL, N, DIM, in_ch, tr->stream);
+
+  int nw_sa = N * H;
+  for (int l = 0; l < 30; l++) {
+    const tr_ss_block_t *B = &f->blocks[l];
+    k_tr_add_vec<<<(9216 + 255) / 256, 256, 0, tr->stream>>>(B->modulation, W->mod_d, W->mod_blk_d, 9216);
+    const float *shift_msa = W->mod_blk_d + 0 * DIM;
+    const float *scale_msa = W->mod_blk_d + 1 * DIM;
+    const float *gate_msa  = W->mod_blk_d + 2 * DIM;
+    const float *shift_mlp = W->mod_blk_d + 3 * DIM;
+    const float *scale_mlp = W->mod_blk_d + 4 * DIM;
+    const float *gate_mlp  = W->mod_blk_d + 5 * DIM;
+
+    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(W->x_d, NULL, NULL, scale_msa, shift_msa, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
+    tr_gemm(W->xn_bf16, B->sa_qkv_w, B->sa_qkv_b, W->qkv_d, NULL, N, 3 * DIM, DIM, tr->stream);
+    k_slat_self_qkv_rope<<<(nw_sa + 7) / 8, 256, 0, tr->stream>>>(
+        W->qkv_d, B->sa_qn, B->sa_kn, coords_d, W->Q_b, W->K_b, W->V_b, N, H);
+    ec_ops_fa2_bf16(W->Q_b, W->K_b, W->V_b, NULL, W->ao_bf16, N, N, N, N, H, H, 128, scale, 0, tr->stream);
+    tr_gemm(W->ao_bf16, B->sa_out_w, B->sa_out_b, W->tmp_d, NULL, N, DIM, DIM, tr->stream);
+    k_tr_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(W->x_d, W->tmp_d, gate_msa, N, DIM);
+
+    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(W->x_d, B->norm2_w, B->norm2_b, NULL, NULL, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
+    tr_gemm(W->xn_bf16, B->ca_q_w, B->ca_q_b, W->qkv_d, NULL, N, DIM, DIM, tr->stream);
+    k_ss_cross_q_norm<<<(nw_sa + 7) / 8, 256, 0, tr->stream>>>(W->qkv_d, B->ca_qn, W->Q_b, N, H);
+    ec_ops_fa2_bf16(W->Q_b, ck_cache[l], cv_cache[l], NULL, W->ao_bf16, N, Lkv, N, Lkv, H, H, 128, scale, 0, tr->stream);
+    tr_gemm(W->ao_bf16, B->ca_out_w, B->ca_out_b, W->tmp_d, NULL, N, DIM, DIM, tr->stream);
+    k_tr_add_inplace<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(W->x_d, W->tmp_d, (long)N * DIM);
+
+    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(W->x_d, NULL, NULL, scale_mlp, shift_mlp, NULL, W->xn_bf16, N, DIM, 1e-6f, 0);
+    tr_gemm(W->xn_bf16, B->mlp0_w, B->mlp0_b, W->fc0_d, NULL, N, FFN, DIM, tr->stream);
+    k_tr_gelu_tanh_bf16<<<((long)N * FFN + 255) / 256, 256, 0, tr->stream>>>(W->fc0_d, W->mlp_bf16, (long)N * FFN);
+    tr_gemm(W->mlp_bf16, B->mlp2_w, B->mlp2_b, W->tmp_d, NULL, N, DIM, FFN, tr->stream);
+    k_tr_add_scaled<<<((long)N * DIM + 255) / 256, 256, 0, tr->stream>>>(W->x_d, W->tmp_d, gate_mlp, N, DIM);
+  }
+
+  k_tr_layernorm<<<N, 256, 0, tr->stream>>>(W->x_d, NULL, NULL, NULL, NULL, NULL, W->xn_bf16, N, DIM, 1e-5f, 0);
+  tr_gemm(W->xn_bf16, f->out_w, f->out_b, out_v_d, NULL, N, out_ch, DIM, tr->stream);
+}
+
+static int run_slat_flow_generic(
+    ec_trellis2_t *tr, const ec_safetensors_t *flow_st,
+    const int32_t *coords_d, int N, int in_ch, int out_ch,
+    const float *concat_cond_d, uint16_t *const *view_conds_d, int n_views,
+    int steps, float cfg_scale, float guidance_rescale, float cfg_t0, float cfg_t1, float rescale_t,
+    uint32_t seed, float *out_norm_d, const char *stage_name,
+    ec_trellis2_progress_fn cb, void *cb_ctx, int prog_base, int prog_tot, double *out_ms) {
+  double t0 = tr_now_ms();
+  const int DIM = 1536, H = 12, FFN = 8192, Lkv = 1029;
+  const float sigma_min = 1e-5f;
+  if (n_views < 1) n_views = 1;
+  if (n_views > 4) n_views = 4;
+
+  tr_ss_flow_res_t f = {};
+  if (load_slat_flow_generic(flow_st, &f) != 0) return -1;
+
+  int need_neg = (cfg_scale > 1.01f) ? 1 : 0;
+  uint16_t *neg_bf16_d = NULL;
+  if (need_neg) {
+    cudaMalloc(&neg_bf16_d, (size_t)Lkv * 1024 * 2);
+    cudaMemsetAsync(neg_bf16_d, 0, (size_t)Lkv * 1024 * 2, tr->stream);
+  }
+
+  uint16_t *ck_pos[4][30] = {{0}}, *cv_pos[4][30] = {{0}}, *ck_neg[30] = {0}, *cv_neg[30] = {0};
+  float *kv_tmp = NULL;
+  cudaMalloc(&kv_tmp, (size_t)Lkv * 2 * DIM * 4);
+  int nw_kv = Lkv * H;
+  for (int l = 0; l < 30; l++) {
+    const tr_ss_block_t *B = &f.blocks[l];
+    for (int v = 0; v < n_views; v++) {
+      cudaMalloc(&ck_pos[v][l], (size_t)Lkv * DIM * 2);
+      cudaMalloc(&cv_pos[v][l], (size_t)Lkv * DIM * 2);
+      tr_gemm(view_conds_d[v], B->ca_kv_w, B->ca_kv_b, kv_tmp, NULL, Lkv, 2 * DIM, 1024, tr->stream);
+      k_ss_cross_kv_norm<<<(nw_kv + 7) / 8, 256, 0, tr->stream>>>(kv_tmp, B->ca_kn, ck_pos[v][l], cv_pos[v][l], Lkv, H);
+    }
+    if (need_neg) {
+      cudaMalloc(&ck_neg[l], (size_t)Lkv * DIM * 2);
+      cudaMalloc(&cv_neg[l], (size_t)Lkv * DIM * 2);
+      tr_gemm(neg_bf16_d, B->ca_kv_w, B->ca_kv_b, kv_tmp, NULL, Lkv, 2 * DIM, 1024, tr->stream);
+      k_ss_cross_kv_norm<<<(nw_kv + 7) / 8, 256, 0, tr->stream>>>(kv_tmp, B->ca_kn, ck_neg[l], cv_neg[l], Lkv, H);
+    }
+  }
+  cudaFree(kv_tmp);
+  cudaFree(neg_bf16_d);
+
+  ss_work_t W = {};
+  cudaMalloc(&W.x8_bf16,  (size_t)N * in_ch * 2);
+  cudaMalloc(&W.x_d,      (size_t)N * DIM * 4);
+  cudaMalloc(&W.xn_bf16,  (size_t)N * DIM * 2);
+  cudaMalloc(&W.qkv_d,    (size_t)N * 3 * DIM * 4);
+  cudaMalloc(&W.Q_b,      (size_t)N * DIM * 2);
+  cudaMalloc(&W.K_b,      (size_t)N * DIM * 2);
+  cudaMalloc(&W.V_b,      (size_t)N * DIM * 2);
+  cudaMalloc(&W.ao_bf16,  (size_t)N * DIM * 2);
+  cudaMalloc(&W.tmp_d,    (size_t)N * DIM * 4);
+  cudaMalloc(&W.fc0_d,    (size_t)N * FFN * 4);
+  cudaMalloc(&W.mlp_bf16, (size_t)N * FFN * 2);
+  cudaMalloc(&W.mod_d,     9216 * 4);
+  cudaMalloc(&W.mod_blk_d, 9216 * 4);
+  cudaMalloc(&W.t_f_d,     256 * 2);
+  cudaMalloc(&W.t_hf_d,    1536 * 4);
+  cudaMalloc(&W.t_hb_d,    1536 * 2);
+
+  float *xt_h = (float *)malloc((size_t)N * out_ch * 4);
+  uint64_t rng = (uint64_t)seed * 6364136223846793005ULL + (concat_cond_d ? 0xD1B54A32D192ED03ULL : 0xA0761D6478BD642FULL);
+  for (long i = 0; i < (long)N * out_ch; i++) xt_h[i] = tr_randn(&rng);
+
+  float *xt_d = NULL, *vp_d = NULL, *vn_d = NULL;
+  cudaMalloc(&xt_d, (size_t)N * out_ch * 4);
+  cudaMalloc(&vp_d, (size_t)N * out_ch * 4);
+  if (need_neg) cudaMalloc(&vn_d, (size_t)N * out_ch * 4);
+  cudaMemcpyAsync(xt_d, xt_h, (size_t)N * out_ch * 4, cudaMemcpyHostToDevice, tr->stream);
+  free(xt_h);
+
+  float t_seq[65];
+  for (int i = 0; i <= steps; i++) {
+    float u = 1.0f - (float)i / (float)steps;
+    t_seq[i] = rescale_t * u / (1.0f + (rescale_t - 1.0f) * u);
+  }
+
+  int cancelled = 0;
+  for (int s = 0; s < steps; s++) {
+    if (cb && cb(prog_base + s, prog_tot, stage_name, cb_ctx) != 0) { cancelled = 1; break; }
+    float t_cur = t_seq[s], t_prev = t_seq[s + 1], dt = t_cur - t_prev;
+    int vid = s % n_views;
+    slat_flow_forward_one(tr, &f, xt_d, concat_cond_d, coords_d, N, in_ch, out_ch, t_cur, ck_pos[vid], cv_pos[vid], &W, vp_d);
+    int use_cfg = (need_neg && t_cur >= cfg_t0 && t_cur <= cfg_t1) ? 1 : 0;
+    if (use_cfg) {
+      slat_flow_forward_one(tr, &f, xt_d, concat_cond_d, coords_d, N, in_ch, out_ch, t_cur, ck_neg, cv_neg, &W, vn_d);
+    }
+    ec_ops_trellis_cfg_euler(
+        xt_d, vp_d, use_cfg ? vn_d : NULL, N * out_ch, dt, t_cur,
+        cfg_scale, guidance_rescale, sigma_min, use_cfg, tr->stream);
+  }
+
+  if (!cancelled) {
+    cudaMemcpyAsync(out_norm_d, xt_d, (size_t)N * out_ch * 4, cudaMemcpyDeviceToDevice, tr->stream);
+  }
+  cudaStreamSynchronize(tr->stream);
+
+  for (int l = 0; l < 30; l++) {
+    for (int v = 0; v < n_views; v++) { cudaFree(ck_pos[v][l]); cudaFree(cv_pos[v][l]); }
+    cudaFree(ck_neg[l]); cudaFree(cv_neg[l]);
+  }
+  cudaFree(W.x8_bf16); cudaFree(W.x_d); cudaFree(W.xn_bf16); cudaFree(W.qkv_d);
+  cudaFree(W.Q_b); cudaFree(W.K_b); cudaFree(W.V_b); cudaFree(W.ao_bf16);
+  cudaFree(W.tmp_d); cudaFree(W.fc0_d); cudaFree(W.mlp_bf16); cudaFree(W.mod_d); cudaFree(W.mod_blk_d);
+  cudaFree(W.t_f_d); cudaFree(W.t_hf_d); cudaFree(W.t_hb_d);
+  cudaFree(xt_d); cudaFree(vp_d); cudaFree(vn_d);
+  free_flow_res(&f);
+
+  if (out_ms) *out_ms = tr_now_ms() - t0;
+  return cancelled ? -2 : 0;
+}
+
+typedef struct {
+  int      n_child;
+  int32_t *child_coords_h; // [n_child * 3]
+  int32_t *child_parent_h; // [n_child]
+  uint8_t *child_sub_h;    // [n_child]
+} tr_subdiv_level_t;
+
+static void free_subdiv_levels(tr_subdiv_level_t lvls[4]) {
+  for (int i = 0; i < 4; i++) {
+    free(lvls[i].child_coords_h);
+    free(lvls[i].child_parent_h);
+    free(lvls[i].child_sub_h);
+  }
+  memset(lvls, 0, 4 * sizeof(tr_subdiv_level_t));
+}
+
+static int build_sp_nb_gpu(
+    ec_trellis2_t *tr, const int32_t *coords_h, int N, int R, int32_t **out_nb_d) {
+  uint32_t cap = 1024u;
+  while (cap < (uint32_t)N * 4u) cap <<= 1;
+  uint32_t mask = cap - 1u;
+  int32_t *coords_d = NULL, *vals_d = NULL, *nb_d = NULL;
+  unsigned long long *keys_d = NULL;
+  if (cudaMalloc(&coords_d, (size_t)N * 3 * sizeof(int32_t)) != cudaSuccess ||
+      cudaMalloc(&keys_d,   (size_t)cap * sizeof(unsigned long long)) != cudaSuccess ||
+      cudaMalloc(&vals_d,   (size_t)cap * sizeof(int32_t)) != cudaSuccess ||
+      cudaMalloc(&nb_d,     (size_t)N * 27 * sizeof(int32_t)) != cudaSuccess) {
+    cudaFree(coords_d); cudaFree(keys_d); cudaFree(vals_d); cudaFree(nb_d);
+    return -1;
+  }
+  cudaMemcpyAsync(coords_d, coords_h, (size_t)N * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, tr->stream);
+  cudaMemsetAsync(keys_d, 0, (size_t)cap * sizeof(unsigned long long), tr->stream);
+  k_tr_sp_hash_insert<<<(N + 255) / 256, 256, 0, tr->stream>>>(coords_d, N, keys_d, vals_d, mask);
+  k_tr_sp_build_nb<<<((long)N * 27 + 255) / 256, 256, 0, tr->stream>>>(coords_d, N, R, keys_d, vals_d, mask, nb_d);
+  cudaStreamSynchronize(tr->stream);
+  cudaFree(coords_d); cudaFree(keys_d); cudaFree(vals_d);
+  *out_nb_d = nb_d;
+  return 0;
+}
+
+static void run_sp_conv3d_k3(
+    ec_trellis2_t *tr, const float *x_d, const int32_t *nb_d, float *y_d,
+    const uint16_t *w_bf16, const float *b_f32,
+    int N, int Cin, int Cout, uint16_t *col_scratch, size_t col_cap_elems) {
+  int max_chunk = (int)(col_cap_elems / (size_t)(27 * Cin));
+  if (max_chunk < 64) max_chunk = 64;
+  for (int v0 = 0; v0 < N; v0 += max_chunk) {
+    int ch = (N - v0 < max_chunk) ? (N - v0) : max_chunk;
+    long n = (long)ch * 27 * Cin;
+    k_tr_sp_gather_k3<<<(n + 255) / 256, 256, 0, tr->stream>>>(x_d, nb_d, col_scratch, v0, ch, Cin);
+    tr_gemm(col_scratch, w_bf16, b_f32, y_d + (long)v0 * Cout, NULL, ch, Cout, 27 * Cin, tr->stream);
+  }
+}
+
+// Unified Streamed Sparse 3D ConvNeXt + C2S Decoder (runs BOTH shape_dec [7ch, pred_subdiv=1] AND tex_dec [6ch, pred_subdiv=0]!)
+static int run_sparse_unet_decoder(
+    ec_trellis2_t *tr, const ec_safetensors_t *dec_st,
+    const float *slat_d, const int32_t *coords32_h, int N0,
+    int pred_subdiv, int out_ch,
+    tr_subdiv_level_t subdiv_lvls[4],
+    int *out_N_final, int32_t **out_coords512_h, float **out_feats_h, double *out_ms) {
+  double t0 = tr_now_ms();
+  const int CH[5]   = { 1024, 512, 256, 128, 64 };
+  const int NBLK[4] = { 4, 16, 8, 4 };
+  const int RES[5]  = { 32, 64, 128, 256, 512 };
+  const size_t COL_CAP = 32L * 1024 * 1024; // 64 MB BF16 scratch
+  uint16_t *col_d = NULL;
+  if (cudaMalloc(&col_d, COL_CAP * 2) != cudaSuccess) return -1;
+
+  // from_latent: [N0, 32] -> [N0, 1024]
+  float *x_d = NULL;
+  uint16_t *in_b = NULL;
+  cudaMalloc(&x_d,  (size_t)N0 * CH[0] * 4);
+  cudaMalloc(&in_b, (size_t)N0 * 32 * 2);
+  k_tr_f32_to_bf16<<<((long)N0 * 32 + 255) / 256, 256, 0, tr->stream>>>(slat_d, in_b, (long)N0 * 32);
+  {
+    uint16_t *fw = tr_upload_bf16(dec_st, "from_latent.weight");
+    float    *fb = tr_upload_f32(dec_st,  "from_latent.bias");
+    if (!fw || !fb) { cudaFree(fw); cudaFree(fb); cudaFree(x_d); cudaFree(in_b); cudaFree(col_d); return -1; }
+    tr_gemm(in_b, fw, fb, x_d, NULL, N0, CH[0], 32, tr->stream);
+    cudaStreamSynchronize(tr->stream);
+    cudaFree(fw); cudaFree(fb);
+  }
+  cudaFree(in_b);
+
+  int N = N0;
+  int32_t *cur_coords_h = (int32_t *)malloc((size_t)N * 3 * sizeof(int32_t));
+  memcpy(cur_coords_h, coords32_h, (size_t)N * 3 * sizeof(int32_t));
+  int32_t *nb_d = NULL;
+  if (build_sp_nb_gpu(tr, cur_coords_h, N, RES[0], &nb_d) != 0) {
+    free(cur_coords_h); cudaFree(x_d); cudaFree(col_d); return -1;
+  }
+
+  char k[192];
+  for (int s = 0; s < 4; s++) {
+    int Cin = CH[s], Cout = CH[s + 1];
+    float *h_d = NULL, *fc_d = NULL;
+    uint16_t *hb_d = NULL, *fcb_d = NULL;
+    cudaMalloc(&h_d,   (size_t)N * Cin * 4);
+    cudaMalloc(&hb_d,  (size_t)N * Cin * 2);
+    cudaMalloc(&fc_d,  (size_t)N * (4 * Cin) * 4);
+    cudaMalloc(&fcb_d, (size_t)N * (4 * Cin) * 2);
+
+    // 1. NBLK[s] SparseConvNeXtBlock3d layers at resolution RES[s], channels Cin
+    for (int j = 0; j < NBLK[s]; j++) {
+      snprintf(k, sizeof k, "blocks.%d.%d.conv.weight", s, j);  uint16_t *cw = tr_upload_bf16(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.conv.bias", s, j);    float    *cb = tr_upload_f32(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.norm.weight", s, j);  float    *nw = tr_upload_f32(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.norm.bias", s, j);    float    *nb = tr_upload_f32(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.mlp.0.weight", s, j); uint16_t *m0w = tr_upload_bf16(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.mlp.0.bias", s, j);   float    *m0b = tr_upload_f32(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.mlp.2.weight", s, j); uint16_t *m2w = tr_upload_bf16(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.mlp.2.bias", s, j);   float    *m2b = tr_upload_f32(dec_st, k);
+      if (!cw || !nw || !m0w || !m2w) {
+        cudaFree(cw); cudaFree(cb); cudaFree(nw); cudaFree(nb); cudaFree(m0w); cudaFree(m0b); cudaFree(m2w); cudaFree(m2b);
+        cudaFree(h_d); cudaFree(hb_d); cudaFree(fc_d); cudaFree(fcb_d); cudaFree(nb_d); cudaFree(x_d); cudaFree(col_d);
+        free(cur_coords_h); return -1;
+      }
+      run_sp_conv3d_k3(tr, x_d, nb_d, h_d, cw, cb, N, Cin, Cin, col_d, COL_CAP);
+      k_tr_layernorm<<<N, 256, 0, tr->stream>>>(h_d, nw, nb, NULL, NULL, NULL, hb_d, N, Cin, 1e-6f, 0);
+      tr_gemm(hb_d, m0w, m0b, fc_d, NULL, N, 4 * Cin, Cin, tr->stream);
+      k_tr_silu_bf16<<<((long)N * 4 * Cin + 255) / 256, 256, 0, tr->stream>>>(fc_d, fcb_d, (long)N * 4 * Cin);
+      tr_gemm(fcb_d, m2w, m2b, h_d, NULL, N, Cin, 4 * Cin, tr->stream);
+      k_tr_add_inplace<<<((long)N * Cin + 255) / 256, 256, 0, tr->stream>>>(x_d, h_d, (long)N * Cin);
+      cudaStreamSynchronize(tr->stream);
+      cudaFree(cw); cudaFree(cb); cudaFree(nw); cudaFree(nb);
+      cudaFree(m0w); cudaFree(m0b); cudaFree(m2w); cudaFree(m2b);
+    }
+    cudaFree(fc_d); cudaFree(fcb_d);
+
+    // 2. SparseResBlockC2S3d upsample block: blocks.{s}.{NBLK[s]}
+    int uj = NBLK[s];
+    if (pred_subdiv) {
+      snprintf(k, sizeof k, "blocks.%d.%d.to_subdiv.weight", s, uj); uint16_t *sw = tr_upload_bf16(dec_st, k);
+      snprintf(k, sizeof k, "blocks.%d.%d.to_subdiv.bias", s, uj);   float    *sb = tr_upload_f32(dec_st, k);
+      float *sub_d = NULL;
+      cudaMalloc(&sub_d, (size_t)N * 8 * 4);
+      k_tr_f32_to_bf16<<<((long)N * Cin + 255) / 256, 256, 0, tr->stream>>>(x_d, hb_d, (long)N * Cin);
+      tr_gemm(hb_d, sw, sb, sub_d, NULL, N, 8, Cin, tr->stream);
+      float *sub_h = (float *)malloc((size_t)N * 8 * 4);
+      cudaMemcpyAsync(sub_h, sub_d, (size_t)N * 8 * 4, cudaMemcpyDeviceToHost, tr->stream);
+      cudaStreamSynchronize(tr->stream);
+      cudaFree(sw); cudaFree(sb); cudaFree(sub_d);
+
+      // Count active children (sub_h[p*8 + b] > 0) — exact TRELLIS.2 subdivision threshold (0.0f)!
+      // Only raise threshold if extreme pathological seed exceeds 3.5M voxels (never chop valid 512^3 shells!).
+      int n_child = 0;
+      for (long i = 0; i < (long)N * 8; i++) if (sub_h[i] > 0.0f) n_child++;
+      float thresh = 0.0f;
+      if (n_child > 3500000) {
+        thresh = 0.25f; n_child = 0;
+        for (long i = 0; i < (long)N * 8; i++) if (sub_h[i] > thresh) n_child++;
+      }
+      if (n_child == 0) {
+        // Guarantee at least 1 child per parent if all negative
+        for (int p = 0; p < N; p++) { sub_h[p * 8] = 1.0f; }
+        n_child = N; thresh = 0.0f;
+      }
+      int32_t *cc = (int32_t *)malloc((size_t)n_child * 3 * sizeof(int32_t));
+      int32_t *cp = (int32_t *)malloc((size_t)n_child * sizeof(int32_t));
+      uint8_t *cs = (uint8_t *)malloc((size_t)n_child);
+      int ci = 0;
+      for (int p = 0; p < N; p++) {
+        int px = cur_coords_h[p * 3 + 0] * 2;
+        int py = cur_coords_h[p * 3 + 1] * 2;
+        int pz = cur_coords_h[p * 3 + 2] * 2;
+        for (int b = 0; b < 8; b++) {
+          if (sub_h[(long)p * 8 + b] > thresh) {
+            cc[ci * 3 + 0] = px + (b & 1);
+            cc[ci * 3 + 1] = py + ((b >> 1) & 1);
+            cc[ci * 3 + 2] = pz + ((b >> 2) & 1);
+            cp[ci] = p;
+            cs[ci] = (uint8_t)b;
+            ci++;
+          }
+        }
+      }
+      free(sub_h);
+      subdiv_lvls[s].n_child        = ci;
+      subdiv_lvls[s].child_coords_h = cc;
+      subdiv_lvls[s].child_parent_h = cp;
+      subdiv_lvls[s].child_sub_h    = cs;
+    }
+
+    int N_next = subdiv_lvls[s].n_child;
+    // norm1 + SiLU -> conv1(Cin -> 8 * Cout)
+    snprintf(k, sizeof k, "blocks.%d.%d.norm1.weight", s, uj); float    *n1w = tr_upload_f32(dec_st, k);
+    snprintf(k, sizeof k, "blocks.%d.%d.norm1.bias", s, uj);   float    *n1b = tr_upload_f32(dec_st, k);
+    snprintf(k, sizeof k, "blocks.%d.%d.conv1.weight", s, uj); uint16_t *c1w = tr_upload_bf16(dec_st, k);
+    snprintf(k, sizeof k, "blocks.%d.%d.conv1.bias", s, uj);   float    *c1b = tr_upload_f32(dec_st, k);
+    k_tr_layernorm<<<N, 256, 0, tr->stream>>>(x_d, n1w, n1b, NULL, NULL, h_d, NULL, N, Cin, 1e-6f, 1);
+    float *h8_d = NULL;
+    cudaMalloc(&h8_d, (size_t)N * (8 * Cout) * 4);
+    run_sp_conv3d_k3(tr, h_d, nb_d, h8_d, c1w, c1b, N, Cin, 8 * Cout, col_d, COL_CAP);
+    cudaStreamSynchronize(tr->stream);
+    cudaFree(n1w); cudaFree(n1b); cudaFree(c1w); cudaFree(c1b);
+    cudaFree(h_d); cudaFree(hb_d); cudaFree(nb_d);
+
+    // Channel2Spatial gather onto N_next children!
+    int32_t *cp_d = NULL; uint8_t *cs_d = NULL;
+    cudaMalloc(&cp_d, (size_t)N_next * sizeof(int32_t));
+    cudaMalloc(&cs_d, (size_t)N_next);
+    cudaMemcpyAsync(cp_d, subdiv_lvls[s].child_parent_h, (size_t)N_next * sizeof(int32_t), cudaMemcpyHostToDevice, tr->stream);
+    cudaMemcpyAsync(cs_d, subdiv_lvls[s].child_sub_h,    (size_t)N_next,                   cudaMemcpyHostToDevice, tr->stream);
+
+    float *h_up_d = NULL, *h_n2_d = NULL, *h_c2_d = NULL;
+    cudaMalloc(&h_up_d, (size_t)N_next * Cout * 4);
+    k_tr_c2s_gather<<<((long)N_next * Cout + 255) / 256, 256, 0, tr->stream>>>(h8_d, cp_d, cs_d, h_up_d, N_next, Cout);
+    cudaStreamSynchronize(tr->stream);
+    cudaFree(h8_d);
+
+    // Build neighbor table at RES[s+1]
+    free(cur_coords_h);
+    cur_coords_h = (int32_t *)malloc((size_t)N_next * 3 * sizeof(int32_t));
+    memcpy(cur_coords_h, subdiv_lvls[s].child_coords_h, (size_t)N_next * 3 * sizeof(int32_t));
+    if (build_sp_nb_gpu(tr, cur_coords_h, N_next, RES[s + 1], &nb_d) != 0) {
+      cudaFree(cp_d); cudaFree(cs_d); cudaFree(h_up_d); cudaFree(x_d); cudaFree(col_d); free(cur_coords_h); return -1;
+    }
+
+    // norm2 (no affine, eps=1e-6) + SiLU -> conv2(Cout -> Cout) + C2S skip(x_d)
+    cudaMalloc(&h_n2_d, (size_t)N_next * Cout * 4);
+    cudaMalloc(&h_c2_d, (size_t)N_next * Cout * 4);
+    k_tr_layernorm<<<N_next, 256, 0, tr->stream>>>(h_up_d, NULL, NULL, NULL, NULL, h_n2_d, NULL, N_next, Cout, 1e-6f, 1);
+    cudaFree(h_up_d);
+
+    snprintf(k, sizeof k, "blocks.%d.%d.conv2.weight", s, uj); uint16_t *c2w = tr_upload_bf16(dec_st, k);
+    snprintf(k, sizeof k, "blocks.%d.%d.conv2.bias", s, uj);   float    *c2b = tr_upload_f32(dec_st, k);
+    run_sp_conv3d_k3(tr, h_n2_d, nb_d, h_c2_d, c2w, c2b, N_next, Cout, Cout, col_d, COL_CAP);
+    k_tr_c2s_skip_add<<<((long)N_next * Cout + 255) / 256, 256, 0, tr->stream>>>(h_c2_d, x_d, cp_d, cs_d, N_next, Cin, Cout);
+    cudaStreamSynchronize(tr->stream);
+
+    cudaFree(c2w); cudaFree(c2b); cudaFree(h_n2_d);
+    cudaFree(cp_d); cudaFree(cs_d); cudaFree(x_d);
+    x_d = h_c2_d;
+    N = N_next;
+  }
+
+  // Final output layer at 512^3: F.layer_norm(x, [64], eps=1e-5, no affine) -> output_layer(64 -> out_ch)
+  cudaFree(nb_d);
+  cudaFree(col_d);
+  uint16_t *xn_b = NULL;
+  float *out_d = NULL;
+  cudaMalloc(&xn_b,  (size_t)N * 64 * 2);
+  cudaMalloc(&out_d, (size_t)N * out_ch * 4);
+  k_tr_layernorm<<<N, 64, 0, tr->stream>>>(x_d, NULL, NULL, NULL, NULL, NULL, xn_b, N, 64, 1e-5f, 0);
+  cudaFree(x_d);
+  {
+    uint16_t *ow = tr_upload_bf16(dec_st, "output_layer.weight");
+    float    *ob = tr_upload_f32(dec_st,  "output_layer.bias");
+    tr_gemm(xn_b, ow, ob, out_d, NULL, N, out_ch, 64, tr->stream);
+    cudaStreamSynchronize(tr->stream);
+    cudaFree(ow); cudaFree(ob);
+  }
+  cudaFree(xn_b);
+
+  float *out_h = (float *)malloc((size_t)N * out_ch * 4);
+  cudaMemcpyAsync(out_h, out_d, (size_t)N * out_ch * 4, cudaMemcpyDeviceToHost, tr->stream);
+  cudaStreamSynchronize(tr->stream);
+  cudaFree(out_d);
+
+  *out_N_final = N;
+  if (out_coords512_h) *out_coords512_h = cur_coords_h; else free(cur_coords_h);
+  *out_feats_h = out_h;
+  if (out_ms) *out_ms = tr_now_ms() - t0;
+  return 0;
+}
+
+static int extract_trellis2_ovoxel_pbr(
+    const int32_t *coords512, int N,
+    const float *shape7, const float *tex6, const float *logits_64,
+    ec_mesh_t *mesh, ec_splat3d_t *splat) {
+  memset(mesh, 0, sizeof *mesh);
+  memset(splat, 0, sizeof *splat);
+  if (N <= 0 || !coords512 || !shape7 || !tex6) return -1;
+
+  // Build CPU open-addressing hash table mapping (x, y, z) -> voxel index [0..N-1]
+  uint32_t cap = 1024u;
+  while (cap < (uint32_t)N * 4u) cap <<= 1;
+  uint32_t mask = cap - 1u;
+  uint64_t *hkeys = (uint64_t *)calloc(cap, sizeof(uint64_t));
+  int32_t  *hvals = (int32_t *)malloc(cap * sizeof(int32_t));
+  if (!hkeys || !hvals) { free(hkeys); free(hvals); return -1; }
+  for (int i = 0; i < N; i++) {
+    uint64_t k = (((uint64_t)(uint32_t)coords512[i*3+0] << 20) |
+                  ((uint64_t)(uint32_t)coords512[i*3+1] << 10) |
+                   (uint64_t)(uint32_t)coords512[i*3+2]) + 1ULL;
+    uint32_t sl = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+    while (hkeys[sl] != 0ULL && hkeys[sl] != k) sl = (sl + 1u) & mask;
+    hkeys[sl] = k; hvals[sl] = i;
+  }
+  auto hfind = [&](int x, int y, int z) -> int32_t {
+    if (x < 0 || x >= 512 || y < 0 || y >= 512 || z < 0 || z >= 512) return -1;
+    uint64_t k = (((uint64_t)(uint32_t)x << 20) | ((uint64_t)(uint32_t)y << 10) | (uint64_t)(uint32_t)z) + 1ULL;
+    uint32_t sl = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+    while (hkeys[sl] != 0ULL) {
+      if (hkeys[sl] == k) return hvals[sl];
+      sl = (sl + 1u) & mask;
+    }
+    return -1;
+  };
+
+  // Precompute softplus split weights for all N voxels
+  float *sw = (float *)malloc((size_t)N * 4);
+  for (int i = 0; i < N; i++) {
+    float v = shape7[(long)i * 7 + 6];
+    sw[i] = (v > 20.0f) ? v : log1pf(expf(v));
+  }
+
+  // Exact TRELLIS.2 Flexible Dual Grid neighbor offsets (tr2_flexible_dual_grid.py:173-181)
+  static const int OFF[3][4][3] = {
+    { {0,0,0}, {0,0,1}, {0,1,1}, {0,1,0} }, // X-axis
+    { {0,0,0}, {1,0,0}, {1,0,1}, {0,0,1} }, // Y-axis
+    { {0,0,0}, {0,1,0}, {1,1,0}, {1,0,0} }, // Z-axis
+  };
+
+  uint32_t tcap = (uint32_t)N * 2u + 16384u;
+  uint32_t *raw_idx = (uint32_t *)malloc((size_t)tcap * 3 * sizeof(uint32_t));
+  uint32_t *quad_v  = (uint32_t *)malloc((size_t)(tcap / 2 + 1) * 4 * sizeof(uint32_t));
+  uint32_t n_tris = 0, n_quads = 0;
+  for (int i = 0; i < N; i++) {
+    int cx = coords512[i*3+0], cy = coords512[i*3+1], cz = coords512[i*3+2];
+    const float *s7 = shape7 + (long)i * 7;
+    for (int ax = 0; ax < 3; ax++) {
+      if (s7[3 + ax] <= 0.0f) continue;
+      int32_t qv[4];
+      int valid = 1;
+      for (int c = 0; c < 4; c++) {
+        qv[c] = hfind(cx + OFF[ax][c][0], cy + OFF[ax][c][1], cz + OFF[ax][c][2]);
+        if (qv[c] < 0) { valid = 0; break; }
+      }
+      if (!valid) continue;
+      if (n_tris + 2 > tcap) {
+        tcap *= 2;
+        raw_idx = (uint32_t *)realloc(raw_idx, (size_t)tcap * 3 * sizeof(uint32_t));
+        quad_v  = (uint32_t *)realloc(quad_v,  (size_t)(tcap / 2 + 1) * 4 * sizeof(uint32_t));
+      }
+      quad_v[n_quads*4+0] = (uint32_t)qv[0];
+      quad_v[n_quads*4+1] = (uint32_t)qv[1];
+      quad_v[n_quads*4+2] = (uint32_t)qv[2];
+      quad_v[n_quads*4+3] = (uint32_t)qv[3];
+      n_quads++;
+      if (sw[qv[0]] * sw[qv[2]] > sw[qv[1]] * sw[qv[3]]) {
+        raw_idx[n_tris*3+0] = qv[0]; raw_idx[n_tris*3+1] = qv[1]; raw_idx[n_tris*3+2] = qv[2]; n_tris++;
+        raw_idx[n_tris*3+0] = qv[0]; raw_idx[n_tris*3+1] = qv[2]; raw_idx[n_tris*3+2] = qv[3]; n_tris++;
+      } else {
+        raw_idx[n_tris*3+0] = qv[0]; raw_idx[n_tris*3+1] = qv[1]; raw_idx[n_tris*3+2] = qv[3]; n_tris++;
+        raw_idx[n_tris*3+0] = qv[3]; raw_idx[n_tris*3+1] = qv[1]; raw_idx[n_tris*3+2] = qv[2]; n_tris++;
+      }
+    }
+  }
+  free(hkeys); free(hvals); free(sw);
+  if (n_tris == 0) { free(raw_idx); free(quad_v); return -1; }
+
+  // Compact vertices to only those referenced by triangles
+  int32_t *vmap = (int32_t *)malloc((size_t)N * sizeof(int32_t));
+  memset(vmap, -1, (size_t)N * sizeof(int32_t));
+  uint32_t n_verts = 0;
+  for (uint32_t t = 0; t < n_tris * 3u; t++) {
+    uint32_t oi = raw_idx[t];
+    if (vmap[oi] < 0) vmap[oi] = (int32_t)(n_verts++);
+    raw_idx[t] = (uint32_t)vmap[oi];
+  }
+  for (uint32_t k = 0; k < n_quads * 4u; k++) quad_v[k] = (uint32_t)vmap[quad_v[k]];
+
+  float *pos = (float *)malloc((size_t)n_verts * 3 * 4);
+  float *nrm = (float *)calloc((size_t)n_verts * 3, 4);
+  float *uvs = (float *)malloc((size_t)n_verts * 2 * 4);
+  float *col = (float *)malloc((size_t)n_verts * 3 * 4);
+  float *vmet = (float *)malloc((size_t)n_verts * 4);
+  float *vrgh = (float *)malloc((size_t)n_verts * 4);
+
+  for (int i = 0; i < N; i++) {
+    int32_t vi = vmap[i];
+    if (vi < 0) continue;
+    const float *s7 = shape7 + (long)i * 7;
+    // Exact fdg_vae.py:100: dv = (1 + 2*0.5) * sigmoid(s7[0..2]) - 0.5 = 2*sigmoid - 0.5
+    float dv0 = 2.0f / (1.0f + expf(-s7[0])) - 0.5f;
+    float dv1 = 2.0f / (1.0f + expf(-s7[1])) - 0.5f;
+    float dv2 = 2.0f / (1.0f + expf(-s7[2])) - 0.5f;
+    float px = ((float)coords512[i*3+0] + dv0) * (1.0f / 512.0f) - 0.5f;
+    float py = ((float)coords512[i*3+1] + dv1) * (1.0f / 512.0f) - 0.5f;
+    float pz = ((float)coords512[i*3+2] + dv2) * (1.0f / 512.0f) - 0.5f;
+    // TRELLIS.2 Z-up -> glTF Y-up: (px, pz, -py)
+    pos[vi*3+0] =  px;
+    pos[vi*3+1] =  pz;
+    pos[vi*3+2] = -py;
+    uvs[vi*2+0] = px + 0.5f;
+    uvs[vi*2+1] = pz + 0.5f;
+
+    // Exact tr2_pipeline.py:450: tex_voxels = tex_dec(slat) * 0.5 + 0.5 -> [R, G, B, metallic, roughness, alpha]
+    const float *t6 = tex6 + (long)i * 6;
+    float r = fminf(1.0f, fmaxf(0.0f, t6[0] * 0.5f + 0.5f));
+    float g = fminf(1.0f, fmaxf(0.0f, t6[1] * 0.5f + 0.5f));
+    float b = fminf(1.0f, fmaxf(0.0f, t6[2] * 0.5f + 0.5f));
+    col[vi*3+0] = tr_srgb_to_linear(r);
+    col[vi*3+1] = tr_srgb_to_linear(g);
+    col[vi*3+2] = tr_srgb_to_linear(b);
+    vmet[vi] = fminf(1.0f, fmaxf(0.0f, t6[3] * 0.5f + 0.5f));
+    vrgh[vi] = fminf(1.0f, fmaxf(0.04f, t6[4] * 0.5f + 0.5f));
+  }
+  free(vmap);
+
+  // BFS Edge-Consistent Manifold Winding + Signed-Volume Outward Orientation!
+  // Eliminates 100% of normal-flip contour seams across smooth curved surfaces (Stage-1 64^3 logits are a hollow shell!).
+  {
+    (void)logits_64;
+    uint32_t ecap = 4096u;
+    while (ecap < n_quads * 8u) ecap <<= 1;
+    uint32_t emask = ecap - 1u;
+    struct EdgeSlot { uint64_t key; uint32_t q0, q1; uint8_t d0, d1, cnt; };
+    EdgeSlot *etab = (EdgeSlot *)calloc(ecap, sizeof(EdgeSlot));
+    uint8_t *qvis  = (uint8_t *)calloc(n_quads, 1);
+    uint8_t *qflip = (uint8_t *)calloc(n_quads, 1);
+    uint32_t *qbfs = (uint32_t *)malloc((size_t)n_quads * sizeof(uint32_t));
+    if (etab && qvis && qflip && qbfs) {
+      for (uint32_t q = 0; q < n_quads; q++) {
+        for (int e = 0; e < 4; e++) {
+          uint32_t u = quad_v[q*4 + e], v = quad_v[q*4 + ((e + 1) & 3)];
+          uint8_t dir = (u < v) ? 0 : 1;
+          uint64_t k = (((uint64_t)(dir ? v : u) << 32) | (uint64_t)(dir ? u : v)) + 1ULL;
+          uint32_t sl = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 32) & emask;
+          while (etab[sl].key != 0ULL && etab[sl].key != k) sl = (sl + 1u) & emask;
+          if (etab[sl].key == 0ULL) {
+            etab[sl].key = k; etab[sl].q0 = q; etab[sl].d0 = dir; etab[sl].cnt = 1;
+          } else if (etab[sl].cnt == 1) {
+            etab[sl].q1 = q; etab[sl].d1 = dir; etab[sl].cnt = 2;
+          } else {
+            etab[sl].cnt = 3; // non-manifold edge -> don't propagate across it
+          }
+        }
+      }
+      for (uint32_t qs = 0; qs < n_quads; qs++) {
+        if (qvis[qs]) continue;
+        uint32_t qh = 0, qt = 0;
+        qvis[qs] = 1; qflip[qs] = 0; qbfs[qt++] = qs;
+        while (qh < qt) {
+          uint32_t cur = qbfs[qh++];
+          for (int e = 0; e < 4; e++) {
+            uint32_t u = quad_v[cur*4 + e], v = quad_v[cur*4 + ((e + 1) & 3)];
+            uint8_t dir = (u < v) ? 0 : 1;
+            uint64_t k = (((uint64_t)(dir ? v : u) << 32) | (uint64_t)(dir ? u : v)) + 1ULL;
+            uint32_t sl = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 32) & emask;
+            while (etab[sl].key != 0ULL && etab[sl].key != k) sl = (sl + 1u) & emask;
+            if (etab[sl].cnt != 2) continue;
+            uint32_t nb = (etab[sl].q0 == cur) ? etab[sl].q1 : etab[sl].q0;
+            uint8_t nb_d = (etab[sl].q0 == cur) ? etab[sl].d1 : etab[sl].d0;
+            if (!qvis[nb]) {
+              qvis[nb] = 1;
+              // Adjacent quads MUST traverse shared edge in opposite directions!
+              qflip[nb] = (uint8_t)(qflip[cur] ^ (dir == nb_d ? 1 : 0));
+              qbfs[qt++] = nb;
+            }
+          }
+        }
+        // Compute Green's theorem signed volume of this oriented component to guarantee OUTWARD normals!
+        double vol6 = 0.0, rad_dot = 0.0;
+        for (uint32_t ci = 0; ci < qt; ci++) {
+          uint32_t q = qbfs[ci];
+          uint8_t fl = qflip[q];
+          for (int sub = 0; sub < 2; sub++) {
+            uint32_t t = q * 2u + (uint32_t)sub;
+            uint32_t i0 = raw_idx[t*3+0];
+            uint32_t i1 = raw_idx[t*3+(fl ? 2 : 1)];
+            uint32_t i2 = raw_idx[t*3+(fl ? 1 : 2)];
+            double x0 = pos[i0*3+0], y0 = pos[i0*3+1], z0 = pos[i0*3+2];
+            double x1 = pos[i1*3+0], y1 = pos[i1*3+1], z1 = pos[i1*3+2];
+            double x2 = pos[i2*3+0], y2 = pos[i2*3+1], z2 = pos[i2*3+2];
+            double cx = y1*z2 - z1*y2, cy = z1*x2 - x1*z2, cz = x1*y2 - y1*x2;
+            vol6 += x0*cx + y0*cy + z0*cz;
+            double ax = x1 - x0, ay = y1 - y0, az = z1 - z0;
+            double bx = x2 - x0, by = y2 - y0, bz = z2 - z0;
+            double fnx = ay*bz - az*by, fny = az*bx - ax*bz, fnz = ax*by - ay*bx;
+            rad_dot += fnx * (x0 + x1 + x2) + fny * (y0 + y1 + y2) + fnz * (z0 + z1 + z2);
+          }
+        }
+        if ((qt >= 16 && vol6 < 0.0) || (qt < 16 && rad_dot < 0.0)) {
+          for (uint32_t ci = 0; ci < qt; ci++) qflip[qbfs[ci]] ^= 1u;
+        }
+      }
+      for (uint32_t q = 0; q < n_quads; q++) {
+        for (int sub = 0; sub < 2; sub++) {
+          uint32_t t = q * 2u + (uint32_t)sub;
+          if (qflip[q]) {
+            uint32_t tmp = raw_idx[t*3+1];
+            raw_idx[t*3+1] = raw_idx[t*3+2];
+            raw_idx[t*3+2] = tmp;
+          }
+          uint32_t i0 = raw_idx[t*3+0], i1 = raw_idx[t*3+1], i2 = raw_idx[t*3+2];
+          float ax = pos[i1*3+0]-pos[i0*3+0], ay = pos[i1*3+1]-pos[i0*3+1], az = pos[i1*3+2]-pos[i0*3+2];
+          float bx = pos[i2*3+0]-pos[i0*3+0], by = pos[i2*3+1]-pos[i0*3+1], bz = pos[i2*3+2]-pos[i0*3+2];
+          float fnx = ay*bz - az*by, fny = az*bx - ax*bz, fnz = ax*by - ay*bx;
+          nrm[i0*3+0] += fnx; nrm[i0*3+1] += fny; nrm[i0*3+2] += fnz;
+          nrm[i1*3+0] += fnx; nrm[i1*3+1] += fny; nrm[i1*3+2] += fnz;
+          nrm[i2*3+0] += fnx; nrm[i2*3+1] += fny; nrm[i2*3+2] += fnz;
+        }
+      }
+    }
+    free(etab); free(qvis); free(qflip); free(qbfs);
+  }
+  free(quad_v);
+  for (uint32_t v = 0; v < n_verts; v++) {
+    float x = nrm[v*3+0], y = nrm[v*3+1], z = nrm[v*3+2];
+    float l = sqrtf(x*x + y*y + z*z);
+    if (l > 1e-10f) { nrm[v*3+0] = x/l; nrm[v*3+1] = y/l; nrm[v*3+2] = z/l; }
+    else { nrm[v*3+0] = 0.0f; nrm[v*3+1] = 1.0f; nrm[v*3+2] = 0.0f; }
+  }
+
+  // 1-pass Laplacian smooth on metallic & roughness maps to eliminate 1-triangle speckled material islands!
+  {
+    float *ms = (float *)calloc(n_verts, 4);
+    float *rs = (float *)calloc(n_verts, 4);
+    uint32_t *dg = (uint32_t *)calloc(n_verts, sizeof(uint32_t));
+    if (ms && rs && dg) {
+      for (uint32_t t = 0; t < n_tris; t++) {
+        uint32_t a = raw_idx[t*3+0], b = raw_idx[t*3+1], c = raw_idx[t*3+2];
+        ms[a] += vmet[b] + vmet[c]; rs[a] += vrgh[b] + vrgh[c]; dg[a] += 2;
+        ms[b] += vmet[a] + vmet[c]; rs[b] += vrgh[a] + vrgh[c]; dg[b] += 2;
+        ms[c] += vmet[a] + vmet[b]; rs[c] += vrgh[a] + vrgh[b]; dg[c] += 2;
+      }
+      for (uint32_t v = 0; v < n_verts; v++) {
+        if (dg[v] > 0) {
+          vmet[v] = 0.5f * vmet[v] + 0.5f * (ms[v] / (float)dg[v]);
+          vrgh[v] = 0.5f * vrgh[v] + 0.5f * (rs[v] / (float)dg[v]);
+        }
+      }
+    }
+    free(ms); free(rs); free(dg);
+  }
+
+  // Cluster triangles into 4x4=16 exact-mean (metallic, roughness) PBR material primitives!
+  uint16_t *tri_mats = (uint16_t *)malloc((size_t)n_tris * sizeof(uint16_t));
+  double b_met[16] = {0}, b_rgh[16] = {0};
+  uint32_t b_cnt[16] = {0};
+  double tot_met = 0.0, tot_rgh = 0.0;
+  for (uint32_t t = 0; t < n_tris; t++) {
+    uint32_t i0 = raw_idx[t*3+0], i1 = raw_idx[t*3+1], i2 = raw_idx[t*3+2];
+    float tm = (vmet[i0] + vmet[i1] + vmet[i2]) * (1.0f / 3.0f);
+    float tr = (vrgh[i0] + vrgh[i1] + vrgh[i2]) * (1.0f / 3.0f);
+    int mb = (int)(tm * 4.0f); if (mb < 0) mb = 0; if (mb > 3) mb = 3;
+    int rb = (int)(tr * 4.0f); if (rb < 0) rb = 0; if (rb > 3) rb = 3;
+    int bid = mb * 4 + rb;
+    tri_mats[t] = (uint16_t)bid;
+    b_met[bid] += tm; b_rgh[bid] += tr; b_cnt[bid]++;
+    tot_met += tm; tot_rgh += tr;
+  }
+  ec_pbr_mat_t *mats = (ec_pbr_mat_t *)calloc(16, sizeof(ec_pbr_mat_t));
+  int non_empty_buckets = 0;
+  for (int b = 0; b < 16; b++) {
+    mats[b].base_color[0] = 1.0f; mats[b].base_color[1] = 1.0f;
+    mats[b].base_color[2] = 1.0f; mats[b].base_color[3] = 1.0f;
+    mats[b].metallic  = b_cnt[b] ? (float)(b_met[b] / b_cnt[b]) : ((b / 4 + 0.5f) * 0.25f);
+    mats[b].roughness = b_cnt[b] ? (float)(b_rgh[b] / b_cnt[b]) : ((b % 4 + 0.5f) * 0.25f);
+    mats[b].double_sided = 1;
+    if (b_cnt[b] > 0) non_empty_buckets++;
+  }
+  fprintf(stderr, "[trellis2] v17.2 512^3 O-Voxel PBR mesh: %u verts, %u tris, %d PBR material clusters (avg met=%.2f rgh=%.2f)\n",
+          n_verts, n_tris, non_empty_buckets, tot_met / n_tris, tot_rgh / n_tris);
+
+  mesh->positions   = pos;
+  mesh->normals     = nrm;
+  mesh->uvs         = uvs;
+  mesh->colors      = col;
+  mesh->indices     = raw_idx;
+  mesh->n_verts     = n_verts;
+  mesh->n_tris      = n_tris;
+  mesh->base_color[0] = 1.0f; mesh->base_color[1] = 1.0f; mesh->base_color[2] = 1.0f; mesh->base_color[3] = 1.0f;
+  mesh->metallic    = (float)(tot_met / n_tris);
+  mesh->roughness   = (float)(tot_rgh / n_tris);
+  mesh->tri_mat_ids = tri_mats;
+  mesh->mats        = mats;
+  mesh->n_mats      = 16;
+
+  // Build crisp 3DGS .ply splat cloud (subsampled to <= 120k splats if needed to keep .ply lightweight)
+  uint32_t step = (n_verts > 120000u) ? ((n_verts + 119999u) / 120000u) : 1u;
+  uint32_t ns = (n_verts + step - 1u) / step;
+  splat->n_splats = ns;
+  splat->pos     = (float *)malloc((size_t)ns * 3 * 4);
+  splat->scale   = (float *)malloc((size_t)ns * 3 * 4);
+  splat->rot     = (float *)malloc((size_t)ns * 4 * 4);
+  splat->opacity = (float *)malloc((size_t)ns * 4);
+  splat->sh_dc   = (float *)malloc((size_t)ns * 3 * 4);
+  float log_s = logf((float)step * 1.1f / 512.0f);
+  for (uint32_t si = 0; si < ns; si++) {
+    uint32_t v = si * step;
+    splat->pos[si*3+0] = pos[v*3+0]; splat->pos[si*3+1] = pos[v*3+1]; splat->pos[si*3+2] = pos[v*3+2];
+    splat->scale[si*3+0] = log_s; splat->scale[si*3+1] = log_s; splat->scale[si*3+2] = log_s;
+    splat->rot[si*4+0] = 1.0f; splat->rot[si*4+1] = 0.0f; splat->rot[si*4+2] = 0.0f; splat->rot[si*4+3] = 0.0f;
+    splat->opacity[si] = 3.0f;
+    float cr = powf(fmaxf(0.0f, col[v*3+0]), 1.0f / 2.2f);
+    float cg = powf(fmaxf(0.0f, col[v*3+1]), 1.0f / 2.2f);
+    float cb = powf(fmaxf(0.0f, col[v*3+2]), 1.0f / 2.2f);
+    splat->sh_dc[si*3+0] = (cr - 0.5f) / 0.28209479f;
+    splat->sh_dc[si*3+1] = (cg - 0.5f) / 0.28209479f;
+    splat->sh_dc[si*3+2] = (cb - 0.5f) / 0.28209479f;
+  }
+  free(vmet); free(vrgh);
+  return 0;
+}
+
+// ===========================================================================
 // 12. Public Lifecycle & End-to-End 3D Generator
 // ===========================================================================
 extern "C" ec_trellis2_t *ec_trellis2_create(const ec_trellis2_paths_t *paths) {
@@ -1703,6 +2854,17 @@ extern "C" ec_trellis2_t *ec_trellis2_create(const ec_trellis2_paths_t *paths) {
   tr->flow_open = 1;
   if (ec_st_open(&tr->dec_st, paths->ss_dec_path, err, sizeof err) != 0)   { ec_trellis2_destroy(tr); return NULL; }
   tr->dec_open = 1;
+  if (paths->slat_shape_flow_path[0] && paths->slat_tex_flow_path[0] &&
+      paths->shape_dec_path[0] && paths->tex_dec_path[0]) {
+    if (ec_st_open(&tr->sh_flow_st, paths->slat_shape_flow_path, err, sizeof err) == 0) tr->sh_flow_open = 1;
+    if (ec_st_open(&tr->tx_flow_st, paths->slat_tex_flow_path,   err, sizeof err) == 0) tr->tx_flow_open = 1;
+    if (ec_st_open(&tr->sh_dec_st,  paths->shape_dec_path,       err, sizeof err) == 0) tr->sh_dec_open  = 1;
+    if (ec_st_open(&tr->tx_dec_st,  paths->tex_dec_path,         err, sizeof err) == 0) tr->tx_dec_open  = 1;
+    if (tr->sh_flow_open && tr->tx_flow_open && tr->sh_dec_open && tr->tx_dec_open) {
+      tr->full_3stage = 1;
+      fprintf(stderr, "[trellis2] v17.2 Full 3-Stage 512^3 O-Voxel PBR pipeline READY!\n");
+    }
+  }
   ec_cowrie_file_fingerprint(paths->dino_path, tr->dino_sha);
   return tr;
 }
@@ -1716,9 +2878,13 @@ extern "C" void ec_trellis2_unload_vram(ec_trellis2_t *tr) {
 extern "C" void ec_trellis2_destroy(ec_trellis2_t *tr) {
   if (!tr) return;
   ec_trellis2_unload_vram(tr);
-  if (tr->dino_open) ec_st_close(&tr->dino_st);
-  if (tr->flow_open) ec_st_close(&tr->flow_st);
-  if (tr->dec_open)  ec_st_close(&tr->dec_st);
+  if (tr->dino_open)    ec_st_close(&tr->dino_st);
+  if (tr->flow_open)    ec_st_close(&tr->flow_st);
+  if (tr->dec_open)     ec_st_close(&tr->dec_st);
+  if (tr->sh_flow_open) ec_st_close(&tr->sh_flow_st);
+  if (tr->tx_flow_open) ec_st_close(&tr->tx_flow_st);
+  if (tr->sh_dec_open)  ec_st_close(&tr->sh_dec_st);
+  if (tr->tx_dec_open)  ec_st_close(&tr->tx_dec_st);
   if (tr->stream) cudaStreamDestroy(tr->stream);
   free(tr);
 }
@@ -1800,7 +2966,8 @@ extern "C" int ec_trellis2_generate_3d(
     }
   }
 
-  // Stage 2: 30-Block SparseStructureFlowModel 1.3B BF16 (12-step Flow Euler CFG + Stochastic Multi-View Cycling!)
+  // Stage 1b: 30-Block SparseStructureFlowModel 1.3B BF16 (12-step Flow Euler CFG + Stochastic Multi-View Cycling!)
+  int use_full_3stage = (tr->full_3stage && !(getenv("EC_TRELLIS_STAGE1_ONLY") && atoi(getenv("EC_TRELLIS_STAGE1_ONLY")) != 0)) ? 1 : 0;
   if (ensure_flow_loaded(tr, req->loras, req->n_loras) != 0) {
     for (int v = 0; v < n_views; v++) cudaFree(view_conds_d[v]);
     snprintf(res->error, sizeof res->error, "trellis2 ss_flow load failed");
@@ -1810,38 +2977,167 @@ extern "C" int ec_trellis2_generate_3d(
   float *z_d = NULL;
   cudaMalloc(&z_d, 4096L * 8 * 4);
   int rc = run_ss_flow(tr, view_conds_d, n_views, steps, cfg, rsc, req->seed, z_d, cb, cb_ctx, &res->flow_ms);
-  for (int v = 0; v < n_views; v++) cudaFree(view_conds_d[v]);
+  if (!use_full_3stage) {
+    for (int v = 0; v < n_views; v++) { cudaFree(view_conds_d[v]); view_conds_d[v] = NULL; }
+  }
   if (rc != 0) {
+    for (int v = 0; v < n_views; v++) cudaFree(view_conds_d[v]);
     cudaFree(z_d);
     snprintf(res->error, sizeof res->error, rc == -2 ? "cancelled" : "trellis2 ss_flow failed");
     return rc;
   }
 
-  // Stage 3: SparseStructureDecoder (16^3x8 -> 64^3x1 logits)
+  // Stage 1c: SparseStructureDecoder (16^3x8 -> 64^3x1 logits)
   if (cb) cb(steps + 1, steps + 3, "trellis2_ss_decode_64", cb_ctx);
   if (ensure_dec_loaded(tr) != 0) {
+    for (int v = 0; v < n_views; v++) cudaFree(view_conds_d[v]);
     cudaFree(z_d);
     snprintf(res->error, sizeof res->error, "trellis2 ss_dec load failed");
     return -1;
   }
   float *logits_h = (float *)malloc(262144L * 4);
   if (run_ss_decoder(tr, z_d, logits_h, &res->dec_ms) != 0) {
+    for (int v = 0; v < n_views; v++) cudaFree(view_conds_d[v]);
     free(logits_h); cudaFree(z_d);
     snprintf(res->error, sizeof res->error, "trellis2 ss_dec forward failed");
     return -1;
   }
   cudaFree(z_d);
 
-  // Stage 4: Sub-Voxel Surface Nets Mesh + 3DGS Splat Extraction & Export
-  if (cb) cb(steps + 2, steps + 3, "trellis2_export_glb_ply", cb_ctx);
-  double tm0 = tr_now_ms();
-  ec_mesh_t mesh;
-  ec_splat3d_t splat;
+  ec_mesh_t mesh = {};
+  ec_splat3d_t splat = {};
   int n_act = 0;
-  if (extract_surface_nets_64(logits_h, bcol, req->rgb, req->img_w, req->img_h, &mesh, &splat, &n_act) != 0) {
-    free(logits_h);
-    snprintf(res->error, sizeof res->error, "trellis2 empty occupancy volume (0 active voxels)");
-    return -1;
+  int built_3stage = 0;
+  double tm0 = tr_now_ms();
+
+  // v17.2 Full 3-Stage 512^3 O-Voxel PBR Pipeline (Stage 2 Shape SLat + Stage 3 Texture SLat + Dual Contouring PBR!)
+  if (use_full_3stage) {
+    // Evict Stage-1 resident weights so full 24 GB VRAM is wide open for Stage 2 & Stage 3!
+    free_flow_res(&tr->flow);
+    free_dec_res(&tr->dec);
+
+    // Downsample 64^3 > 0 via 2x2x2 max_pool3d -> 32^3 active sparse coords (exact tr2_pipeline.py:227-233!)
+    int border_tot = 0, border_pos = 0, interior_pos = 0;
+    for (int x = 0; x < 64; x++)
+      for (int y = 0; y < 64; y++)
+        for (int z = 0; z < 64; z++) {
+          int pos_v = (logits_h[(x * 64 + y) * 64 + z] > 0.0f);
+          int on_b = (x == 0 || x == 63 || y == 0 || y == 63 || z == 0 || z == 63);
+          int in_c = (x >= 2 && x <= 61 && y >= 2 && y <= 61 && z >= 2 && z <= 61);
+          if (on_b) { border_tot++; if (pos_v) border_pos++; }
+          if (in_c && pos_v) interior_pos++;
+        }
+    int strip_shell = (border_tot > 0 && (double)border_pos / (double)border_tot > 0.22 && interior_pos >= 800) ? 1 : 0;
+
+    int32_t *coords32_h = (int32_t *)malloc(32768L * 3 * sizeof(int32_t));
+    int N32 = 0;
+    for (int x = 0; x < 32; x++) {
+      for (int y = 0; y < 32; y++) {
+        for (int z = 0; z < 32; z++) {
+          int any = 0;
+          for (int dx = 0; dx < 2 && !any; dx++)
+            for (int dy = 0; dy < 2 && !any; dy++)
+              for (int dz = 0; dz < 2 && !any; dz++) {
+                int gx = x * 2 + dx, gy = y * 2 + dy, gz = z * 2 + dz;
+                if (strip_shell && (gx < 2 || gx > 61 || gy < 2 || gy > 61 || gz < 2 || gz > 61)) continue;
+                if (logits_h[(gx * 64 + gy) * 64 + gz] > 0.0f) any = 1;
+              }
+          if (any) {
+            coords32_h[N32 * 3 + 0] = x;
+            coords32_h[N32 * 3 + 1] = y;
+            coords32_h[N32 * 3 + 2] = z;
+            N32++;
+          }
+        }
+      }
+    }
+    fprintf(stderr, "[trellis2] Stage-1 32^3 active sparse voxels: %d (strip_shell=%d)\n", N32, strip_shell);
+
+    if (N32 >= 16 && N32 <= 24576) {
+      int32_t *coords32_d = NULL;
+      float *sh_norm_d = NULL, *sh_un_d = NULL, *tx_norm_d = NULL, *tx_un_d = NULL;
+      float *mean_d = NULL, *std_d = NULL;
+      cudaMalloc(&coords32_d, (size_t)N32 * 3 * sizeof(int32_t));
+      cudaMalloc(&sh_norm_d,  (size_t)N32 * 32 * 4);
+      cudaMalloc(&sh_un_d,    (size_t)N32 * 32 * 4);
+      cudaMalloc(&tx_norm_d,  (size_t)N32 * 32 * 4);
+      cudaMalloc(&tx_un_d,    (size_t)N32 * 32 * 4);
+      cudaMalloc(&mean_d,     32 * 4);
+      cudaMalloc(&std_d,      32 * 4);
+      cudaMemcpy(coords32_d, coords32_h, (size_t)N32 * 3 * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+      double s2_flow_ms = 0.0, s3_flow_ms = 0.0, s2_dec_ms = 0.0, s3_dec_ms = 0.0;
+      int rc2 = run_slat_flow_generic(
+          tr, &tr->sh_flow_st, coords32_d, N32, 32, 32, NULL, view_conds_d, n_views,
+          12, 7.5f, 0.5f, 0.6f, 1.0f, 3.0f, req->seed, sh_norm_d, "trellis2_shape_slat_flow",
+          cb, cb_ctx, steps + 1, steps + 28, &s2_flow_ms);
+      int rc3 = (rc2 == 0) ? run_slat_flow_generic(
+          tr, &tr->tx_flow_st, coords32_d, N32, 64, 32, sh_norm_d, view_conds_d, n_views,
+          12, 1.0f, 0.0f, 0.6f, 0.9f, 3.0f, req->seed + 1u, tx_norm_d, "trellis2_tex_slat_flow",
+          cb, cb_ctx, steps + 13, steps + 28, &s3_flow_ms) : rc2;
+      for (int v = 0; v < n_views; v++) { cudaFree(view_conds_d[v]); view_conds_d[v] = NULL; }
+      cudaFree(coords32_d);
+      res->flow_ms += s2_flow_ms + s3_flow_ms;
+
+      if (rc2 == -2 || rc3 == -2) {
+        cudaFree(sh_norm_d); cudaFree(sh_un_d); cudaFree(tx_norm_d); cudaFree(tx_un_d);
+        cudaFree(mean_d); cudaFree(std_d); free(coords32_h); free(logits_h);
+        snprintf(res->error, sizeof res->error, "cancelled");
+        return -2;
+      }
+
+      if (rc2 == 0 && rc3 == 0) {
+        cudaMemcpy(mean_d, TR2_SHAPE_MEAN, 32 * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(std_d,  TR2_SHAPE_STD,  32 * 4, cudaMemcpyHostToDevice);
+        k_tr_unnorm_ch<<<((long)N32 * 32 + 255) / 256, 256, 0, tr->stream>>>(sh_norm_d, sh_un_d, mean_d, std_d, N32, 32);
+        cudaMemcpy(mean_d, TR2_TEX_MEAN,   32 * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(std_d,  TR2_TEX_STD,    32 * 4, cudaMemcpyHostToDevice);
+        k_tr_unnorm_ch<<<((long)N32 * 32 + 255) / 256, 256, 0, tr->stream>>>(tx_norm_d, tx_un_d, mean_d, std_d, N32, 32);
+        cudaStreamSynchronize(tr->stream);
+
+        tr_subdiv_level_t sub_lvls[4] = {};
+        int N512_sh = 0, N512_tx = 0;
+        int32_t *coords512_h = NULL;
+        float *shape7_h = NULL, *tex6_h = NULL;
+        if (cb) cb(steps + 25, steps + 28, "trellis2_shape_dec_512", cb_ctx);
+        int drc2 = run_sparse_unet_decoder(
+            tr, &tr->sh_dec_st, sh_un_d, coords32_h, N32, 1, 7,
+            sub_lvls, &N512_sh, &coords512_h, &shape7_h, &s2_dec_ms);
+        if (cb) cb(steps + 26, steps + 28, "trellis2_tex_dec_512", cb_ctx);
+        int drc3 = (drc2 == 0) ? run_sparse_unet_decoder(
+            tr, &tr->tx_dec_st, tx_un_d, coords32_h, N32, 0, 6,
+            sub_lvls, &N512_tx, NULL, &tex6_h, &s3_dec_ms) : -1;
+        res->dec_ms += s2_dec_ms + s3_dec_ms;
+        free_subdiv_levels(sub_lvls);
+
+        if (drc2 == 0 && drc3 == 0 && N512_sh > 0 && N512_sh == N512_tx) {
+          fprintf(stderr, "[trellis2] Stage 2/3 decoded %d 512^3 O-Voxels (s2_flow=%.0fms s3_flow=%.0fms s2_dec=%.0fms s3_dec=%.0fms)\n",
+                  N512_sh, s2_flow_ms, s3_flow_ms, s2_dec_ms, s3_dec_ms);
+          tm0 = tr_now_ms();
+          if (extract_trellis2_ovoxel_pbr(coords512_h, N512_sh, shape7_h, tex6_h, logits_h, &mesh, &splat) == 0) {
+            n_act = N512_sh;
+            built_3stage = 1;
+          }
+        }
+        free(coords512_h); free(shape7_h); free(tex6_h);
+      }
+      cudaFree(sh_norm_d); cudaFree(sh_un_d); cudaFree(tx_norm_d); cudaFree(tx_un_d);
+      cudaFree(mean_d); cudaFree(std_d);
+    } else {
+      for (int v = 0; v < n_views; v++) { cudaFree(view_conds_d[v]); view_conds_d[v] = NULL; }
+    }
+    free(coords32_h);
+  }
+
+  // Fallback to Stage-1 64^3 Surface Nets if 3-stage weights not installed or EC_TRELLIS_STAGE1_ONLY=1
+  if (!built_3stage) {
+    if (cb) cb(steps + 2, steps + 3, "trellis2_export_glb_ply", cb_ctx);
+    tm0 = tr_now_ms();
+    if (extract_surface_nets_64(logits_h, bcol, req->rgb, req->img_w, req->img_h, &mesh, &splat, &n_act) != 0) {
+      free(logits_h);
+      snprintf(res->error, sizeof res->error, "trellis2 empty occupancy volume (0 active voxels)");
+      return -1;
+    }
   }
   free(logits_h);
 

@@ -20,6 +20,7 @@
 #include "ec_trellis2.h"
 #include "ec_vram_pool.h"
 #include "ec_wan22.h"
+#include "ec_ltx2.h"
 #include "ec_zimage.h"
 #include <cuda_fp16.h>
 #include <math.h>
@@ -61,13 +62,14 @@ struct ec_studio {
   ec_acestep_t       *acestep;
   ec_trellis2_t      *trellis2;
   ec_wan22_t         *wan22;
+  ec_ltx2_t          *ltx2;
   char                dag_model_sha[65];
   uint64_t            artifact_seq;
   int                 active_engine_mask;
   int                 initialized;
 };
 
-// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2, 5=Z-Image, 0=ALL).
+// Evicts resident GPU weights from all flagship engines EXCEPT keep_id (1=FLUX.2, 2=ACE-Step, 3=TRELLIS.2, 4=Wan2.2, 5=Z-Image, 6=LTX-2.3, 0=ALL).
 // Lightweight mmap handles & tokenizers stay open so switching modalities incurs zero file re-parsing!
 static void studio_evict_other_engines_locked(ec_studio_t *st, int keep_id) {
   if (keep_id != 1 && st->flux2)    ec_flux2_unload_vram(st->flux2);
@@ -75,7 +77,8 @@ static void studio_evict_other_engines_locked(ec_studio_t *st, int keep_id) {
   if (keep_id != 3 && st->trellis2) ec_trellis2_unload_vram(st->trellis2);
   if (keep_id != 4 && st->wan22)    ec_wan22_unload_vram(st->wan22);
   if (keep_id != 5 && st->zimage)   ec_zimage_unload_vram(st->zimage);
-  st->active_engine_mask = (keep_id >= 1 && keep_id <= 5) ? (1 << (keep_id - 1)) : 0;
+  if (keep_id != 6 && st->ltx2)     ec_ltx2_unload_vram(st->ltx2);
+  st->active_engine_mask = (keep_id >= 1 && keep_id <= 6) ? (1 << (keep_id - 1)) : 0;
 }
 
 extern "C" int ec_studio_unload_all_vram(ec_studio_t *st, double *out_ms, double *out_free_mb) {
@@ -155,7 +158,7 @@ static void studio_try_init_all_engines_locked(ec_studio_t *st) {
     }
   }
 
-  // 3. Native 3D Asset Generation: TRELLIS.2 (DINOv3-L/16 + 1.3B Flow + 64^3 3D Conv Decoder)
+  // 3. Native 3D Asset Generation: TRELLIS.2 (Stage-1 1.3B + optional v17.2 Full 3-Stage 512^3 O-Voxel PBR!)
   if (!st->trellis2 || !ec_trellis2_is_ready(st->trellis2)) {
     const ec_storage_asset_t *dino = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "dinov3_vitl16");
     const ec_storage_asset_t *flow = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_ss_flow");
@@ -165,6 +168,16 @@ static void studio_try_init_all_engines_locked(ec_studio_t *st) {
       snprintf(p.dino_path,    sizeof p.dino_path,    "%s", dino->path);
       snprintf(p.ss_flow_path, sizeof p.ss_flow_path, "%s", flow->path);
       snprintf(p.ss_dec_path,  sizeof p.ss_dec_path,  "%s", dec->path);
+      const ec_storage_asset_t *s_fl = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_slat_shape_flow");
+      const ec_storage_asset_t *t_fl = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_slat_tex_flow");
+      const ec_storage_asset_t *s_dc = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_shape_dec");
+      const ec_storage_asset_t *t_dc = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "trellis2_tex_dec");
+      if (s_fl && t_fl && s_dc && t_dc) {
+        snprintf(p.slat_shape_flow_path, sizeof p.slat_shape_flow_path, "%s", s_fl->path);
+        snprintf(p.slat_tex_flow_path,   sizeof p.slat_tex_flow_path,   "%s", t_fl->path);
+        snprintf(p.shape_dec_path,       sizeof p.shape_dec_path,       "%s", s_dc->path);
+        snprintf(p.tex_dec_path,         sizeof p.tex_dec_path,         "%s", t_dc->path);
+      }
       if (st->trellis2) { ec_trellis2_destroy(st->trellis2); st->trellis2 = NULL; }
       st->trellis2 = ec_trellis2_create(&p);
     }
@@ -184,6 +197,23 @@ static void studio_try_init_all_engines_locked(ec_studio_t *st) {
       snprintf(p.tokenizer_path,    sizeof p.tokenizer_path,    "%s", tok->path);
       if (st->wan22) { ec_wan22_destroy(st->wan22); st->wan22 = NULL; }
       st->wan22 = ec_wan22_create(&p);
+    }
+  }
+
+  // 5. v17.3 Joint Synchronized Audio+Video Frontier: Lightricks LTX-2.3 (22B Distilled FP8 + Gemma-3-12B-IT)
+  if (!st->ltx2 || !ec_ltx2_is_ready(st->ltx2)) {
+    const ec_storage_asset_t *ckpt = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "ltx-2.3");
+    if (!ckpt) ckpt = ec_storage_find(&st->vault, EC_ASSET_CHECKPOINT, "ltx2");
+    const ec_storage_asset_t *te   = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "gemma_3_12B");
+    if (!te) te = ec_storage_find(&st->vault, EC_ASSET_TEXT_ENC, "gemma");
+    const ec_storage_asset_t *tok  = ec_storage_find(&st->vault, EC_ASSET_TOKENIZER, "gemma3_tokenizer");
+    if (ckpt && te && tok) {
+      ec_ltx2_paths_t lp = {};
+      snprintf(lp.checkpoint_path,   sizeof lp.checkpoint_path,   "%s", ckpt->path);
+      snprintf(lp.text_encoder_path, sizeof lp.text_encoder_path, "%s", te->path);
+      snprintf(lp.tokenizer_path,    sizeof lp.tokenizer_path,    "%s", tok->path);
+      if (st->ltx2) { ec_ltx2_destroy(st->ltx2); st->ltx2 = NULL; }
+      st->ltx2 = ec_ltx2_create(&lp);
     }
   }
 
@@ -345,6 +375,7 @@ extern "C" void ec_studio_destroy(ec_studio_t *st) {
     if (st->acestep)  { ec_acestep_destroy(st->acestep);   st->acestep = NULL; }
     if (st->trellis2) { ec_trellis2_destroy(st->trellis2); st->trellis2 = NULL; }
     if (st->wan22)    { ec_wan22_destroy(st->wan22);       st->wan22 = NULL; }
+    if (st->ltx2)     { ec_ltx2_destroy(st->ltx2);         st->ltx2 = NULL; }
     ec_registry_free(&st->registry);
     ec_flow_free(&st->flow_graph);
     ec_vram_pool_free(&st->vram_pool);
@@ -382,6 +413,7 @@ extern "C" void ec_studio_get_info(const ec_studio_t *st, ec_studio_info_t *out)
   out->acestep_ready   = (st->acestep  && ec_acestep_is_ready(st->acestep))   ? 1 : 0;
   out->trellis2_ready  = (st->trellis2 && ec_trellis2_is_ready(st->trellis2)) ? 1 : 0;
   out->wan22_ready     = (st->wan22    && ec_wan22_is_ready(st->wan22))       ? 1 : 0;
+  out->ltx2_ready      = (st->ltx2     && ec_ltx2_is_ready(st->ltx2))         ? 1 : 0;
   out->storage_roots = st->vault.n_roots;
   out->recipes_count = st->recipes.count;
   for (int i = 0; i < st->vault.n_assets; i++) {
@@ -602,7 +634,9 @@ extern "C" int ec_studio_gen_3d_v8(
       char pbuf[512];
       if (req->input_images[i] && resolve_studio_media_path(st, req->input_images[i], pbuf, sizeof pbuf) == 0) {
         if (ec_load_image_rgb(pbuf, &views[n_loaded], &vw[n_loaded], &vh[n_loaded]) == 0) {
-          if (req->isolate_fg) ec_rgb_isolate_foreground(views[n_loaded], vw[n_loaded], vh[n_loaded]);
+          // NOTE: Do NOT call legacy radial ec_rgb_isolate_foreground() here — ec_trellis2's
+          // Coons-patch 2D bilinear studio backdrop matte + hole punch + largest-CC handles
+          // background isolation cleanly without carving a circular rad=0.35 halo into the photo!
           n_loaded++;
         }
       }
@@ -810,6 +844,60 @@ extern "C" int ec_studio_gen_video_v8(
     ec_progress_cb_t cb, void *cb_ctx, ec_studio_result_t *res) {
   memset(res, 0, sizeof *res);
   if (!st || !st->initialized || !req) return -1;
+
+  // v17.3 Joint Synchronized Audio+Video Frontier: Lightricks LTX-2.3 (22B Distilled FP8)
+  int want_ltx2 = (req->checkpoint_query && ci_substr(req->checkpoint_query, "ltx")) ? 1 : 0;
+  if (req->full_model && st->ltx2 && ec_ltx2_is_ready(st->ltx2) &&
+      (want_ltx2 || (!st->wan22 && !req->start_frame_path && !req->end_frame_path))) {
+    int W = (req->width  >= 256) ? ((req->width  + 16) / 32) * 32 : 768;
+    int H = (req->height >= 256) ? ((req->height + 16) / 32) * 32 : 512;
+    int F = (req->n_frames >= 9) ? req->n_frames : 49;
+    int afps = (req->fps >= 8 && req->fps <= 60) ? req->fps : 24;
+    int asteps = (req->steps >= 2 && req->steps <= 8) ? req->steps : 8;
+
+    uint64_t tag = hash_prompt_seed(req->prompt, req->seed) ^ 0x4C54583233ULL;
+    tag ^= ((uint64_t)W << 32) ^ ((uint64_t)H << 16) ^ (uint64_t)F;
+    uint32_t tag32 = next_artifact_hash32(st, tag);
+    snprintf(res->file_mp4, sizeof res->file_mp4, "%s/ltx23_%u_%08x%s.mp4",
+             st->artifact_dir, req->seed, tag32, req->with_audio ? "_av" : "");
+    snprintf(res->file_aux, sizeof res->file_aux, "%s/ltx23_%u_%08x_kf0.png",
+             st->artifact_dir, req->seed, tag32);
+    snprintf(res->file_last, sizeof res->file_last, "%s/ltx23_%u_%08x_last.png",
+             st->artifact_dir, req->seed, tag32);
+    snprintf(res->stem_files[0], sizeof res->stem_files[0], "%s/ltx23_%u_%08x_48k.wav",
+             st->artifact_dir, req->seed, tag32);
+    snprintf(res->file_main, sizeof res->file_main, "%s", res->file_mp4);
+
+    ec_ltx2_req_t lreq = {};
+    lreq.prompt = (req->prompt && req->prompt[0]) ? req->prompt : "Dramatic ocean waves crashing onto volcanic basalt cliffs at sunset with roaring surf and mist";
+    lreq.seed = req->seed;
+    lreq.width = W; lreq.height = H;
+    lreq.n_frames = F; lreq.fps = afps;
+    lreq.steps = asteps; lreq.with_audio = req->with_audio ? 1 : 0;
+
+    fx_cb_bridge_t bridge = { cb, cb_ctx };
+    ec_ltx2_stats_t lstats = {};
+    pthread_mutex_lock(&st->gpu_mu);
+    studio_evict_other_engines_locked(st, 6);
+    int rc = ec_ltx2_generate(st->ltx2, &lreq, res->file_mp4,
+                              req->with_audio ? res->stem_files[0] : NULL,
+                              res->file_aux, res->file_last,
+                              cb ? fx_progress_bridge : NULL, &bridge, &lstats);
+    pthread_mutex_unlock(&st->gpu_mu);
+    if (rc == 0) {
+      snprintf(res->engine_mode, sizeof res->engine_mode, "ltx2.3_22b_joint_av");
+      snprintf(res->encoder_used, sizeof res->encoder_used, "%s", lstats.encoder_used);
+      res->width = lstats.width; res->height = lstats.height; res->frames = lstats.n_frames;
+      res->steps_run = lstats.steps_run;
+      res->sample_rate = lstats.sample_rate;
+      res->text_enc_ms = lstats.text_enc_ms; res->dit_ms = lstats.dit_ms;
+      res->vae_ms = lstats.video_vae_ms + lstats.audio_vae_ms;
+      res->gpu_ms = lstats.total_ms;
+      res->fps = (double)lstats.n_frames / ((lstats.total_ms > 1.0 ? lstats.total_ms : 1.0) * 1e-3);
+      return 0;
+    }
+    return -1;
+  }
 
   if (req->full_model && st->wan22 && ec_wan22_is_ready(st->wan22)) {
     int W = (req->width  >= 320) ? ((req->width  + 31) & ~31) : 1280;
@@ -2869,13 +2957,32 @@ static int inspect_supported_ckpt(
       ok = 1;
     } else {
       const ec_st_entry_t *as_q = ec_st_find(&st, "decoder.layers.0.self_attn.q_proj.weight");
-      if (as_q && as_q->rank == 2 && as_q->shape[0] == 2048 && as_q->shape[1] == 2048) {
+      if (as_q && as_q->rank == 2 &&
+          ((as_q->shape[0] == 2048 && as_q->shape[1] == 2048) ||
+           (as_q->shape[0] == 4096 && as_q->shape[1] == 2560))) {
+        int is_xl  = (as_q->shape[1] == 2560) ? 1 : 0;
         int is_sft = ci_substr(name, "sft") || (ec_st_find(&st, "null_condition_emb") != NULL && !ci_substr(name, "turbo"));
         *out_family = "acestep"; *out_mod = "music";
-        *out_variant = is_sft ? "sft" : "turbo";
-        *out_rec_steps = is_sft ? 32 : 8;
-        *out_rec_cfg = is_sft ? 3.5f : 1.0f;
+        *out_variant = is_xl ? (is_sft ? "xl_sft" : "xl_turbo") : (is_sft ? "sft" : "turbo");
+        *out_rec_steps = is_sft ? (is_xl ? 40 : 32) : 8;
+        *out_rec_cfg = is_sft ? (is_xl ? 7.0f : 6.5f) : 1.0f;
         *out_supports_neg = 0;
+        ok = 1;
+      } else if (ec_st_find(&st, "model.diffusion_model.transformer_blocks.47.attn1.to_q.weight") &&
+                 ec_st_find(&st, "vocoder.bwe_generator.conv_post.weight")) {
+        *out_family = "ltx2"; *out_mod = "video";
+        *out_variant = "distilled_av";
+        *out_rec_steps = 8;
+        *out_rec_cfg = 1.0f;
+        *out_supports_neg = 0;
+        ok = 1;
+      } else if (ec_st_find(&st, "blocks.0.self_attn.q.weight") &&
+                 ec_st_find(&st, "patch_embedding.weight")) {
+        *out_family = "wan22"; *out_mod = "video";
+        *out_variant = "ti2v_5b";
+        *out_rec_steps = 30;
+        *out_rec_cfg = 4.0f;
+        *out_supports_neg = 1;
         ok = 1;
       }
     }

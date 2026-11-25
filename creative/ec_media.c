@@ -90,80 +90,155 @@ int ec_export_glb(const char *path, const ec_mesh_t *m) {
   const uint32_t bin_raw = off_idx + idx_bytes;
   const uint32_t bin_pad = (bin_raw + 3u) & ~3u;
 
-  char json[4096];
-  int jn = 0;
-  int bv_idx = 0, acc_idx = 0;
-  int acc_pos = 0, acc_nrm = -1, acc_uv = -1, acc_col = -1, acc_ind = 0;
+  // Support multi-material PBR primitives (distinct metallic/roughness regions sharing 1 vertex buffer!)
+  int multi_mat = (m->tri_mat_ids && m->mats && m->n_mats > 1 && m->n_mats <= 32) ? 1 : 0;
+  uint32_t *sorted_idx = NULL;
+  uint32_t mat_tri_cnt[32] = {0}, mat_tri_off[32] = {0};
+  int n_active_mats = 0;
+  int active_mat_ids[32];
+  if (multi_mat) {
+    for (uint32_t t = 0; t < m->n_tris; t++) {
+      uint32_t mid = m->tri_mat_ids[t];
+      if (mid >= m->n_mats) mid = 0;
+      mat_tri_cnt[mid]++;
+    }
+    uint32_t cur = 0;
+    for (uint32_t k = 0; k < m->n_mats; k++) {
+      mat_tri_off[k] = cur;
+      if (mat_tri_cnt[k] > 0) active_mat_ids[n_active_mats++] = (int)k;
+      cur += mat_tri_cnt[k];
+    }
+    if (n_active_mats <= 1) {
+      multi_mat = 0;
+    } else {
+      sorted_idx = (uint32_t *)malloc(idx_bytes);
+      if (!sorted_idx) return -1;
+      uint32_t write_pos[32];
+      memcpy(write_pos, mat_tri_off, sizeof write_pos);
+      for (uint32_t t = 0; t < m->n_tris; t++) {
+        uint32_t mid = m->tri_mat_ids[t];
+        if (mid >= m->n_mats) mid = 0;
+        uint32_t dst = write_pos[mid]++;
+        sorted_idx[dst * 3 + 0] = m->indices[t * 3 + 0];
+        sorted_idx[dst * 3 + 1] = m->indices[t * 3 + 1];
+        sorted_idx[dst * 3 + 2] = m->indices[t * 3 + 2];
+      }
+    }
+  }
 
-  jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+  size_t json_cap = 32768;
+  char *json = (char *)malloc(json_cap);
+  if (!json) { free(sorted_idx); return -1; }
+  int jn = 0;
+  int bv_idx = 0;
+  int acc_pos = 0, acc_nrm = -1, acc_uv = -1, acc_col = -1, acc_ind_base = 0;
+
+  jn += snprintf(json + jn, json_cap - (size_t)jn,
       "{\"asset\":{\"version\":\"2.0\",\"generator\":\"eureka-engine-creative\"},"
-      "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],"
-      "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[%.4f,%.4f,%.4f,%.4f],"
-      "\"metallicFactor\":%.4f,\"roughnessFactor\":%.4f}}],"
-      "\"buffers\":[{\"byteLength\":%u}],\"bufferViews\":[",
-      m->base_color[0], m->base_color[1], m->base_color[2], m->base_color[3],
-      m->metallic, m->roughness, bin_raw);
+      "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],\"materials\":[");
+  if (multi_mat) {
+    for (int i = 0; i < n_active_mats; i++) {
+      const ec_pbr_mat_t *pm = &m->mats[active_mat_ids[i]];
+      jn += snprintf(json + jn, json_cap - (size_t)jn,
+          "%s{\"pbrMetallicRoughness\":{\"baseColorFactor\":[%.4f,%.4f,%.4f,%.4f],"
+          "\"metallicFactor\":%.4f,\"roughnessFactor\":%.4f}%s}",
+          i ? "," : "",
+          pm->base_color[0], pm->base_color[1], pm->base_color[2], pm->base_color[3],
+          pm->metallic, pm->roughness,
+          pm->double_sided ? ",\"doubleSided\":true" : "");
+    }
+  } else {
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
+        "{\"pbrMetallicRoughness\":{\"baseColorFactor\":[%.4f,%.4f,%.4f,%.4f],"
+        "\"metallicFactor\":%.4f,\"roughnessFactor\":%.4f},\"doubleSided\":true}",
+        m->base_color[0], m->base_color[1], m->base_color[2], m->base_color[3],
+        m->metallic, m->roughness);
+  }
+  jn += snprintf(json + jn, json_cap - (size_t)jn,
+      "],\"buffers\":[{\"byteLength\":%u}],\"bufferViews\":[", bin_raw);
 
   // bufferView 0: positions
-  jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+  jn += snprintf(json + jn, json_cap - (size_t)jn,
       "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}", off_pos, pos_bytes);
   bv_idx++;
   if (m->normals) {
-    jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
         ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}", off_nrm, nrm_bytes);
     acc_nrm = bv_idx++;
   }
   if (m->uvs) {
-    jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
         ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}", off_uv, uv_bytes);
     acc_uv = bv_idx++;
   }
   if (m->colors) {
-    jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
         ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}", off_col, col_bytes);
     acc_col = bv_idx++;
   }
-  acc_ind = bv_idx++;
-  jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
-      ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963}],\"accessors\":[",
-      off_idx, idx_bytes);
+  acc_ind_base = bv_idx;
+  if (multi_mat) {
+    for (int i = 0; i < n_active_mats; i++) {
+      int k = active_mat_ids[i];
+      uint32_t bo = off_idx + mat_tri_off[k] * 3u * 4u;
+      uint32_t bl = mat_tri_cnt[k] * 3u * 4u;
+      jn += snprintf(json + jn, json_cap - (size_t)jn,
+          ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963}", bo, bl);
+      bv_idx++;
+    }
+  } else {
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
+        ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963}", off_idx, idx_bytes);
+    bv_idx++;
+  }
+  jn += snprintf(json + jn, json_cap - (size_t)jn, "],\"accessors\":[");
 
   // accessors mirror bufferViews 1:1
-  jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+  jn += snprintf(json + jn, json_cap - (size_t)jn,
       "{\"bufferView\":%d,\"componentType\":5126,\"count\":%u,\"type\":\"VEC3\","
       "\"min\":[%.6f,%.6f,%.6f],\"max\":[%.6f,%.6f,%.6f]}",
       acc_pos, m->n_verts, pmin[0], pmin[1], pmin[2], pmax[0], pmax[1], pmax[2]);
-  acc_idx++;
   if (acc_nrm >= 0) {
-    jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
         ",{\"bufferView\":%d,\"componentType\":5126,\"count\":%u,\"type\":\"VEC3\"}", acc_nrm, m->n_verts);
-    acc_idx++;
   }
   if (acc_uv >= 0) {
-    jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
         ",{\"bufferView\":%d,\"componentType\":5126,\"count\":%u,\"type\":\"VEC2\"}", acc_uv, m->n_verts);
-    acc_idx++;
   }
   if (acc_col >= 0) {
-    jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
         ",{\"bufferView\":%d,\"componentType\":5126,\"count\":%u,\"type\":\"VEC3\"}", acc_col, m->n_verts);
-    acc_idx++;
   }
-  (void)acc_idx;
-  jn += snprintf(json + jn, sizeof(json) - (size_t)jn,
-      ",{\"bufferView\":%d,\"componentType\":5125,\"count\":%u,\"type\":\"SCALAR\"}],"
-      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0",
-      acc_ind, m->n_tris * 3u);
-  if (acc_nrm >= 0) jn += snprintf(json + jn, sizeof(json) - (size_t)jn, ",\"NORMAL\":%d", acc_nrm);
-  if (acc_uv  >= 0) jn += snprintf(json + jn, sizeof(json) - (size_t)jn, ",\"TEXCOORD_0\":%d", acc_uv);
-  if (acc_col >= 0) jn += snprintf(json + jn, sizeof(json) - (size_t)jn, ",\"COLOR_0\":%d", acc_col);
-  jn += snprintf(json + jn, sizeof(json) - (size_t)jn, "},\"indices\":%d,\"material\":0}]}]}", acc_ind);
+  if (multi_mat) {
+    for (int i = 0; i < n_active_mats; i++) {
+      int k = active_mat_ids[i];
+      jn += snprintf(json + jn, json_cap - (size_t)jn,
+          ",{\"bufferView\":%d,\"componentType\":5125,\"count\":%u,\"type\":\"SCALAR\"}",
+          acc_ind_base + i, mat_tri_cnt[k] * 3u);
+    }
+  } else {
+    jn += snprintf(json + jn, json_cap - (size_t)jn,
+        ",{\"bufferView\":%d,\"componentType\":5125,\"count\":%u,\"type\":\"SCALAR\"}",
+        acc_ind_base, m->n_tris * 3u);
+  }
+
+  jn += snprintf(json + jn, json_cap - (size_t)jn, "],\"meshes\":[{\"primitives\":[");
+  int n_prims = multi_mat ? n_active_mats : 1;
+  for (int i = 0; i < n_prims; i++) {
+    jn += snprintf(json + jn, json_cap - (size_t)jn, "%s{\"attributes\":{\"POSITION\":0", i ? "," : "");
+    if (acc_nrm >= 0) jn += snprintf(json + jn, json_cap - (size_t)jn, ",\"NORMAL\":%d", acc_nrm);
+    if (acc_uv  >= 0) jn += snprintf(json + jn, json_cap - (size_t)jn, ",\"TEXCOORD_0\":%d", acc_uv);
+    if (acc_col >= 0) jn += snprintf(json + jn, json_cap - (size_t)jn, ",\"COLOR_0\":%d", acc_col);
+    jn += snprintf(json + jn, json_cap - (size_t)jn, "},\"indices\":%d,\"material\":%d}", acc_ind_base + i, i);
+  }
+  jn += snprintf(json + jn, json_cap - (size_t)jn, "]}]}");
 
   const uint32_t json_pad = ((uint32_t)jn + 3u) & ~3u;
   const uint32_t total_len = 12u + 8u + json_pad + 8u + bin_pad;
 
   FILE *f = fopen(path, "wb");
-  if (!f) return -1;
+  if (!f) { free(json); free(sorted_idx); return -1; }
   uint32_t hdr[3] = { 0x46546C67u, 2u, total_len }; // "glTF", v2
   uint32_t jchk[2] = { json_pad, 0x4E4F534Au };     // "JSON"
   uint32_t bchk[2] = { bin_pad,  0x004E4942u };     // "BIN\0"
@@ -176,10 +251,12 @@ int ec_export_glb(const char *path, const ec_mesh_t *m) {
   if (m->normals) fwrite(m->normals, 1, nrm_bytes, f);
   if (m->uvs)     fwrite(m->uvs,     1, uv_bytes,  f);
   if (m->colors)  fwrite(m->colors,  1, col_bytes, f);
-  fwrite(m->indices, 1, idx_bytes, f);
+  fwrite(multi_mat ? sorted_idx : m->indices, 1, idx_bytes, f);
   for (uint32_t p = bin_raw; p < bin_pad; p++) fputc(0, f);
   int ok = ferror(f) == 0 ? 0 : -1;
   fclose(f);
+  free(json);
+  free(sorted_idx);
   return ok;
 }
 
@@ -1565,6 +1642,7 @@ int ec_ovoxel_build_mesh(
 void ec_mesh_free(ec_mesh_t *m) {
   if (!m) return;
   free(m->positions); free(m->normals); free(m->uvs); free(m->colors); free(m->indices);
+  free(m->tri_mat_ids); free(m->mats);
   memset(m, 0, sizeof *m);
 }
 

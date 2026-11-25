@@ -171,7 +171,8 @@ static ec_asset_kind_t classify_asset(const char *fullpath, const char *fname, u
   if (ci_contains(fullpath, "/vae/") || ci_contains(fname, "vae") || ci_contains(fname, "_ae.") || strcasecmp(fname, "ae.safetensors") == 0) return EC_ASSET_VAE;
   if (ci_contains(fullpath, "/text_encoders/") || ci_contains(fullpath, "/clip/") ||
       ci_contains(fname, "qwen_3_") || ci_contains(fname, "qwen3_") ||
-      ci_contains(fname, "qwen_2.5") || ci_contains(fname, "umt5") || ci_contains(fname, "t5xxl")) {
+      ci_contains(fname, "qwen_2.5") || ci_contains(fname, "umt5") || ci_contains(fname, "t5xxl") ||
+      ci_contains(fname, "gemma")) {
     return EC_ASSET_TEXT_ENC;
   }
   if (bytes > 50ULL * 1024ULL * 1024ULL) return EC_ASSET_CHECKPOINT;
@@ -240,6 +241,7 @@ void ec_storage_init(ec_storage_vault_t *v, const char *primary_models_dir, cons
   }
   // Auto-discover existing secondary / ComfyUI / external storage vaults if present
   const char *auto_roots[][2] = {
+    { "/mnt/storage/creative-models", "Storage HDD (Frontier Models)" },
     { "/mnt/storage/ai-models/comfyui/models", "Storage HDD (ComfyUI)" },
     { "/mnt/storage/pc-archive/comfyui-models", "Storage HDD (Archive)" },
     { "/mnt/storage/maestro-ckpts", "Storage HDD (Maestro)" },

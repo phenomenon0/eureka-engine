@@ -27,6 +27,12 @@ int ec_bpe_encode_flux2_qwen3(
     const ec_bpe_t *tok, const char *prompt,
     int32_t *out_ids, uint8_t *out_mask, int fixed_len, int *out_real_len);
 
+// Encode raw prompt for Gemma-3 (LTX-2.3): Replace ' ' -> '▁' (U+2581), SentencePiece BPE with
+// <0xXX> byte fallback, and prepend <bos> (id=2). Returns token count (<= max_out), or <0 on error.
+int ec_bpe_encode_gemma3(
+    const ec_bpe_t *tok, const char *prompt,
+    int32_t *out_ids, int max_out);
+
 #ifdef __cplusplus
 }
 #endif

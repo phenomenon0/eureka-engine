@@ -517,16 +517,22 @@ typedef struct {
 
 typedef struct {
   int loaded;
-  uint16_t *proj_in_w;     // transposed [2048, 384] BF16
-  float    *proj_in_b;     // [2048]
-  uint16_t *cond_emb_w;    // [2048, 2048]
-  float    *cond_emb_b;    // [2048]
+  int n_layers; // 24 (2B) or 32 (4B XL)
+  int dim;      // 2048 (2B) or 2560 (4B XL)
+  int hq;       // 16 (2B) or 32 (4B XL)
+  int hkv;      // 8
+  int ffn;      // 6144 (2B) or 9728 (4B XL)
+  int cond_in;  // 2048 (condition encoder hidden dim)
+  uint16_t *proj_in_w;     // transposed [dim, 384] BF16
+  float    *proj_in_b;     // [dim]
+  uint16_t *cond_emb_w;    // [dim, cond_in]
+  float    *cond_emb_b;    // [dim]
   as_time_emb_t time_embed;
   as_time_emb_t time_embed_r;
-  as_dit_layer_t layers[24];
-  float    *norm_out_w;    // [2048]
-  float    *scale_shift_out; // [2 * 2048]
-  uint16_t *proj_out_w;    // transposed [128, 2048] BF16
+  as_dit_layer_t layers[36];
+  float    *norm_out_w;    // [dim]
+  float    *scale_shift_out; // [2 * dim]
+  uint16_t *proj_out_w;    // transposed [128, dim] BF16
   float    *proj_out_b2;   // [128] (bias[64] duplicated twice)
 } as_dit_resident_t;
 
@@ -588,7 +594,8 @@ static void free_dit_resident(as_dit_resident_t *d) {
   cudaFree(d->cond_emb_w); cudaFree(d->cond_emb_b);
   free_time_emb(&d->time_embed);
   free_time_emb(&d->time_embed_r);
-  for (int i = 0; i < 24; i++) {
+  int nl = (d->n_layers > 0 && d->n_layers <= 36) ? d->n_layers : 24;
+  for (int i = 0; i < nl; i++) {
     as_dit_layer_t *L = &d->layers[i];
     cudaFree(L->self_norm_w); cudaFree(L->cross_norm_w); cudaFree(L->mlp_norm_w);
     cudaFree(L->self_q_norm); cudaFree(L->self_k_norm);
@@ -674,19 +681,44 @@ static int ensure_dit_loaded(ec_acestep_t *as, const char *ckpt_override, const 
   as_dit_resident_t *d = &as->dit;
   ec_lora_apply_stats_t lstats = {};
 
-  // proj_in.1.weight [2048, 192, 2] -> transpose to [2048, 384] where [oc, k*192 + ic] = W[oc, ic, k]
+  // Auto-detect ACE-Step 1.5 (2B: dim=2048, 24L, 16Q/8KV, ffn=6144) vs 1.5-XL (4B: dim=2560, 32L, 32Q/8KV, ffn=9728)!
+  const ec_st_entry_t *e_pi = ec_st_find(st, "decoder.proj_in.1.weight");
+  const ec_st_entry_t *e_ce = ec_st_find(st, "decoder.condition_embedder.weight");
+  const ec_st_entry_t *e_q0 = ec_st_find(st, "decoder.layers.0.self_attn.q_proj.weight");
+  const ec_st_entry_t *e_k0 = ec_st_find(st, "decoder.layers.0.self_attn.k_proj.weight");
+  const ec_st_entry_t *e_m0 = ec_st_find(st, "decoder.layers.0.mlp.gate_proj.weight");
+  if (!e_pi || !e_ce || !e_q0 || !e_k0 || !e_m0) return -1;
+  const int DIM     = (int)e_pi->shape[0];
+  const int COND_IN = (int)e_ce->shape[1];
+  const int Q_OUT   = (int)e_q0->shape[0];
+  const int KV_OUT  = (int)e_k0->shape[0];
+  const int FFN     = (int)e_m0->shape[0];
+  const int HQ      = Q_OUT / 128;
+  const int HKV     = KV_OUT / 128;
+  int NL = 0;
+  char k[192];
+  for (int i = 0; i < 36; i++) {
+    snprintf(k, sizeof k, "decoder.layers.%d.self_attn.q_proj.weight", i);
+    if (ec_st_find(st, k)) NL = i + 1; else break;
+  }
+  if (NL < 1 || DIM < 512 || HQ < 1 || HKV < 1 || FFN < 512) return -1;
+  d->n_layers = NL; d->dim = DIM; d->hq = HQ; d->hkv = HKV; d->ffn = FFN; d->cond_in = COND_IN;
+  fprintf(stderr, "[acestep] loading DiT (%s): %dL dim=%d hq=%d hkv=%d ffn=%d cond_in=%d\n",
+          NL >= 32 ? "1.5-XL-4B" : "1.5-2B", NL, DIM, HQ, HKV, FFN, COND_IN);
+
+  // proj_in.1.weight [DIM, 192, 2] -> transpose to [DIM, 384] where [oc, k*192 + ic] = W[oc, ic, k]
   float *w_in_h = NULL;
   if (st_read_host_f32(st, "decoder.proj_in.1.weight", &w_in_h, NULL) != 0) return -1;
-  uint16_t *w_in_t = (uint16_t *)malloc(2048L * 384L * 2);
-  for (int oc = 0; oc < 2048; oc++) {
+  uint16_t *w_in_t = (uint16_t *)malloc((size_t)DIM * 384L * 2);
+  for (int oc = 0; oc < DIM; oc++) {
     for (int ic = 0; ic < 192; ic++) {
       w_in_t[(long)oc * 384 + ic]       = as_f32_to_bf16_host(w_in_h[((long)oc * 192 + ic) * 2 + 0]);
       w_in_t[(long)oc * 384 + 192 + ic] = as_f32_to_bf16_host(w_in_h[((long)oc * 192 + ic) * 2 + 1]);
     }
   }
   free(w_in_h);
-  cudaMalloc(&d->proj_in_w, 2048L * 384L * 2);
-  cudaMemcpy(d->proj_in_w, w_in_t, 2048L * 384L * 2, cudaMemcpyHostToDevice);
+  cudaMalloc(&d->proj_in_w, (size_t)DIM * 384L * 2);
+  cudaMemcpy(d->proj_in_w, w_in_t, (size_t)DIM * 384L * 2, cudaMemcpyHostToDevice);
   free(w_in_t);
   d->proj_in_b = st_upload_f32(st, "decoder.proj_in.1.bias");
 
@@ -695,8 +727,7 @@ static int ensure_dit_loaded(ec_acestep_t *as, const char *ckpt_override, const 
   if (load_time_emb(st, "decoder.time_embed", &d->time_embed) != 0) return -1;
   if (load_time_emb(st, "decoder.time_embed_r", &d->time_embed_r) != 0) return -1;
 
-  char k[192];
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < NL; i++) {
     as_dit_layer_t *L = &d->layers[i];
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn_norm.weight", i);    L->self_norm_w  = st_upload_f32(st, k);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn_norm.weight", i);   L->cross_norm_w = st_upload_f32(st, k);
@@ -706,27 +737,27 @@ static int ensure_dit_loaded(ec_acestep_t *as, const char *ckpt_override, const 
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.q_norm.weight", i); L->cross_q_norm = st_upload_f32(st, k);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.k_norm.weight", i); L->cross_k_norm = st_upload_f32(st, k);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.q_proj.weight", i);  L->self_q  = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->self_q) ec_lora_fuse_onto_bf16(L->self_q, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->self_q) ec_lora_fuse_onto_bf16(L->self_q, Q_OUT, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.k_proj.weight", i);  L->self_k  = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->self_k) ec_lora_fuse_onto_bf16(L->self_k, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->self_k) ec_lora_fuse_onto_bf16(L->self_k, KV_OUT, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.v_proj.weight", i);  L->self_v  = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->self_v) ec_lora_fuse_onto_bf16(L->self_v, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->self_v) ec_lora_fuse_onto_bf16(L->self_v, KV_OUT, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.self_attn.o_proj.weight", i);  L->self_o  = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->self_o) ec_lora_fuse_onto_bf16(L->self_o, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->self_o) ec_lora_fuse_onto_bf16(L->self_o, DIM, Q_OUT, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.q_proj.weight", i); L->cross_q = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->cross_q) ec_lora_fuse_onto_bf16(L->cross_q, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->cross_q) ec_lora_fuse_onto_bf16(L->cross_q, Q_OUT, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.k_proj.weight", i); L->cross_k = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->cross_k) ec_lora_fuse_onto_bf16(L->cross_k, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->cross_k) ec_lora_fuse_onto_bf16(L->cross_k, KV_OUT, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.v_proj.weight", i); L->cross_v = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->cross_v) ec_lora_fuse_onto_bf16(L->cross_v, 1024, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->cross_v) ec_lora_fuse_onto_bf16(L->cross_v, KV_OUT, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.cross_attn.o_proj.weight", i); L->cross_o = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->cross_o) ec_lora_fuse_onto_bf16(L->cross_o, 2048, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->cross_o) ec_lora_fuse_onto_bf16(L->cross_o, DIM, Q_OUT, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.mlp.gate_proj.weight", i);     L->mlp_gate = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->mlp_gate) ec_lora_fuse_onto_bf16(L->mlp_gate, 6144, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->mlp_gate) ec_lora_fuse_onto_bf16(L->mlp_gate, FFN, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.mlp.up_proj.weight", i);       L->mlp_up   = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->mlp_up) ec_lora_fuse_onto_bf16(L->mlp_up, 6144, 2048, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->mlp_up) ec_lora_fuse_onto_bf16(L->mlp_up, FFN, DIM, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.mlp.down_proj.weight", i);     L->mlp_down = st_upload_bf16(st, k);
-    if (n_loras > 0 && L->mlp_down) ec_lora_fuse_onto_bf16(L->mlp_down, 2048, 6144, k, loras, n_loras, &lstats, as->stream);
+    if (n_loras > 0 && L->mlp_down) ec_lora_fuse_onto_bf16(L->mlp_down, DIM, FFN, k, loras, n_loras, &lstats, as->stream);
     snprintf(k, sizeof k, "decoder.layers.%d.scale_shift_table", i);        L->scale_shift = st_upload_f32(st, k);
     if (!L->self_q || !L->cross_q || !L->mlp_down || !L->scale_shift) {
       free_dit_resident(d);
@@ -737,23 +768,23 @@ static int ensure_dit_loaded(ec_acestep_t *as, const char *ckpt_override, const 
   d->norm_out_w      = st_upload_f32(st, "decoder.norm_out.weight");
   d->scale_shift_out = st_upload_f32(st, "decoder.scale_shift_table");
 
-  // proj_out.1.weight [2048, 64, 2] -> transpose to [128, 2048] where row (k*64 + oc), col ic = W[ic, oc, k]
+  // proj_out.1.weight [DIM, 64, 2] -> transpose to [128, DIM] where row (k*64 + oc), col ic = W[ic, oc, k]
   float *w_out_h = NULL, *b_out_h = NULL;
   if (st_read_host_f32(st, "decoder.proj_out.1.weight", &w_out_h, NULL) != 0) return -1;
   if (st_read_host_f32(st, "decoder.proj_out.1.bias", &b_out_h, NULL) != 0) { free(w_out_h); return -1; }
-  uint16_t *w_out_t = (uint16_t *)malloc(128L * 2048L * 2);
+  uint16_t *w_out_t = (uint16_t *)malloc(128L * (size_t)DIM * 2);
   for (int k_i = 0; k_i < 2; k_i++) {
     for (int oc = 0; oc < 64; oc++) {
-      for (int ic = 0; ic < 2048; ic++) {
-        w_out_t[(long)(k_i * 64 + oc) * 2048 + ic] = as_f32_to_bf16_host(w_out_h[((long)ic * 64 + oc) * 2 + k_i]);
+      for (int ic = 0; ic < DIM; ic++) {
+        w_out_t[(long)(k_i * 64 + oc) * DIM + ic] = as_f32_to_bf16_host(w_out_h[((long)ic * 64 + oc) * 2 + k_i]);
       }
     }
   }
   float b_out2[128];
   for (int oc = 0; oc < 64; oc++) { b_out2[oc] = b_out_h[oc]; b_out2[64 + oc] = b_out_h[oc]; }
   free(w_out_h); free(b_out_h);
-  cudaMalloc(&d->proj_out_w, 128L * 2048L * 2);
-  cudaMemcpy(d->proj_out_w, w_out_t, 128L * 2048L * 2, cudaMemcpyHostToDevice);
+  cudaMalloc(&d->proj_out_w, 128L * (size_t)DIM * 2);
+  cudaMemcpy(d->proj_out_w, w_out_t, 128L * (size_t)DIM * 2, cudaMemcpyHostToDevice);
   free(w_out_t);
   cudaMalloc(&d->proj_out_b2, 128 * sizeof(float));
   cudaMemcpy(d->proj_out_b2, b_out2, 128 * sizeof(float), cudaMemcpyHostToDevice);
@@ -1195,8 +1226,59 @@ static int run_condition_encoder(
 // ===========================================================================
 // 10. Stage 3: Native CUDA 24-Layer AceStepDiTModel (8-Step Shift=3.0 Turbo ODE)
 // ===========================================================================
+// Official ACE-Step 1.5-XL APG (Adaptive Projected Guidance, dims=[1] along TIME axis T,
+// momentum=-0.75, norm_threshold=2.5, eta=0.0) — exact match to modeling_acestep_v15_xl_base.py:2045!
+// 1 block = 1 channel c in [0..63], 256 threads reduce over all frames t in [0..T-1] in double precision!
+__global__ void k_as_apg_step(
+    float *__restrict__ v_cond, const float *__restrict__ v_uncond,
+    float *__restrict__ mom_buf, int T, float cfg_scale, float momentum, float norm_thresh, float eta) {
+  int c = blockIdx.x;
+  int tid = threadIdx.x;
+  if (c >= 64) return;
+
+  double s_d2 = 0.0, s_vc2 = 0.0, s_dot = 0.0;
+  for (int t = tid; t < T; t += blockDim.x) {
+    long idx = (long)t * 64 + c;
+    double vc = (double)v_cond[idx];
+    double vu = (double)v_uncond[idx];
+    double m = (vc - vu) + (double)momentum * (double)mom_buf[idx];
+    mom_buf[idx] = (float)m;
+    s_d2  += m * m;
+    s_vc2 += vc * vc;
+    s_dot += m * vc;
+  }
+
+  __shared__ double sm_d2[256], sm_vc2[256], sm_dot[256];
+  sm_d2[tid] = s_d2; sm_vc2[tid] = s_vc2; sm_dot[tid] = s_dot;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) {
+      sm_d2[tid]  += sm_d2[tid + s];
+      sm_vc2[tid] += sm_vc2[tid + s];
+      sm_dot[tid] += sm_dot[tid + s];
+    }
+    __syncthreads();
+  }
+
+  double dnorm = sqrt(sm_d2[0] + 1e-12);
+  double dscale = (norm_thresh > 0.0f && dnorm > (double)norm_thresh) ? ((double)norm_thresh / dnorm) : 1.0;
+  double vc_norm2 = sm_vc2[0] + 1e-12;
+  double proj_coeff = (sm_dot[0] * dscale) / vc_norm2;
+  double w = (double)(cfg_scale - 1.0f);
+  double eta_m1 = (double)eta - 1.0;
+
+  for (int t = tid; t < T; t += blockDim.x) {
+    long idx = (long)t * 64 + c;
+    double vc = (double)v_cond[idx];
+    double d_scaled = (double)mom_buf[idx] * dscale;
+    // v_orth + eta * v_par = d_scaled + (eta - 1) * v_par
+    double upd = d_scaled + eta_m1 * proj_coeff * vc;
+    v_cond[idx] = (float)(vc + w * upd);
+  }
+}
+
 static void compute_time_embed_gpu(
-    ec_acestep_t *as, const as_time_emb_t *te, float t_val,
+    ec_acestep_t *as, const as_time_emb_t *te, float t_val, int dim,
     uint16_t *f_d, float *h_f32, uint16_t *h_bf16,
     float *out_temb_d, float *out_tproj_d) {
   uint16_t freq_bf16_h[256];
@@ -1208,11 +1290,11 @@ static void compute_time_embed_gpu(
     freq_bf16_h[128 + i] = as_f32_to_bf16_host((float)sin(a));
   }
   cudaMemcpyAsync(f_d, freq_bf16_h, 256 * 2, cudaMemcpyHostToDevice, as->stream);
-  as_gemm(f_d, te->l1_w, te->l1_b, h_f32, NULL, 1, 2048, 256, as->stream);
-  ec_ops_silu_f32_to_bf16(h_f32, h_bf16, 2048, as->stream);
-  as_gemm(h_bf16, te->l2_w, te->l2_b, out_temb_d, NULL, 1, 2048, 2048, as->stream);
-  ec_ops_silu_f32_to_bf16(out_temb_d, h_bf16, 2048, as->stream);
-  as_gemm(h_bf16, te->proj_w, te->proj_b, out_tproj_d, NULL, 1, 12288, 2048, as->stream);
+  as_gemm(f_d, te->l1_w, te->l1_b, h_f32, NULL, 1, dim, 256, as->stream);
+  ec_ops_silu_f32_to_bf16(h_f32, h_bf16, dim, as->stream);
+  as_gemm(h_bf16, te->l2_w, te->l2_b, out_temb_d, NULL, 1, dim, dim, as->stream);
+  ec_ops_silu_f32_to_bf16(out_temb_d, h_bf16, dim, as->stream);
+  as_gemm(h_bf16, te->proj_w, te->proj_b, out_tproj_d, NULL, 1, 6 * dim, dim, as->stream);
 }
 
 __global__ void k_as_add_vec(const float *a, const float *b, float *out, int n) {
@@ -1248,7 +1330,7 @@ static int run_acestep_dit(
     double *out_ms) {
   double t0 = as_now_ms();
   const as_dit_resident_t *d = &as->dit;
-  const int DIM = 2048, HQ = 16, HKV = 8, D = 128, FFN = 6144;
+  const int NL = d->n_layers, DIM = d->dim, HQ = d->hq, HKV = d->hkv, D = 128, FFN = d->ffn, COND_IN = d->cond_in;
   int T_pad = (T + 1) & ~1;
   int T_p = T_pad / 2;
   int use_cfg = (uncond_packed_bf16_d != NULL && L_uncond > 0 && cfg_scale > 1.05f) ? 1 : 0;
@@ -1286,22 +1368,22 @@ static int run_acestep_dit(
   if (rp_t1 <= rp_t0) rp_t1 = T;
   if (rp_t1 > T) rp_t1 = T;
 
-  // Project encoder_hidden_states ONCE through decoder.condition_embedder (pos + optional uncond for SFT CFG!)
+  // Project encoder_hidden_states ONCE through decoder.condition_embedder [COND_IN=2048 -> DIM]
   uint16_t *cond_bf16_d = NULL, *ucond_bf16_d = NULL;
   cudaMalloc(&cond_bf16_d, (size_t)L_enc * DIM * 2);
-  as_gemm(enc_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, cond_bf16_d, L_enc, DIM, DIM, as->stream);
+  as_gemm(enc_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, cond_bf16_d, L_enc, DIM, COND_IN, as->stream);
   if (use_cfg) {
     cudaMalloc(&ucond_bf16_d, (size_t)L_uncond * DIM * 2);
-    as_gemm(uncond_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, ucond_bf16_d, L_uncond, DIM, DIM, as->stream);
+    as_gemm(uncond_packed_bf16_d, d->cond_emb_w, d->cond_emb_b, NULL, ucond_bf16_d, L_uncond, DIM, COND_IN, as->stream);
   }
 
-  uint16_t *ck_cache[24] = {0}, *cv_cache[24] = {0};
-  uint16_t *uck_cache[24] = {0}, *ucv_cache[24] = {0};
+  uint16_t *ck_cache[36] = {0}, *cv_cache[36] = {0};
+  uint16_t *uck_cache[36] = {0}, *ucv_cache[36] = {0};
   int L_max_kv = (use_cfg && L_uncond > L_enc) ? L_uncond : L_enc;
   float *ck_tmp = NULL, *cv_tmp = NULL;
   cudaMalloc(&ck_tmp, (size_t)L_max_kv * HKV * D * 4);
   cudaMalloc(&cv_tmp, (size_t)L_max_kv * HKV * D * 4);
-  for (int l = 0; l < 24; l++) {
+  for (int l = 0; l < NL; l++) {
     cudaMalloc(&ck_cache[l], (size_t)HKV * L_enc * D * 2);
     cudaMalloc(&cv_cache[l], (size_t)HKV * L_enc * D * 2);
     as_gemm(cond_bf16_d, d->layers[l].cross_k, NULL, ck_tmp, NULL, L_enc, HKV * D, DIM, as->stream);
@@ -1331,8 +1413,8 @@ static int run_acestep_dit(
   cudaMalloc(&temb_t_d,  DIM * 4); cudaMalloc(&tproj_t_d, 6 * DIM * 4);
   cudaMalloc(&temb_d,    DIM * 4); cudaMalloc(&tproj_d,   6 * DIM * 4);
   cudaMalloc(&mod_d,     6 * DIM * 4); cudaMalloc(&out_mod_d, 2 * DIM * 4);
-  cudaMalloc(&te_f_d,    256 * 2); cudaMalloc(&te_hf_d, 2048 * 4); cudaMalloc(&te_hb_d, 2048 * 2);
-  compute_time_embed_gpu(as, &d->time_embed_r, 0.0f, te_f_d, te_hf_d, te_hb_d, temb_r_d, tproj_r_d);
+  cudaMalloc(&te_f_d,    256 * 2); cudaMalloc(&te_hf_d, DIM * 4); cudaMalloc(&te_hb_d, DIM * 2);
+  compute_time_embed_gpu(as, &d->time_embed_r, 0.0f, DIM, te_f_d, te_hf_d, te_hb_d, temb_r_d, tproj_r_d);
 
   // Prepare native ACE-Step 1.5 context_latents [T, 128] = cat(ctx_64, gen_mask_64) and initial xt [T, 64]
   float *ctx_h = (float *)malloc((size_t)T * 128 * 4);
@@ -1397,7 +1479,7 @@ static int run_acestep_dit(
         ctx_d, xt_d, patch_in_bf16, T, T_p);
     as_gemm(patch_in_bf16, d->proj_in_w, d->proj_in_b, x_d, NULL, T_p, DIM, 384, as->stream);
 
-    for (int l = 0; l < 24; l++) {
+    for (int l = 0; l < NL; l++) {
       const as_dit_layer_t *L = &d->layers[l];
       k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(L->scale_shift, tproj_d, mod_d, 6 * DIM);
       const float *shift_msa = mod_d + 0 * DIM;
@@ -1448,6 +1530,12 @@ static int run_acestep_dit(
     as_gemm(xn_bf16, d->proj_out_w, d->proj_out_b2, out_v, NULL, T_p, 128, DIM, as->stream);
   };
 
+  float *apg_mom_d = NULL;
+  if (use_cfg) {
+    cudaMalloc(&apg_mom_d, (size_t)T_pad * 64 * 4);
+    cudaMemsetAsync(apg_mom_d, 0, (size_t)T_pad * 64 * 4, as->stream);
+  }
+
   int cancelled = 0;
   for (int step = s0; step < n_steps; step++) {
     if (cb && cb(step + 2, n_steps + 3, "acestep_dit_step", cb_ctx) != 0) {
@@ -1455,28 +1543,34 @@ static int run_acestep_dit(
       break;
     }
     float t_cur = sched[step];
-    compute_time_embed_gpu(as, &d->time_embed, t_cur, te_f_d, te_hf_d, te_hb_d, temb_t_d, tproj_t_d);
+    compute_time_embed_gpu(as, &d->time_embed, t_cur, DIM, te_f_d, te_hf_d, te_hb_d, temb_t_d, tproj_t_d);
     k_as_add_vec<<<(DIM + 255) / 256, 256, 0, as->stream>>>(temb_t_d, temb_r_d, temb_d, DIM);
     k_as_add_vec<<<(6 * DIM + 255) / 256, 256, 0, as->stream>>>(tproj_t_d, tproj_r_d, tproj_d, 6 * DIM);
 
     eval_dit_pass(ck_cache, cv_cache, L_enc, vt_d);
-    // Official ACE-Step SFT CFG interval [0.0, 0.90]: release CFG in final 10% to keep cymbals & vocal air pristine!
+    // Official ACE-Step 1.5 / 1.5-XL SFT Guidance:
+    // Use official APG (momentum=-0.75, norm_threshold=2.5, eta=0.0) on XL-4B & SFT for crystal-clear cymbals/vocals!
     float pct = (float)(step - s0) / (float)(n_steps - s0 > 0 ? n_steps - s0 : 1);
-    if (use_cfg && pct <= 0.90f) {
+    if (use_cfg && pct <= 0.92f) {
       eval_dit_pass(uck_cache, ucv_cache, L_uncond, vu_d);
-      ec_ops_cfg_zerostar_vel(vt_d, vu_d, vt_d, (long)T * 64, cfg_scale, 0, as->stream);
+      if (NL >= 32) {
+        k_as_apg_step<<<64, 256, 0, as->stream>>>(vt_d, vu_d, apg_mom_d, T, cfg_scale, -0.75f, 2.5f, 0.0f);
+      } else {
+        ec_ops_cfg_zerostar_vel(vt_d, vu_d, vt_d, (long)T * 64, cfg_scale, 0, as->stream);
+      }
     }
 
     float dt = (step == n_steps - 1) ? t_cur : (t_cur - sched[step + 1]);
     k_as_ode_step<<<((long)T * 64 + 255) / 256, 256, 0, as->stream>>>(xt_d, vt_d, dt, (long)T * 64);
   }
+  cudaFree(apg_mom_d);
 
   if (!cancelled) {
     cudaMemcpyAsync(out_x0_d, xt_d, (size_t)T * 64 * 4, cudaMemcpyDeviceToDevice, as->stream);
   }
   cudaStreamSynchronize(as->stream);
 
-  for (int l = 0; l < 24; l++) {
+  for (int l = 0; l < NL; l++) {
     cudaFree(ck_cache[l]); cudaFree(cv_cache[l]);
     cudaFree(uck_cache[l]); cudaFree(ucv_cache[l]);
   }

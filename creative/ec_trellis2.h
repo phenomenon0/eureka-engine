@@ -18,9 +18,14 @@ extern "C" {
 typedef struct ec_trellis2 ec_trellis2_t;
 
 typedef struct {
-  char dino_path[512];     // dinov3_vitl16.safetensors
-  char ss_flow_path[512];  // trellis2_ss_flow_1.3b_bf16.safetensors
-  char ss_dec_path[512];   // trellis2_ss_dec_16l8_fp16.safetensors
+  char dino_path[512];            // dinov3_vitl16.safetensors
+  char ss_flow_path[512];         // trellis2_ss_flow_1.3b_bf16.safetensors
+  char ss_dec_path[512];          // trellis2_ss_dec_16l8_fp16.safetensors
+  // Optional v17.2 Full 3-Stage 512^3 O-Voxel PBR weights (auto-enabled when all 4 are present!)
+  char slat_shape_flow_path[512]; // trellis2_slat_shape_flow_512_bf16.safetensors
+  char slat_tex_flow_path[512];   // trellis2_slat_tex_flow_512_bf16.safetensors
+  char shape_dec_path[512];       // trellis2_shape_dec_fp16.safetensors
+  char tex_dec_path[512];         // trellis2_tex_dec_fp16.safetensors
 } ec_trellis2_paths_t;
 
 typedef struct {

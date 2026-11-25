@@ -31,13 +31,14 @@ typedef struct {
   double vram_free_mb;
   double vram_pool_used_mb;
   double vram_pool_budget_mb;
-  int    engines_resident_mask; // bit0=flux2, bit1=acestep, bit2=trellis2, bit3=wan22, bit4=zimage
+  int    engines_resident_mask; // bit0=flux2, bit1=acestep, bit2=trellis2, bit3=wan22, bit4=zimage, bit5=ltx2
   int    models_discovered;
   int    photoreal_ready;
   int    zimage_ready;
   int    acestep_ready;
   int    trellis2_ready;
   int    wan22_ready;
+  int    ltx2_ready;
   int    storage_roots;
   int    loras_discovered;
   int    checkpoints_discovered;
@@ -103,6 +104,7 @@ typedef struct {
   const char             *end_frame_path;    // FLF2V end frame (set == start_frame for Seamless Loop!)
   const char             *camera_motion;     // auto|orbit|dolly_in|pan_left|pan_right|crane_up|fpv|static
   int                     hero_keyframe_i2v; // 1 -> synthesize photoreal hero still first, then animate via Wan 2.2 I2V
+  const char             *checkpoint_query;  // optional: "ltx-2.3" (22B Joint A/V) vs "wan2.2" (TI2V-5B)
   const ec_studio_lora_t *loras;
   int                     n_loras;
 } ec_studio_video_v8_t;

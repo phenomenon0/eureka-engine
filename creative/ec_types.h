@@ -79,18 +79,30 @@ typedef struct {
   int32_t     hash_cap;     // power-of-2 >= 2 * n_active
 } ec_ovoxel_t;
 
+// Native 3D PBR Material Cluster (for multi-material GLB 2.0 export!)
+typedef struct {
+  float base_color[4];
+  float metallic;
+  float roughness;
+  int   double_sided;
+} ec_pbr_mat_t;
+
 // Native 3D Mesh with PBR maps (exports directly to GLB 2.0)
 typedef struct {
-  float      *positions;    // [n_verts * 3]
-  float      *normals;      // [n_verts * 3] (optional)
-  float      *uvs;          // [n_verts * 2] (optional)
-  float      *colors;       // [n_verts * 3] linear RGB vertex colors -> COLOR_0 (optional)
-  uint32_t   *indices;      // [n_tris * 3]
-  uint32_t    n_verts;
-  uint32_t    n_tris;
-  float       base_color[4];
-  float       metallic;
-  float       roughness;
+  float        *positions;    // [n_verts * 3]
+  float        *normals;      // [n_verts * 3] (optional)
+  float        *uvs;          // [n_verts * 2] (optional)
+  float        *colors;       // [n_verts * 3] linear RGB vertex colors -> COLOR_0 (optional)
+  uint32_t     *indices;      // [n_tris * 3]
+  uint32_t      n_verts;
+  uint32_t      n_tris;
+  float         base_color[4];
+  float         metallic;
+  float         roughness;
+  // Optional v17 Multi-Material PBR (per-triangle material index -> distinct metallic/roughness glTF 2.0 primitives!)
+  uint16_t     *tri_mat_ids;  // [n_tris] material index into mats[] (NULL = single-material legacy path)
+  ec_pbr_mat_t *mats;         // [n_mats]
+  uint32_t      n_mats;
 } ec_mesh_t;
 
 // Native 3D Gaussian Splat cloud (exports directly to .ply / WebGPU splat viewer)
