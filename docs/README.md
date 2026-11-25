@@ -38,7 +38,9 @@ This directory holds the Eureka Engine documentation. Start with the
 | [`tools/tts/README.md`](../tools/tts/README.md) | Text-to-speech. |
 | [`tools/glue/README.md`](../tools/glue/README.md) | Vision connector rows. |
 | [`tools/mtp27/README.md`](../tools/mtp27/README.md) | MTP drafter pack for speculative decoding. |
-| [`backends/README.md`](../backends/README.md) | One page per backend: CUDA, Metal, iOS, Android, WebGPU. |
+| [`backends/README.md`](../backends/README.md) | One page per backend: CUDA, Vulkan, Metal, iOS, Android, WebGPU. |
+| [`backends/vulkan/README.md`](../backends/vulkan/README.md) | Native cross-vendor Vulkan 1.2+ backend (LLM and Creative Studio). |
+| [`backends/vulkan/turbo-path.md`](../backends/vulkan/turbo-path.md) | Vulkan turbo path: paired CUDA vs Vulkan baseline and 5-phase speedup roadmap. |
 | [`backends/metal/build-internals.md`](../backends/metal/build-internals.md) | How the Metal build reproduces the Mac product. |
 | [`release/README-llb.md`](../release/README-llb.md) | The `llb` command. |
 

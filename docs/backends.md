@@ -92,8 +92,15 @@ source location and build commands.
 - Android runs on the CPU. The Vulkan path for Android is not built yet. The
   battery labels the cells `android-vulkan`, but every Android receipt
   declares the CPU route.
-- Vulkan on Linux is parked. As of 2026-10-19, SPIR-V output is proven, coverage
-  is 26 %, and there is no runtime.
+- Native Vulkan 1.2+ on Linux is active as of 2026-11-25 for both the LLM stack
+  (`engine_vulkan`, `backends/vulkan/`) and Creative Studio
+  (`eureka-creative-serve`, `creative/backends/ec_backend_vulkan.c`), verified
+  on NVIDIA RTX 3090 and AMD RDNA2 (`RADV`). It currently runs portable
+  SPIR-V 1.3 shaders without batched LLM prefill, single-submit LLM graphs, or
+  `VK_KHR_cooperative_matrix`; see the staged optimization plan in
+  [`backends/vulkan/turbo-path.md`](../backends/vulkan/turbo-path.md). Windows
+  Vulkan build wiring exists in `backends/windows/build.ps1` and is untested on
+  Windows hardware.
 - There is no CPU/WASM build of the engine.
 - Windows (2026-11-16): `backends/windows/build.ps1` builds the CUDA engine
   (`engine_gpu.exe`, the emitted Bend engine with `winabi.ps1` and `wincuda.ps1`)

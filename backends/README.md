@@ -8,6 +8,7 @@ downloaded or built separately; each page lists them.
 | Backend | Devices | Source | Result | Page |
 |---|---|---|---|---|
 | CUDA | NVIDIA, Linux | Repository root (`build.sh`) and `tools/sys1dual/` (server) | 38.8 tok/s, 27B, RTX 3090 | [cuda](cuda/README.md) |
+| Vulkan | AMD Radeon, Intel Arc, NVIDIA (Linux; Windows build script) | `vulkan/` (LLM) and `creative/backends/ec_backend_vulkan.c` (Creative) | 18.4 tok/s decode, 4B, RTX 3090; 46/46 `ec-bench` | [vulkan](vulkan/README.md) ([turbo path](vulkan/turbo-path.md)) |
 | Metal | macOS | `metal/` (engine and server) | 70.2 tok/s, 9B, M3 Ultra | [metal](metal/README.md) |
 | Metal | iOS | `ios/` (engine library) | 20.6 tok/s, 4B, iPhone 18 Pro Max | [ios](ios/README.md) |
 | CPU | Android | `android/` (engine executable) | 3.2 s per short reply, 4B, Pixel 6a | [android](android/README.md) |
