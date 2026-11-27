@@ -1,0 +1,221 @@
+#version 460
+// backends/vulkan/shaders/llm_gemv_fp32.comp — Exact FP32 Subgroup GEMV & Prefill GEMM (LLB_VULKAN_EXACT=1 / fallback)
+// Also supports Tier 0 portable SPIR-V 1.3 (when NO_SUBGROUPS is defined) via shared-memory tree reduction!
+// Macros: FMT_Q4K | FMT_Q5K | FMT_Q6K | FMT_Q8_0 | FMT_F32, BM=1|8, [NO_SUBGROUPS]
+
+#ifndef NO_SUBGROUPS
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#endif
+
+#ifndef BM
+#define BM 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly  buffer SlabBuf  { uint  slab[]; };
+layout(set = 0, binding = 1)           buffer ActBuf   { float act[];  };
+layout(set = 0, binding = 2)           buffer StateBuf { float st[];   };
+layout(set = 0, binding = 3)           buffer KvBuf    { float kv[];   };
+layout(set = 0, binding = 4) readonly  buffer Xq8Buf   { int   xq8[];  };
+
+layout(push_constant) uniform PC {
+  uint p0, p1, p2, p3;
+  uint p4, p5, p6, p7;
+  uint p8, p9, p10, p11;
+  float f0, f1, f2, f3;
+} pc;
+
+#ifdef NO_SUBGROUPS
+shared float sm_red[128];
+#endif
+
+uint u8_at(uint bo) {
+  return (slab[bo >> 2u] >> ((bo & 3u) * 8u)) & 0xffu;
+}
+int s8_at(uint bo) {
+  uint sh = (3u - (bo & 3u)) * 8u;
+  return int(slab[bo >> 2u] << sh) >> 24;
+}
+float h2f_at(uint bo) {
+  uint u16 = u8_at(bo) | (u8_at(bo + 1u) << 8u);
+  return unpackHalf2x16(u16).x;
+}
+vec2 gsm4(uint j, uint sc_bo) {
+  if (j < 4u) return vec2(float(u8_at(sc_bo + j) & 63u), float(u8_at(sc_bo + j + 4u) & 63u));
+  uint b4 = u8_at(sc_bo + j + 4u);
+  uint sd = (b4 & 0xfu) | ((u8_at(sc_bo + j - 4u) >> 6u) << 4u);
+  uint sm = (b4 >> 4u)  | ((u8_at(sc_bo + j)      >> 6u) << 4u);
+  return vec2(float(sd), float(sm));
+}
+
+void main() {
+#ifdef NO_SUBGROUPS
+  uint sub = gl_LocalInvocationID.x >> 5u;
+  uint lane = gl_LocalInvocationID.x & 31u;
+  uint ssz = 32u;
+  uint row = pc.p4 + gl_WorkGroupID.x * 4u + sub;
+#else
+  uint lane = gl_SubgroupInvocationID;
+  uint ssz = gl_SubgroupSize;
+  uint row = pc.p4 + gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+#endif
+  uint tok0 = gl_WorkGroupID.y * uint(BM);
+  uint rows = pc.p0, cols = pc.p1, B = pc.p7;
+  bool valid_row = (row < rows && tok0 < B);
+  uint row_bo = pc.p3 + row * pc.p2;
+
+  float acc[BM];
+  for (uint t = 0u; t < uint(BM); t++) acc[t] = 0.0;
+
+  if (valid_row) {
+#if defined(FMT_Q4K)
+    uint nblk = cols >> 8u;
+    uint blk_start = (ssz >= 32u) ? (lane >> 5u) : 0u;
+    uint blk_step  = (ssz >= 32u) ? (ssz >> 5u)  : 1u;
+    uint l_base = lane & 31u;
+    uint l_step = (ssz >= 32u) ? 32u : ssz;
+    for (uint b = blk_start; b < nblk; b += blk_step) {
+      uint blk = row_bo + b * 144u;
+      float d = h2f_at(blk), dmin = h2f_at(blk + 2u);
+      uint sc_bo = blk + 4u, qs_bo = blk + 16u;
+      uint xb = b * 256u;
+      for (uint g = 0u; g < 4u; g++) {
+        vec2 p0 = gsm4(2u * g, sc_bo), p1 = gsm4(2u * g + 1u, sc_bo);
+        float d1 = d * p0.x, m1 = dmin * p0.y;
+        float d2 = d * p1.x, m2 = dmin * p1.y;
+        uint xg = xb + g * 64u;
+        for (uint l = l_base; l < 32u; l += l_step) {
+          uint qb = u8_at(qs_bo + g * 32u + l);
+          float w0 = d1 * float(qb & 0xfu) - m1;
+          float w1 = d2 * float(qb >> 4u)  - m2;
+          for (uint t = 0u; t < uint(BM); t++) {
+            uint tok = tok0 + t;
+            if (tok >= B) break;
+            uint xo = pc.p5 + tok * cols + xg + l;
+            acc[t] = fma(w0, act[xo], acc[t]);
+            acc[t] = fma(w1, act[xo + 32u], acc[t]);
+          }
+        }
+      }
+    }
+#elif defined(FMT_Q5K)
+    uint nblk = cols >> 8u;
+    uint blk_start = (ssz >= 32u) ? (lane >> 5u) : 0u;
+    uint blk_step  = (ssz >= 32u) ? (ssz >> 5u)  : 1u;
+    uint l_base = lane & 31u;
+    uint l_step = (ssz >= 32u) ? 32u : ssz;
+    for (uint b = blk_start; b < nblk; b += blk_step) {
+      uint blk = row_bo + b * 176u;
+      float d = h2f_at(blk), dmin = h2f_at(blk + 2u);
+      uint sc_bo = blk + 4u, qs_bo = blk + 48u;
+      uint xb = b * 256u;
+      for (uint l = l_base; l < 32u; l += l_step) {
+        uint qh = u8_at(blk + 16u + l);
+        for (uint g = 0u; g < 4u; g++) {
+          vec2 p0 = gsm4(2u * g, sc_bo), p1 = gsm4(2u * g + 1u, sc_bo);
+          float d1 = d * p0.x, m1 = dmin * p0.y;
+          float d2 = d * p1.x, m2 = dmin * p1.y;
+          uint qb = u8_at(qs_bo + g * 32u + l);
+          uint q0 = (qb & 0xfu) + (((qh >> (2u * g)) & 1u) << 4u);
+          uint q1 = (qb >> 4u)  + (((qh >> (2u * g + 1u)) & 1u) << 4u);
+          float w0 = d1 * float(q0) - m1;
+          float w1 = d2 * float(q1) - m2;
+          uint xg = xb + g * 64u + l;
+          for (uint t = 0u; t < uint(BM); t++) {
+            uint tok = tok0 + t;
+            if (tok >= B) break;
+            uint xo = pc.p5 + tok * cols + xg;
+            acc[t] = fma(w0, act[xo], acc[t]);
+            acc[t] = fma(w1, act[xo + 32u], acc[t]);
+          }
+        }
+      }
+    }
+#elif defined(FMT_Q6K)
+    uint nblk = cols >> 8u;
+    uint blk_start = (ssz >= 32u) ? (lane >> 5u) : 0u;
+    uint blk_step  = (ssz >= 32u) ? (ssz >> 5u)  : 1u;
+    uint l_base = lane & 31u;
+    uint l_step = (ssz >= 32u) ? 32u : ssz;
+    for (uint b = blk_start; b < nblk; b += blk_step) {
+      uint blk = row_bo + b * 210u;
+      float d = h2f_at(blk + 208u);
+      uint xb = b * 256u;
+      for (uint l = l_base; l < 32u; l += l_step) {
+        uint l_hi = l >> 4u;
+        for (uint half_i = 0u; half_i < 2u; half_i++) {
+          uint qlh = blk + half_i * 64u, qhh = blk + 128u + half_i * 32u, sch = blk + 192u + half_i * 8u;
+          uint ql0 = u8_at(qlh + l), ql1 = u8_at(qlh + 32u + l), qhv = u8_at(qhh + l);
+          float w0 = d * float(s8_at(sch + 0u + l_hi)) * float(int((ql0 & 0xfu) | ((qhv & 3u) << 4u)) - 32);
+          float w1 = d * float(s8_at(sch + 2u + l_hi)) * float(int((ql1 & 0xfu) | (((qhv >> 2u) & 3u) << 4u)) - 32);
+          float w2 = d * float(s8_at(sch + 4u + l_hi)) * float(int((ql0 >> 4u)  | (((qhv >> 4u) & 3u) << 4u)) - 32);
+          float w3 = d * float(s8_at(sch + 6u + l_hi)) * float(int((ql1 >> 4u)  | (((qhv >> 6u) & 3u) << 4u)) - 32);
+          uint xh = xb + half_i * 128u + l;
+          for (uint t = 0u; t < uint(BM); t++) {
+            uint tok = tok0 + t;
+            if (tok >= B) break;
+            uint xo = pc.p5 + tok * cols + xh;
+            acc[t] = fma(w0, act[xo + 0u],  acc[t]);
+            acc[t] = fma(w1, act[xo + 32u], acc[t]);
+            acc[t] = fma(w2, act[xo + 64u], acc[t]);
+            acc[t] = fma(w3, act[xo + 96u], acc[t]);
+          }
+        }
+      }
+    }
+#elif defined(FMT_Q8_0)
+    uint d_bo = row_bo + cols;
+    uint nblk = cols >> 5u;
+    uint blk_start = (ssz >= 32u) ? (lane >> 5u) : 0u;
+    uint blk_step  = (ssz >= 32u) ? (ssz >> 5u)  : 1u;
+    uint l_base = lane & 31u;
+    uint l_step = (ssz >= 32u) ? 32u : ssz;
+    for (uint b = blk_start; b < nblk; b += blk_step) {
+      float dd = h2f_at(d_bo + 2u * b);
+      for (uint l = l_base; l < 32u; l += l_step) {
+        float w = float(s8_at(row_bo + b * 32u + l)) * dd;
+        for (uint t = 0u; t < uint(BM); t++) {
+          uint tok = tok0 + t;
+          if (tok >= B) break;
+          acc[t] = fma(w, act[pc.p5 + tok * cols + b * 32u + l], acc[t]);
+        }
+      }
+    }
+#elif defined(FMT_F32)
+    uint w0 = row_bo >> 2u;
+    for (uint c = lane; c < cols; c += ssz) {
+      float wv = uintBitsToFloat(slab[w0 + c]);
+      for (uint t = 0u; t < uint(BM); t++) {
+        uint tok = tok0 + t;
+        if (tok >= B) break;
+        acc[t] = fma(wv, act[pc.p5 + tok * cols + c], acc[t]);
+      }
+    }
+#endif
+  }
+
+  for (uint t = 0u; t < uint(BM); t++) {
+    uint tok = tok0 + t;
+#ifdef NO_SUBGROUPS
+    uint base = sub * 32u;
+    sm_red[base + lane] = acc[t];
+    barrier();
+    if (lane < 16u) sm_red[base + lane] += sm_red[base + lane + 16u];
+    barrier();
+    if (lane < 8u)  sm_red[base + lane] += sm_red[base + lane + 8u];
+    barrier();
+    if (lane < 4u)  sm_red[base + lane] += sm_red[base + lane + 4u];
+    barrier();
+    if (lane == 0u && valid_row && tok < B) {
+      act[pc.p6 + tok * rows + row] = sm_red[base] + sm_red[base + 1u] + sm_red[base + 2u] + sm_red[base + 3u];
+    }
+    barrier();
+#else
+    if (!valid_row || tok >= B) continue;
+    float sum = subgroupAdd(acc[t]);
+    if (subgroupElect()) act[pc.p6 + tok * rows + row] = sum;
+#endif
+  }
+}

@@ -1,0 +1,331 @@
+#version 460
+// backends/vulkan/shaders/llm_gemv_dp4a.comp — High-Throughput Subgroup + DP4A (OpSDot) LLM GEMV & Prefill GEMM
+// Targets Vulkan 1.3 / SPIR-V 1.6 with GL_KHR_shader_subgroup_arithmetic + GL_EXT_integer_dot_product.
+// Supports BOTH NVIDIA wave32 (4 rows/WG) and AMD RDNA2/3/4 wave64 (2 rows/WG) natively via gl_SubgroupSize!
+// Macros:
+//   FMT_Q4K | FMT_Q5K | FMT_Q6K | FMT_Q8_0 | FMT_F32
+//   BM = 1 (decode GEMV) or BM = 8 (batched prefill GEMM, 8x weight reuse in registers!)
+// Push constants:
+//   p0=rows, p1=cols, p2=rb, p3=w_bo, p4=row_base, p5=x_off, p6=y_off, p7=B (total tokens)
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_integer_dot_product : enable
+
+#ifndef BM
+#define BM 1
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly  buffer SlabBuf  { uint  slab[]; };
+layout(set = 0, binding = 1)           buffer ActBuf   { float act[];  };
+layout(set = 0, binding = 2)           buffer StateBuf { float st[];   };
+layout(set = 0, binding = 3)           buffer KvBuf    { float kv[];   };
+layout(set = 0, binding = 4) readonly  buffer Xq8Buf   { int   xq8[];  };
+
+layout(push_constant) uniform PC {
+  uint p0, p1, p2, p3;
+  uint p4, p5, p6, p7;
+  uint p8, p9, p10, p11;
+  float f0, f1, f2, f3;
+} pc;
+
+uint u32_unaligned(uint bo) {
+  uint w = bo >> 2u;
+  uint s = (bo & 3u) * 8u;
+  if (s == 0u) return slab[w];
+  return (slab[w] >> s) | (slab[w + 1u] << (32u - s));
+}
+uint u8_at(uint bo) {
+  return (slab[bo >> 2u] >> ((bo & 3u) * 8u)) & 0xffu;
+}
+int s8_at(uint bo) {
+  uint sh = (3u - (bo & 3u)) * 8u;
+  return int(slab[bo >> 2u] << sh) >> 24;
+}
+float h2f_at(uint bo) {
+  uint u16 = u8_at(bo) | (u8_at(bo + 1u) << 8u);
+  return unpackHalf2x16(u16).x;
+}
+
+void main() {
+  uint row = pc.p4 + gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+  uint tok0 = gl_WorkGroupID.y * uint(BM);
+  uint rows = pc.p0;
+  uint cols = pc.p1;
+  uint B = pc.p7;
+  if (row >= rows || tok0 >= B) return;
+
+  uint lane = gl_SubgroupInvocationID;
+  uint ssz = gl_SubgroupSize;
+  uint row_bo = pc.p3 + row * pc.p2;
+
+  float acc[BM];
+  for (uint t = 0u; t < uint(BM); t++) acc[t] = 0.0;
+
+#if defined(FMT_Q4K)
+  // 144 bytes per 256-elem block (always 4-byte aligned when row_bo % 4 == 0).
+  // 32 lanes per block: g = l>>3 (0..3), k4 = l&7 (0..7) -> 1 coalesced u32 load = 4 low + 4 high nibbles!
+  uint nblk = cols >> 8u;
+  uint x_nb = cols >> 5u;
+  uint blk_start = (ssz >= 32u) ? (lane >> 5u) : 0u;
+  uint blk_step  = (ssz >= 32u) ? (ssz >> 5u)  : 1u;
+  uint l_base    = lane & 31u;
+  uint l_step    = (ssz >= 32u) ? 32u : ssz;
+
+  for (uint b = blk_start; b < nblk; b += blk_step) {
+    uint blk_w = (row_bo + b * 144u) >> 2u;
+    vec2 dm = unpackHalf2x16(slab[blk_w]);
+    float d = dm.x, dmin = dm.y;
+    uint sc0 = slab[blk_w + 1u];
+    uint sc1 = slab[blk_w + 2u];
+    uint sc2 = slab[blk_w + 3u];
+
+    for (uint l = l_base; l < 32u; l += l_step) {
+      uint g = l >> 3u;
+      uint k4 = l & 7u;
+      uint j0 = 2u * g;
+      uint j1 = j0 + 1u;
+      uint sd0, sm0, sd1, sm1;
+      if (g < 2u) {
+        sd0 = (sc0 >> (j0 * 8u)) & 63u;
+        sm0 = (sc1 >> (j0 * 8u)) & 63u;
+        sd1 = (sc0 >> (j1 * 8u)) & 63u;
+        sm1 = (sc1 >> (j1 * 8u)) & 63u;
+      } else {
+        uint sh0 = (j0 - 4u) * 8u;
+        uint sh1 = (j1 - 4u) * 8u;
+        uint b40 = (sc2 >> sh0) & 0xffu;
+        uint b41 = (sc2 >> sh1) & 0xffu;
+        sd0 = (b40 & 0xfu) | ((((sc0 >> sh0) & 0xffu) >> 6u) << 4u);
+        sm0 = (b40 >> 4u)  | ((((sc1 >> sh0) & 0xffu) >> 6u) << 4u);
+        sd1 = (b41 & 0xfu) | ((((sc0 >> sh1) & 0xffu) >> 6u) << 4u);
+        sm1 = (b41 >> 4u)  | ((((sc1 >> sh1) & 0xffu) >> 6u) << 4u);
+      }
+      float d1 = d * float(sd0), m1 = dmin * float(sm0);
+      float d2 = d * float(sd1), m2 = dmin * float(sm1);
+      uint w32 = slab[blk_w + 4u + l];
+      int q_lo = int(w32 & 0x0f0f0f0fu);
+      int q_hi = int((w32 >> 4u) & 0x0f0f0f0fu);
+
+      uint xblk0 = b * 8u + 2u * g;
+#if BM == 1
+      uint xb0 = xblk0 * 10u;
+      uint xb1 = xb0 + 10u;
+      int d_lo = dotPacked4x8EXT(q_lo, xq8[xb0 + k4]);
+      int d_hi = dotPacked4x8EXT(q_hi, xq8[xb1 + k4]);
+      float xd0 = intBitsToFloat(xq8[xb0 + 8u]);
+      float xd1 = intBitsToFloat(xq8[xb1 + 8u]);
+      acc[0] = fma(d1 * xd0, float(d_lo), acc[0]);
+      acc[0] = fma(d2 * xd1, float(d_hi), acc[0]);
+      if (k4 == 0u) {
+        acc[0] = fma(-m1, intBitsToFloat(xq8[xb0 + 9u]), acc[0]);
+        acc[0] = fma(-m2, intBitsToFloat(xq8[xb1 + 9u]), acc[0]);
+      }
+#else
+      for (uint t = 0u; t < uint(BM); t++) {
+        uint tok = tok0 + t;
+        if (tok >= B) break;
+        uint xb0 = (tok * x_nb + xblk0) * 10u;
+        uint xb1 = xb0 + 10u;
+        int d_lo = dotPacked4x8EXT(q_lo, xq8[xb0 + k4]);
+        int d_hi = dotPacked4x8EXT(q_hi, xq8[xb1 + k4]);
+        float xd0 = intBitsToFloat(xq8[xb0 + 8u]);
+        float xd1 = intBitsToFloat(xq8[xb1 + 8u]);
+        acc[t] = fma(d1 * xd0, float(d_lo), acc[t]);
+        acc[t] = fma(d2 * xd1, float(d_hi), acc[t]);
+        if (k4 == 0u) {
+          acc[t] = fma(-m1, intBitsToFloat(xq8[xb0 + 9u]), acc[t]);
+          acc[t] = fma(-m2, intBitsToFloat(xq8[xb1 + 9u]), acc[t]);
+        }
+      }
+#endif
+    }
+  }
+
+#elif defined(FMT_Q5K)
+  // 176 bytes per 256-elem block (44 u32 words, 4-byte aligned)
+  uint nblk = cols >> 8u;
+  uint x_nb = cols >> 5u;
+  uint blk_start = (ssz >= 32u) ? (lane >> 5u) : 0u;
+  uint blk_step  = (ssz >= 32u) ? (ssz >> 5u)  : 1u;
+  uint l_base    = lane & 31u;
+  uint l_step    = (ssz >= 32u) ? 32u : ssz;
+
+  for (uint b = blk_start; b < nblk; b += blk_step) {
+    uint blk_w = (row_bo + b * 176u) >> 2u;
+    vec2 dm = unpackHalf2x16(slab[blk_w]);
+    float d = dm.x, dmin = dm.y;
+    uint sc0 = slab[blk_w + 1u];
+    uint sc1 = slab[blk_w + 2u];
+    uint sc2 = slab[blk_w + 3u];
+
+    for (uint l = l_base; l < 32u; l += l_step) {
+      uint g = l >> 3u;
+      uint k4 = l & 7u;
+      uint j0 = 2u * g;
+      uint j1 = j0 + 1u;
+      uint sd0, sm0, sd1, sm1;
+      if (g < 2u) {
+        sd0 = (sc0 >> (j0 * 8u)) & 63u;
+        sm0 = (sc1 >> (j0 * 8u)) & 63u;
+        sd1 = (sc0 >> (j1 * 8u)) & 63u;
+        sm1 = (sc1 >> (j1 * 8u)) & 63u;
+      } else {
+        uint sh0 = (j0 - 4u) * 8u;
+        uint sh1 = (j1 - 4u) * 8u;
+        uint b40 = (sc2 >> sh0) & 0xffu;
+        uint b41 = (sc2 >> sh1) & 0xffu;
+        sd0 = (b40 & 0xfu) | ((((sc0 >> sh0) & 0xffu) >> 6u) << 4u);
+        sm0 = (b40 >> 4u)  | ((((sc1 >> sh0) & 0xffu) >> 6u) << 4u);
+        sd1 = (b41 & 0xfu) | ((((sc0 >> sh1) & 0xffu) >> 6u) << 4u);
+        sm1 = (b41 >> 4u)  | ((((sc1 >> sh1) & 0xffu) >> 6u) << 4u);
+      }
+      float d1 = d * float(sd0), m1 = dmin * float(sm0);
+      float d2 = d * float(sd1), m2 = dmin * float(sm1);
+      uint qh32 = slab[blk_w + 4u + k4];
+      uint w32  = slab[blk_w + 12u + l];
+      uint hb0 = ((qh32 >> j0) & 0x01010101u) << 4u;
+      uint hb1 = ((qh32 >> j1) & 0x01010101u) << 4u;
+      int q_lo = int((w32 & 0x0f0f0f0fu) | hb0);
+      int q_hi = int(((w32 >> 4u) & 0x0f0f0f0fu) | hb1);
+
+      uint xblk0 = b * 8u + 2u * g;
+#if BM == 1
+      uint xb0 = xblk0 * 10u;
+      uint xb1 = xb0 + 10u;
+      int d_lo = dotPacked4x8EXT(q_lo, xq8[xb0 + k4]);
+      int d_hi = dotPacked4x8EXT(q_hi, xq8[xb1 + k4]);
+      float xd0 = intBitsToFloat(xq8[xb0 + 8u]);
+      float xd1 = intBitsToFloat(xq8[xb1 + 8u]);
+      acc[0] = fma(d1 * xd0, float(d_lo), acc[0]);
+      acc[0] = fma(d2 * xd1, float(d_hi), acc[0]);
+      if (k4 == 0u) {
+        acc[0] = fma(-m1, intBitsToFloat(xq8[xb0 + 9u]), acc[0]);
+        acc[0] = fma(-m2, intBitsToFloat(xq8[xb1 + 9u]), acc[0]);
+      }
+#else
+      for (uint t = 0u; t < uint(BM); t++) {
+        uint tok = tok0 + t;
+        if (tok >= B) break;
+        uint xb0 = (tok * x_nb + xblk0) * 10u;
+        uint xb1 = xb0 + 10u;
+        int d_lo = dotPacked4x8EXT(q_lo, xq8[xb0 + k4]);
+        int d_hi = dotPacked4x8EXT(q_hi, xq8[xb1 + k4]);
+        float xd0 = intBitsToFloat(xq8[xb0 + 8u]);
+        float xd1 = intBitsToFloat(xq8[xb1 + 8u]);
+        acc[t] = fma(d1 * xd0, float(d_lo), acc[t]);
+        acc[t] = fma(d2 * xd1, float(d_hi), acc[t]);
+        if (k4 == 0u) {
+          acc[t] = fma(-m1, intBitsToFloat(xq8[xb0 + 9u]), acc[t]);
+          acc[t] = fma(-m2, intBitsToFloat(xq8[xb1 + 9u]), acc[t]);
+        }
+      }
+#endif
+    }
+  }
+
+#elif defined(FMT_Q6K)
+  // 210 bytes per 256-elem block (2-byte aligned, NOT 4-byte!).
+  // 32 lanes per block: half_i = l>>4 (0..1), qd_pair = (l>>3)&1 (0..1 -> qd=0,2 or 1,3), k4 = l&7 (0..7).
+  // Actually cleaner: half_i = l>>4 (0..1), sub16 = (l>>2)&3 (0..3? no: 2 halves * 16 chunks of 4 = 32 lanes!).
+  // Each lane handles 2 qd's (lo nibble & hi nibble of 4 consecutive bytes = 8 elements per lane -> 32*8 = 256!).
+  uint nblk = cols >> 8u;
+  uint x_nb = cols >> 5u;
+  uint blk_start = (ssz >= 32u) ? (lane >> 5u) : 0u;
+  uint blk_step  = (ssz >= 32u) ? (ssz >> 5u)  : 1u;
+  uint l_base    = lane & 31u;
+  uint l_step    = (ssz >= 32u) ? 32u : ssz;
+
+  for (uint b = blk_start; b < nblk; b += blk_step) {
+    uint blk = row_bo + b * 210u;
+    float d = h2f_at(blk + 208u);
+    for (uint l = l_base; l < 32u; l += l_step) {
+      uint half_i = l >> 4u;       // 0..1
+      uint q_sel  = (l >> 3u) & 1u;// 0 -> qd in {0,2}; 1 -> qd in {1,3}
+      uint k4     = l & 7u;        // 0..7 (groups of 4 within 32)
+      uint l_hi   = k4 >> 2u;      // 0 for elems 0..15, 1 for elems 16..31
+
+      uint qlw = u32_unaligned(blk + half_i * 64u + q_sel * 32u + k4 * 4u);
+      uint qhw = u32_unaligned(blk + 128u + half_i * 32u + k4 * 4u);
+
+      uint qd_a = q_sel;           // 0 or 1 (low nibble)
+      uint qd_b = q_sel + 2u;      // 2 or 3 (high nibble)
+      uint h_a = ((qhw >> (2u * qd_a)) & 0x03030303u) << 4u;
+      uint h_b = ((qhw >> (2u * qd_b)) & 0x03030303u) << 4u;
+      int raw_a = int((qlw & 0x0f0f0f0fu) | h_a);        // 4 unsigned values in 0..63
+      int raw_b = int(((qlw >> 4u) & 0x0f0f0f0fu) | h_b);// 4 unsigned values in 0..63
+
+      float sa = d * float(s8_at(blk + 192u + half_i * 8u + 2u * qd_a + l_hi));
+      float sb = d * float(s8_at(blk + 192u + half_i * 8u + 2u * qd_b + l_hi));
+
+      uint xblk_a = b * 8u + half_i * 4u + qd_a;
+      uint xblk_b = b * 8u + half_i * 4u + qd_b;
+#if BM == 1
+      uint xba = xblk_a * 10u;
+      uint xbb = xblk_b * 10u;
+      int xqa = xq8[xba + k4];
+      int xqb = xq8[xbb + k4];
+      int da = dotPacked4x8EXT(raw_a, xqa) - 32 * dotPacked4x8EXT(0x01010101, xqa);
+      int db = dotPacked4x8EXT(raw_b, xqb) - 32 * dotPacked4x8EXT(0x01010101, xqb);
+      acc[0] = fma(sa * intBitsToFloat(xq8[xba + 8u]), float(da), acc[0]);
+      acc[0] = fma(sb * intBitsToFloat(xq8[xbb + 8u]), float(db), acc[0]);
+#else
+      for (uint t = 0u; t < uint(BM); t++) {
+        uint tok = tok0 + t;
+        if (tok >= B) break;
+        uint xba = (tok * x_nb + xblk_a) * 10u;
+        uint xbb = (tok * x_nb + xblk_b) * 10u;
+        int xqa = xq8[xba + k4];
+        int xqb = xq8[xbb + k4];
+        int da = dotPacked4x8EXT(raw_a, xqa) - 32 * dotPacked4x8EXT(0x01010101, xqa);
+        int db = dotPacked4x8EXT(raw_b, xqb) - 32 * dotPacked4x8EXT(0x01010101, xqb);
+        acc[t] = fma(sa * intBitsToFloat(xq8[xba + 8u]), float(da), acc[t]);
+        acc[t] = fma(sb * intBitsToFloat(xq8[xbb + 8u]), float(db), acc[t]);
+      }
+#endif
+    }
+  }
+
+#elif defined(FMT_Q8_0)
+  // Row-split planar layout: q[0..cols-1] then f16 d[0..cols/32-1].
+  // 8 lanes per 32-elem block -> 4 blocks in parallel per 32 lanes (8 blocks on wave64)!
+  uint nblk = cols >> 5u;
+  uint d_bo = row_bo + cols;
+  uint n4 = cols >> 2u; // total u32 words of int8 weights per row
+  for (uint wi = lane; wi < n4; wi += ssz) {
+    uint b = wi >> 3u;
+    uint k4 = wi & 7u;
+    int w4 = int(u32_unaligned(row_bo + wi * 4u));
+    float dd = h2f_at(d_bo + 2u * b);
+    for (uint t = 0u; t < uint(BM); t++) {
+      uint tok = tok0 + t;
+      if (tok >= B) break;
+      uint xb = (tok * nblk + b) * 10u;
+      int dp = dotPacked4x8EXT(w4, xq8[xb + k4]);
+      acc[t] = fma(dd * intBitsToFloat(xq8[xb + 8u]), float(dp), acc[t]);
+    }
+  }
+
+#elif defined(FMT_F32)
+  uint w0 = row_bo >> 2u;
+  for (uint c = lane; c < cols; c += ssz) {
+    float wv = uintBitsToFloat(slab[w0 + c]);
+    for (uint t = 0u; t < uint(BM); t++) {
+      uint tok = tok0 + t;
+      if (tok >= B) break;
+      acc[t] = fma(wv, act[pc.p5 + tok * cols + c], acc[t]);
+    }
+  }
+#endif
+
+  for (uint t = 0u; t < uint(BM); t++) {
+    uint tok = tok0 + t;
+    if (tok >= B) break;
+    float sum = subgroupAdd(acc[t]);
+    if (subgroupElect()) {
+      act[pc.p6 + tok * rows + row] = sum;
+    }
+  }
+}

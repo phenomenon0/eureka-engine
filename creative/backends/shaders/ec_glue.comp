@@ -1,0 +1,650 @@
+#version 460
+// creative/backends/shaders/ec_glue.comp — Portable Vulkan 1.2 (SPIR-V 1.3) GPU-Resident Creative Glue Shaders (T3)
+// Eliminates mid-step PCIe syncs in FLUX.2 (Text Encoder + DiT + 2D VAE) and ec-bench.
+// Matches ec_backend_vulkan.c 7-binding layout:
+//   binding 0: UBO Params (ec_vk_params_t)
+//   binding 1: b_in0  (uint32 array, readonly)
+//   binding 2: b_in1  (uint32 array, readonly)
+//   binding 3: b_in2  (float  array, readonly)
+//   binding 4: b_in3  (float  array, readonly)
+//   binding 5: b_out0 (float  array, read_write)
+//   binding 6: b_out1 (uint32 array, read_write)
+
+layout(set = 0, binding = 0) uniform Params {
+  uint p0, p1, p2, p3;
+  uint p4, p5, p6, p7;
+  uint o0, o1, o2, o3;
+  uint o4, o5, pad0, pad1;
+  float f0, f1, f2, f3;
+} u;
+
+layout(set = 0, binding = 1) readonly  buffer In0  { uint  b_in0[];  };
+layout(set = 0, binding = 2) readonly  buffer In1  { uint  b_in1[];  };
+layout(set = 0, binding = 3) readonly  buffer In2  { float b_in2[];  };
+layout(set = 0, binding = 4) readonly  buffer In3  { float b_in3[];  };
+layout(set = 0, binding = 5)           buffer Out0 { float b_out0[]; };
+layout(set = 0, binding = 6)           buffer Out1 { uint  b_out1[]; };
+
+uint f32_to_bf16_u16(float v) {
+  uint bits = floatBitsToUint(v);
+  uint lsb = (bits >> 16u) & 1u;
+  bits = bits + 0x7fffu + lsb;
+  return (bits >> 16u) & 0xffffu;
+}
+float bf16_u16_to_f32(uint h) {
+  return uintBitsToFloat(h << 16u);
+}
+float bf16_at_in0(uint elem_idx) {
+  uint g = u.o0 + elem_idx;
+  uint w = b_in0[g >> 1u];
+  return ((g & 1u) != 0u) ? uintBitsToFloat(w & 0xffff0000u) : uintBitsToFloat(w << 16u);
+}
+float bf16_at_in1(uint elem_idx) {
+  uint g = u.o1 + elem_idx;
+  uint w = b_in1[g >> 1u];
+  return ((g & 1u) != 0u) ? uintBitsToFloat(w & 0xffff0000u) : uintBitsToFloat(w << 16u);
+}
+float bf16_at_out1(uint elem_idx) {
+  uint g = u.o5 + elem_idx;
+  uint w = b_out1[g >> 1u];
+  return ((g & 1u) != 0u) ? uintBitsToFloat(w & 0xffff0000u) : uintBitsToFloat(w << 16u);
+}
+float f32_at_in0(uint idx) { return uintBitsToFloat(b_in0[u.o0 + idx]); }
+float f32_at_in1(uint idx) { return uintBitsToFloat(b_in1[u.o1 + idx]); }
+float silu_f(float x) { return x / (1.0 + exp(-x)); }
+
+// =========================================================================
+// 1. OP_NORM_ADALN: Unified RMSNorm / LayerNorm (+ optional w, b, scale, shift) -> F32 and/or BF16x2/F16x2
+//    p0=rows, p1=dim, p2=mode (0=RMSNorm, 1=LayerNorm),
+//    p3=flags: bit0=has_w(b_in1), bit1=has_scale(b_in2), bit2=has_shift(b_in3),
+//              bit3=write_f32(b_out0), bit4=write_bf16(b_out1), bit5=write_f16(b_out1), bit6=apply_silu
+//    p4=has_bias_in_w_half (if set: b_in1[0..dim-1]=w, b_in1[dim..2*dim-1]=b? No: pass w/b only when both null or use separate!)
+//    f0=eps
+//    Bindings: b_in0=x(f32), b_in1=w(f32), b_in2=scale(f32), b_in3=shift(f32), b_out0=y_f32, b_out1=y_16(u32 pairs)
+//    Note: assumes dim is even when write_bf16 or write_f16 is set!
+//    Grid: (rows, 1, 1), local_size_x = 256
+// =========================================================================
+#ifdef OP_NORM_ADALN
+layout(local_size_x = 256) in;
+shared float sm1[256];
+shared float sm2[256];
+void main() {
+  uint r = u.pad0 + gl_WorkGroupID.x;
+  if (r >= u.p0) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint dim = u.p1;
+  uint mode = u.p2;
+  uint fl = u.p3;
+  uint xb = r * dim;
+
+  float s1 = 0.0, s2 = 0.0;
+  for (uint c = lid; c < dim; c += 256u) {
+    float v = f32_at_in0(xb + c);
+    s1 += v;
+    s2 += v * v;
+  }
+  sm1[lid] = s1;
+  sm2[lid] = s2;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) { sm1[lid] += sm1[lid + s]; sm2[lid] += sm2[lid + s]; }
+    barrier();
+  }
+  float mean = (mode == 1u) ? (sm1[0] / float(dim)) : 0.0;
+  float var = (mode == 1u) ? max(0.0, sm2[0] / float(dim) - mean * mean) : (sm2[0] / float(dim));
+  float inv = inversesqrt(var + u.f0);
+
+  bool has_w   = (fl & 1u) != 0u;
+  bool has_sc  = (fl & 2u) != 0u;
+  bool has_sh  = (fl & 4u) != 0u;
+  bool wr_f32  = (fl & 8u) != 0u;
+  bool wr_bf16 = (fl & 16u) != 0u;
+  bool wr_f16  = (fl & 32u) != 0u;
+  bool do_silu = (fl & 64u) != 0u;
+
+  if (wr_bf16 || wr_f16) {
+    uint half_d = dim >> 1u;
+    for (uint p = lid; p < half_d; p += 256u) {
+      uint c0 = p * 2u, c1 = c0 + 1u;
+      float v0 = (f32_at_in0(xb + c0) - mean) * inv;
+      float v1 = (f32_at_in0(xb + c1) - mean) * inv;
+      if (has_w)  { v0 *= f32_at_in1(c0); v1 *= f32_at_in1(c1); }
+      if (has_sc) { v0 *= (1.0 + b_in2[u.o2 + c0]); v1 *= (1.0 + b_in2[u.o2 + c1]); }
+      if (has_sh) { v0 += b_in3[u.o3 + c0]; v1 += b_in3[u.o3 + c1]; }
+      if (do_silu){ v0 = silu_f(v0); v1 = silu_f(v1); }
+      if (wr_f32) { b_out0[u.o4 + xb + c0] = v0; b_out0[u.o4 + xb + c1] = v1; }
+      uint packed = wr_bf16
+        ? (f32_to_bf16_u16(v0) | (f32_to_bf16_u16(v1) << 16u))
+        : packHalf2x16(vec2(v0, v1));
+      b_out1[u.o5 + (xb >> 1u) + p] = packed;
+    }
+  } else if (wr_f32) {
+    for (uint c = lid; c < dim; c += 256u) {
+      float v = (f32_at_in0(xb + c) - mean) * inv;
+      if (has_w)  v *= f32_at_in1(c);
+      if (has_sc) v *= (1.0 + b_in2[u.o2 + c]);
+      if (has_sh) v += b_in3[u.o3 + c];
+      if (do_silu) v = silu_f(v);
+      b_out0[u.o4 + xb + c] = v;
+    }
+  }
+}
+#endif
+
+// =========================================================================
+// 2. OP_GATED_RES: x[r*dim + c] += gate[c] * h[r*dim + c]
+//    p0=n_rows, p1=dim
+//    Bindings: b_in2=h(f32), b_in3=gate(f32), b_out0=x(f32, rw)
+//    Grid: (ceil(n_rows*dim/256), 1, 1)
+// =========================================================================
+#ifdef OP_GATED_RES
+layout(local_size_x = 256) in;
+void main() {
+  uint idx = (u.pad0 + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+  uint tot = u.p0 * u.p1;
+  if (idx >= tot) return;
+  uint c = idx % u.p1;
+  b_out0[u.o4 + idx] += b_in3[u.o3 + c] * b_in2[u.o2 + idx];
+}
+#endif
+
+// =========================================================================
+// 3. OP_ELEMWISE: Fast 1D elementwise ops (zero PCIe sync!)
+//    p0 = count (elements or pairs), p1 = op:
+//      0: add_inplace:      b_out0[i] += b_in2[i]
+//      1: silu_f32_to_bf16: b_out1[p] = bf16x2(silu(b_in2[2p]), silu(b_in2[2p+1]))  (p0=n_elems, even)
+//      2: swiglu_mul:       b_out0[i] = silu(b_in2[i]) * b_in3[i]  (p2=1: also write f16x2 to b_out1)
+//      3: swiglu_pair_bf16: b_out1[p] = bf16x2(silu(b_in2[2p])*b_in3[2p], ...)
+//      4: flux2_swiglu_bf16: p2=F; b_in2 is [N, 2*F], b_out1 is [N, F] bf16x2
+//      5: flow_cfg_euler:   p2=has_uncond, f0=dt, f1=cfg_scale;
+//                           b_in0=x(f32), b_in2=v_cond(f32), b_in3=v_uncond(f32), b_out0=x_next(f32)
+//      6: dequant_q8g64_bf16: b_in0=q8(u32 packed 4xs8), b_in2=sc(f32), b_out1=bf16x2 (p0=total_elems/2)
+// =========================================================================
+#ifdef OP_ELEMWISE
+layout(local_size_x = 256) in;
+void main() {
+  uint tid = (u.pad0 + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+  uint op = u.p1;
+  if (op == 0u) {
+    if (tid >= u.p0) return;
+    b_out0[u.o4 + tid] += b_in2[u.o2 + tid];
+  } else if (op == 1u) {
+    uint pairs = u.p0 >> 1u;
+    if (tid >= pairs) return;
+    float a = silu_f(b_in2[u.o2 + tid * 2u]);
+    float b = silu_f(b_in2[u.o2 + tid * 2u + 1u]);
+    b_out1[u.o5 + tid] = f32_to_bf16_u16(a) | (f32_to_bf16_u16(b) << 16u);
+  } else if (op == 2u) {
+    if (u.p2 == 0u) {
+      if (tid >= u.p0) return;
+      b_out0[u.o4 + tid] = silu_f(b_in2[u.o2 + tid]) * b_in3[u.o3 + tid];
+    } else {
+      uint pairs = u.p0 >> 1u;
+      if (tid >= pairs) return;
+      uint i0 = tid * 2u, i1 = i0 + 1u;
+      float v0 = silu_f(b_in2[u.o2 + i0]) * b_in3[u.o3 + i0];
+      float v1 = silu_f(b_in2[u.o2 + i1]) * b_in3[u.o3 + i1];
+      b_out0[u.o4 + i0] = v0;
+      b_out0[u.o4 + i1] = v1;
+      b_out1[u.o5 + tid] = packHalf2x16(vec2(v0, v1));
+    }
+  } else if (op == 3u) {
+    uint pairs = u.p0 >> 1u;
+    if (tid >= pairs) return;
+    uint i0 = tid * 2u, i1 = i0 + 1u;
+    float v0 = silu_f(b_in2[u.o2 + i0]) * b_in3[u.o3 + i0];
+    float v1 = silu_f(b_in2[u.o2 + i1]) * b_in3[u.o3 + i1];
+    b_out1[u.o5 + tid] = f32_to_bf16_u16(v0) | (f32_to_bf16_u16(v1) << 16u);
+  } else if (op == 4u) {
+    uint F = u.p2;
+    uint half_f = F >> 1u;
+    uint pairs = u.p0; // N * (F/2)
+    if (tid >= pairs) return;
+    uint t = tid / half_f;
+    uint c0 = (tid - t * half_f) * 2u;
+    uint row = u.o2 + t * (2u * F);
+    float v0 = silu_f(b_in2[row + c0])      * b_in2[row + F + c0];
+    float v1 = silu_f(b_in2[row + c0 + 1u]) * b_in2[row + F + c0 + 1u];
+    b_out1[u.o5 + tid] = f32_to_bf16_u16(v0) | (f32_to_bf16_u16(v1) << 16u);
+  } else if (op == 5u) {
+    if (tid >= u.p0) return;
+    float vc = b_in2[u.o2 + tid];
+    float v = (u.p2 != 0u) ? (b_in3[u.o3 + tid] + u.f1 * (vc - b_in3[u.o3 + tid])) : vc;
+    b_out0[u.o4 + tid] = f32_at_in0(tid) + u.f0 * v;
+  } else if (op == 6u) {
+    if (tid >= u.p0) return; // p0 = total_elems / 2 (pairs)
+    uint g = tid >> 5u;      // 32 pairs = 64 elems per group
+    float sc = b_in2[u.o2 + g];
+    uint elem = tid * 2u;
+    uint bo = u.o0 + elem;
+    uint w = b_in0[bo >> 2u];
+    uint sh0 = (3u - (bo & 3u)) * 8u;
+    uint sh1 = (3u - ((bo + 1u) & 3u)) * 8u;
+    float a = float(int(w << sh0) >> 24) * sc;
+    float b = float(int(w << sh1) >> 24) * sc;
+    b_out1[u.o5 + tid] = f32_to_bf16_u16(a) | (f32_to_bf16_u16(b) << 16u);
+  }
+}
+#endif
+
+// =========================================================================
+// 4. OP_FLUX2_PACK_QKV_ROPE: One component (Q=0, K=1, V=2) per dispatch into [H, n_pad, D] FP16x2
+//    Doing Q, K, V as 3 tiny back-to-back dispatches in the same command buffer uses the exact 7-binding layout!
+//    p0=n_tok, p1=tok_off, p2=n_pad, p3=H, p4=D, p5=row_stride, p6=mode (0=Q, 1=K, 2=V)
+//    f0=eps
+//    Bindings: b_in0=qkv(f32), b_in1=norm_w(f32, unused for V), b_in2=rope_cos, b_in3=rope_sin, b_out1=out_f16x2(u32)
+//    Grid: (n_tok * H, 1, 1), local_size_x = 128 (supports D=64 or D=128)
+// =========================================================================
+#ifdef OP_FLUX2_PACK_QKV_ROPE
+layout(local_size_x = 128) in;
+shared float sm[128];
+shared float xbuf[128];
+void main() {
+  uint pair = u.pad0 + gl_WorkGroupID.x;
+  uint n_tok = u.p0, tok_off = u.p1, n_pad = u.p2, H = u.p3, D = u.p4, stride = u.p5, mode = u.p6;
+  if (pair >= n_tok * H) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint h = pair % H;
+  uint t = pair / H;
+  uint E = H * D;
+  uint src = t * stride + mode * E + h * D;
+  uint gtok = tok_off + t;
+  uint out_base_u32 = ((h * n_pad + gtok) * D) >> 1u;
+
+  if (mode == 2u) {
+    uint half_d = D >> 1u;
+    if (lid < half_d) {
+      float v0 = clamp(f32_at_in0(src + 2u * lid),      -65000.0, 65000.0);
+      float v1 = clamp(f32_at_in0(src + 2u * lid + 1u), -65000.0, 65000.0);
+      b_out1[u.o5 + out_base_u32 + lid] = packHalf2x16(vec2(v0, v1));
+    }
+    return;
+  }
+
+  float v = (lid < D) ? f32_at_in0(src + lid) : 0.0;
+  sm[lid] = v * v;
+  barrier();
+  for (uint s = 64u; s > 0u; s >>= 1u) {
+    if (lid < s) sm[lid] += sm[lid + s];
+    barrier();
+  }
+  float inv = inversesqrt(sm[0] / float(D) + u.f0);
+  if (lid < D) xbuf[lid] = v * inv * f32_at_in1(lid);
+  barrier();
+
+  uint half_d = D >> 1u;
+  if (lid < half_d) {
+    float a = xbuf[2u * lid];
+    float b = xbuf[2u * lid + 1u];
+    float cs = b_in2[u.o2 + gtok * half_d + lid];
+    float sn = b_in3[u.o3 + gtok * half_d + lid];
+    float o0 = clamp(a * cs - b * sn, -65000.0, 65000.0);
+    float o1 = clamp(a * sn + b * cs, -65000.0, 65000.0);
+    b_out1[u.o5 + out_base_u32 + lid] = packHalf2x16(vec2(o0, o1));
+  }
+}
+#endif
+
+// =========================================================================
+// 5. OP_FLUX2_SINGLE_CAT_Q8G64: Concat [attn_out(E), silu(lin1[3E..3E+F])*lin1[3E+F..3E+2F]] -> Q8_G64
+//    p0=N_tot, p1=E, p2=F
+//    Bindings: b_in2=attn_out(f32), b_in3=lin1(f32), b_out0=dst_sc(f32), b_out1=dst_q8(u32 packed 4xs8)
+//    Grid: (N_tot * ((E+F)/64), 1, 1), local_size_x = 64 (1 thread per element of the 64-elem group!)
+// =========================================================================
+#ifdef OP_FLUX2_SINGLE_CAT_Q8G64
+layout(local_size_x = 64) in;
+shared float sm_v[64];
+shared float sm_a[64];
+shared uint  sm_q[64];
+void main() {
+  uint g = u.pad0 + gl_WorkGroupID.x;
+  uint N_tot = u.p0, E = u.p1, F = u.p2;
+  uint stride_out = E + F;
+  uint gpr = stride_out >> 6u;
+  if (g >= N_tot * gpr) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint t = g / gpr;
+  uint c = (g - t * gpr) * 64u + lid;
+  float v;
+  if (c < E) {
+    v = b_in2[u.o2 + t * E + c];
+  } else {
+    uint fc = c - E;
+    uint row = u.o3 + t * (3u * E + 2u * F) + 3u * E;
+    v = silu_f(b_in3[row + fc]) * b_in3[row + F + fc];
+  }
+  // Exact BF16 round parity with ec_port_k_flux2_single_cat_q8g64
+  v = bf16_u16_to_f32(f32_to_bf16_u16(v));
+  sm_v[lid] = v;
+  sm_a[lid] = abs(v);
+  barrier();
+  for (uint s = 32u; s > 0u; s >>= 1u) {
+    if (lid < s) sm_a[lid] = max(sm_a[lid], sm_a[lid + s]);
+    barrier();
+  }
+  float amax = sm_a[0];
+  float sc = amax / 127.0;
+  float inv = (amax > 1e-30) ? (127.0 / amax) : 0.0;
+  int q = clamp(int(roundEven(sm_v[lid] * inv)), -127, 127);
+  sm_q[lid] = uint(q) & 0xffu;
+  barrier();
+  if (lid == 0u) b_out0[u.o4 + g] = sc;
+  if (lid < 16u) {
+    uint i = lid * 4u;
+    b_out1[u.o5 + g * 16u + lid] = sm_q[i] | (sm_q[i + 1u] << 8u) | (sm_q[i + 2u] << 16u) | (sm_q[i + 3u] << 24u);
+  }
+}
+#endif
+
+// =========================================================================
+// 6. OP_NHWC_GN_STATS: Compute 32-group sum & sumsq for NHWC [M, C] F32 -> stats64[0..63]
+//    p0=M, p1=C
+//    Bindings: b_in2=x_nhwc(f32), b_out0=stats64(f32)
+//    Grid: (32, 1, 1), local_size_x = 256
+// =========================================================================
+#ifdef OP_NHWC_GN_STATS
+layout(local_size_x = 256) in;
+shared float sm1[256];
+shared float sm2[256];
+void main() {
+  uint grp = gl_WorkGroupID.x;
+  if (grp >= 32u) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint M = u.p0, C = u.p1;
+  uint gc = C >> 5u;
+  uint c0 = grp * gc;
+  uint tot = M * gc;
+  float s1 = 0.0, s2 = 0.0;
+  for (uint i = lid; i < tot; i += 256u) {
+    uint m = i / gc;
+    uint dc = i - m * gc;
+    float v = b_in2[u.o2 + m * C + c0 + dc];
+    s1 += v;
+    s2 += v * v;
+  }
+  sm1[lid] = s1;
+  sm2[lid] = s2;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) { sm1[lid] += sm1[lid + s]; sm2[lid] += sm2[lid + s]; }
+    barrier();
+  }
+  if (lid == 0u) {
+    b_out0[u.o4 + grp] = sm1[0];
+    b_out0[u.o4 + 32u + grp] = sm2[0];
+  }
+}
+#endif
+
+// =========================================================================
+// 7. OP_NHWC_GN_APPLY_BF16: Apply 32-group GroupNorm (+ optional SiLU) -> NHWC BF16x2
+//    p0=M, p1=C, p2=apply_silu, f0=eps
+//    Bindings: b_in0=x_nhwc(f32), b_in1=stats64(f32), b_in2=gamma(f32), b_in3=beta(f32), b_out1=y_bf16x2(u32)
+//    Grid: (ceil((M*C/2)/256), 1, 1)
+// =========================================================================
+#ifdef OP_NHWC_GN_APPLY_BF16
+layout(local_size_x = 256) in;
+void main() {
+  uint pair = (u.pad0 + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+  uint M = u.p0, C = u.p1;
+  uint tot_pairs = (M * C) >> 1u;
+  if (pair >= tot_pairs) return;
+  uint gc = C >> 5u;
+  float inv_n = 1.0 / (float(M) * float(gc));
+  uint i0 = pair * 2u, i1 = i0 + 1u;
+  uint c0 = i0 % C, c1 = i1 % C;
+  uint g0 = c0 / gc, g1 = c1 / gc;
+
+  float m0 = f32_at_in1(g0) * inv_n;
+  float r0 = inversesqrt(max(0.0, f32_at_in1(32u + g0) * inv_n - m0 * m0) + u.f0);
+  float m1 = (g1 == g0) ? m0 : (f32_at_in1(g1) * inv_n);
+  float r1 = (g1 == g0) ? r0 : inversesqrt(max(0.0, f32_at_in1(32u + g1) * inv_n - m1 * m1) + u.f0);
+
+  float v0 = (f32_at_in0(i0) - m0) * r0 * b_in2[u.o2 + c0] + b_in3[u.o3 + c0];
+  float v1 = (f32_at_in0(i1) - m1) * r1 * b_in2[u.o2 + c1] + b_in3[u.o3 + c1];
+  if (u.p2 != 0u) { v0 = silu_f(v0); v1 = silu_f(v1); }
+  b_out1[u.o5 + pair] = f32_to_bf16_u16(v0) | (f32_to_bf16_u16(v1) << 16u);
+}
+#endif
+
+// =========================================================================
+// 8. OP_UPSAMPLE2X_NHWC_BF16: 2x nearest upsample F32 [H, W, C] -> BF16x2 [2H, 2W, C]
+//    p0=H, p1=W, p2=C
+//    Bindings: b_in2=x_nhwc(f32), b_out1=y_bf16x2(u32)
+//    Grid: (ceil((4*H*W*C/2)/256), 1, 1)
+// =========================================================================
+#ifdef OP_UPSAMPLE2X_NHWC_BF16
+layout(local_size_x = 256) in;
+void main() {
+  uint pair = (u.pad0 + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+  uint H = u.p0, W = u.p1, C = u.p2;
+  uint W2 = W * 2u, H2 = H * 2u;
+  uint half_c = C >> 1u;
+  if (pair >= H2 * W2 * half_c) return;
+  uint pix = pair / half_c;
+  uint c0 = (pair - pix * half_c) * 2u;
+  uint y2 = pix / W2, x2 = pix - y2 * W2;
+  uint src = ((y2 >> 1u) * W + (x2 >> 1u)) * C + c0;
+  float a = b_in2[u.o2 + src];
+  float b = b_in2[u.o2 + src + 1u];
+  b_out1[u.o5 + pair] = f32_to_bf16_u16(a) | (f32_to_bf16_u16(b) << 16u);
+}
+#endif
+
+// =========================================================================
+// 9. OP_VAE_MID_ATTN_D512: Single-head spatial self-attention (D=512, BF16 or F32) -> BF16x2
+//    p0=S, p1=C (<=512, even), p2=is_bf16_in (1=BF16 b_in0/b_in1/b_in2_as_u32? No: b_in0=Q, b_in1=K, b_out0=V(ro as f32 or bf16))
+//    Cleaner bindings: b_in0=Q(bf16/f32), b_in1=K(bf16/f32), b_in2=V(f32 if mode=0, else uintBits of bf16), b_out1=O_bf16x2
+//    f0 = scale
+//    Grid: (S, 1, 1), local_size_x = 256 (each thread handles 2 channels: 2*lid, 2*lid+1 -> covers up to C=512!)
+// =========================================================================
+#ifdef OP_VAE_MID_ATTN_D512
+layout(local_size_x = 256) in;
+shared float sm[256];
+void main() {
+  uint q = u.pad0 + gl_WorkGroupID.x;
+  uint S = u.p0, C = u.p1, is_bf16 = u.p2;
+  if (q >= S) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint c0 = lid * 2u, c1 = c0 + 1u;
+  bool v0 = (c0 < C), v1 = (c1 < C);
+
+  float q0 = 0.0, q1 = 0.0;
+  if (is_bf16 != 0u) {
+    if (v0) q0 = bf16_at_in0(q * C + c0);
+    if (v1) q1 = bf16_at_in0(q * C + c1);
+  } else {
+    if (v0) q0 = f32_at_in0(q * C + c0);
+    if (v1) q1 = f32_at_in0(q * C + c1);
+  }
+  float a0 = 0.0, a1 = 0.0;
+  float m_max = -1e30, l_sum = 0.0;
+  for (uint k = 0u; k < S; k++) {
+    float k0 = 0.0, k1 = 0.0;
+    if (is_bf16 != 0u) {
+      if (v0) k0 = bf16_at_in1(k * C + c0);
+      if (v1) k1 = bf16_at_in1(k * C + c1);
+    } else {
+      if (v0) k0 = f32_at_in1(k * C + c0);
+      if (v1) k1 = f32_at_in1(k * C + c1);
+    }
+    sm[lid] = q0 * k0 + q1 * k1;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+      if (lid < s) sm[lid] += sm[lid + s];
+      barrier();
+    }
+    float sc = sm[0] * u.f0;
+    float nm = max(m_max, sc);
+    float al = exp(m_max - nm);
+    float p  = exp(sc - nm);
+    l_sum = l_sum * al + p;
+    m_max = nm;
+    float vv0 = 0.0, vv1 = 0.0;
+    if (is_bf16 != 0u) {
+      if (v0) {
+        uint g = u.o2 + ((k * C + c0) >> 1u);
+        uint w = floatBitsToUint(b_in2[g]);
+        vv0 = uintBitsToFloat(w << 16u);
+        vv1 = uintBitsToFloat(w & 0xffff0000u);
+      }
+    } else {
+      if (v0) vv0 = b_in2[u.o2 + k * C + c0];
+      if (v1) vv1 = b_in2[u.o2 + k * C + c1];
+    }
+    a0 = fma(p, vv0, a0 * al);
+    a1 = fma(p, vv1, a1 * al);
+  }
+  float inv = (l_sum > 0.0) ? (1.0 / l_sum) : 0.0;
+  if (v0) {
+    uint pair = (q * C + c0) >> 1u;
+    b_out1[u.o5 + pair] = f32_to_bf16_u16(a0 * inv) | (f32_to_bf16_u16(a1 * inv) << 16u);
+  }
+}
+#endif
+
+// =========================================================================
+// 10. OP_QWEN3_QK_ROPE: Qwen3 text encoder per-head Q/K RMSNorm + Neox RoPE + transpose
+//     p0=L, p1=Hq, p2=Hkv, p3=D, p4=mode (0=Q, 1=K, 2=V), f0=theta, f1=eps
+//     Bindings: b_in0=in(f32), b_in1=norm_w(f32), b_out0=out(f32, [H, L, D])
+//     Grid: (L * H_cur, 1, 1), local_size_x = 128
+// =========================================================================
+#ifdef OP_QWEN3_QK_ROPE
+layout(local_size_x = 128) in;
+shared float sm[128];
+shared float xbuf[128];
+void main() {
+  uint idx = u.pad0 + gl_WorkGroupID.x;
+  uint L = u.p0, D = u.p3, mode = u.p4;
+  uint Hc = (mode == 0u) ? u.p1 : u.p2;
+  if (idx >= L * Hc) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint pos = idx / Hc;
+  uint h = idx - pos * Hc;
+  uint src = (pos * Hc + h) * D;
+  uint dst = (h * L + pos) * D;
+  if (mode == 2u) {
+    if (lid < D) b_out0[u.o4 + dst + lid] = f32_at_in0(src + lid);
+    return;
+  }
+  float v = (lid < D) ? f32_at_in0(src + lid) : 0.0;
+  sm[lid] = v * v;
+  barrier();
+  for (uint s = 64u; s > 0u; s >>= 1u) {
+    if (lid < s) sm[lid] += sm[lid + s];
+    barrier();
+  }
+  float inv = inversesqrt(sm[0] / float(D) + u.f1);
+  if (lid < D) xbuf[lid] = v * inv * f32_at_in1(lid);
+  barrier();
+  uint half_d = D >> 1u;
+  if (lid < half_d) {
+    float x0 = xbuf[lid], x1 = xbuf[lid + half_d];
+    float ang = float(pos) * exp(-log(u.f0) * float(2u * lid) / float(D));
+    float cs = cos(ang), sn = sin(ang);
+    b_out0[u.o4 + dst + lid]          = x0 * cs - x1 * sn;
+    b_out0[u.o4 + dst + lid + half_d] = x1 * cs + x0 * sn;
+  }
+}
+#endif
+
+// =========================================================================
+// 11. OP_QWEN3_GQA_ATTN: Causal masked GQA attention (D<=128) -> BF16x2 [L, Hq*D]
+//     p0=L, p1=Hq, p2=Hkv, p3=D, f0=scale
+//     Bindings: b_in0=Q(f32), b_in1=K(f32), b_in2=V(f32), b_in3=mask(packed u8 in f32 words), b_out1=O_bf16x2
+//     Grid: (L * Hq, 1, 1), local_size_x = 128
+// =========================================================================
+#ifdef OP_QWEN3_GQA_ATTN
+layout(local_size_x = 128) in;
+shared float sm[128];
+shared float acc_s[128];
+void main() {
+  uint pair = u.pad0 + gl_WorkGroupID.x;
+  uint L = u.p0, Hq = u.p1, Hkv = u.p2, D = u.p3;
+  if (pair >= L * Hq) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint qpos = pair / Hq;
+  uint hq = pair - qpos * Hq;
+  uint hkv = hq / (Hq / Hkv);
+  float qv = (lid < D) ? f32_at_in0((hq * L + qpos) * D + lid) : 0.0;
+  float acc = 0.0, m_max = -1e30, l_sum = 0.0;
+  uint kv_base = hkv * L * D;
+  for (uint kpos = 0u; kpos <= qpos; kpos++) {
+    uint mword = floatBitsToUint(b_in3[u.o3 + (kpos >> 2u)]);
+    uint mb = (mword >> ((kpos & 3u) * 8u)) & 0xffu;
+    if (mb == 0u && kpos != qpos) continue;
+    float kv = (lid < D) ? f32_at_in1(kv_base + kpos * D + lid) : 0.0;
+    sm[lid] = qv * kv;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (lid < s) sm[lid] += sm[lid + s];
+      barrier();
+    }
+    float sc = sm[0] * u.f0;
+    float nm = max(m_max, sc);
+    float al = exp(m_max - nm);
+    float p  = exp(sc - nm);
+    l_sum = l_sum * al + p;
+    m_max = nm;
+    float vv = (lid < D) ? b_in2[u.o2 + kv_base + kpos * D + lid] : 0.0;
+    acc = fma(p, vv, acc * al);
+  }
+  float inv = 1.0 / max(l_sum, 1e-20);
+  if (lid < D) acc_s[lid] = acc * inv;
+  barrier();
+  uint half_d = D >> 1u;
+  if (lid < half_d) {
+    uint out_pair = ((qpos * Hq + hq) * D >> 1u) + lid;
+    b_out1[u.o5 + out_pair] = f32_to_bf16_u16(acc_s[2u * lid]) | (f32_to_bf16_u16(acc_s[2u * lid + 1u]) << 16u);
+  }
+}
+#endif
+
+// =========================================================================
+// 12. OP_GROUPNORM_SILU: NCHW GroupNorm + optional SiLU (ec_launch_groupnorm_silu)
+//     p0=C, p1=spatial, p2=num_groups, p3=flags (bit0=gamma, bit1=beta, bit2=silu), f0=eps
+//     Bindings: b_in0=x(f32), b_in2=gamma(f32), b_in3=beta(f32), b_out0=y(f32)
+//     Grid: (num_groups, 1, 1), local_size_x = 256
+// =========================================================================
+#ifdef OP_GROUPNORM_SILU
+layout(local_size_x = 256) in;
+shared float sm1[256];
+shared float sm2[256];
+void main() {
+  uint g = gl_WorkGroupID.x;
+  uint C = u.p0, sp = u.p1, ng = u.p2;
+  if (g >= ng) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint cpg = C / ng;
+  uint c0 = g * cpg;
+  uint n = cpg * sp;
+  uint base = c0 * sp;
+  float s1 = 0.0, s2 = 0.0;
+  for (uint i = lid; i < n; i += 256u) {
+    float v = f32_at_in0(base + i);
+    s1 += v;
+    s2 += v * v;
+  }
+  sm1[lid] = s1;
+  sm2[lid] = s2;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) { sm1[lid] += sm1[lid + s]; sm2[lid] += sm2[lid + s]; }
+    barrier();
+  }
+  float mean = sm1[0] / float(n);
+  float var = max(0.0, sm2[0] / float(n) - mean * mean);
+  float inv = inversesqrt(var + u.f0);
+  bool has_g = (u.p3 & 1u) != 0u;
+  bool has_b = (u.p3 & 2u) != 0u;
+  bool do_s  = (u.p3 & 4u) != 0u;
+  for (uint i = lid; i < n; i += 256u) {
+    uint c = c0 + (i / sp);
+    float val = (f32_at_in0(base + i) - mean) * inv;
+    if (has_g) val *= b_in2[u.o2 + c];
+    if (has_b) val += b_in3[u.o3 + c];
+    if (do_s)  val = silu_f(val);
+    b_out0[u.o4 + base + i] = val;
+  }
+}
+#endif

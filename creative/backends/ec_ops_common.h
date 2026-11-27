@@ -40,11 +40,12 @@ static inline float ec_cmn_fp8_e4m3_to_f32(uint8_t b) {
 extern "C" {
 #endif
 
+#ifndef EC_BACKEND_VULKAN
 int ec_ops_dequant_q8g64_bf16(
     const int8_t *src_q8, const float *src_sc, uint16_t *dst_bf16,
     int rows, int cols, cudaStream_t stream) {
   if (!src_q8 || !src_sc || !dst_bf16 || rows <= 0 || cols <= 0 || (cols & 63)) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const int groups = cols >> 6;
   const long total_g = (long)rows * groups;
   EC_PAR_FOR_BEGIN(g, total_g)
@@ -59,17 +60,18 @@ int ec_ops_dequant_q8g64_bf16(
 
 int ec_ops_silu_f32_to_bf16(const float *src, uint16_t *dst, long n, cudaStream_t stream) {
   if (n <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n) dst[i] = ec_cmn_f32_to_bf16(ec_cmn_silu(src[i])); EC_PAR_FOR_END
   ec_hal_mark_host_dirty(dst);
   return 0;
 }
+#endif
 
 int ec_ops_wan_cfg_euler(
     float *xt, const float *vp, const float *vn, float *delta_cache,
     long n, float dt, float cfg_scale, int mode, cudaStream_t stream) {
   if (n <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n)
     float v;
     if (mode == 0) {
@@ -94,7 +96,7 @@ int ec_ops_trellis_cfg_euler(
     float guidance_rescale, float sigma_min, int use_cfg,
     cudaStream_t stream) {
   if (n <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   if (!use_cfg || !vn) {
     EC_PAR_FOR_BEGIN(i, n) xt[i] -= dt * vp[i]; EC_PAR_FOR_END
     ec_hal_mark_host_dirty(xt);
@@ -133,11 +135,12 @@ int ec_ops_trellis_cfg_euler(
   return 0;
 }
 
+#ifndef EC_BACKEND_VULKAN
 int ec_ops_rmsnorm_adaln(
     const float *x, const float *w, const float *scale, const float *shift,
     float *y_f32, uint16_t *y_bf16, int rows, int dim, float eps, cudaStream_t stream) {
   if (!x || rows <= 0 || dim <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(r, rows)
     const float *xr = x + (long)r * dim;
     float ss = 0.0f;
@@ -162,7 +165,7 @@ int ec_ops_layernorm_adaln(
     const float *x, const float *w, const float *b, const float *scale, const float *shift,
     float *y_f32, uint16_t *y_bf16, int rows, int dim, float eps, cudaStream_t stream) {
   if (!x || rows <= 0 || dim <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(r, rows)
     const float *xr = x + (long)r * dim;
     float s1 = 0.0f, s2 = 0.0f;
@@ -193,7 +196,7 @@ int ec_launch_adaln_zero(
     float *y, __half *y_f16, int n_rows, int dim, float eps, int norm_mode,
     cudaStream_t stream) {
   if (n_rows <= 0 || dim <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(r, n_rows)
     const float *xr = x + (long)r * dim;
     float mean = 0.0f;
@@ -225,11 +228,12 @@ int ec_launch_adaln_zero(
 int ec_launch_gated_res(float *x, const float *h, const float *gate, int n_rows, int dim, cudaStream_t stream) {
   long total = (long)n_rows * dim;
   if (total <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, total) x[i] += gate[i % dim] * h[i]; EC_PAR_FOR_END
   ec_hal_mark_host_dirty(x);
   return 0;
 }
+#endif
 
 int ec_launch_rope_nd(
     const float *q_in, const float *k_in, const float *v_in,
@@ -239,7 +243,7 @@ int ec_launch_rope_nd(
     int ndims, const int32_t axis_dims[3], float theta_base, float eps,
     cudaStream_t stream) {
   if (n_tokens <= 0 || n_heads <= 0 || (head_dim & 1) || ndims < 1 || ndims > 3) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const long pairs = (long)n_tokens * n_heads;
   const int E = n_heads * head_dim;
   const int half_d = head_dim >> 1;
@@ -297,7 +301,7 @@ int ec_launch_lora_add(
   const int R = lora->rank;
   if (ec_launch_gemm_f16(X, (const __half *)lora->A_d, NULL, NULL, tmp_f32, tmp_f16, M, R, K, 0, stream) != 0)
     return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const __half *B = (const __half *)lora->B_d;
   const long total = (long)M * N;
   EC_PAR_FOR_BEGIN(idx, total)
@@ -319,7 +323,7 @@ int ec_launch_gemm_i8(
     const float *bias, float *Y,
     int M, int N, int K, cudaStream_t stream) {
   if (M <= 0 || N <= 0 || K <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   #pragma omp parallel for collapse(2) schedule(static)
   for (int m = 0; m < M; m++) {
     for (int n = 0; n < N; n++) {
@@ -343,7 +347,7 @@ int ec_launch_gemm_svd4(
     float *tmp_f32, __half *tmp_f16, float *Y,
     int M, int N, int K, cudaStream_t stream) {
   if (M <= 0 || N <= 0 || K <= 0 || (K & 31)) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const int ng = K / 32;
   #pragma omp parallel for collapse(2) schedule(static)
   for (int r = 0; r < M; r++) {
@@ -382,12 +386,13 @@ int ec_launch_gemm_svd4(
   return 0;
 }
 
+#ifndef EC_BACKEND_VULKAN
 int ec_launch_groupnorm_silu(
     const float *x, const float *gamma, const float *beta,
     float *y, int C, int spatial, int num_groups, float eps, int apply_silu,
     cudaStream_t stream) {
   if (C <= 0 || spatial <= 0 || num_groups <= 0 || (C % num_groups)) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const int cpg = C / num_groups;
   const long n = (long)cpg * spatial;
   EC_PAR_FOR_BEGIN(g, num_groups)
@@ -412,6 +417,7 @@ int ec_launch_groupnorm_silu(
   ec_hal_mark_host_dirty(y);
   return 0;
 }
+#endif
 
 int ec_launch_conv1d_f32(
     const float *x, const float *w, const float *bias, float *y,
@@ -421,7 +427,7 @@ int ec_launch_conv1d_f32(
   const int pad_total = causal ? (K - 1) * dilation : 2 * pad;
   const int L_out = (L + pad_total - dilation * (K - 1) - 1) / stride + 1;
   if (L_out <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const long total = (long)Cout * L_out;
   EC_PAR_FOR_BEGIN(idx, total)
     int co = (int)(idx / L_out), lo = (int)(idx % L_out);
@@ -448,7 +454,7 @@ int ec_launch_conv2d_f32(
   const int H_out = (H + 2 * pad - Kh) / stride + 1;
   const int W_out = (W + 2 * pad - Kw) / stride + 1;
   if (H_out <= 0 || W_out <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const long hw_out = (long)H_out * W_out;
   const long total = (long)Cout * hw_out;
   EC_PAR_FOR_BEGIN(idx, total)
@@ -481,7 +487,7 @@ int ec_launch_conv3d_causal_f32(
   const int H_out = H + 2 * pad_hw - Kh + 1;
   const int W_out = W + 2 * pad_hw - Kw + 1;
   if (T <= 0 || H_out <= 0 || W_out <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const long thw_out = (long)T * H_out * W_out;
   const long total = (long)Cout * thw_out;
   const int past = Kt - 1;
@@ -541,7 +547,7 @@ static inline int32_t ec_cmn_ov_lookup(const uint64_t *keys, const int32_t *vals
 
 int ec_launch_ovoxel_hash_build(ec_ovoxel_t *ov, cudaStream_t stream) {
   if (!ov || ov->n_active <= 0 || ov->hash_cap < 2 * ov->n_active || (ov->hash_cap & (ov->hash_cap - 1))) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   memset(ov->hash_keys_d, 0, (size_t)ov->hash_cap * sizeof(uint64_t));
   memset(ov->hash_vals_d, 0xFF, (size_t)ov->hash_cap * sizeof(int32_t));
   const uint32_t mask = (uint32_t)(ov->hash_cap - 1);
@@ -562,7 +568,7 @@ int ec_launch_ovoxel_sparse_conv3d(
     const float *w, const float *bias, float *feats_out,
     int Cout, cudaStream_t stream) {
   if (!ov || ov->n_active <= 0 || Cout <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const int Cin = ov->channels;
   const uint32_t mask = (uint32_t)(ov->hash_cap - 1);
   const long total = (long)ov->n_active * Cout;
@@ -586,11 +592,12 @@ int ec_launch_ovoxel_sparse_conv3d(
   return 0;
 }
 
+#ifndef EC_BACKEND_VULKAN
 int ec_launch_flow_cfg_euler(
     const float *x, const float *v_cond, const float *v_uncond,
     float *x_next, int n_elems, float dt, float cfg_scale, cudaStream_t stream) {
   if (n_elems <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n_elems)
     float v = v_uncond ? (v_uncond[i] + cfg_scale * (v_cond[i] - v_uncond[i])) : v_cond[i];
     x_next[i] = x[i] + dt * v;
@@ -598,10 +605,11 @@ int ec_launch_flow_cfg_euler(
   ec_hal_mark_host_dirty(x_next);
   return 0;
 }
+#endif
 
 int ec_launch_l1_rel_diff(const float *a, const float *b, float *out_stats_d, int n_elems, cudaStream_t stream) {
   if (n_elems <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   double ld = 0.0, lr = 0.0;
   #pragma omp parallel for reduction(+:ld,lr) schedule(static)
   for (int i = 0; i < n_elems; i++) {
@@ -618,7 +626,7 @@ int ec_launch_kv_ring_append(
     ec_kv_ring_t *ring, const __half *chunk_k, const __half *chunk_v,
     int chunk_tokens, cudaStream_t stream) {
   if (!ring || chunk_tokens <= 0 || chunk_tokens > ring->cap_tokens) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   __half *kr = (__half *)ring->k_ring_d;
   __half *vr = (__half *)ring->v_ring_d;
   const long total = (long)ring->n_heads * chunk_tokens * ring->head_dim;
@@ -642,7 +650,7 @@ int ec_launch_kv_ring_append(
 
 int ec_launch_bf16_to_f16(const uint16_t *src_bf16, __half *dst_f16, size_t n, cudaStream_t stream) {
   if (!src_bf16 || !dst_f16 || n == 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n) dst_f16[i] = __float2half_rn(ec_cmn_bf16_to_f32(src_bf16[i])); EC_PAR_FOR_END
   ec_hal_mark_host_dirty(dst_f16);
   return 0;
@@ -650,7 +658,7 @@ int ec_launch_bf16_to_f16(const uint16_t *src_bf16, __half *dst_f16, size_t n, c
 
 int ec_launch_fp8_to_f16(const uint8_t *src_fp8, __half *dst_f16, size_t n, float scale, cudaStream_t stream) {
   if (!src_fp8 || !dst_f16 || n == 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n) dst_f16[i] = __float2half_rn(ec_cmn_fp8_e4m3_to_f32(src_fp8[i]) * scale); EC_PAR_FOR_END
   ec_hal_mark_host_dirty(dst_f16);
   return 0;
@@ -680,7 +688,7 @@ int ec_launch_conv2d_tc(
   const int H_out = (H + 2 * pad - Kh) / stride + 1;
   const int W_out = (W + 2 * pad - Kw) / stride + 1;
   if (H_out <= 0 || W_out <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const int M = H_out * W_out;
   const int K = Cin * Kh * Kw;
   const long col_n = (long)M * K;
@@ -696,7 +704,7 @@ int ec_launch_conv2d_tc(
   ec_hal_mark_host_dirty(col_f16);
   if (ec_launch_gemm_f16(col_f16, w_f16, bias, NULL, y_rowmajor_tmp, NULL, M, Cout, K, bias ? 1 : 0, stream) != 0)
     return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const long out_n = (long)M * Cout;
   EC_PAR_FOR_BEGIN(idx, out_n)
     int c = (int)(idx / M), m = (int)(idx % M);
@@ -710,7 +718,7 @@ int ec_launch_upsample2x_2d(const float *x, float *y, int C, int H, int W, cudaS
   int H2 = H * 2, W2 = W * 2;
   long total = (long)C * H2 * W2;
   if (total <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(idx, total)
     int w = (int)(idx % W2);
     long rem = idx / W2;
@@ -744,9 +752,10 @@ int ec_launch_cross_attn(
   return ec_launch_fa2_f16(Q, K, V, O, O_f16, n_q, n_kv, n_q_pad, n_kv_pad, n_heads, head_dim, scale, 0, stream);
 }
 
+#ifndef EC_BACKEND_VULKAN
 int ec_launch_swiglu_mul(const float *gate, const float *up, float *out, __half *out_f16, int n_elems, cudaStream_t stream) {
   if (n_elems <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n_elems)
     float v = ec_cmn_silu(gate[i]) * up[i];
     out[i] = v;
@@ -756,10 +765,11 @@ int ec_launch_swiglu_mul(const float *gate, const float *up, float *out, __half 
   ec_hal_mark_host_dirty(out_f16);
   return 0;
 }
+#endif
 
 int ec_launch_timestep_embed(float t_val, float *out_emb, int dim, float max_period, cudaStream_t stream) {
   if (dim <= 0 || (dim & 1)) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   const int half_d = dim >> 1;
   const float lmp = logf(max_period);
   for (int i = 0; i < half_d; i++) {
@@ -783,7 +793,7 @@ void ec_rf_shifted_schedule(int n_steps, float shift, float *out_ts) {
 
 int ec_launch_flow_heun(const float *x, const float *v1, const float *v2, float *x_next, int n_elems, float dt, cudaStream_t stream) {
   if (n_elems <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n_elems) x_next[i] = x[i] + 0.5f * dt * (v1[i] + v2[i]); EC_PAR_FOR_END
   ec_hal_mark_host_dirty(x_next);
   return 0;
@@ -793,7 +803,7 @@ int ec_launch_modality_cfg(
     const float *v_uncond, const float *v_text, const float *v_modal,
     float *v_out, int n_elems, float cfg_text, float cfg_modal, cudaStream_t stream) {
   if (n_elems <= 0) return -1;
-  ec_hal_stream_sync(stream);
+  ec_hal_sync_all_for_cpu(stream);
   EC_PAR_FOR_BEGIN(i, n_elems)
     float v = v_uncond[i] + cfg_text * (v_text[i] - v_uncond[i]);
     if (v_modal) v += cfg_modal * (v_modal[i] - v_text[i]);

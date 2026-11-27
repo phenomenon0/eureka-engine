@@ -91,6 +91,37 @@ __global__ void k_flux2_swiglu_bf16(const float *in2h, uint16_t *out_h, int rows
   out_h[idx] = f32_to_bf16_dev(silu_dev(g) * u);
 }
 
+static inline void fx_f32_to_bf16(const float *src, uint16_t *dst, long n, cudaStream_t s) {
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_f32_to_bf16(src, dst, n) == 0) return;
+#endif
+  EC_LAUNCH_1D(k_f32_to_bf16, (int)((n + 255) / 256), 256, s, src, dst, n);
+}
+static inline void fx_silu_f32_to_bf16(const float *src, uint16_t *dst, long n, cudaStream_t s) {
+#ifdef EC_BACKEND_VULKAN
+  if (ec_ops_silu_f32_to_bf16(src, dst, n, s) == 0) return;
+#endif
+  EC_LAUNCH_1D(k_silu_f32_to_bf16, (int)((n + 255) / 256), 256, s, src, dst, n);
+}
+static inline void fx_add_inplace(float *dst, const float *src, long n, cudaStream_t s) {
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_add_inplace(dst, src, n) == 0) return;
+#endif
+  EC_LAUNCH_1D(k_add_inplace, (int)((n + 255) / 256), 256, s, dst, src, n);
+}
+static inline void fx_swiglu_pair_bf16(const float *gate, const float *up, uint16_t *out, long n, cudaStream_t s) {
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_swiglu_pair_bf16(gate, up, out, n) == 0) return;
+#endif
+  EC_LAUNCH_1D(k_swiglu_pair_bf16, (int)((n + 255) / 256), 256, s, gate, up, out, n);
+}
+static inline void fx_flux2_swiglu_bf16(const float *in2h, uint16_t *out_h, int rows, int H, cudaStream_t s) {
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_flux2_swiglu_bf16(in2h, out_h, rows, H) == 0) return;
+#endif
+  EC_LAUNCH_1D(k_flux2_swiglu_bf16, (int)(((long)rows * H + 255) / 256), 256, s, in2h, out_h, rows, H);
+}
+
 // RMSNorm: y_bf16[r, c] = (x[r, c] * rsqrt(mean(x^2) + eps)) * w[c]
 #ifdef __CUDACC__
 __global__ void k_rmsnorm_bf16(const float *x, const float *w, uint16_t *y_bf16, int rows, int dim, float eps) {
@@ -1447,14 +1478,14 @@ static int run_qwen3_text_encoder(
     EC_DISPATCH_PORT(k_qwen3_gqa_attn, (attn_warps + 7) / 8, 256, 0, s, qh_d, kh_d, vh_d, mask_d, ao_bf16, L, Hq, Hkv, D, attn_scale);
 
     gemm_bf16(ao_bf16, c_wo, NULL, o_d, NULL, L, E, Hq * D, s);
-    EC_LAUNCH_1D(k_add_inplace, (L * E + 255) / 256, 256, s, x_d, o_d, (long)L * E);
+    fx_add_inplace(x_d, o_d, (long)L * E, s);
 
     EC_DISPATCH_PORT(k_rmsnorm_bf16, L, 256, 0, s, x_d, c_ln2, h_bf16, L, E, 1e-6f);
     gemm_bf16(h_bf16, c_wg, NULL, g_d, NULL, L, F, E, s);
     gemm_bf16(h_bf16, c_wu, NULL, u_d, NULL, L, F, E, s);
-    EC_LAUNCH_1D(k_swiglu_pair_bf16, ((long)L * F + 255) / 256, 256, s, g_d, u_d, mlp_bf16, (long)L * F);
+    fx_swiglu_pair_bf16(g_d, u_d, mlp_bf16, (long)L * F, s);
     gemm_bf16(mlp_bf16, c_wd, NULL, o_d, NULL, L, E, F, s);
-    EC_LAUNCH_1D(k_add_inplace, (L * E + 255) / 256, 256, s, x_d, o_d, (long)L * E);
+    fx_add_inplace(x_d, o_d, (long)L * E, s);
 
     if (l == 8 || l == 17 || l == 26) {
       int slot = (l == 8) ? 0 : ((l == 17) ? 1 : 2);
@@ -1698,7 +1729,7 @@ static int run_flux2_dit(
   };
 
   auto eval_mmdit_pass = [&](const uint16_t *emb_bf, float *out_v) {
-    EC_LAUNCH_1D(k_f32_to_bf16, ((long)N_img * 128 + 255) / 256, 256, s, out_latents_gpu_f32, x_bf16, (long)N_img * 128);
+    fx_f32_to_bf16(out_latents_gpu_f32, x_bf16, (long)N_img * 128, s);
     gemm_bf16(x_bf16, d->img_in, NULL, img_d, NULL, N_img, E, 128, s);
     gemm_bf16(emb_bf, d->txt_in, NULL, txt_d, NULL, N_txt, E, 7680, s);
 
@@ -1712,20 +1743,20 @@ static int run_flux2_dit(
       EC_DISPATCH_PORT(k_flux2_pack_qkv_rope, (w_txt + 7) / 8, 256, 0, s, qkv_txt, 3 * E, w->txt_qn, w->txt_kn, rope_cos, rope_sin, Q_h, K_h, V_h, N_txt, 0, N_pad, H, D, 1e-6f);
       EC_DISPATCH_PORT(k_flux2_pack_qkv_rope, (w_img + 7) / 8, 256, 0, s, qkv_img, 3 * E, w->img_qn, w->img_kn, rope_cos, rope_sin, Q_h, K_h, V_h, N_img, N_txt, N_pad, H, D, 1e-6f);
       attn_fx();
-      EC_LAUNCH_1D(k_f32_to_bf16, ((long)N_txt * E + 255) / 256, 256, s, attn_out, norm_txt_bf, (long)N_txt * E);
-      EC_LAUNCH_1D(k_f32_to_bf16, ((long)N_img * E + 255) / 256, 256, s, attn_out + (long)N_txt * E, norm_bf, (long)N_img * E);
+      fx_f32_to_bf16(attn_out, norm_txt_bf, (long)N_txt * E, s);
+      fx_f32_to_bf16(attn_out + (long)N_txt * E, norm_bf, (long)N_img * E, s);
       gemm_fx(norm_txt_bf, w->txt_proj, proj_out, N_txt, E, E);
       ec_launch_gated_res(txt_d, proj_out, mod_txt_v + 2 * E, N_txt, E, s);
       gemm_fx(norm_bf, w->img_proj, proj_out, N_img, E, E);
       ec_launch_gated_res(img_d, proj_out, mod_img_v + 2 * E, N_img, E, s);
       EC_DISPATCH_PORT(k_adaln_bf16, N_img, 256, 0, s, img_d, mod_img_v + 3 * E, mod_img_v + 4 * E, norm_bf, N_img, E, 1e-6f);
       gemm_fx(norm_bf, w->img_mlp0, mlp_2f, N_img, 2 * F, E);
-      EC_LAUNCH_1D(k_flux2_swiglu_bf16, ((long)N_img * F + 255) / 256, 256, s, mlp_2f, cat_bf, N_img, F);
+      fx_flux2_swiglu_bf16(mlp_2f, cat_bf, N_img, F, s);
       gemm_fx(cat_bf, w->img_mlp2, proj_out, N_img, E, F);
       ec_launch_gated_res(img_d, proj_out, mod_img_v + 5 * E, N_img, E, s);
       EC_DISPATCH_PORT(k_adaln_bf16, N_txt, 256, 0, s, txt_d, mod_txt_v + 3 * E, mod_txt_v + 4 * E, norm_txt_bf, N_txt, E, 1e-6f);
       gemm_fx(norm_txt_bf, w->txt_mlp0, mlp_2f, N_txt, 2 * F, E);
-      EC_LAUNCH_1D(k_flux2_swiglu_bf16, ((long)N_txt * F + 255) / 256, 256, s, mlp_2f, cat_bf, N_txt, F);
+      fx_flux2_swiglu_bf16(mlp_2f, cat_bf, N_txt, F, s);
       gemm_fx(cat_bf, w->txt_mlp2, proj_out, N_txt, E, F);
       ec_launch_gated_res(txt_d, proj_out, mod_txt_v + 5 * E, N_txt, E, s);
     }
@@ -1770,11 +1801,11 @@ static int run_flux2_dit(
       t_h[i] = (float)cos(arg); t_h[128 + i] = (float)sin(arg);
     }
     cudaMemcpyAsync(temb_256, t_h, sizeof t_h, cudaMemcpyHostToDevice, s);
-    EC_LAUNCH_1D(k_f32_to_bf16, 1, 256, s, temb_256, temb_256_bf, 256);
+    fx_f32_to_bf16(temb_256, temb_256_bf, 256, s);
     gemm_bf16(temb_256_bf, d->time_in0, NULL, temb_0, NULL, 1, E, 256, s);
-    EC_LAUNCH_1D(k_silu_f32_to_bf16, (E + 255) / 256, 256, s, temb_0, temb_0_bf, E);
+    fx_silu_f32_to_bf16(temb_0, temb_0_bf, E, s);
     gemm_bf16(temb_0_bf, d->time_in1, NULL, temb, NULL, 1, E, E, s);
-    EC_LAUNCH_1D(k_silu_f32_to_bf16, (E + 255) / 256, 256, s, temb, silu_temb_bf, E);
+    fx_silu_f32_to_bf16(temb, silu_temb_bf, E, s);
     gemm_bf16(silu_temb_bf, d->mod_img, NULL, mod_img_v, NULL, 1, 6 * E, E, s);
     gemm_bf16(silu_temb_bf, d->mod_txt, NULL, mod_txt_v, NULL, 1, 6 * E, E, s);
     gemm_bf16(silu_temb_bf, d->mod_sng, NULL, mod_sng_v, NULL, 1, 3 * E, E, s);
@@ -2251,7 +2282,7 @@ static int vae_resnet_nhwc(
 
   const float *res_ptr = x_f32;
   if (Cin != Cout) {
-    EC_LAUNCH_1D(k_f32_to_bf16, (int)(((long)M * Cin + 255) / 256), 256, s, x_f32, tmp_bf16, (long)M * Cin);
+    fx_f32_to_bf16(x_f32, tmp_bf16, (long)M * Cin, s);
     snprintf(k, sizeof k, "%s.conv_shortcut.weight", prefix); uint16_t *ws = get_vae_bf16(fx, k);
     snprintf(k, sizeof k, "%s.conv_shortcut.bias", prefix);   float    *bs = get_vae_f32(fx, k);
     if (!ws || !bs) return -1;
@@ -2499,7 +2530,7 @@ static int vae_mid_attention_nhwc(
     gemm_bf16(tmp_bf16, wv, bv, NULL, v_bf, S, C, C, s);
     EC_DISPATCH_PORT(k_vae_mid_attn_tc_d512, (S + 31) / 32, 256, 0, s, q_bf, k_bf, v_bf, ao_bf, S, 1.0f / sqrtf((float)C));
     gemm_bf16(ao_bf, wo, bo, out, NULL, S, C, C, s);
-    EC_LAUNCH_1D(k_add_inplace, (int)(((long)S * C + 255) / 256), 256, s, x_nhwc, out, (long)S * C);
+    fx_add_inplace(x_nhwc, out, (long)S * C, s);
     return 0;
   }
 
@@ -2514,7 +2545,7 @@ static int vae_mid_attention_nhwc(
   gemm_bf16(tmp_bf16, wv, bv, v, NULL, S, C, C, s);
   EC_DISPATCH_PORT(k_vae_mid_attn, S, 256, 0, s, q, k, v, ao_bf, S, C, 1.0f / sqrtf((float)C));
   gemm_bf16(ao_bf, wo, bo, out, NULL, S, C, C, s);
-  EC_LAUNCH_1D(k_add_inplace, (int)(((long)S * C + 255) / 256), 256, s, x_nhwc, out, (long)S * C);
+  fx_add_inplace(x_nhwc, out, (long)S * C, s);
   return 0;
 }
 

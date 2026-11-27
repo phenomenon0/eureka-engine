@@ -92,12 +92,17 @@ source location and build commands.
 - Android runs on the CPU. The Vulkan path for Android is not built yet. The
   battery labels the cells `android-vulkan`, but every Android receipt
   declares the CPU route.
-- Native Vulkan 1.2+ on Linux is active as of 2026-11-25 for both the LLM stack
+- Native Vulkan 1.2/1.3+ on Linux is active for both the LLM stack
   (`engine_vulkan`, `backends/vulkan/`) and Creative Studio
   (`eureka-creative-serve`, `creative/backends/ec_backend_vulkan.c`), verified
-  on NVIDIA RTX 3090 and AMD RDNA2 (`RADV`). It currently runs portable
-  SPIR-V 1.3 shaders without batched LLM prefill, single-submit LLM graphs, or
-  `VK_KHR_cooperative_matrix`; see the staged optimization plan in
+  on NVIDIA RTX 3090 and AMD RDNA2 (`RADV`). As of 2026-11-27, all five Vulkan
+  Turbo phases (`T1` through `T5`) are implemented and verified: single-submit
+  LLM graph + wave32 `dp4a` + `BM=8` batched prefill (`416.122 tok/s` prefill,
+  `105.343 tok/s` decode on `Qwen3.5-4B-Q4_K_M`, RTX 3090; `16/16` exact CLI
+  parity on RTX 3090 and AMD RDNA2), GPU-resident Creative glue shaders +
+  `VK_KHR_cooperative_matrix` (`57.643 TF` BF16, `53.990 TF` FP16, `148.066 TOPS`
+  INT8, `29.872 TF` FA2 BF16, `601.26 ms` warm `FLUX.2-klein-4B` `256x256`
+  4-step), disk `VkPipelineCache`, and automatic Tier-0 SPIR-V 1.3 fallback; see
   [`backends/vulkan/turbo-path.md`](../backends/vulkan/turbo-path.md). Windows
   Vulkan build wiring exists in `backends/windows/build.ps1` and is untested on
   Windows hardware.

@@ -1,0 +1,568 @@
+#version 460
+// backends/vulkan/shaders/llm_ops.comp — Portable Vulkan 1.2 (SPIR-V 1.3) LLM Layer Graph Kernels
+// Compiled per-op via -DOP_<NAME> into backends/vulkan/llb_vulkan_turbo_spv.h.
+// Single static descriptor set per weight slab:
+//   binding 0: weight slab (uint32 array, <=1 GiB)
+//   binding 1: workspace activations (float array, read_write)
+//   binding 2: recurrent state gS (transposed [L,TR,SZ,SZ]) + gConv ([L,KC-1,CONVD])
+//   binding 3: KV cache gK + gV
+//   binding 4: quantized activation scratch x_q8_1 (int32 array)
+
+layout(set = 0, binding = 0) readonly  buffer SlabBuf  { uint  slab[]; };
+layout(set = 0, binding = 1)           buffer ActBuf   { float act[];  };
+layout(set = 0, binding = 2)           buffer StateBuf { float st[];   };
+layout(set = 0, binding = 3)           buffer KvBuf    { float kv[];   };
+layout(set = 0, binding = 4)           buffer Xq8Buf   { int   xq8[];  };
+
+layout(push_constant) uniform PC {
+  uint p0, p1, p2, p3;
+  uint p4, p5, p6, p7;
+  uint p8, p9, p10, p11;
+  float f0, f1, f2, f3;
+} pc;
+
+uint u8_at(uint bo) {
+  return (slab[bo >> 2u] >> ((bo & 3u) * 8u)) & 0xffu;
+}
+int s8_at(uint bo) {
+  uint sh = (3u - (bo & 3u)) * 8u;
+  return int(slab[bo >> 2u] << sh) >> 24;
+}
+uint u16_at(uint bo) {
+  return u8_at(bo) | (u8_at(bo + 1u) << 8u);
+}
+float h2f_at(uint bo) {
+  return unpackHalf2x16(u16_at(bo)).x;
+}
+vec2 gsm4(uint j, uint sc_bo) {
+  if (j < 4u) {
+    return vec2(float(u8_at(sc_bo + j) & 63u), float(u8_at(sc_bo + j + 4u) & 63u));
+  }
+  uint b4 = u8_at(sc_bo + j + 4u);
+  uint sd = (b4 & 0xfu) | ((u8_at(sc_bo + j - 4u) >> 6u) << 4u);
+  uint sm = (b4 >> 4u)  | ((u8_at(sc_bo + j)      >> 6u) << 4u);
+  return vec2(float(sd), float(sm));
+}
+float silu_f(float x) {
+  return x / (1.0 + exp(-x));
+}
+float sigmoid_f(float x) {
+  return 1.0 / (1.0 + exp(-x));
+}
+
+// =========================================================================
+// 1. OP_DEQ_EMBED: Dequantize B rows from token_embd into act[x_off + t*cols]
+//    p0=fmt, p1=cols, p2=rb, p3=w_bo, p4=x_off, p5=tok_ids_off (in act as uintBits), p6=B
+//    Grid: (ceil(cols/256), B, 1)
+// =========================================================================
+#ifdef OP_DEQ_EMBED
+layout(local_size_x = 256) in;
+void main() {
+  uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  uint t = gl_WorkGroupID.y;
+  if (c >= pc.p1 || t >= pc.p6) return;
+  uint tok = floatBitsToUint(act[pc.p5 + t]);
+  uint row_bo = pc.p3 + tok * pc.p2;
+  uint fmt = pc.p0;
+  float val = 0.0;
+  if (fmt == 0u) {
+    val = uintBitsToFloat(slab[(row_bo >> 2u) + c]);
+  } else if (fmt == 1u) {
+    uint b = c >> 5u;
+    float dd = h2f_at(row_bo + pc.p1 + 2u * b);
+    val = float(s8_at(row_bo + c)) * dd;
+  } else if (fmt == 3u) {
+    uint b = c >> 8u;
+    uint rem = c & 255u;
+    uint g = rem >> 6u;
+    uint sub = rem & 63u;
+    uint blk = row_bo + b * 144u;
+    float d = h2f_at(blk);
+    float dmin = h2f_at(blk + 2u);
+    vec2 sc = gsm4(2u * g + (sub >> 5u), blk + 4u);
+    uint qb = u8_at(blk + 16u + g * 32u + (sub & 31u));
+    uint q = (sub < 32u) ? (qb & 0xfu) : (qb >> 4u);
+    val = d * sc.x * float(q) - dmin * sc.y;
+  } else if (fmt == 9u) {
+    uint b = c >> 8u;
+    uint rem = c & 255u;
+    uint g = rem >> 6u;
+    uint sub = rem & 63u;
+    uint l = sub & 31u;
+    uint hi_idx = (sub < 32u) ? (2u * g) : (2u * g + 1u);
+    uint blk = row_bo + b * 176u;
+    float d = h2f_at(blk);
+    float dmin = h2f_at(blk + 2u);
+    vec2 sc = gsm4(hi_idx, blk + 4u);
+    uint qh = u8_at(blk + 16u + l);
+    uint qb = u8_at(blk + 48u + g * 32u + l);
+    uint q = ((sub < 32u) ? (qb & 0xfu) : (qb >> 4u)) + (((qh >> hi_idx) & 1u) << 4u);
+    val = d * sc.x * float(q) - dmin * sc.y;
+  } else if (fmt == 4u) {
+    uint b = c >> 8u;
+    uint rem = c & 255u;
+    uint half_i = rem >> 7u;
+    uint qd = (rem >> 5u) & 3u;
+    uint l = rem & 31u;
+    uint blk = row_bo + b * 210u;
+    float d = h2f_at(blk + 208u);
+    uint qq = u8_at(blk + half_i * 64u + (qd & 1u) * 32u + l);
+    uint qhv = u8_at(blk + 128u + half_i * 32u + l);
+    uint nib = (qd < 2u) ? (qq & 0xfu) : (qq >> 4u);
+    int code = int(nib | (((qhv >> (2u * qd)) & 3u) << 4u)) - 32;
+    int sc = s8_at(blk + 192u + half_i * 8u + 2u * qd + (l >> 4u));
+    val = (d * float(sc)) * float(code);
+  }
+  act[pc.p4 + t * pc.p1 + c] = val;
+}
+#endif
+
+// =========================================================================
+// 2. OP_RMS_NORM: Optional X += res, then out = rms_norm(X, w)
+//    p0=D, p1=w_f32_idx (slab word offset), p2=x_off, p3=out_off, p4=res_off (0xffffffff=none), p5=B
+//    f0=EPS
+//    Grid: (B, 1, 1)
+// =========================================================================
+#ifdef OP_RMS_NORM
+layout(local_size_x = 256) in;
+shared float sm[256];
+void main() {
+  uint t = gl_WorkGroupID.x;
+  if (t >= pc.p5) return;
+  uint lid = gl_LocalInvocationID.x;
+  uint D = pc.p0;
+  uint xb = pc.p2 + t * D;
+  uint ob = pc.p3 + t * D;
+  bool do_res = (pc.p4 != 0xffffffffu);
+  uint rb = pc.p4 + t * D;
+  float ss = 0.0;
+  for (uint i = lid; i < D; i += 256u) {
+    float v = act[xb + i];
+    if (do_res) {
+      v += act[rb + i];
+      act[xb + i] = v;
+    }
+    ss += v * v;
+  }
+  sm[lid] = ss;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) sm[lid] += sm[lid + s];
+    barrier();
+  }
+  float inv = inversesqrt(sm[0] / float(D) + pc.f0);
+  for (uint i = lid; i < D; i += 256u) {
+    act[ob + i] = act[xb + i] * inv * uintBitsToFloat(slab[pc.p1 + i]);
+  }
+}
+#endif
+
+// =========================================================================
+// 3. OP_QUANT_X_Q8_1: Quantize act[x_off..x_off+B*cols] into Q8_1 blocks of 32
+//    Each 32-elem block = 10 int32 words in xq8: [8 packed s8x4, float d, float exact_sum]
+//    p0=cols, p1=x_off, p2=B
+//    Grid: (cols/32, B, 1)
+// =========================================================================
+#ifdef OP_QUANT_X_Q8_1
+layout(local_size_x = 32) in;
+shared float sm_a[32];
+shared float sm_s[32];
+shared uint  sm_q[32];
+void main() {
+  uint blk = gl_WorkGroupID.x;
+  uint t = gl_WorkGroupID.y;
+  uint lid = gl_LocalInvocationID.x;
+  uint nblk = pc.p0 >> 5u;
+  if (blk >= nblk || t >= pc.p2) return;
+  float v = act[pc.p1 + t * pc.p0 + blk * 32u + lid];
+  sm_a[lid] = abs(v);
+  sm_s[lid] = v;
+  barrier();
+  if (lid < 16u) { sm_a[lid] = max(sm_a[lid], sm_a[lid + 16u]); sm_s[lid] += sm_s[lid + 16u]; }
+  barrier();
+  if (lid < 8u)  { sm_a[lid] = max(sm_a[lid], sm_a[lid + 8u]);  sm_s[lid] += sm_s[lid + 8u]; }
+  barrier();
+  if (lid < 4u)  { sm_a[lid] = max(sm_a[lid], sm_a[lid + 4u]);  sm_s[lid] += sm_s[lid + 4u]; }
+  barrier();
+  if (lid < 2u)  { sm_a[lid] = max(sm_a[lid], sm_a[lid + 2u]);  sm_s[lid] += sm_s[lid + 2u]; }
+  barrier();
+  float amax = max(sm_a[0], sm_a[1]);
+  float sumv = sm_s[0] + sm_s[1];
+  float d = amax / 127.0;
+  float inv_d = (amax > 1e-30) ? (127.0 / amax) : 0.0;
+  int q = clamp(int(roundEven(v * inv_d)), -127, 127);
+  sm_q[lid] = uint(q) & 0xffu;
+  barrier();
+  uint dst = (t * nblk + blk) * 10u;
+  if (lid < 8u) {
+    uint i = lid * 4u;
+    uint packed = sm_q[i] | (sm_q[i + 1u] << 8u) | (sm_q[i + 2u] << 16u) | (sm_q[i + 3u] << 24u);
+    xq8[dst + lid] = int(packed);
+  } else if (lid == 8u) {
+    xq8[dst + 8u] = floatBitsToInt(d);
+  } else if (lid == 9u) {
+    xq8[dst + 9u] = floatBitsToInt(sumv);
+  }
+}
+#endif
+
+// =========================================================================
+// 4. OP_FULL_QK_ROPE_KV: RMSNorm Q/K + partial NEOX RoPE + store K/V into kv_buf
+//    p0=H, p1=KV, p2=HDIM, p3=ROPEDIM, p4=pos0, p5=B, p6=il, p7=cap
+//    p8=qnw_slab_w, p9=knw_slab_w, p10=inv_freq_act_off, p11=layout_offs_act_off
+//    f0=EPS
+//    layout_offs (6 uints stored in act[p11..p11+5] via floatBitsToUint):
+//      [0]=QGN_off, [1]=QN_off, [2]=KB_off, [3]=VB_off, [4]=KV_V_base, [5]=unused
+//    Grid: (H + KV, B, 1)
+// =========================================================================
+#ifdef OP_FULL_QK_ROPE_KV
+layout(local_size_x = 256) in;
+shared float sm[256];
+shared float xbuf[256];
+void main() {
+  uint wid = gl_WorkGroupID.x;
+  uint t = gl_WorkGroupID.y;
+  uint lid = gl_LocalInvocationID.x;
+  uint H = pc.p0, KV = pc.p1, HD = pc.p2, RD = pc.p3;
+  uint pos = pc.p4 + t;
+  if (wid >= H + KV || t >= pc.p5) return;
+
+  uint qgn_off = floatBitsToUint(act[pc.p11 + 0u]);
+  uint qn_off  = floatBitsToUint(act[pc.p11 + 1u]);
+  uint kb_off  = floatBitsToUint(act[pc.p11 + 2u]);
+  uint vb_off  = floatBitsToUint(act[pc.p11 + 3u]);
+  uint kv_voff = floatBitsToUint(act[pc.p11 + 4u]);
+
+  uint half_rd = RD >> 1u;
+  if (wid < H) {
+    uint hh = wid;
+    uint src = qgn_off + t * (H * 2u * HD) + hh * 2u * HD;
+    float v = (lid < HD) ? act[src + lid] : 0.0;
+    sm[lid] = v * v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+      if (lid < s) sm[lid] += sm[lid + s];
+      barrier();
+    }
+    float inv = inversesqrt(sm[0] / float(HD) + pc.f0);
+    if (lid < HD) xbuf[lid] = v * inv * uintBitsToFloat(slab[pc.p8 + lid]);
+    barrier();
+    uint dst = qn_off + t * (H * HD) + hh * HD;
+    if (lid < half_rd) {
+      float theta = float(pos) * act[pc.p10 + lid];
+      float c = cos(theta), s = sin(theta);
+      float a = xbuf[lid], b = xbuf[lid + half_rd];
+      act[dst + lid]           = a * c - b * s;
+      act[dst + lid + half_rd] = a * s + b * c;
+    } else if (lid >= RD && lid < HD) {
+      act[dst + lid] = xbuf[lid];
+    }
+  } else {
+    uint g = wid - H;
+    uint ksrc = kb_off + t * (KV * HD) + g * HD;
+    uint vsrc = vb_off + t * (KV * HD) + g * HD;
+    float v = (lid < HD) ? act[ksrc + lid] : 0.0;
+    sm[lid] = v * v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+      if (lid < s) sm[lid] += sm[lid + s];
+      barrier();
+    }
+    float inv = inversesqrt(sm[0] / float(HD) + pc.f0);
+    if (lid < HD) xbuf[lid] = v * inv * uintBitsToFloat(slab[pc.p9 + lid]);
+    barrier();
+    uint kv_idx = ((pc.p6 * pc.p7 + pos) * KV + g) * HD;
+    if (lid < half_rd) {
+      float theta = float(pos) * act[pc.p10 + lid];
+      float c = cos(theta), s = sin(theta);
+      float a = xbuf[lid], b = xbuf[lid + half_rd];
+      kv[kv_idx + lid]           = a * c - b * s;
+      kv[kv_idx + lid + half_rd] = a * s + b * c;
+    } else if (lid >= RD && lid < HD) {
+      kv[kv_idx + lid] = xbuf[lid];
+    }
+    if (lid < HD) {
+      kv[kv_voff + kv_idx + lid] = act[vsrc + lid];
+    }
+  }
+}
+#endif
+
+// =========================================================================
+// 5. OP_GQA_ATTN_GATE: Causal online-softmax GQA + output sigmoid gate
+//    p0=H, p1=KV, p2=HDIM, p3=pos0, p4=B, p5=il, p6=cap
+//    p7=QGN_off, p8=QN_off, p9=ATTN_off, p10=KV_V_base
+//    f0 = 1/sqrt(HDIM)
+//    Grid: (H, B, 1)
+// =========================================================================
+#ifdef OP_GQA_ATTN_GATE
+layout(local_size_x = 256) in;
+shared float sm[256];
+void main() {
+  uint hh = gl_WorkGroupID.x;
+  uint t  = gl_WorkGroupID.y;
+  uint lid = gl_LocalInvocationID.x;
+  uint H = pc.p0, KV = pc.p1, HD = pc.p2;
+  if (hh >= H || t >= pc.p4) return;
+  uint kvh = hh / (H / KV);
+  uint max_tp = pc.p3 + t;
+
+  float qd = (lid < HD) ? act[pc.p8 + t * (H * HD) + hh * HD + lid] : 0.0;
+  float acc = 0.0;
+  float m = -1e30;
+  float l = 0.0;
+
+  uint layer_base = pc.p5 * pc.p6 * KV * HD;
+  uint kv_stride = KV * HD;
+  for (uint tp = 0u; tp <= max_tp; tp++) {
+    uint k_idx = layer_base + tp * kv_stride + kvh * HD;
+    float kd = (lid < HD) ? kv[k_idx + lid] : 0.0;
+    sm[lid] = qd * kd;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+      if (lid < s) sm[lid] += sm[lid + s];
+      barrier();
+    }
+    float score = sm[0] * pc.f0;
+    float nm = max(m, score);
+    float al = exp(m - nm);
+    float p  = exp(score - nm);
+    l = l * al + p;
+    m = nm;
+    float vd = (lid < HD) ? kv[pc.p10 + k_idx + lid] : 0.0;
+    acc = fma(p, vd, acc * al);
+  }
+  if (lid < HD) {
+    float g = act[pc.p7 + t * (H * 2u * HD) + hh * 2u * HD + HD + lid];
+    act[pc.p9 + t * (H * HD) + hh * HD + lid] = (acc / l) * sigmoid_f(g);
+  }
+}
+#endif
+
+// =========================================================================
+// 6. OP_LIN_CONV_SILU: Depthwise causal Conv1D + SiLU + Beta/GatePre over B tokens
+//    p0=CONVD, p1=KC, p2=TR, p3=B, p4=il, p5=conv_state_base
+//    p6=cw_slab_w, p7=dt_slab_w, p8=alog_slab_w, p9=offs_act_idx
+//    offs (5 uints in act[p9..p9+4]): [0]=QKV, [1]=Y, [2]=BETA_RAW/BETA, [3]=ALPHA_RAW, [4]=GATE_PRE
+//    Grid: (ceil(CONVD/256), 1, 1)
+// =========================================================================
+#ifdef OP_LIN_CONV_SILU
+layout(local_size_x = 256) in;
+void main() {
+  uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  uint CONVD = pc.p0, KC = pc.p1, TR = pc.p2, B = pc.p3;
+  uint qkv_off = floatBitsToUint(act[pc.p9 + 0u]);
+  uint y_off   = floatBitsToUint(act[pc.p9 + 1u]);
+  uint beta_off= floatBitsToUint(act[pc.p9 + 2u]);
+  uint alp_off = floatBitsToUint(act[pc.p9 + 3u]);
+  uint gp_off  = floatBitsToUint(act[pc.p9 + 4u]);
+
+  if (c < CONVD) {
+    uint cs_base = pc.p5 + pc.p4 * (KC - 1u) * CONVD;
+    float cw[8];
+    float cs[7];
+    for (uint k = 0u; k < KC; k++) cw[k] = uintBitsToFloat(slab[pc.p6 + c * KC + k]);
+    for (uint k = 0u; k < KC - 1u; k++) cs[k] = st[cs_base + k * CONVD + c];
+    for (uint t = 0u; t < B; t++) {
+      float qv = act[qkv_off + t * CONVD + c];
+      float acc = 0.0;
+      for (uint k = 0u; k < KC - 1u; k++) acc = fma(cs[k], cw[k], acc);
+      acc = fma(qv, cw[KC - 1u], acc);
+      act[y_off + t * CONVD + c] = silu_f(acc);
+      for (uint k = 0u; k + 1u < KC - 1u; k++) cs[k] = cs[k + 1u];
+      if (KC > 1u) cs[KC - 2u] = qv;
+    }
+    for (uint k = 0u; k < KC - 1u; k++) st[cs_base + k * CONVD + c] = cs[k];
+  }
+  if (c < TR) {
+    float dt_v = uintBitsToFloat(slab[pc.p7 + c]);
+    float al_v = uintBitsToFloat(slab[pc.p8 + c]);
+    for (uint t = 0u; t < B; t++) {
+      float br = act[beta_off + t * TR + c];
+      act[beta_off + t * TR + c] = sigmoid_f(br);
+      float x = act[alp_off + t * TR + c] + dt_v;
+      float sp = (x > 20.0) ? x : log(1.0 + exp(min(x, 88.0)));
+      act[gp_off + t * TR + c] = sp * al_v;
+    }
+  }
+}
+#endif
+
+// =========================================================================
+// 7. OP_LIN_DELTA_NET: Coalesced Gated Delta-Net recurrence + gated RMSNorm over B tokens
+//    State layout: st[il * TR * SZ * SZ + hh * SZ * SZ + i * SZ + j] (j contiguous across threads!)
+//    p0=TR, p1=GK, p2=SZ, p3=KDC, p4=VDC, p5=CONVD, p6=B, p7=il, p8=sn_slab_w, p9=offs_act_idx
+//    f0=EPS
+//    offs (5 uints): [0]=Y, [1]=Z, [2]=BETA, [3]=GATE_PRE, [4]=OUT0
+//    Grid: (TR, 1, 1)
+// =========================================================================
+#ifdef OP_LIN_DELTA_NET
+layout(local_size_x = 128) in;
+shared float sq_h[256];
+shared float sk_h[256];
+shared float sm1[128];
+shared float sm2[128];
+void main() {
+  uint hh = gl_WorkGroupID.x;
+  uint lid = gl_LocalInvocationID.x;
+  uint TR = pc.p0, GK = pc.p1, SZ = pc.p2, KDC = pc.p3, VDC = pc.p4, CONVD = pc.p5, B = pc.p6;
+  if (hh >= TR) return;
+
+  uint y_off    = floatBitsToUint(act[pc.p9 + 0u]);
+  uint z_off    = floatBitsToUint(act[pc.p9 + 1u]);
+  uint beta_off = floatBitsToUint(act[pc.p9 + 2u]);
+  uint gp_off   = floatBitsToUint(act[pc.p9 + 3u]);
+  uint out_off  = floatBitsToUint(act[pc.p9 + 4u]);
+
+  uint g = hh % GK;
+  uint s_base = (pc.p7 * TR + hh) * SZ * SZ;
+  float inv_sqrt_sz = inversesqrt(float(SZ));
+
+  for (uint t = 0u; t < B; t++) {
+    uint yt = y_off + t * CONVD;
+    float qsq = 0.0, ksq = 0.0;
+    for (uint i = lid; i < SZ; i += 128u) {
+      float qv = act[yt + g * SZ + i];
+      float kv_v = act[yt + KDC + g * SZ + i];
+      sq_h[i] = qv;
+      sk_h[i] = kv_v;
+      qsq += qv * qv;
+      ksq += kv_v * kv_v;
+    }
+    sm1[lid] = qsq;
+    sm2[lid] = ksq;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (lid < s) { sm1[lid] += sm1[lid + s]; sm2[lid] += sm2[lid + s]; }
+      barrier();
+    }
+    float invq = (1.0 / max(sqrt(sm1[0]), pc.f0)) * inv_sqrt_sz;
+    float invk = 1.0 / max(sqrt(sm2[0]), pc.f0);
+    for (uint i = lid; i < SZ; i += 128u) {
+      sq_h[i] *= invq;
+      sk_h[i] *= invk;
+    }
+    barrier();
+
+    float decay = exp(act[gp_off + t * TR + hh]);
+    float beta  = act[beta_off + t * TR + hh];
+
+    float oss = 0.0;
+    float o_local[2];
+    uint n_loc = 0u;
+    for (uint j = lid; j < SZ; j += 128u) {
+      float kvacc = 0.0;
+      for (uint i = 0u; i < SZ; i++) {
+        kvacc = fma(st[s_base + i * SZ + j] * decay, sk_h[i], kvacc);
+      }
+      float vhj = act[yt + 2u * KDC + hh * SZ + j];
+      float delta = (vhj - kvacc) * beta;
+      float o = 0.0;
+      for (uint i = 0u; i < SZ; i++) {
+        float sv = fma(st[s_base + i * SZ + j], decay, sk_h[i] * delta);
+        st[s_base + i * SZ + j] = sv;
+        o = fma(sv, sq_h[i], o);
+      }
+      o_local[n_loc++] = o;
+      oss += o * o;
+    }
+    sm1[lid] = oss;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (lid < s) sm1[lid] += sm1[lid + s];
+      barrier();
+    }
+    float rms = inversesqrt(sm1[0] / float(SZ) + pc.f0);
+    uint k_idx = 0u;
+    for (uint j = lid; j < SZ; j += 128u) {
+      float sn_w = uintBitsToFloat(slab[pc.p8 + j]);
+      float zv = act[z_off + t * VDC + hh * SZ + j];
+      act[out_off + t * VDC + hh * SZ + j] = o_local[k_idx++] * rms * sn_w * silu_f(zv);
+    }
+    barrier();
+  }
+}
+#endif
+
+// =========================================================================
+// 8. OP_SWIGLU_MUL: act[gate_off + i] = silu(act[gate_off + i]) * act[up_off + i]
+//    p0=total_elems, p1=gate_off, p2=up_off
+// =========================================================================
+#ifdef OP_SWIGLU_MUL
+layout(local_size_x = 256) in;
+void main() {
+  uint i = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.p0) return;
+  float g = act[pc.p1 + i];
+  act[pc.p1 + i] = silu_f(g) * act[pc.p2 + i];
+}
+#endif
+
+// =========================================================================
+// 9. OP_RES_ADD: act[x_off + i] += act[add_off + i]
+//    p0=total_elems, p1=x_off, p2=add_off
+// =========================================================================
+#ifdef OP_RES_ADD
+layout(local_size_x = 256) in;
+void main() {
+  uint i = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  if (i >= pc.p0) return;
+  act[pc.p1 + i] += act[pc.p2 + i];
+}
+#endif
+
+// =========================================================================
+// 10. OP_ARGMAX_TOP2: Exact tie-breaking top-2 over LOGITS[0..V-1]
+//     p0=V, p1=logits_off, p2=out_off (4 floats written as uintBitsToFloat: i1, bits1, i2, bits2)
+//     Grid: (1, 1, 1)
+// =========================================================================
+#ifdef OP_ARGMAX_TOP2
+layout(local_size_x = 256) in;
+shared float sm_v1[256], sm_v2[256];
+shared uint  sm_i1[256], sm_i2[256];
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  uint V = pc.p0;
+  uint base = pc.p1;
+  float v1 = -3.4028234e38, v2 = -3.4028234e38;
+  uint  i1 = 0xffffffffu,   i2 = 0xffffffffu;
+  for (uint i = lid; i < V; i += 256u) {
+    float v = act[base + i];
+    if (v > v1 || (v == v1 && i < i1)) {
+      v2 = v1; i2 = i1;
+      v1 = v;  i1 = i;
+    } else if (v > v2 || (v == v2 && i < i2)) {
+      v2 = v;  i2 = i;
+    }
+  }
+  sm_v1[lid] = v1; sm_i1[lid] = i1;
+  sm_v2[lid] = v2; sm_i2[lid] = i2;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      float av1 = sm_v1[lid], av2 = sm_v2[lid];
+      uint  ai1 = sm_i1[lid], ai2 = sm_i2[lid];
+      float bv1 = sm_v1[lid + s], bv2 = sm_v2[lid + s];
+      uint  bi1 = sm_i1[lid + s], bi2 = sm_i2[lid + s];
+      // Insert b1 then b2 into (a1, a2)
+      if (bv1 > av1 || (bv1 == av1 && bi1 < ai1)) {
+        av2 = av1; ai2 = ai1; av1 = bv1; ai1 = bi1;
+      } else if (bv1 > av2 || (bv1 == av2 && bi1 < ai2)) {
+        av2 = bv1; ai2 = bi1;
+      }
+      if (bv2 > av2 || (bv2 == av2 && bi2 < ai2)) {
+        av2 = bv2; ai2 = bi2;
+      }
+      sm_v1[lid] = av1; sm_i1[lid] = ai1;
+      sm_v2[lid] = av2; sm_i2[lid] = ai2;
+    }
+    barrier();
+  }
+  if (lid == 0u) {
+    act[pc.p2 + 0u] = uintBitsToFloat(sm_i1[0]);
+    act[pc.p2 + 1u] = sm_v1[0];
+    act[pc.p2 + 2u] = uintBitsToFloat(sm_i2[0]);
+    act[pc.p2 + 3u] = sm_v2[0];
+  }
+}
+#endif

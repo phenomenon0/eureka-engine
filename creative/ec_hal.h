@@ -173,6 +173,11 @@
   cudaError_t ec_hal_device_sync(void);
   void        ec_hal_sync_ptr_for_cpu(const void *ptr);
   void        ec_hal_mark_host_dirty(const void *ptr);
+#ifdef EC_BACKEND_VULKAN
+  void        ec_hal_sync_all_for_cpu(cudaStream_t stream);
+#else
+  static inline void ec_hal_sync_all_for_cpu(cudaStream_t stream) { ec_hal_stream_sync(stream); }
+#endif
   cudaError_t ec_hal_event_create(cudaEvent_t *event, unsigned int flags);
   cudaError_t ec_hal_event_destroy(cudaEvent_t event);
   cudaError_t ec_hal_event_record(cudaEvent_t event, cudaStream_t stream);
@@ -306,7 +311,7 @@
   #endif
 
   #define EC_LAUNCH_1D(kern, grid_val, block_val, stream, ...) do { \
-    ec_hal_stream_sync(stream); \
+    ec_hal_sync_all_for_cpu(stream); \
     const dim3 _g(grid_val); \
     const dim3 _b(block_val); \
     const long _total_blocks = (long)_g.x * (long)_g.y * (long)_g.z; \

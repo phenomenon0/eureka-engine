@@ -362,11 +362,22 @@ static int is_eog(int id) {
 static void reset_state(void) {
   memset(gS, 0, (size_t)L * TR * SZ * SZ * 4);
   memset(gConv, 0, (size_t)L * (KC - 1) * CONVD * 4);
+#ifdef LLB_VULKAN
+  if (llb_vk_graph_active()) llb_vk_graph_reset();
+#endif
   done_n = 0;
 }
 /* bring the state to hold positions [0, upto) of hist */
 static void replay_to(int upto) {
   if (upto < done_n) reset_state(); /* the recurrent state cannot step back */
+#ifdef LLB_VULKAN
+  if (done_n < upto && llb_vk_graph_active()) {
+    if (llb_vk_graph_prefill(hist + done_n, upto - done_n, done_n, 0, NULL, NULL) == 0) {
+      done_n = upto;
+      return;
+    }
+  }
+#endif
   while (done_n < upto) forward_token(hist[done_n], done_n), done_n++;
 }
 
@@ -418,8 +429,32 @@ static void run_request(char *cmd, const char *hidden, unsigned n) {
   FILE *hf = NULL;
   if (hidden && !(hf = fopen(hidden, "wb"))) ecpu_die("cannot write the hidden rows %s", hidden);
   int onorm = find("output_norm.weight");
+#ifdef LLB_VULKAN
+  int vk_g = llb_vk_graph_active();
+  if (vk_g && !hf && k > 0) {
+    for (int i = 0; i < k; i++) hist[hist_n++] = ids_buf[i];
+    if (llb_vk_graph_prefill(ids_buf, k, done_n, 0, NULL, NULL) == 0) {
+      done_n += k;
+    } else {
+      vk_g = 0;
+      hist_n -= k;
+    }
+  }
+  if (!vk_g || hf)
+#endif
   for (int i = 0; i < k; i++) {
     hist[hist_n++] = ids_buf[i];
+#ifdef LLB_VULKAN
+    if (vk_g && llb_vk_graph_step(ids_buf[i], done_n, 0, NULL, NULL) == 0) {
+      done_n++;
+      if (hf) {
+        u32 hd[2] = { (u32)i, (u32)D };
+        llb_vk_graph_read_norm_hidden(HH);
+        if (fwrite(hd, 4, 2, hf) != 2 || fwrite(HH, 4, (size_t)D, hf) != (size_t)D) ecpu_die("hidden rows: write failed%s", NULL);
+      }
+      continue;
+    }
+#endif
     forward_token(ids_buf[i], done_n), done_n++;
     if (hf) { /* CLEF-3: the prompt row after the output RMS norm, {pos, width} + width floats (llb_hidden_put) */
       u32 hd[2] = { (u32)i, (u32)D };
@@ -430,10 +465,28 @@ static void run_request(char *cmd, const char *hidden, unsigned n) {
   if (hf && fclose(hf)) ecpu_die("hidden rows: close failed%s", NULL);
   u64 t1 = now_ms();
   int gen = 0, padded = 0, eog = 0, cur = 0;
+#ifdef LLB_VULKAN
+  int greedy = llb_smp_is_argmax(&smp_par);
+  int have_first_logits = 0;
+  uint32_t t2buf[4] = {0};
+#endif
   for (int st = 0; st < steps; st++) {
     if (!eog) {
-      final_logits();
-      cur = pick(hist_n);
+#ifdef LLB_VULKAN
+      if (vk_g) {
+        if (!have_first_logits) {
+          if (greedy) { llb_vk_graph_final_logits(NULL, t2buf); cur = (int)t2buf[0]; }
+          else        { llb_vk_graph_final_logits(LOGITS, NULL); cur = pick(hist_n); }
+          have_first_logits = 1;
+        } else {
+          cur = greedy ? (int)t2buf[0] : pick(hist_n);
+        }
+      } else
+#endif
+      {
+        final_logits();
+        cur = pick(hist_n);
+      }
     }
     printf("%d\n", cur);
     fflush(stdout);
@@ -442,6 +495,15 @@ static void run_request(char *cmd, const char *hidden, unsigned n) {
     if (st + 1 >= steps) break;
     if (!eog && eog_pad && is_eog(cur)) eog = 1; /* see eog_pad: the rest are copies of this id, not computed */
     if (eog) { padded++; continue; }
+#ifdef LLB_VULKAN
+    if (vk_g) {
+      if (llb_vk_graph_step(cur, done_n, 1, greedy ? NULL : LOGITS, greedy ? t2buf : NULL) == 0) {
+        done_n++;
+        continue;
+      }
+      vk_g = 0;
+    }
+#endif
     forward_token(cur, done_n), done_n++;
   }
   u64 t2 = now_ms();
@@ -536,7 +598,58 @@ int main(int argc, char **argv) {
       }
       u64 tvk0 = now_ms();
       if (llb_vk_init(gPack, psz, vk_spans, n_vk_spans, max_r, max_c) == 0) {
-        fprintf(stderr, "engine_vulkan: %s in %llu ms\n", llb_vk_device_info(), (unsigned long long)(now_ms() - tvk0));
+        llb_vk_model_cfg_t vcfg = {
+          .L = L, .D = D, .H = H, .KV = KV, .HDIM = HDIM, .dff = dff, .V = V,
+          .INTERVAL = INTERVAL, .KC = KC, .SZ = SZ, .GK = GK, .TR = TR, .VHD = VHD,
+          .KDC = KDC, .VDC = VDC, .CONVD = CONVD, .ROPEDIM = ROPEDIM,
+          .EPS = EPS, .ROPE_BASE = ROPE_BASE, .cap_pos = cap_pos,
+        };
+        llb_vk_tensor_desc_t *vtd = (llb_vk_tensor_desc_t *)malloc((size_t)gNT * sizeof *vtd);
+        llb_vk_model_ids_t vids;
+        memset(&vids, -1, sizeof vids);
+        vids.n_layers = L;
+        vids.token_embd = find("token_embd.weight");
+        vids.output_norm = find("output_norm.weight");
+        vids.output_w = find("output.weight");
+        int ids_ok = (vids.token_embd >= 0 && vids.output_norm >= 0 && vids.output_w >= 0 && L <= 64);
+        for (int il = 0; il < L && ids_ok; il++) {
+          char p[32], nm[80];
+          snprintf(p, sizeof p, "blk.%d.", il);
+          #define VF(s) (snprintf(nm, sizeof nm, "%s%s", p, s), find(nm))
+          llb_vk_layer_ids_t *ly = &vids.layers[il];
+          ly->is_full = gFull[il];
+          ly->attn_norm = VF("attn_norm.weight");
+          ly->post_attn_norm = VF("post_attention_norm.weight");
+          ly->ffn_gate = VF("ffn_gate.weight");
+          ly->ffn_up = VF("ffn_up.weight");
+          ly->ffn_down = VF("ffn_down.weight");
+          if (ly->attn_norm < 0 || ly->post_attn_norm < 0 || ly->ffn_gate < 0 || ly->ffn_up < 0 || ly->ffn_down < 0) ids_ok = 0;
+          if (ly->is_full) {
+            ly->attn_q = VF("attn_q.weight"); ly->attn_q_norm = VF("attn_q_norm.weight");
+            ly->attn_k = VF("attn_k.weight"); ly->attn_k_norm = VF("attn_k_norm.weight");
+            ly->attn_v = VF("attn_v.weight"); ly->attn_output = VF("attn_output.weight");
+            if (ly->attn_q < 0 || ly->attn_q_norm < 0 || ly->attn_k < 0 || ly->attn_k_norm < 0 || ly->attn_v < 0 || ly->attn_output < 0) ids_ok = 0;
+          } else {
+            ly->attn_qkv = VF("attn_qkv.weight"); ly->attn_gate = VF("attn_gate.weight");
+            ly->ssm_beta = VF("ssm_beta.weight"); ly->ssm_alpha = VF("ssm_alpha.weight");
+            ly->ssm_dt_bias = VF("ssm_dt.bias"); ly->ssm_a = VF("ssm_a");
+            ly->ssm_conv1d = VF("ssm_conv1d.weight"); ly->ssm_norm = VF("ssm_norm.weight");
+            ly->ssm_out = VF("ssm_out.weight");
+            if (ly->attn_qkv < 0 || ly->attn_gate < 0 || ly->ssm_beta < 0 || ly->ssm_alpha < 0 ||
+                ly->ssm_dt_bias < 0 || ly->ssm_a < 0 || ly->ssm_conv1d < 0 || ly->ssm_norm < 0 || ly->ssm_out < 0) ids_ok = 0;
+          }
+          #undef VF
+        }
+        int g_rc = -1;
+        if (vtd && ids_ok) {
+          for (int i = 0; i < gNT; i++) {
+            vtd[i] = (llb_vk_tensor_desc_t){ gT[i].off, gT[i].bytes, gT[i].rows, gT[i].cols, gT[i].row_bytes, gT[i].fmt };
+          }
+          g_rc = llb_vk_graph_init(&vcfg, vtd, gNT, &vids);
+        }
+        free(vtd);
+        fprintf(stderr, "engine_vulkan: %s [%s] in %llu ms\n", llb_vk_device_info(),
+                g_rc == 0 ? "turbo-graph" : "gemv-fallback", (unsigned long long)(now_ms() - tvk0));
       } else {
         fprintf(stderr, "engine_vulkan: no hardware Vulkan GPU usable; falling back to %d CPU GEMV threads\n", pool_n);
       }
@@ -557,6 +670,30 @@ int main(int argc, char **argv) {
     u64 a = now_ms();
     reset_state();
     hist_n = 0;
+#ifdef LLB_VULKAN
+    if (llb_vk_graph_active()) {
+      int greedy = llb_smp_is_argmax(&smp_par);
+      uint32_t t2[4] = {0};
+      for (int i = 0; i < nrun; i++) hist[hist_n++] = run_ids[i];
+      if (llb_vk_graph_prefill(run_ids, nrun, 0, 1, greedy ? NULL : LOGITS, t2) == 0) {
+        done_n = nrun;
+        for (int st = 0; st < steps; st++) {
+          fprintf(stderr, "logits %d %u %u %u %u\n", hist_n - 1, t2[0], t2[1], t2[2], t2[3]);
+          int cur = greedy ? (int)t2[0] : pick(hist_n);
+          printf("%d\n", cur);
+          hist[hist_n++] = cur;
+          if (st + 1 < steps) {
+            llb_vk_graph_step(cur, done_n, 1, greedy ? NULL : LOGITS, t2);
+            done_n++;
+          }
+        }
+        printf("wall_ms %llu\n", (unsigned long long)(now_ms() - a));
+        return 0;
+      }
+      reset_state();
+      hist_n = 0;
+    }
+#endif
     for (int i = 0; i < nrun; i++) hist[hist_n++] = run_ids[i], forward_token(run_ids[i], done_n), done_n++;
     for (int st = 0; st < steps; st++) {
       final_logits();

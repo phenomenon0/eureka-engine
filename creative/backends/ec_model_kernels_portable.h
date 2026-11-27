@@ -12,6 +12,35 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#ifdef EC_BACKEND_VULKAN
+#ifdef __cplusplus
+extern "C" {
+#endif
+int ec_vk_k_flux2_pack_qkv_rope(const float *qkv, int row_stride, const float *q_norm_w, const float *k_norm_w,
+    const float *rope_cos, const float *rope_sin, __half *Q_out, __half *K_out, __half *V_out,
+    int n_tok, int tok_off, int n_pad, int H, int D, float eps);
+int ec_vk_k_flux2_single_cat_q8g64(const float *attn_out, const float *lin1, int8_t *dst_q8, float *dst_sc,
+    int N_tot, int E, int F);
+int ec_vk_k_nhwc_gn_stats(const float *x_nhwc, float *stats64, int M, int C);
+int ec_vk_k_nhwc_gn_apply_bf16(const float *x_nhwc, const float *stats64, const float *gamma, const float *beta,
+    uint16_t *y_bf16, int M, int C, float eps, int apply_silu);
+int ec_vk_k_upsample2x_nhwc_bf16(const float *x_nhwc, uint16_t *y_bf16, int H, int W, int C);
+int ec_vk_k_vae_mid_attn(const void *Q, const void *K, const void *V, uint16_t *O_bf16,
+    int S, int C, float scale, int is_bf16);
+int ec_vk_k_qwen3_qk_rope(const float *q_in, const float *k_in, const float *v_in,
+    const float *q_norm_w, const float *k_norm_w, float *q_out, float *k_out, float *v_out,
+    int L, int Hq, int Hkv, int D, float theta, float eps);
+int ec_vk_k_qwen3_gqa_attn(const float *Q, const float *K, const float *V, const uint8_t *mask,
+    uint16_t *O_bf16, int L, int Hq, int Hkv, int D, float scale);
+int ec_vk_f32_to_bf16(const float *src, uint16_t *dst, long n);
+int ec_vk_add_inplace(float *dst, const float *src, long n);
+int ec_vk_swiglu_pair_bf16(const float *gate, const float *up, uint16_t *out, long n);
+int ec_vk_flux2_swiglu_bf16(const float *in2h, uint16_t *out_h, int rows, int H);
+#ifdef __cplusplus
+}
+#endif
+#endif
+
 static inline float ecp_bf16_to_f32(uint16_t b) { return __uint_as_float(((uint32_t)b) << 16); }
 static inline uint16_t ecp_f32_to_bf16(float f) {
   uint32_t u = __float_as_uint(f);
@@ -42,7 +71,7 @@ static inline void ec_port_k_tr_layernorm(
     cudaStream_t s, const float *x, const float *w, const float *b,
     const float *adaln_scale, const float *adaln_shift,
     float *y_f32, uint16_t *y_bf16, int rows, int dim, float eps, int apply_silu) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(r, rows)
     const float *xr = x + (long)r * dim;
     float s1 = 0.0f, s2 = 0.0f;
@@ -72,7 +101,7 @@ static inline void ec_port_k_wn_rmsnorm(
     ec_ops_rmsnorm_adaln(x, w, NULL, NULL, y_f32, y_bf16, rows, dim, eps, s);
     return;
   }
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(r, rows)
     const float *xr = x + (long)r * dim;
     float ss = 0.0f;
@@ -103,7 +132,10 @@ static inline void ec_port_k_qwen3_qk_rope(
     const float *q_norm_w, const float *k_norm_w,
     float *q_out, float *k_out, float *v_out,
     int L, int Hq, int Hkv, int D, float theta, float eps) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_qwen3_qk_rope(q_in, k_in, v_in, q_norm_w, k_norm_w, q_out, k_out, v_out, L, Hq, Hkv, D, theta, eps) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   const int total_q = L * Hq, total_kv = L * Hkv, half = D >> 1;
   EC_PAR_FOR_BEGIN(idx, total_q + total_kv)
     if (idx < total_q) {
@@ -151,7 +183,10 @@ static inline void ec_port_k_qwen3_qk_rope(
 static inline void ec_port_k_qwen3_gqa_attn(
     cudaStream_t s, const float *Q, const float *K, const float *V,
     const uint8_t *mask, uint16_t *O_bf16, int L, int Hq, int Hkv, int D, float scale) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_qwen3_gqa_attn(Q, K, V, mask, O_bf16, L, Hq, Hkv, D, scale) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(pair, L * Hq)
     int qpos = pair / Hq, hq = pair % Hq, hkv = hq / (Hq / Hkv);
     const float *qvec = Q + ((long)hq * L + qpos) * D;
@@ -184,7 +219,11 @@ static inline void ec_port_k_flux2_pack_qkv_rope(
     const float *rope_cos, const float *rope_sin,
     __half *Q_out, __half *K_out, __half *V_out,
     int n_tok, int tok_off, int n_pad, int H, int D, float eps) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_flux2_pack_qkv_rope(qkv, row_stride, q_norm_w, k_norm_w, rope_cos, rope_sin,
+                                  Q_out, K_out, V_out, n_tok, tok_off, n_pad, H, D, eps) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   const int E = H * D;
   EC_PAR_FOR_BEGIN(pair, (long)n_tok * H)
     int h = (int)(pair % H), t = (int)(pair / H);
@@ -219,7 +258,10 @@ static inline void ec_port_k_flux2_pack_qkv_rope(
 static inline void ec_port_k_flux2_single_cat_q8g64(
     cudaStream_t s, const float *attn_out, const float *lin1,
     int8_t *dst_q8, float *dst_sc, int N_tot, int E, int F) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_flux2_single_cat_q8g64(attn_out, lin1, dst_q8, dst_sc, N_tot, E, F) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   const int stride_out = E + F, stride_in = 3 * E + 2 * F;
   const int gpr = stride_out >> 6;
   const long total_g = (long)N_tot * gpr;
@@ -258,7 +300,10 @@ static inline void ec_port_k_flux2_single_cat_q8g64(
 static inline void ec_port_k_vae_mid_attn(
     cudaStream_t s, const float *Q, const float *K, const float *V,
     uint16_t *O_bf16, int S, int C, float scale) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_vae_mid_attn(Q, K, V, O_bf16, S, C, scale, 0) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(q, S)
     const float *qv = Q + (long)q * C;
     float acc[512] = {0};
@@ -284,7 +329,10 @@ static inline void ec_port_k_vae_mid_attn(
 static inline void ec_port_k_vae_mid_attn_tc_d512(
     cudaStream_t s, const uint16_t *Q_bf, const uint16_t *K_bf, const uint16_t *V_bf,
     uint16_t *O_bf, int S, float scale) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_vae_mid_attn(Q_bf, K_bf, V_bf, O_bf, S, 512, scale, 1) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(q, S)
     const uint16_t *qv = Q_bf + (long)q * 512;
     float qf[512], acc[512];
@@ -310,7 +358,10 @@ static inline void ec_port_k_vae_mid_attn_tc_d512(
 
 static inline void ec_port_k_nhwc_gn_stats(
     cudaStream_t s, const float *x_nhwc, float *stats64, int M, int C) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_nhwc_gn_stats(x_nhwc, stats64, M, C) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   const int gc = C >> 5;
   EC_PAR_FOR_BEGIN(grp, 32)
     int c0 = grp * gc;
@@ -329,7 +380,10 @@ static inline void ec_port_k_nhwc_gn_apply_bf16(
     cudaStream_t s, const float *x_nhwc, const float *stats64,
     const float *gamma, const float *beta,
     uint16_t *y_bf16, int M, int C, float eps, int apply_silu) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_nhwc_gn_apply_bf16(x_nhwc, stats64, gamma, beta, y_bf16, M, C, eps, apply_silu) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   const int gc = C >> 5;
   const float inv_n = 1.0f / ((float)M * (float)gc);
   float s_mean[32], s_rstd[32];
@@ -352,7 +406,10 @@ static inline void ec_port_k_nhwc_gn_apply_bf16(
 
 static inline void ec_port_k_upsample2x_nhwc_bf16(
     cudaStream_t s, const float *x_nhwc, uint16_t *y_bf16, int H, int W, int C) {
-  ec_hal_stream_sync(s);
+#ifdef EC_BACKEND_VULKAN
+  if (ec_vk_k_upsample2x_nhwc_bf16(x_nhwc, y_bf16, H, W, C) == 0) return;
+#endif
+  ec_hal_sync_all_for_cpu(s);
   const int H2 = H * 2, W2 = W * 2;
   EC_PAR_FOR_BEGIN(pix, H2 * W2)
     int y2 = pix / W2, x2 = pix - y2 * W2;
@@ -366,7 +423,7 @@ static inline void ec_port_k_upsample2x_nhwc_bf16(
 static inline void ec_port_k_vae_conv_out_rgb8_nhwc(
     cudaStream_t s, const uint16_t *X_nhwc, const uint16_t *W_ohwi, const float *bias,
     uint8_t *out_rgb, int H, int W) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   float sW[3][9 * 128];
   for (int i = 0; i < 3 * 9 * 128; i++) sW[i / (9 * 128)][i % (9 * 128)] = ecp_bf16_to_f32(W_ohwi[i]);
   EC_PAR_FOR_BEGIN(pix, H * W)
@@ -402,7 +459,7 @@ static inline void ec_port_k_as_qk_norm_rope_bf16(
     const float *q_norm_w, const float *k_norm_w,
     uint16_t *q_out, uint16_t *k_out, uint16_t *v_out,
     int Lq, int Lkv, int Hq, int Hkv, int D, float theta, float eps, int apply_rope) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   const int total_q = q_in ? (Lq * Hq) : 0, total_kv = k_in ? (Lkv * Hkv) : 0, half = D >> 1;
   EC_PAR_FOR_BEGIN(idx, total_q + total_kv)
     if (idx < total_q) {
@@ -457,7 +514,7 @@ static inline void ec_port_k_as_qk_norm_rope(
     const float *q_norm_w, const float *k_norm_w,
     float *q_out, float *k_out, float *v_out,
     int Lq, int Lkv, int Hq, int Hkv, int D, float theta, float eps, int apply_rope) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   const int total_q = q_in ? (Lq * Hq) : 0, total_kv = k_in ? (Lkv * Hkv) : 0, half = D >> 1;
   EC_PAR_FOR_BEGIN(idx, total_q + total_kv)
     if (idx < total_q) {
@@ -505,7 +562,7 @@ static inline void ec_port_k_as_qk_norm_rope(
 static inline void ec_port_k_as_gqa_attn(
     cudaStream_t s, const float *Q, const float *K, const float *V,
     uint16_t *O_bf16, int Lq, int Lkv, int Hq, int Hkv, int D, float scale, int mode, int window) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(pair, Lq * Hq)
     int qpos = pair / Hq, hq = pair % Hq, hkv = hq / (Hq / Hkv);
     const float *qvec = Q + ((long)hq * Lq + qpos) * D;
@@ -539,7 +596,7 @@ static inline void ec_port_k_as_gqa_attn(
 static inline void ec_port_k_ss_self_qkv_rope(
     cudaStream_t s, const float *qkv, const float *q_gamma, const float *k_gamma,
     uint16_t *Q, uint16_t *K, uint16_t *V, int N, int H, int res) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(idx, N * H)
     int tok = idx / H, h = idx % H;
     const float *base = qkv + (long)tok * (3 * H * 128);
@@ -573,7 +630,7 @@ static inline void ec_port_k_ss_self_qkv_rope(
 
 static inline void ec_port_k_ss_cross_q_norm(
     cudaStream_t s, const float *q_in, const float *q_gamma, uint16_t *Q, int Lq, int H) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(idx, Lq * H)
     int tok = idx / H, h = idx % H;
     const float *qs = q_in + ((long)tok * H + h) * 128, *qg = q_gamma + (long)h * 128;
@@ -588,7 +645,7 @@ static inline void ec_port_k_ss_cross_q_norm(
 
 static inline void ec_port_k_ss_cross_kv_norm(
     cudaStream_t s, const float *kv_in, const float *k_gamma, uint16_t *K, uint16_t *V, int Lkv, int H) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(idx, Lkv * H)
     int tok = idx / H, h = idx % H;
     const float *ks = kv_in + ((long)tok * 2 * H + h) * 128;
@@ -623,7 +680,7 @@ static inline int ecp_t5_rel_bucket(int rel_pos) {
 static inline void ec_port_k_wn_t5_attn_d64(
     cudaStream_t s, const float *Q, const float *K, const float *V,
     const float *rel_bias, uint16_t *O_bf16, int L, int H) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   EC_PAR_FOR_BEGIN(pair, L * H)
     int qpos = pair / H, h = pair % H;
     const float *qv = Q + ((long)qpos * H + h) * 64;
@@ -650,7 +707,7 @@ static inline void ec_port_k_wn_sa_qkv_norm_rope_bf16(
     cudaStream_t s, const float *qkv, const float *nq_w, const float *nk_w,
     uint16_t *qr_b, uint16_t *kr_b, uint16_t *vr_b, int N, int F, int Hp, int Wp) {
   (void)F;
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   const int DIM = 3072;
   EC_PAR_FOR_BEGIN(tok, N)
     const float *qs = qkv + (long)tok * (3 * DIM), *ks = qs + DIM, *vs = qs + 2 * DIM;
@@ -685,7 +742,7 @@ static inline void ec_port_k_wn_sa_qkv_norm_rope_bf16(
 
 static inline void ec_port_k_wn_vae_attn_1h(
     cudaStream_t s, const float *qkv, uint16_t *out_bf16, int HW, int C) {
-  ec_hal_stream_sync(s);
+  ec_hal_sync_all_for_cpu(s);
   const float scale = rsqrtf((float)C);
   EC_PAR_FOR_BEGIN(qpos, HW)
     const float *qv = qkv + (long)qpos * (3 * C);
